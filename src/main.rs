@@ -1,8 +1,12 @@
 use clap::{Parser, Subcommand};
 
-/// agt - ticket tool
+mod ticket;
+
+use ticket::{Priority, State, Ticket, TicketId};
+
+/// pm - ticket tool
 #[derive(Parser, Debug)]
-#[command(name = "agt", version)]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -28,7 +32,23 @@ fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Ticket { cmd } => match cmd {
-            TicketCmd::List => println!("no tickets yet"),
+            TicketCmd::List => {
+                let t = Ticket {
+                    id: TicketId(1),
+                    title: String::from("learn rust by building pm"),
+                    state: State::InProgress,
+                    priority: Priority::High,
+                    project: None,
+                };
+                let project = match &t.project {
+                    Some(p) => p.as_str(),
+                    None => "-",
+                };
+                println!(
+                    "{} {} {} {} {}",
+                    t.id, t.state, t.priority, project, t.title
+                );
+            }
         },
     }
     Ok(())
