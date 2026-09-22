@@ -6,7 +6,7 @@ mod ticket;
 
 use ticket::{Priority, State, Ticket, TicketId};
 
-/// pm - ticket tool
+/// pm - ticket tool for the saltline vault (AGT-numbered tickets)
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Cli {
@@ -57,7 +57,12 @@ fn main() -> anyhow::Result<()> {
                 let text = std::fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
                 let t = Ticket::parse(&text)?;
-                println!("{t:#?}");
+                let project = t.project.as_deref().unwrap_or("-");
+                println!("id:       {}", t.id);
+                println!("title:    {}", t.title);
+                println!("state:    {}", t.state);
+                println!("priority: {}", t.priority);
+                println!("project:  {project}");
             }
         },
     }

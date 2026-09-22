@@ -19,7 +19,7 @@ impl FromStr for TicketId {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let num = s
             .strip_prefix("AGT-")
-            .ok_or_else(|| anyhow::anyhow!("ticket id must start with AGT-: {s}"))?;
+            .ok_or_else(|| anyhow::anyhow!("ticket id '{s}' must look like AGT-123"))?;
         let n: u32 = num.parse()?;
         Ok(TicketId(n))
     }
@@ -53,7 +53,7 @@ impl FromStr for Priority {
             "low" => Ok(Priority::Low),
             "medium" => Ok(Priority::Medium),
             "high" => Ok(Priority::High),
-            other => anyhow::bail!("unknown priority: {other}"),
+            other => anyhow::bail!("unknown priority '{other}': expected one of low, medium, high"),
         }
     }
 }
@@ -85,7 +85,9 @@ impl FromStr for State {
             "triage" => Ok(State::Triage),
             "in-progress" => Ok(State::InProgress),
             "done" => Ok(State::Done),
-            other => anyhow::bail!("unknown state: {other}"),
+            other => {
+                anyhow::bail!("unknown state '{other}': expected one of triage, in-progress, done")
+            }
         }
     }
 }
