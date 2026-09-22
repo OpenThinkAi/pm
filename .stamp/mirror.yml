@@ -1,0 +1,8 @@
+github:
+  repo: OpenThinkAi/pm
+  branches:
+    - main
+  # Mirror tags to GitHub too — uncomment if you publish on tag push
+  # (npm/Cargo/PyPI release workflows). Glob patterns or 'true' for all.
+  # tags:
+  #   - "v*"
