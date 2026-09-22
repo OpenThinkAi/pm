@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::fmt;
 use std::str::FromStr;
 
@@ -99,9 +100,85 @@ pub struct Ticket {
     pub project: Option<String>,
 }
 
+/// The text between the opening and closing `---` lines.
+fn frontmatter(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("---\n")?;
+    let (fm, _body) = rest.split_once("\n---")?;
+    Some(fm)
+}
+
+/// The value of one `key: value` line, if the key is present.
+fn field<'a>(fm: &'a str, key: &str) -> Option<&'a str> {
+    for line in fm.lines() {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        if k == key {
+            return Some(v.trim());
+        }
+    }
+    None
+}
+
+/// Like `field`, but a missing key is an error that names the key.
+fn required<'a>(fm: &'a str, key: &str) -> anyhow::Result<&'a str> {
+    field(fm, key).with_context(|| format!("missing field: {key}"))
+}
+
+impl Ticket {
+    /// Build a ticket from the full text of a vault ticket file.
+    pub fn parse(text: &str) -> anyhow::Result<Ticket> {
+        let fm = frontmatter(text).context("no frontmatter block")?;
+        let id: TicketId = required(fm, "id")?.parse()?;
+        let state: State = required(fm, "state")?.parse()?;
+        let priority: Priority = required(fm, "priority")?.parse()?;
+        let title = required(fm, "title")?.trim_matches('"').to_string();
+        let project = field(fm, "project")
+            .filter(|p| !p.is_empty())
+            .map(String::from);
+        Ok(Ticket {
+            id,
+            title,
+            state,
+            priority,
+            project,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SAMPLE: &str = r#"---
+id: AGT-7
+title: "Parse tickets: the real ones"
+state: in-progress
+priority: high
+project:
+---
+
+## Problem Statement
+"#;
+
+    #[test]
+    fn frontmatter_is_the_fenced_block() {
+        let fm = frontmatter(SAMPLE).unwrap();
+        assert!(fm.starts_with("id: AGT-7"));
+        assert!(fm.ends_with("project:"));
+        assert!(frontmatter("no fences here").is_none());
+    }
+
+    #[test]
+    fn parses_a_whole_ticket() {
+        let t = Ticket::parse(SAMPLE).unwrap();
+        assert_eq!(t.id, TicketId(7));
+        assert_eq!(t.title, "Parse tickets: the real ones");
+        assert_eq!(t.state, State::InProgress);
+        assert_eq!(t.priority, Priority::High);
+        assert_eq!(t.project, None);
+        assert!(Ticket::parse("---\nid: AGT-1\n---\n").is_err());
+    }
 
     #[test]
     fn id_round_trips() {

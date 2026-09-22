@@ -1,4 +1,6 @@
+use anyhow::Context;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 mod ticket;
 
@@ -25,6 +27,8 @@ enum Cmd {
 enum TicketCmd {
     /// List tickets
     List,
+    /// Show one ticket file
+    Show { path: PathBuf },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -48,6 +52,12 @@ fn main() -> anyhow::Result<()> {
                     "{} {} {} {} {}",
                     t.id, t.state, t.priority, project, t.title
                 );
+            }
+            TicketCmd::Show { path } => {
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let t = Ticket::parse(&text)?;
+                println!("{t:#?}");
             }
         },
     }
