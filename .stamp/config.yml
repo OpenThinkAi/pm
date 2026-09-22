@@ -1,0 +1,7 @@
+branches:
+  main:
+    required:
+      - example
+reviewers:
+  example:
+    prompt: .stamp/reviewers/example.md
