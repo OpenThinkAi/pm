@@ -1,7 +1,15 @@
 branches:
   main:
     required:
-      - example
+      - security
+      - standards
+      - product
 reviewers:
+  security:
+    prompt: .stamp/reviewers/security.md
+  standards:
+    prompt: .stamp/reviewers/standards.md
+  product:
+    prompt: .stamp/reviewers/product.md
   example:
     prompt: .stamp/reviewers/example.md
