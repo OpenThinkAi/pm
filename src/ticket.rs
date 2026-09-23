@@ -10,7 +10,7 @@ pub struct TicketId(pub u32);
 
 impl fmt::Display for TicketId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "AGT-{}", self.0)
+        f.pad(&format!("AGT-{}", self.0))
     }
 }
 
