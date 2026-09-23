@@ -1,10 +1,10 @@
-use anyhow::Context;
 use clap::{Parser, Subcommand};
+use std::cmp::Reverse;
 use std::path::PathBuf;
 
 mod ticket;
 
-use ticket::{Priority, State, Ticket, TicketId};
+use ticket::Ticket;
 
 /// pm - ticket tool for the saltline vault (AGT-numbered tickets)
 #[derive(Parser, Debug)]
@@ -25,8 +25,8 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum TicketCmd {
-    /// List tickets
-    List,
+    /// List every ticket under a directory
+    List { dir: PathBuf },
     /// Show one ticket file
     Show { path: PathBuf },
 }
@@ -36,27 +36,15 @@ fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Ticket { cmd } => match cmd {
-            TicketCmd::List => {
-                let t = Ticket {
-                    id: TicketId(1),
-                    title: String::from("learn rust by building pm"),
-                    state: State::InProgress,
-                    priority: Priority::High,
-                    project: None,
-                };
-                let project = match &t.project {
-                    Some(p) => p.as_str(),
-                    None => "-",
-                };
-                println!(
-                    "{} {} {} {} {}",
-                    t.id, t.state, t.priority, project, t.title
-                );
+            TicketCmd::List { dir } => {
+                let mut tickets = ticket::load_dir(&dir)?;
+                tickets.sort_by_key(|t| (Reverse(t.priority), t.id));
+                for t in &tickets {
+                    println!("{t}");
+                }
             }
             TicketCmd::Show { path } => {
-                let text = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading {}", path.display()))?;
-                let t = Ticket::parse(&text)?;
+                let t = Ticket::load(&path)?;
                 let project = t.project.as_deref().unwrap_or("-");
                 println!("id:       {}", t.id);
                 println!("title:    {}", t.title);
