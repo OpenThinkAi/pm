@@ -1,5 +1,6 @@
 use anyhow::Context;
 use std::fmt;
+use std::path::Path;
 use std::str::FromStr;
 
 /// A ticket ID like AGT-123. Wraps the number so it can't
@@ -9,7 +10,7 @@ pub struct TicketId(pub u32);
 
 impl fmt::Display for TicketId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "AGT-{}", self.0)
+        f.pad(&format!("AGT-{}", self.0))
     }
 }
 
@@ -41,7 +42,7 @@ impl fmt::Display for Priority {
             Priority::Medium => "medium",
             Priority::High => "high",
         };
-        write!(f, "{s}")
+        f.pad(s)
     }
 }
 
@@ -73,7 +74,7 @@ impl fmt::Display for State {
             State::InProgress => "in-progress",
             State::Done => "done",
         };
-        write!(f, "{s}")
+        f.pad(s)
     }
 }
 
@@ -146,6 +147,42 @@ impl Ticket {
             project,
         })
     }
+    /// Read and parse one ticket file.
+    pub fn load(path: &Path) -> anyhow::Result<Ticket> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Ticket::parse(&text)
+    }
+}
+
+/// One row of `pm ticket list`.
+impl fmt::Display for Ticket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let project = self.project.as_deref().unwrap_or("-");
+        write!(
+            f,
+            "{:<8} {:<11} {:<6} {:<24} {}",
+            self.id, self.state, self.priority, project, self.title
+        )
+    }
+}
+
+/// Every ticket file in dir and its subfolders.
+pub fn load_dir(dir: &Path) -> anyhow::Result<Vec<Ticket>> {
+    let mut tickets = Vec::new();
+    let entries = std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))?;
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            tickets.extend(load_dir(&path)?);
+        } else if path.extension().is_some_and(|e| e == "md") {
+            match Ticket::load(&path) {
+                Ok(t) => tickets.push(t),
+                Err(e) => eprintln!("warning: {e:#}"),
+            }
+        }
+    }
+    Ok(tickets)
 }
 
 #[cfg(test)]
@@ -180,6 +217,14 @@ project:
         assert_eq!(t.priority, Priority::High);
         assert_eq!(t.project, None);
         assert!(Ticket::parse("---\nid: AGT-1\n---\n").is_err());
+    }
+
+    #[test]
+    fn display_pads_each_column() {
+        assert_eq!(format!("[{:<6}]", Priority::Low), "[low   ]");
+        let row = Ticket::parse(SAMPLE).unwrap().to_string();
+        assert!(row.starts_with("AGT-7    in-progress high   -   "));
+        assert!(row.ends_with("  Parse tickets: the real ones"));
     }
 
     #[test]
