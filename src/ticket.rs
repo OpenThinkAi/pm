@@ -167,6 +167,26 @@ impl fmt::Display for Ticket {
     }
 }
 
+#[derive(Default)]
+pub struct Filter {
+    pub state: Option<State>,
+    pub project: Option<String>,
+}
+
+impl Filter {
+    pub fn matches(&self, t: &Ticket) -> bool {
+        let state_ok = match self.state {
+            None => true,
+            Some(s) => t.state == s,
+        };
+        let project_ok = match &self.project {
+            None => true,
+            Some(p) => t.project.as_ref() == Some(p),
+        };
+        state_ok && project_ok
+    }
+}
+
 /// Every ticket file in dir and its subfolders.
 pub fn load_dir(dir: &Path) -> anyhow::Result<Vec<Ticket>> {
     let mut tickets = Vec::new();
@@ -225,6 +245,32 @@ project:
         let row = Ticket::parse(SAMPLE).unwrap().to_string();
         assert!(row.starts_with("AGT-7    in-progress high   -   "));
         assert!(row.ends_with("  Parse tickets: the real ones"));
+    }
+
+    #[test]
+    fn filter_matches_state_and_project() {
+        let t = Ticket::parse(SAMPLE).unwrap();
+        assert!(Filter::default().matches(&t));
+
+        let wip = Filter {
+            state: Some(State::InProgress),
+            ..Default::default()
+        };
+        assert!(wip.matches(&t));
+        let done = Filter {
+            state: Some(State::Done),
+            ..Default::default()
+        };
+        assert!(!done.matches(&t));
+
+        let pm = Filter {
+            project: Some("pm".into()),
+            ..Default::default()
+        };
+        assert!(!pm.matches(&t));
+        let mut in_pm = t.clone();
+        in_pm.project = Some("pm".into());
+        assert!(pm.matches(&in_pm));
     }
 
     #[test]
