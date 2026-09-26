@@ -167,6 +167,7 @@ impl fmt::Display for Ticket {
     }
 }
 
+/// Which tickets `pm ticket list` keeps. A field left as None matches every ticket.
 #[derive(Default)]
 pub struct Filter {
     pub state: Option<State>,
@@ -271,6 +272,14 @@ project:
         let mut in_pm = t.clone();
         in_pm.project = Some("pm".into());
         assert!(pm.matches(&in_pm));
+
+        // Both fields set: each must pass on its own.
+        let wip_in_pm = Filter {
+            state: Some(State::InProgress),
+            project: Some("pm".into()),
+        };
+        assert!(wip_in_pm.matches(&in_pm));
+        assert!(!wip_in_pm.matches(&t));
     }
 
     #[test]
