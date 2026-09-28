@@ -48,32 +48,23 @@ impl SourceFm {
 
 /// Every frontmatter field `pm new --from-file` understands (AC1).
 /// `id`/`state`/`created`/`updated` are read here — so they never leak
-/// into `ext` — and then discarded: pm computes all four itself (a
+/// into `ext` — and ignored by `pm new`: pm computes all four itself (a
 /// human number, the workspace's initial state, and both timestamps from
-/// the op's own HLC). Everything else unrecognized is preserved verbatim
-/// in `ext`.
+/// the op's own HLC). Only `pm import vault` (AGT-1347) reads them: the
+/// vault's number, state and dates are exactly what it preserves.
+/// Everything else unrecognized is preserved verbatim in `ext`.
 #[derive(Debug, Default, Deserialize)]
 pub struct FileFrontmatter {
     #[serde(default)]
     pub title: Option<String>,
-    /// Read only to keep it out of `ext`; pm mints its own id.
     #[serde(default)]
-    #[allow(dead_code)]
-    id: Option<serde_yaml_ng::Value>,
-    /// Read only to keep it out of `ext`; every new ticket starts in the
-    /// workspace's initial (unstarted) state.
+    pub id: Option<serde_yaml_ng::Value>,
     #[serde(default)]
-    #[allow(dead_code)]
-    state: Option<serde_yaml_ng::Value>,
-    /// Read only to keep it out of `ext`; pm stamps `created` from the
-    /// `ticket.create` op's own HLC.
+    pub state: Option<serde_yaml_ng::Value>,
     #[serde(default)]
-    #[allow(dead_code)]
-    created: Option<serde_yaml_ng::Value>,
-    /// Read only to keep it out of `ext`; same as `created`.
+    pub created: Option<serde_yaml_ng::Value>,
     #[serde(default)]
-    #[allow(dead_code)]
-    updated: Option<serde_yaml_ng::Value>,
+    pub updated: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     pub project: Option<String>,
     #[serde(default)]
@@ -139,8 +130,9 @@ pub struct BatchEntry {
 
 /// The text between a vault ticket file's frontmatter fences, and
 /// everything after the closing fence (trimmed), which becomes the
-/// ticket's description verbatim.
-fn split_frontmatter(text: &str) -> Result<(&str, &str)> {
+/// ticket's description verbatim. `pub(crate)`: `crate::import` splits
+/// the same way, then normalizes the frontmatter before parsing it.
+pub(crate) fn split_frontmatter(text: &str) -> Result<(&str, &str)> {
     let rest = text.strip_prefix("---\n").ok_or_else(|| {
         CliError::usage("file has no frontmatter block (expected a leading '---' line)")
     })?;

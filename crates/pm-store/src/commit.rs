@@ -114,9 +114,14 @@ fn allocate_number_in(tx: &Transaction<'_>, ticket: Ulid, actor: &ActorId) -> Re
         }
         Some(None) => {}
     }
-    let next: i64 = tx.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM ticket", [], |r| {
-        r.get(0)
-    })?;
+    // Above every number in use *and* the allocator floor `pm import
+    // vault` raises to the vault's maximum (import.rs, AGT-1347).
+    let next: i64 = tx.query_row(
+        "SELECT MAX(COALESCE((SELECT MAX(number) FROM ticket), 0),
+                    COALESCE((SELECT number_floor FROM workspace), 0)) + 1",
+        [],
+        |r| r.get(0),
+    )?;
     let hlc = Clock::from_latest(latest_hlc(tx)?).send(now_ms());
     let op = Op::new(
         Ulid::new(),

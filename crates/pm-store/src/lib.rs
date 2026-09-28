@@ -20,6 +20,8 @@
 //! - `project` — project document bodies as `body.edit` ops (AGT-1344):
 //!   creation, named documents, deletion (refused with live tickets), and
 //!   the doc-replay `doctor`/`rebuild` fold in
+//! - `import` — the number allocator's floor and project upserts for
+//!   `pm import vault` (AGT-1347)
 //! - [`StoreError`] — typed failures (R2/R4/R5 violations, claim rejection, …)
 
 mod backup;
@@ -29,6 +31,7 @@ mod commit;
 mod config;
 mod doctor;
 mod error;
+mod import;
 mod project;
 mod query;
 mod ready;
@@ -53,10 +56,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_schema_v1.sql")),
     (2, include_str!("../migrations/0002_backup_agt1350.sql")),
     (3, include_str!("../migrations/0003_project_doc_bodies.sql")),
+    (4, include_str!("../migrations/0004_number_floor.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// How long a writer waits for the database lock before giving up. Sized
 /// for many concurrent CLI invocations (build loops fan out), not for a
