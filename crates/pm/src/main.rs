@@ -1,22 +1,75 @@
 use clap::{Parser, Subcommand};
 use std::cmp::Reverse;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
+mod exit;
 mod ticket;
+mod verbs;
+mod workspace;
 
 use ticket::{Filter, State, Ticket};
 
-/// pm - ticket tool for the saltline vault (AGT-numbered tickets)
+/// pm - local-first ticketing for agents and humans
+///
+/// Exit codes: 0 ok, 1 error, 2 usage, 3 not found.
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Cli {
+    /// Workspace directory (else PM_WORKSPACE, else `workspace` in ~/.config/pm/config.toml)
+    #[arg(long, global = true, value_name = "DIR")]
+    workspace: Option<PathBuf>,
+    /// Actor recorded on every op (PM_ACTOR wins over this; $USER is the fallback)
+    #[arg(long = "as", global = true, value_name = "ACTOR")]
+    as_actor: Option<String>,
+    /// Machine-readable output (`{"schema": 1, ...}`)
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Tickets
+    /// Create a workspace database (saltline states: triage, in-progress, done)
+    Init {
+        /// Ticket id prefix, e.g. AGT
+        #[arg(long)]
+        prefix: String,
+    },
+    /// File a ticket and print its id
+    New {
+        #[arg(long)]
+        title: String,
+        /// Project id; the project must already exist
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        /// low, medium (default), high or critical
+        #[arg(long, value_parser = verbs::parse_priority)]
+        priority: Option<pm_core::Priority>,
+        /// Label to add; repeat or comma-separate for several
+        #[arg(long = "label", value_name = "LABEL", value_delimiter = ',')]
+        labels: Vec<String>,
+    },
+    /// Print a ticket
+    Show {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+        /// Print only this field's value
+        #[arg(long, value_name = "NAME")]
+        field: Option<String>,
+    },
+    /// Set ticket fields: title, priority, project, repo (empty value clears)
+    Set {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+        /// key=value pairs
+        #[arg(required = true, value_name = "KEY=VALUE")]
+        assignments: Vec<String>,
+    },
+    /// Markdown vault tickets (legacy, reads ticket files directly)
     Ticket {
         #[command(subcommand)]
         cmd: TicketCmd,
@@ -39,37 +92,77 @@ enum TicketCmd {
     Show { path: PathBuf },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
+    // Clap exits 2 on usage errors and 0 for --help/--version.
     let cli = Cli::parse();
+    let env = workspace::Env::from_process();
+    let ctx = verbs::Ctx {
+        env: &env,
+        workspace: cli.workspace.as_deref(),
+        as_flag: cli.as_actor.as_deref(),
+        json: cli.json,
+    };
+    match run(&ctx, cli.cmd) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("pm: {:#}", e.error);
+            ExitCode::from(e.code)
+        }
+    }
+}
 
-    match cli.cmd {
-        Cmd::Ticket { cmd } => match cmd {
-            TicketCmd::List {
-                dir,
-                state,
+fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
+    match cmd {
+        Cmd::Init { prefix } => verbs::init(ctx, &prefix),
+        Cmd::New {
+            title,
+            project,
+            repo,
+            priority,
+            labels,
+        } => verbs::new(
+            ctx,
+            verbs::NewArgs {
+                title,
                 project,
-            } => {
-                let filter = Filter { state, project };
-                let mut tickets = ticket::load_dir(&dir)?;
-                tickets.retain(|t| filter.matches(t));
-                tickets.sort_by_key(|t| (Reverse(t.priority), t.id));
-                if tickets.is_empty() {
-                    eprintln!("no tickets found");
-                }
-                for t in &tickets {
-                    println!("{t}");
-                }
+                repo,
+                priority,
+                labels,
+            },
+        ),
+        Cmd::Show { id, field } => verbs::show(ctx, &id, field.as_deref()),
+        Cmd::Set { id, assignments } => verbs::set(ctx, &id, &assignments),
+        Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
+    }
+}
+
+fn legacy_ticket(cmd: TicketCmd) -> anyhow::Result<()> {
+    match cmd {
+        TicketCmd::List {
+            dir,
+            state,
+            project,
+        } => {
+            let filter = Filter { state, project };
+            let mut tickets = ticket::load_dir(&dir)?;
+            tickets.retain(|t| filter.matches(t));
+            tickets.sort_by_key(|t| (Reverse(t.priority), t.id));
+            if tickets.is_empty() {
+                eprintln!("no tickets found");
             }
-            TicketCmd::Show { path } => {
-                let t = Ticket::load(&path)?;
-                let project = t.project.as_deref().unwrap_or("-");
-                println!("id:       {}", t.id);
-                println!("title:    {}", t.title);
-                println!("state:    {}", t.state);
-                println!("priority: {}", t.priority);
-                println!("project:  {project}");
+            for t in &tickets {
+                println!("{t}");
             }
-        },
+        }
+        TicketCmd::Show { path } => {
+            let t = Ticket::load(&path)?;
+            let project = t.project.as_deref().unwrap_or("-");
+            println!("id:       {}", t.id);
+            println!("title:    {}", t.title);
+            println!("state:    {}", t.state);
+            println!("priority: {}", t.priority);
+            println!("project:  {project}");
+        }
     }
     Ok(())
 }
