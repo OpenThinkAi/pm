@@ -14,8 +14,10 @@
 //! - `query` — by id / number / filtered list, comments, relations, ops
 //! - `config` — workspace + states, projects + docs
 //! - `doctor` — [`Store::doctor`] (verify) and [`Store::rebuild`] (replay the log)
+//! - `backup` — [`Store::ops_since`] and per-target progress (AGT-1350)
 //! - [`StoreError`] — typed failures (R2/R4/R5 violations, claim rejection, …)
 
+mod backup;
 mod codec;
 mod commit;
 mod config;
@@ -28,6 +30,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior};
 
+pub use backup::BackupStatus;
 pub use doctor::{
     ColumnChange, Diff, ForeignKeyViolation, Report, Row, RowChange, TICKET_TABLES, TableDiff,
 };
@@ -36,10 +39,13 @@ pub use query::TicketFilter;
 
 /// Embedded migrations, in order. Each runs once, inside its own
 /// transaction, and is recorded in `schema_version`.
-const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../migrations/0001_schema_v1.sql"))];
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("../migrations/0001_schema_v1.sql")),
+    (2, include_str!("../migrations/0002_backup_agt1350.sql")),
+];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// How long a writer waits for the database lock before giving up. Sized
 /// for many concurrent CLI invocations (build loops fan out), not for a

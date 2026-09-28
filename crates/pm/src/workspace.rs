@@ -96,6 +96,23 @@ pub struct Config {
     /// the directory holding config.toml.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<PathBuf>,
+    /// `[backup]` (AGT-1350): where `pm backup` writes and pushes from
+    /// when `--to` is not given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<BackupConfig>,
+}
+
+/// `pm backup`'s config section (AGT-1350 AC1: "default dir from config
+/// `backup.repo`").
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct BackupConfig {
+    /// The backup target: a git working directory `pm backup` writes
+    /// `ops/<prefix>.jsonl` into, commits, and pushes (if it has a
+    /// remote). A relative path is relative to the directory holding
+    /// config.toml, same as `workspace`. Default: a clone of the private
+    /// `OpenThinkAi/pm-backup-saltline` repo (README §Decisions A2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<PathBuf>,
 }
 
 impl Config {
@@ -116,6 +133,12 @@ impl Config {
             && ws.is_relative()
         {
             config.workspace = Some(dir.join(ws));
+        }
+        if let (Some(backup), Some(dir)) = (&mut config.backup, path.parent())
+            && let Some(repo) = &backup.repo
+            && repo.is_relative()
+        {
+            backup.repo = Some(dir.join(repo));
         }
         Ok(Some(config))
     }

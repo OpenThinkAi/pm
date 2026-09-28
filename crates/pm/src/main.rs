@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod backup;
 mod batch;
 mod doctor;
 mod exit;
@@ -158,6 +159,36 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TicketCmd,
     },
+    /// Export the op log to a git repo (or restore a workspace from one), and manage its launchd timer
+    Backup {
+        /// Append new ops to <DIR> as JSONL, commit, and push (default: config `backup.repo`)
+        #[arg(long = "to", value_name = "DIR")]
+        to: Option<PathBuf>,
+        /// Rebuild the resolved --workspace from <DIR>'s ops/*.jsonl instead of backing up
+        #[arg(long, value_name = "DIR", conflicts_with = "to")]
+        restore: Option<PathBuf>,
+        #[command(subcommand)]
+        cmd: Option<BackupCmd>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BackupCmd {
+    /// Write (and, by default, load) an hourly launchd job that runs `pm backup` for this workspace
+    InstallTimer {
+        /// Write the plist here instead of ~/Library/LaunchAgents; never loads it into launchd
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Write the plist without loading it
+        #[arg(long = "no-load")]
+        no_load: bool,
+    },
+    /// Report the last backup's outcome; exit 1 if it never succeeded or is more than 24h old
+    Status {
+        /// Which target to report on (default: config `backup.repo`)
+        #[arg(long = "to", value_name = "DIR")]
+        to: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -252,6 +283,19 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         Cmd::Unclaim { id } => mutate::unclaim(ctx, &id),
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
+        Cmd::Backup { to, restore, cmd } => match cmd {
+            Some(BackupCmd::InstallTimer { dir, no_load }) => {
+                backup::install_timer(ctx, dir, no_load)
+            }
+            Some(BackupCmd::Status { to }) => backup::status(ctx, to),
+            None if to.is_some() && restore.is_some() => {
+                unreachable!("clap's conflicts_with rules this out")
+            }
+            None => match restore {
+                Some(dir) => backup::restore(ctx, &dir),
+                None => backup::run(ctx, to),
+            },
+        },
     }
 }
 

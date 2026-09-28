@@ -142,6 +142,7 @@ fn open_creates_a_wal_database_with_every_table_and_records_the_migration() {
         "ops",
         "ticket_view",
         "schema_version",
+        "backup_target",
     ] {
         assert!(
             tables.contains(expected),
@@ -155,7 +156,7 @@ fn open_creates_a_wal_database_with_every_table_and_records_the_migration() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(applied, [1]);
+    assert_eq!(applied, (1..=SCHEMA_VERSION).collect::<Vec<_>>());
 
     // Reopening is a no-op migration, not a re-run.
     drop(store);
