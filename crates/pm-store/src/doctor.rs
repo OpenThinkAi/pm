@@ -19,14 +19,16 @@
 //! rows with a `doc_id`, so a document written directly (`put_project`'s
 //! bulk `documents` map, before one is assigned) is left alone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::types::Value as Sql;
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use ulid::Ulid;
 
 use crate::Store;
+use crate::codec::ulid;
 use crate::commit::replay_in;
 use crate::error::{Result, StoreError};
 use crate::query::read_ops;
@@ -186,18 +188,36 @@ impl Store {
     }
 }
 
+/// Every entity a `ticket.create` op has ever named, straight from the
+/// log — never affected by a row's current state (a ticket's tombstone,
+/// a project document's deletion), unlike a materialized-table lookup.
+fn ticket_create_entities(tx: &Transaction<'_>) -> Result<BTreeSet<Ulid>> {
+    let mut stmt = tx.prepare("SELECT DISTINCT entity FROM ops WHERE kind = ?1")?;
+    let rows = stmt.query_map(params!["ticket.create"], |r| r.get::<_, String>(0))?;
+    rows.map(|row| ulid("ops.entity", &row?)).collect()
+}
+
 fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
     let before = snapshot(tx, &TICKET_TABLES)?;
     for table in TICKET_TABLES.iter().rev() {
         tx.execute(&format!("DELETE FROM {table}"), [])?;
     }
     // The op log shares one `entity` namespace between tickets and project
-    // documents (AGT-1344): a `body.edit` whose entity is a known doc_id
-    // belongs to `crate::project::replay_project_docs` below, not here —
-    // replaying it as a ticket op would report `UnknownTicket`.
-    let doc_ids = crate::project::known_doc_ids(tx)?;
+    // documents (AGT-1344): a `body.edit` whose entity is a document, not
+    // a ticket, belongs to `crate::project::replay_project_docs` below,
+    // not here — replaying it as a ticket op would report `UnknownTicket`.
+    //
+    // Told apart structurally, not by `known_doc_ids` (live doc_ids on
+    // `project`/`project_doc` right now): only a ticket ever gets a
+    // `ticket.create` op, so an entity with none is never a ticket. This
+    // stays correct after `Store::delete_project` removes a document's
+    // doc_id from those rows — its old `body.edit` ops are still in the
+    // log (never pruned) but no longer "known"; `known_doc_ids` would
+    // wrongly let them fall through to `replay_in` here. A ticket-create
+    // check has no such blind spot: it depends only on the log itself.
+    let ticket_entities = ticket_create_entities(tx)?;
     for (seq, op) in read_ops(tx, "", [])? {
-        if doc_ids.contains(&op.entity) {
+        if op.kind() == "body.edit" && !ticket_entities.contains(&op.entity) {
             continue;
         }
         replay_in(tx, &op).map_err(|source| StoreError::Replay {

@@ -393,3 +393,24 @@ fn doctor_stays_clean_through_a_full_project_workflow() {
     assert_eq!(v["healthy"], true);
     assert_eq!(v["rebuilt"]["tables"], serde_json::json!([]));
 }
+
+/// Round-3 review finding: a project's `body.edit` ops stay in the log
+/// after `pm project delete` (the log is never pruned), and `pm doctor` /
+/// `--rebuild` must not choke on them — they used to be misrouted into
+/// the ticket replay path and fail with `UnknownTicket`.
+#[test]
+fn doctor_survives_a_deleted_project_that_had_document_edits() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    let editor = sb.editor_script("editor.sh", "design text");
+    assert_ok(&sb.run(
+        &["project", "edit", "pm"],
+        &[("EDITOR", editor.to_str().unwrap())],
+    ));
+    assert_ok(&sb.pm(&["project", "delete", "pm"]));
+
+    assert_ok(&sb.pm(&["doctor"]));
+    let v = json(&sb.pm(&["doctor", "--rebuild", "--json"]));
+    assert_eq!(v["healthy"], true, "{v}");
+    assert_eq!(v["rebuilt"]["tables"], serde_json::json!([]));
+}

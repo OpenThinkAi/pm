@@ -256,6 +256,48 @@ fn delete_project_removes_it_and_its_document_view_rows() {
     assert!(store.doc_view(doc_id).unwrap().is_none());
 }
 
+/// Round-3 review finding: `delete_project` removes a document's `doc_id`
+/// from `project`/`project_doc`, but its `body.edit` ops stay in the log
+/// (never pruned). Before the fix, `doctor::replay_all`'s ticket-replay
+/// loop used `known_doc_ids` (the *current* set) to skip those ops — once
+/// the doc_id was gone from `known_doc_ids`, the orphaned `body.edit`
+/// fell through to the ticket replay path and failed with `UnknownTicket`
+/// (no `ticket.create` for that entity). `pm doctor` / `--rebuild` must
+/// survive a project deletion that had document edits.
+#[test]
+fn doctor_and_rebuild_survive_a_deleted_project_that_had_document_edits() {
+    let (_dir, mut store) = store();
+    let doc_id = store
+        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .unwrap();
+    store
+        .commit_doc_edit(doc_id, &body_edit_op(doc_id, 1, None, "design text"))
+        .unwrap();
+    // A real ticket in the mix too (in a different, undeleted project —
+    // `delete_project` refuses "pm" itself if it has live tickets), so the
+    // fix is proven not to also start skipping (or otherwise mishandle)
+    // genuine ticket ops.
+    store
+        .create_project("other", "other", &BTreeSet::new(), None)
+        .unwrap();
+    let ticket = Ulid::new();
+    store.commit(&create_ticket(ticket, 2, "other")).unwrap();
+    store.delete_project("pm").unwrap();
+
+    let report = store.doctor().unwrap();
+    assert!(report.is_healthy(), "{report:#?}");
+    assert_eq!(report.replay_error, None);
+
+    let diff = store.rebuild().unwrap();
+    assert!(
+        diff.is_empty(),
+        "a clean rebuild changes nothing: {diff:#?}"
+    );
+    assert!(store.doctor().unwrap().is_healthy());
+    // The ticket survived the deletion of its (now orphaned) project.
+    assert!(store.ticket(ticket).unwrap().is_some());
+}
+
 // ------------------------------------------------------------- doctor
 
 #[test]
