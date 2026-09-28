@@ -93,6 +93,18 @@ pub enum StateCategory {
     Canceled,
 }
 
+impl StateCategory {
+    /// Neither `started` nor `done`: a ticket here has not been picked up
+    /// yet, so an `assignee` on it is stale (AGT-1379) — `pm move` clears
+    /// it moving in, and `pm check`'s `assigned-unstarted` rule flags one
+    /// already there. Broader than [`StateCategory::Unstarted`] alone,
+    /// which is the narrower "claimable" category `pm ready`/`pm claim`
+    /// use.
+    pub fn is_unstarted_or_backlog(self) -> bool {
+        matches!(self, StateCategory::Unstarted | StateCategory::Backlog)
+    }
+}
+
 /// One workflow state. `position` orders states within a workspace.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
