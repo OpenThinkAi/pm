@@ -184,9 +184,8 @@ pub struct Ticket {
     pub project: Option<String>,
     pub repo: Option<String>,
     pub assignee: Option<ActorId>,
-    /// Markdown body. Materialized from the text CRDT once AGT-1338 lands;
-    /// until then always empty (the raw `body.edit` payloads are kept on
-    /// the view).
+    /// Markdown body, materialized from the text CRDT
+    /// ([`crate::view::TicketView::body`]).
     pub description: String,
     pub labels: BTreeSet<String>,
     pub created: Hlc,

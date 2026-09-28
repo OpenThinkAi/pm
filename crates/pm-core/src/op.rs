@@ -207,8 +207,9 @@ pub struct HoldSet {
     pub hold: Hold,
 }
 
-/// Opaque text-CRDT update bytes. Placeholder until AGT-1338 chooses the
-/// CRDT (Loro vs yrs); the bytes are stored, not interpreted.
+/// One text-CRDT update: the bytes of a [`crate::BodyUpdate`] (a Loro
+/// update or snapshot, AGT-1338). Opaque to the op log and to pm-hub; the
+/// view folds it in with [`crate::Body::apply`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BodyEdit {
     pub update: Vec<u8>,

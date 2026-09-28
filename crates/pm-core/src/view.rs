@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ulid::Ulid;
 
+use crate::body::{Body, BodyError, BodyUpdate};
 use crate::domain::{
     ActorId, Comment, Hold, NotBefore, Parked, Priority, Relation, Source, State, StateCategory,
     Ticket, Waiver,
@@ -51,9 +52,108 @@ pub struct TicketView {
     pub labels: OrSet<String>,
     pub relations: OrSet<Relation>,
     pub comments: CommentLog,
-    /// Raw `body.edit` payloads keyed by op id, until AGT-1338 replaces
-    /// this with the text CRDT.
-    pub body_edits: BTreeMap<Ulid, Vec<u8>>,
+    /// The description as a text CRDT; every `body.edit` update is folded
+    /// in with [`Body::apply`].
+    pub body: BodyState,
+}
+
+/// A [`Body`] replica that only ever *imports*: the view never edits the
+/// text itself, so its peer id is fixed at 0 and [`apply`] stays free of
+/// randomness (`Body::new` would draw a random peer).
+///
+/// `Body` has no `Clone`, `PartialEq` or serde, so this wrapper supplies
+/// the semantics the view needs:
+/// - **Equality** is by materialized text. Two replicas that have seen the
+///   same updates in any order have the same text (that is the CRDT's
+///   promise); an update still queued behind a missing dependency is not
+///   visible in either the text or the comparison.
+/// - **Serde** persists the Loro *snapshot* (`Body::snapshot`), which keeps
+///   the full history so a restored view goes on merging later updates.
+///   The bytes serialize like `BodyEdit::update` does (a byte sequence).
+/// - **Clone** goes through the same snapshot/restore path.
+///
+/// The alternative — keeping the raw update log on the view and
+/// materializing on demand — would have made `snapshot()` fallible and
+/// re-run every import per read, so the view holds the live replica.
+#[derive(Debug)]
+pub struct BodyState {
+    body: Body,
+}
+
+impl BodyState {
+    /// The peer id every view replica uses. The view never produces local
+    /// edits, so the id is never stamped on an update; it only exists to
+    /// avoid `Body::new`'s random draw.
+    pub const PEER: u64 = 0;
+
+    /// An empty body.
+    pub fn new() -> Self {
+        BodyState {
+            body: Body::with_peer(Self::PEER).expect("a fresh doc accepts a peer id"),
+        }
+    }
+
+    /// The materialized text.
+    pub fn text(&self) -> String {
+        self.body.text()
+    }
+
+    /// Folds one update (or snapshot) in; idempotent and order-independent.
+    pub fn apply(&mut self, update: &BodyUpdate) -> Result<(), BodyError> {
+        self.body.apply(update)
+    }
+
+    /// Everything this replica knows, as one blob: what serde writes.
+    pub fn snapshot(&self) -> Result<BodyUpdate, BodyError> {
+        self.body.snapshot()
+    }
+
+    /// A body rebuilt from a [`BodyState::snapshot`]; empty bytes give an
+    /// empty body.
+    pub fn from_snapshot(bytes: &[u8]) -> Result<Self, BodyError> {
+        let mut state = Self::new();
+        if !bytes.is_empty() {
+            state.apply(&BodyUpdate::from_bytes(bytes.to_vec()))?;
+        }
+        Ok(state)
+    }
+}
+
+impl Default for BodyState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for BodyState {
+    fn clone(&self) -> Self {
+        // Exporting an in-memory doc and importing a snapshot the same Loro
+        // build just produced cannot fail short of an allocation failure.
+        let snap = self.snapshot().expect("snapshot of an in-memory body");
+        Self::from_snapshot(snap.as_bytes()).expect("restore of a fresh snapshot")
+    }
+}
+
+impl PartialEq for BodyState {
+    fn eq(&self, other: &Self) -> bool {
+        self.text() == other.text()
+    }
+}
+
+impl Eq for BodyState {}
+
+impl Serialize for BodyState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let snap = self.snapshot().map_err(serde::ser::Error::custom)?;
+        snap.as_bytes().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BodyState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Self::from_snapshot(&bytes).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -69,6 +169,13 @@ pub enum ApplyError {
         op_id: Ulid,
         relation: Relation,
         ticket: Ulid,
+    },
+    /// The `body.edit` bytes were not a Loro update. The view is unchanged.
+    #[error("op {op_id}: {source}")]
+    BodyImport {
+        op_id: Ulid,
+        #[source]
+        source: BodyError,
     },
 }
 
@@ -112,7 +219,7 @@ impl TicketView {
             labels: OrSet::default(),
             relations: OrSet::default(),
             comments: CommentLog::default(),
-            body_edits: BTreeMap::new(),
+            body: BodyState::new(),
         }
     }
 
@@ -151,7 +258,7 @@ impl TicketView {
             project: self.project.value.clone(),
             repo: self.repo.value.clone(),
             assignee: self.assignee.value.clone(),
-            description: String::new(),
+            description: self.body.text(),
             labels: self.labels.iter().cloned().collect(),
             created: self.created.as_ref().map_or(Hlc::ZERO, |s| s.hlc),
             updated: self.updated.as_ref().map_or(Hlc::ZERO, |s| s.hlc),
@@ -286,7 +393,12 @@ pub fn apply(view: &mut TicketView, op: &Op) -> Result<(), ApplyError> {
             view.hold.set(None, stamp.clone());
         }
         Payload::BodyEdit(b) => {
-            view.body_edits.insert(op.op_id, b.update.clone());
+            view.body
+                .apply(&BodyUpdate::from_bytes(b.update.clone()))
+                .map_err(|source| ApplyError::BodyImport {
+                    op_id: op.op_id,
+                    source,
+                })?;
         }
         Payload::Tombstone => {
             if view.deleted_at.as_ref().is_none_or(|s| stamp < *s) {
@@ -343,6 +455,24 @@ mod tests {
             ActorId::new(actor),
             ticket,
             payload,
+        )
+    }
+
+    /// A real Loro update: `text` typed into a fresh replica owned by `peer`.
+    fn body_update(peer: u64, text: &str) -> Vec<u8> {
+        Body::with_peer(peer)
+            .unwrap()
+            .diff_from_text(text)
+            .unwrap()
+            .into_bytes()
+    }
+
+    fn body_edit(ticket: Ulid, wall_ms: u64, actor: &str, update: Vec<u8>) -> Op {
+        op(
+            ticket,
+            wall_ms,
+            actor,
+            Payload::BodyEdit(BodyEdit { update }),
         )
     }
 
@@ -437,12 +567,7 @@ mod tests {
                 }),
             ),
             op(ticket, 8, "matt", Payload::HoldClear),
-            op(
-                ticket,
-                9,
-                "matt",
-                Payload::BodyEdit(BodyEdit { update: vec![9, 9] }),
-            ),
+            body_edit(ticket, 9, "matt", body_update(1, "# original\n\nBody.\n")),
             op(
                 ticket,
                 10,
@@ -502,7 +627,92 @@ mod tests {
         assert_eq!(t.updated, Hlc::new(13, 0));
         assert_eq!(once.comments.len(), 1);
         assert!(once.relations.is_empty());
-        assert_eq!(once.body_edits.len(), 1);
+        assert_eq!(t.description, "# original\n\nBody.\n");
+        assert_eq!(t.description, once.body.text());
+    }
+
+    #[test]
+    fn body_edit_applied_twice_is_idempotent() {
+        let ticket = Ulid::new();
+        let edit = body_edit(ticket, 2, "matt", body_update(1, "once"));
+        let mut view = TicketView::new(ticket);
+        apply(&mut view, &edit).unwrap();
+        let after_first = view.clone();
+        apply(&mut view, &edit).unwrap();
+        assert_eq!(view, after_first);
+        assert_eq!(view.snapshot().description, "once");
+    }
+
+    #[test]
+    fn concurrent_body_edits_converge_in_either_order() {
+        let ticket = Ulid::new();
+        // Two replicas start from a shared base and edit different spans
+        // offline; the view sees the three resulting ops.
+        let mut a = Body::with_peer(1).unwrap();
+        let base = a.diff_from_text("alpha\nbeta\n").unwrap();
+        let mut b = Body::with_peer(2).unwrap();
+        b.apply(&base).unwrap();
+        let from_a = a.diff_from_text("ALPHA\nbeta\n").unwrap();
+        let from_b = b.diff_from_text("alpha\nbeta\ngamma\n").unwrap();
+
+        let base = body_edit(ticket, 1, "matt", base.into_bytes());
+        let from_a = body_edit(ticket, 2, "matt", from_a.into_bytes());
+        let from_b = body_edit(ticket, 2, "claude:pm-build", from_b.into_bytes());
+
+        let mut texts = Vec::new();
+        for order in [
+            [&base, &from_a, &from_b],
+            [&base, &from_b, &from_a],
+            [&from_b, &from_a, &base],
+        ] {
+            let mut view = TicketView::new(ticket);
+            for o in order {
+                apply(&mut view, o).unwrap();
+            }
+            assert_eq!(view.snapshot().description, view.body.text());
+            texts.push(view.body.text());
+        }
+        assert!(texts.iter().all(|t| t == &texts[0]), "{texts:?}");
+        assert_eq!(texts[0], "ALPHA\nbeta\ngamma\n");
+    }
+
+    #[test]
+    fn body_edit_with_garbage_bytes_is_rejected_and_leaves_the_view_untouched() {
+        let ticket = Ulid::new();
+        let mut view = TicketView::new(ticket);
+        apply(&mut view, &create(ticket, 1)).unwrap();
+        let before = view.clone();
+        let bad = body_edit(ticket, 2, "matt", vec![9, 9]);
+        assert!(matches!(
+            apply(&mut view, &bad),
+            Err(ApplyError::BodyImport { op_id, .. }) if op_id == bad.op_id
+        ));
+        assert_eq!(view, before);
+    }
+
+    #[test]
+    fn body_survives_serde_and_keeps_merging() {
+        let ticket = Ulid::new();
+        let mut author = Body::with_peer(1).unwrap();
+        let first = author.diff_from_text("v1").unwrap();
+        let second = author.diff_from_text("v1 v2").unwrap();
+
+        let mut view = TicketView::new(ticket);
+        apply(&mut view, &create(ticket, 1)).unwrap();
+        apply(&mut view, &body_edit(ticket, 2, "matt", first.into_bytes())).unwrap();
+
+        let json = serde_json::to_string(&view).unwrap();
+        let mut back: TicketView = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, view);
+        assert_eq!(back.body.text(), "v1");
+
+        // The snapshot carried the history, so the next update still lands.
+        apply(
+            &mut back,
+            &body_edit(ticket, 3, "matt", second.into_bytes()),
+        )
+        .unwrap();
+        assert_eq!(back.snapshot().description, "v1 v2");
     }
 
     #[test]
