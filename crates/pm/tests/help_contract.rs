@@ -119,15 +119,17 @@ fn strip_fenced_code_blocks(text: &str) -> String {
         .join("")
 }
 
-fn contract_doc() -> String {
+fn raw_contract_doc() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("docs")
         .join("cli-contract.md");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-    strip_fenced_code_blocks(&text)
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+}
+
+fn contract_doc() -> String {
+    strip_fenced_code_blocks(&raw_contract_doc())
 }
 
 #[test]
@@ -179,4 +181,139 @@ fn every_listed_path_is_a_real_command() {
             path.join(" ")
         );
     }
+}
+
+/// The quoted alternatives the doc lists after `"<key>": ` in the JSON
+/// shape that starts at `anchor`, up to the next `"message"`/`"tickets"`
+/// key: e.g. `"reason": "state" | "assigned" | ...` in `pm ready`'s shape.
+fn documented_alternatives(doc: &str, anchor: &str, key: &str, until: &str) -> BTreeSet<String> {
+    let section = &doc[doc
+        .find(anchor)
+        .unwrap_or_else(|| panic!("docs/cli-contract.md has no `{anchor}`"))..];
+    let start = section
+        .find(&format!("\"{key}\": "))
+        .unwrap_or_else(|| panic!("no `\"{key}\"` after `{anchor}`"))
+        + key.len()
+        + 4;
+    let end = start + section[start..].find(until).unwrap();
+    section[start..end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// AGT-1353: `pm ready`'s `excluded[].reason` and `pm check`'s
+/// `findings[].rule` are spelled in the doc exactly as the binary prints
+/// them (`Reason::kind`, `Finding::rule`) — the doc once said `blocked_by`,
+/// `no_project`, `blocker_cycle` while the binary printed `blocked-by`,
+/// `R1`, `blocker-cycle`. Each variant is built once below; the exhaustive
+/// `match`es make adding a variant a compile error here until it is listed.
+#[test]
+fn documented_ready_reasons_and_check_rules_match_the_binary() {
+    use pm_core::ready::{Gate, Reason};
+    use pm_core::{ActorId, Finding, Hlc, Hold, Relation, RelationKind};
+    use ulid::Ulid;
+
+    let hold = Hold {
+        reason: "r".into(),
+        by: ActorId::new("a"),
+        at: Hlc::ZERO,
+    };
+    let id = Ulid::nil();
+    let gate = Gate::Label {
+        label: "manual".into(),
+    };
+    let reasons = [
+        Reason::State { state: "s".into() },
+        Reason::Assigned {
+            assignee: ActorId::new("a"),
+        },
+        Reason::Held { hold: hold.clone() },
+        Reason::Label { label: "l".into() },
+        Reason::Parked {
+            until: "forever".into(),
+        },
+        Reason::NotBefore {
+            date: "2099-01-01".into(),
+        },
+        Reason::Cycle { tickets: vec![id] },
+        Reason::BlockedBy {
+            blocker: id,
+            gate: None,
+        },
+        Reason::TransitivelyBlocked {
+            via: id,
+            root: id,
+            gate,
+        },
+        Reason::Model { labels: vec![] },
+    ];
+    for r in &reasons {
+        match r {
+            Reason::State { .. }
+            | Reason::Assigned { .. }
+            | Reason::Held { .. }
+            | Reason::Label { .. }
+            | Reason::Parked { .. }
+            | Reason::NotBefore { .. }
+            | Reason::Cycle { .. }
+            | Reason::BlockedBy { .. }
+            | Reason::TransitivelyBlocked { .. }
+            | Reason::Model { .. } => {}
+        }
+    }
+    let findings = [
+        Finding::NoProject { ticket: id },
+        Finding::Stale {
+            ticket: id,
+            days: 1,
+        },
+        Finding::Held { ticket: id, hold },
+        Finding::BlockerCycle { tickets: vec![id] },
+        Finding::DanglingRelation {
+            relation: Relation {
+                kind: RelationKind::Blocks,
+                from: id,
+                to: id,
+            },
+            missing: id,
+        },
+    ];
+    for f in &findings {
+        match f {
+            Finding::NoProject { .. }
+            | Finding::Stale { .. }
+            | Finding::Held { .. }
+            | Finding::BlockerCycle { .. }
+            | Finding::DanglingRelation { .. } => {}
+        }
+    }
+
+    // `done` is the CLI's own reason for an `--ids` entry that is not a
+    // candidate at all (crates/pm/src/ready.rs), not a `Reason` variant.
+    let mut want_reasons: BTreeSet<String> = reasons.iter().map(|r| r.kind().to_string()).collect();
+    want_reasons.insert("done".into());
+    let want_rules: BTreeSet<String> = findings.iter().map(|f| f.rule().to_string()).collect();
+
+    // The serialized tag must agree with the accessor the CLI prints.
+    for r in &reasons {
+        assert_eq!(serde_json::to_value(r).unwrap()["reason"], r.kind());
+    }
+    for f in &findings {
+        assert_eq!(serde_json::to_value(f).unwrap()["rule"], f.rule());
+    }
+
+    let doc = raw_contract_doc();
+    assert_eq!(
+        documented_alternatives(&doc, "### `pm ready`", "reason", "\"message\""),
+        want_reasons,
+        "docs/cli-contract.md `pm ready` excluded[].reason values"
+    );
+    assert_eq!(
+        documented_alternatives(&doc, "### `pm check`", "rule", "\"tickets\""),
+        want_rules,
+        "docs/cli-contract.md `pm check` findings[].rule values"
+    );
 }

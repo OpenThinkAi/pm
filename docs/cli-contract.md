@@ -474,10 +474,17 @@ its reason).
     "excluded": [
       {
         "id": "AGT-4", "ulid": "<ULID>",
-        "reason": "state" | "assigned" | "held" | "label" | "parked" | "not_before"
-                | "cycle" | "blocked_by" | "transitively_blocked" | "model" | "done",
+        "reason": "state" | "assigned" | "held" | "label" | "parked" | "not-before"
+                | "cycle" | "blocked-by" | "transitively-blocked" | "model" | "done",
         "message": "string",
-        /* plus reason-specific fields, e.g. {"state": "..."} or {"blocker": "AGT-2", "gate": {...} | null} */
+        /* plus reason-specific fields:
+             state -> {state}; assigned -> {assignee}; held -> {hold}; label -> {label};
+             parked -> {until}; not-before -> {date}; cycle -> {tickets};
+             blocked-by -> {blocker, gate: Gate | null};
+             transitively-blocked -> {via, root, gate: Gate};
+             model -> {labels, wanted}; done -> {} (only for an --ids entry that is
+             done, archived or deleted)
+           where Gate = {"kind": "held", "hold": {...}} | {"kind": "label", "label": "string"} */
       },
       ...
     ],
@@ -522,11 +529,12 @@ tickets).
     "count": 1,
     "findings": [
       {
-        "rule": "no_project" | "stale" | "held" | "blocker_cycle" | "dangling_relation",
+        "rule": "R1" | "stale" | "held" | "blocker-cycle" | "dangling-relation",
         "tickets": ["AGT-2", ...],
         "message": "string",
         /* plus rule-specific fields: stale -> {days, stale_days}; held -> {hold};
-           dangling_relation -> {relation: {kind, from, to}, missing} */
+           dangling-relation -> {relation: {kind: "blocks" | "parent" | "superseded_by",
+           from, to}, missing}. R1 is "no project and no R1/standalone waiver". */
       },
       ...
     ]
