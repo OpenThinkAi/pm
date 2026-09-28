@@ -79,7 +79,12 @@ pub fn claim(ctx: &Ctx<'_>, args: ClaimArgs) -> Result<()> {
             let ticket = verbs::find(claimer.store, &ws, reference)?;
             match claimer.attempt(ticket.id)? {
                 Outcome::Claimed(ticket) => print_claimed(ctx, claimer.store, &ws, &ticket),
-                Outcome::Taken(taken) => Err(taken.into_error(ctx, &ws)),
+                Outcome::Taken(taken) => {
+                    if ctx.json {
+                        verbs::print_json(&taken.json(&ws));
+                    }
+                    Err(taken.into_error(&ws))
+                }
             }
         }
         (None, true) => {
@@ -160,19 +165,22 @@ struct Taken {
 }
 
 impl Taken {
-    fn into_error(self, ctx: &Ctx<'_>, ws: &Workspace) -> CliError {
+    /// The `--json` payload a loser gets: `{taken_by, at}` plus context.
+    fn json(&self, ws: &Workspace) -> serde_json::Value {
+        json!({
+            "schema": SCHEMA,
+            "id": verbs::display_id(ws, &self.ticket),
+            "ulid": self.ticket.id,
+            "taken_by": self.taken_by,
+            "at": self.at,
+            "state": self.ticket.state,
+            "reason": self.reason.to_string(),
+        })
+    }
+
+    /// The exit-75 error (a pure conversion; printing is the caller's).
+    fn into_error(self, ws: &Workspace) -> CliError {
         let id = verbs::display_id(ws, &self.ticket);
-        if ctx.json {
-            verbs::print_json(&json!({
-                "schema": SCHEMA,
-                "id": id,
-                "ulid": self.ticket.id,
-                "taken_by": self.taken_by,
-                "at": self.at,
-                "state": self.ticket.state,
-                "reason": self.reason.to_string(),
-            }));
-        }
         let holder = match &self.taken_by {
             Some(actor) => format!("taken by {actor}"),
             None => format!("in state '{}'", self.ticket.state),
