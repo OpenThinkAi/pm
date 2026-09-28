@@ -780,6 +780,29 @@ fn move_into_unstarted_clears_assignee_and_says_so_on_stderr() {
     );
 }
 
+/// AC1 also covers the `backlog`-category state the default preset adds
+/// (AGT-1373): moving into it clears the assignee just like moving into
+/// an `unstarted`-category one.
+#[test]
+fn move_into_backlog_clears_assignee_on_the_default_preset() {
+    let sb = Sandbox::new();
+    assert_ok(&sb.pm(&["init", "--workspace", sb.ws_str()]));
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_ok(&sb.pm(&["move", "PM-1", "in-progress"]));
+    assert_ok(&sb.pm(&["set", "PM-1", "assignee=matt"]));
+
+    let out = sb.pm(&["move", "PM-1", "backlog", "--json"]);
+    assert_ok(&out);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["state"], "backlog");
+    assert!(v["assignee"].is_null());
+    assert!(
+        stderr(&out).contains("cleared assignee"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 #[test]
 fn move_keep_assignee_opts_out() {
     let sb = Sandbox::initialized();
