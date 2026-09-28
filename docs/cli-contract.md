@@ -601,7 +601,25 @@ Flags: `--dry-run` (read and plan everything, print the report, write
 nothing), `--recover <PATH=REV>` (repeatable: read a vault file that lost
 its frontmatter from `git show REV:PATH` instead, appending whatever
 comment entries the working-tree file still holds; AGT-806's `82a9982` is
-built in).
+built in), `--report <FILE>` (AGT-1348: after the import — or, with
+`--dry-run`, against whatever an earlier run left in the store — write a
+markdown parity report to `FILE`: every source ticket file is parsed with
+the importer's parser, the imported ticket is rendered back as
+`pm export md --legacy-markers` writes it and parsed the same way, and the
+two parses are diffed field by field; textual differences the parse
+normalises — key order, quoting, whitespace, list order — are counted but
+are not diffs; each remaining difference is either an *explained* class
+listed in the report header with its rationale, or *unexplained*, listed
+with both values; a source file with no ticket in pm is an unexplained
+`missing`).
+
+Dates: every op is stamped from the file. A ticket's record ops (fields,
+body, state, markers) never run backwards within the ticket — one dated
+before `created` lands at `created` — but a comment keeps its entry's own
+date even when that precedes `created` (re-filed tickets carry their
+history), so `pm show`'s comment dates and the export's `### <date>`
+headings are the file's; the `ticket.create` op is committed ahead of such
+a comment.
 
 - Exit `1`: a `--recover` git object cannot be read; a store failure
   mid-import (already-committed tickets stay, a re-run resumes since they
@@ -636,7 +654,56 @@ built in).
     "ext_keys": {"team": 756, ...},          // frontmatter keys preserved in ext, by file count
     "max_number": 1376,                      // greatest vault number seen
     "number_floor": 1376,                    // the allocator floor after this run (next number is above it)
+    "parity": {                              // only with --report (the key is absent otherwise)
+      "report": "/path/given",               // where the markdown report was written
+      "compared": 1373,                      // source ticket files compared
+      "missing": 0,                          // source files with no ticket in pm (each is an unexplained diff)
+      "unexplained": 0,
+      "explained": {"updated: ISO datetime": 2, "renumbered duplicate": 1, ...},  // class → tickets it applies to
+      "anomalies": 13                        // lines in the report's Anomalies section
+    },
     "elapsed_ms": 0
+  }
+  ```
+
+### `pm export md <DIR>`
+
+The inverse of `pm import vault` (AGT-1348): every non-deleted, numbered
+ticket and every project written into `DIR` (created if missing; existing
+files overwritten, nothing else removed) as vault-format markdown. A
+ticket is `tickets/<state>/<id>-<slug>.md`, or `archive/<YYYY-MM>/…` once
+archived (the month of its `archived_at`); its frontmatter is the
+template's keys in the template's order (`id, title, state, created,
+updated, project, repo, blocked-by, linked-github, linked-pr, priority,
+labels, source`), then `assignee`/`linear`/`not-before` when set, then
+every `ext` key sorted; values are quoted only when YAML needs it; the
+body is the description followed by `## Comments` with one
+`### <YYYY-MM-DD> — <author>` entry per comment. A project is
+`projects/<id>/README.md` (the design doc verbatim), or
+`archive/projects/<id>/` when its status is complete or abandoned, with
+each named document as `<name>.md` beside it. Flags: `--legacy-markers`
+(write waivers, the hold and parked as the vault's prose lines —
+`waived: <rule> — <reason>`, `⚠ NEEDS-HUMAN: <reason>`,
+`parked: <until|reason>` — at the end of the description, instead of the
+default `waived:`/`hold:`/`parked:` frontmatter keys; `pm import vault`
+reads both forms back to the same fields).
+
+- Exit `1`: `DIR` or a file under it cannot be written.
+- A ticket with no number yet (`AGT-?`) has no vault id and is not
+  written; it is counted under `unnumbered` (and noted on stderr in the
+  human output).
+- `--json`:
+  ```jsonc
+  {
+    "schema": 1,
+    "dir": "/path/given",
+    "legacy_markers": false,
+    "tickets": 1373,                // files written under tickets/ and archive/<month>/
+    "archived": 1137,               // of which archived
+    "unnumbered": 0,                // skipped: no vault id yet
+    "projects": 75,
+    "documents": 109,               // named documents written beside the READMEs
+    "files": 1557                   // every file written
   }
   ```
 

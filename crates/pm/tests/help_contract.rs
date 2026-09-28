@@ -41,6 +41,8 @@ const PATHS: &[&[&str]] = &[
     &["unarchive"],
     &["import"],
     &["import", "vault"],
+    &["export"],
+    &["export", "md"],
     &["project"],
     &["project", "new"],
     &["project", "show"],

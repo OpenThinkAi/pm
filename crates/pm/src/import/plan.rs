@@ -10,9 +10,15 @@
 //! and stamped afterwards by [`stamp`], in wall-time order through one
 //! [`Clock`], so every stamp is unique and monotonic while `wall_ms` stays
 //! the file's own date wherever the log allows it. Within a ticket the
-//! intended times never go backwards (a comment dated before `created`
-//! is clamped forward), so each ticket's ops are HLC-ordered exactly as
-//! they are listed here.
+//! intended times of the record's own ops never go backwards (a body
+//! edit dated before `created` is clamped forward), so those are
+//! HLC-ordered exactly as they are listed here. A comment is the one
+//! exception: it keeps its entry's date even when that precedes
+//! `created` (109 entries in the saltline vault do — re-filed tickets
+//! carrying their history), because a comment is a dated log entry, not
+//! an LWW write, and its date is content the export must give back
+//! (AGT-1348). `super::vault` commits every `ticket.create` ahead of the
+//! rest so such a comment still finds its ticket.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -54,6 +60,14 @@ pub struct Intent {
     pub actor: ActorId,
     pub payload: Payload,
     pub phase: Phase,
+    /// Stamped at `at_ms` itself — the file's own date — because nothing
+    /// in the store competes with it: every op of a ticket the store
+    /// does not have yet, an appended comment, a label or relation
+    /// added to a set. `false` is an LWW write against a register the
+    /// store already holds (a re-imported field, state, hold, body),
+    /// which must be stamped after the log's newest op to win
+    /// (README §Conflict semantics). See [`stamp`].
+    pub dated: bool,
 }
 
 /// What one vault file turned into.
@@ -270,28 +284,38 @@ struct Emitter<'a> {
     entity: Ulid,
     actor: &'a ActorId,
     floor: u64,
+    /// The ticket is new to the store, so every op is [`Intent::dated`].
+    fresh: bool,
 }
 
 impl Emitter<'_> {
     fn at(&mut self, at_ms: u64, payload: Payload, phase: Phase) {
         self.floor = self.floor.max(at_ms);
+        let dated = self.fresh
+            || matches!(
+                payload,
+                Payload::LabelAdd(_) | Payload::RelationAdd(_) | Payload::CommentAdd(_)
+            );
         self.out.push(Intent {
             entity: self.entity,
             at_ms: self.floor,
             actor: self.actor.clone(),
             payload,
             phase,
+            dated,
         });
     }
 
-    fn with_actor(&mut self, at_ms: u64, actor: ActorId, payload: Payload) {
-        self.floor = self.floor.max(at_ms);
+    /// A comment: stamped at its own date, and never moving the floor —
+    /// see the module docs.
+    fn comment(&mut self, at_ms: u64, actor: ActorId, payload: Payload) {
         self.out.push(Intent {
             entity: self.entity,
-            at_ms: self.floor,
+            at_ms,
             actor,
             payload,
             phase: Phase::Ticket,
+            dated: true,
         });
     }
 }
@@ -337,6 +361,7 @@ fn create_intents(
         entity: id,
         actor,
         floor: 0,
+        fresh: true,
     };
     let c = vt.created_ms;
     e.at(
@@ -382,7 +407,7 @@ fn create_intents(
         if comment.body.is_empty() {
             continue;
         }
-        e.with_actor(
+        e.comment(
             comment.date_ms,
             ActorId::new(&comment.author),
             Payload::CommentAdd(CommentAdd {
@@ -468,6 +493,7 @@ fn diff_intents(
         entity: t.id,
         actor,
         floor: 0,
+        fresh: false,
     };
     let u = vt.updated_ms;
     let mut field = |changed: bool, name: &'static str, f: FieldSet, e: &mut Emitter<'_>| {
@@ -607,7 +633,7 @@ fn diff_intents(
             continue;
         }
         kinds.push("comment");
-        e.with_actor(
+        e.comment(
             c.date_ms,
             ActorId::new(&c.author),
             Payload::CommentAdd(CommentAdd {
@@ -704,19 +730,29 @@ fn diff_intents(
     Ok(kinds)
 }
 
-/// Stamps every intent through `clock`, in intended-time order (stable,
-/// so a ticket's ops keep their order), and returns the ops in that
-/// order. `clock` is seeded from the log's newest HLC: on a first import
-/// every stamp carries the file's own date; on a re-import an intent
-/// older than the log's newest op is stamped just after it instead, so
-/// LWW fields take the file's value (README §Conflict semantics).
+/// Stamps every intent in intended-time order (stable, so a ticket's
+/// ops keep their order) and returns the ops in that order. A
+/// [`Intent::dated`] intent is stamped at the file's own date through a
+/// clock of its own, so `created`, `updated` and every comment date read
+/// exactly as the file says however much newer the log already is; any
+/// other intent goes through `clock`, seeded from the log's newest HLC,
+/// so an LWW write against a register the store already holds lands
+/// after it and the file's value wins (README §Conflict semantics).
+/// Stamps are unique within a run and strictly increasing within each
+/// clock; two runs may reuse a dated stamp, which only ever ties two
+/// comments' order (broken by author, then op id).
 pub fn stamp(intents: Vec<Intent>, clock: &mut Clock) -> Vec<(Op, Phase)> {
+    let mut dated = Clock::new();
     let mut indexed: Vec<(usize, Intent)> = intents.into_iter().enumerate().collect();
     indexed.sort_by_key(|(i, intent)| (intent.at_ms, *i));
     indexed
         .into_iter()
         .map(|(_, intent)| {
-            let hlc = clock.send(intent.at_ms);
+            let hlc = if intent.dated {
+                dated.send(intent.at_ms)
+            } else {
+                clock.send(intent.at_ms)
+            };
             let mut payload = intent.payload;
             if let Payload::HoldSet(set) = &mut payload {
                 set.hold.at = hlc;
@@ -740,6 +776,7 @@ mod tests {
             actor: ActorId::new(IMPORT_ACTOR),
             payload: Payload::HoldClear,
             phase: Phase::Ticket,
+            dated: false,
         }
     }
 
@@ -768,16 +805,20 @@ mod tests {
         assert_eq!(ops[0].0.entity, b);
         assert_eq!(ops[2].0.entity, a);
 
-        // Seeded past the intents: stamped after the log's newest op.
+        // Seeded past the intents: an LWW write is stamped after the
+        // log's newest op; a dated intent keeps the file's date.
+        let mut kept = intent(a, 500);
+        kept.dated = true;
         let ops = stamp(
-            vec![intent(a, 500)],
+            vec![intent(a, 500), kept],
             &mut Clock::from_latest(Hlc::new(900, 3)),
         );
         assert_eq!(ops[0].0.hlc, Hlc::new(900, 4));
+        assert_eq!(ops[1].0.hlc, Hlc::new(500, 0));
     }
 
     #[test]
-    fn emitter_never_lets_a_tickets_times_go_backwards() {
+    fn emitter_never_lets_a_tickets_times_go_backwards_except_comments() {
         let mut out = Vec::new();
         let actor = ActorId::new(IMPORT_ACTOR);
         let mut e = Emitter {
@@ -785,11 +826,26 @@ mod tests {
             entity: Ulid::new(),
             actor: &actor,
             floor: 0,
+            fresh: false,
         };
         e.at(200, Payload::HoldClear, Phase::Ticket);
         e.at(100, Payload::HoldClear, Phase::Ticket);
+        // A comment keeps its own date, before or after the floor, and
+        // leaves the floor where it was.
+        let comment = Payload::CommentAdd(CommentAdd { body: "c".into() });
+        e.comment(50, ActorId::new("Filed"), comment.clone());
+        e.comment(900, ActorId::new("Filed"), comment);
         e.at(300, Payload::HoldClear, Phase::Relation);
+        e.at(
+            300,
+            Payload::LabelAdd(LabelAdd { label: "x".into() }),
+            Phase::Ticket,
+        );
         let times: Vec<u64> = out.iter().map(|i| i.at_ms).collect();
-        assert_eq!(times, [200, 200, 300]);
+        assert_eq!(times, [200, 200, 50, 900, 300, 300]);
+        // On an existing ticket only the comments and the set add are
+        // dated; the LWW writes are not.
+        let dated: Vec<bool> = out.iter().map(|i| i.dated).collect();
+        assert_eq!(dated, [false, false, true, true, false, true]);
     }
 }

@@ -407,16 +407,30 @@ fn imports_every_file_field_comment_and_doc() {
     assert_eq!(sb.project("gamma")["parent"], "alpha");
     assert_eq!(sb.project("old-audit")["status"], "complete");
 
-    // Every op is dated from the file, HLC-ordered per ticket, and by
-    // the import actor except comments, which keep their vault author.
+    // Every op is dated from the file and by the import actor except
+    // comments, which keep their vault author and their entry's own date
+    // (AGT-1348: a comment is a dated log entry, so it may be stamped
+    // before or after the record's ops); the record's ops are
+    // HLC-ordered per ticket, the create first.
     let store = sb.store();
     let ulid: ulid::Ulid = sb.show("AGT-12")["ulid"].as_str().unwrap().parse().unwrap();
     let ops = store.ops(ulid).unwrap();
     assert_eq!(ops[0].kind(), "ticket.create");
     assert_eq!(ops[0].hlc.wall_ms, AUG_1 + 37 * DAY, "2026-09-07");
+    let record: Vec<&pm_core::Op> = ops.iter().filter(|o| o.kind() != "comment.add").collect();
     assert!(
-        ops.windows(2).all(|w| w[0].hlc < w[1].hlc),
-        "ops must be HLC-ordered"
+        record.windows(2).all(|w| w[0].hlc < w[1].hlc),
+        "record ops must be HLC-ordered"
+    );
+    let dates: Vec<u64> = ops
+        .iter()
+        .filter(|o| o.kind() == "comment.add")
+        .map(|o| o.hlc.wall_ms)
+        .collect();
+    assert_eq!(
+        dates,
+        [AUG_1 + 37 * DAY, AUG_1 + 38 * DAY],
+        "each entry's own date"
     );
     for op in &ops {
         match op.kind() {
@@ -706,14 +720,16 @@ fn recovers_a_clobbered_file_from_a_git_object() {
     let t = sb.show("AGT-20");
     assert_eq!(t["title"], "Recovered from git");
     assert_eq!(t["project"], "alpha");
+    // The fragment's entry is dated 07-27, the recovered file's 07-28:
+    // comments read in date order (AGT-1348).
     assert_eq!(
         comments(&sb, "AGT-20"),
         [
-            ("Found".to_string(), "Evidence.".to_string()),
             (
                 "The fix must update the record".to_string(),
                 "Stray note.".to_string()
             ),
+            ("Found".to_string(), "Evidence.".to_string()),
         ]
     );
     assert!(report["anomalies"].as_array().unwrap().iter().any(|a| {

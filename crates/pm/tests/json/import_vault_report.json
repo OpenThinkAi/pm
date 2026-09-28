@@ -1,0 +1,55 @@
+{
+  "anomalies": [],
+  "archived": 0,
+  "changes": [],
+  "comments": 0,
+  "docs": {
+    "created": 0,
+    "unchanged": 2,
+    "updated": 0
+  },
+  "dry_run": false,
+  "elapsed_ms": 0,
+  "ext_keys": {
+    "team": 1
+  },
+  "files": 1,
+  "markers": {
+    "waiver": 1
+  },
+  "max_number": 900,
+  "migrated": [
+    "AGT-900 waiver: waived: standalone — contract fixture"
+  ],
+  "non_template": {
+    "project status: active": [
+      "projects/vaulted/README.md"
+    ]
+  },
+  "number_floor": 900,
+  "ops": 0,
+  "ops_by_kind": {},
+  "parity": {
+    "anomalies": 0,
+    "compared": 1,
+    "explained": {
+      "body text (parses equal)": 1,
+      "filename: slug differs": 1
+    },
+    "missing": 0,
+    "report": "<HOME>/parity.md",
+    "unexplained": 0
+  },
+  "prefix": "AGT",
+  "project_stubs": [],
+  "projects": 1,
+  "renumbered": [],
+  "schema": 1,
+  "tickets": {
+    "changed": 0,
+    "created": 0,
+    "skipped": 0,
+    "unchanged": 1
+  },
+  "vault": "<HOME>/mini-vault"
+}
