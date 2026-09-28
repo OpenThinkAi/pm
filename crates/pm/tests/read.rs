@@ -437,6 +437,78 @@ fn graph_treats_an_archived_blocker_as_done() {
     assert_eq!(out["done"], false);
 }
 
+#[test]
+fn graph_ids_scopes_waves_and_done_over_just_that_set_and_unknown_id_is_not_found() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "Base", "--project", "pm"])); // AGT-1
+    assert_ok(&sb.pm(&[
+        "new",
+        "--title",
+        "Depends on base",
+        "--project",
+        "pm",
+        "--blocked-by",
+        "AGT-1",
+    ])); // AGT-2
+    // AGT-3, outside the --ids scope: an unrelated pending ticket that must
+    // not show up in waves scoped to AGT-1/AGT-2, unlike a plain (implicit)
+    // whole-workspace scope.
+    assert_ok(&sb.pm(&["new", "--title", "Unrelated", "--project", "pm"]));
+
+    let out = json(&sb.pm(&["graph", "--ids", "AGT-1,AGT-2", "--json"]));
+    assert_eq!(out["project"], Value::Null);
+    assert_eq!(out["ids"], serde_json::json!(["AGT-1", "AGT-2"]));
+    assert_eq!(out["done"], false);
+    assert_eq!(
+        out["waves"],
+        serde_json::json!([["AGT-1"], ["AGT-2"]]),
+        "AGT-3 is out of scope entirely"
+    );
+
+    // Finishing both members of the id set: done, same as `--project` would
+    // report once every ticket in its scope is done (AGT-3 left pending
+    // doesn't matter — it's out of scope).
+    sb.transition(ulid_of(&sb, "AGT-1"), "done");
+    sb.transition(ulid_of(&sb, "AGT-2"), "done");
+    let out = json(&sb.pm(&["graph", "--ids", "AGT-1,AGT-2", "--json"]));
+    assert_eq!(out["done"], true);
+    assert_eq!(out["waves"], serde_json::json!([]));
+
+    // An unknown id is exit 3, same as `pm ready --ids`.
+    assert_code(&sb.pm(&["graph", "--ids", "AGT-999", "--json"]), 3);
+    // `--project` and `--ids` conflict (clap), exit 2.
+    assert_code(
+        &sb.pm(&["graph", "--project", "pm", "--ids", "AGT-1", "--json"]),
+        2,
+    );
+}
+
+#[test]
+fn graph_ids_blockers_still_resolve_workspace_wide() {
+    // A blocker outside the --ids scope still gates its dependent — only
+    // the node set (what's in the ids) narrows, not blocker resolution
+    // (module doc: "Blockers are always resolved through the whole
+    // workspace, whatever the scope").
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "Base", "--project", "pm"])); // AGT-1
+    assert_ok(&sb.pm(&[
+        "new",
+        "--title",
+        "Depends on base",
+        "--project",
+        "pm",
+        "--blocked-by",
+        "AGT-1",
+    ])); // AGT-2
+
+    let out = json(&sb.pm(&["graph", "--ids", "AGT-2", "--json"]));
+    assert_eq!(out["ids"], serde_json::json!(["AGT-2"]));
+    // AGT-1 (the blocker) is out of scope and never resolves within this
+    // id set, so AGT-2 lands in the final, unordered "stuck" wave.
+    assert_eq!(out["waves"], serde_json::json!([["AGT-2"]]));
+    assert_eq!(out["done"], false);
+}
+
 // ---------------------------------------------------------- pm show --section
 
 #[test]

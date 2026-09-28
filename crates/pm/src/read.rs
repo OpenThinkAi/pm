@@ -8,7 +8,7 @@
 //! `pm_store::query` — so nothing here can block on a writer's lock or
 //! touch the network (README §Constraints).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pm_core::{ActorId, Op, Payload, Priority, RelationKind, StateCategory, Ticket};
 use pm_store::TicketFilter;
@@ -310,26 +310,61 @@ pub fn status(ctx: &Ctx<'_>, project: Option<String>) -> Result<()> {
 
 // --------------------------------------------------------------- pm graph
 
-/// `pm graph [--project]` (AC4): tickets not yet in a `completed`-category
-/// state, grouped into readiness waves by their still-pending `blocks`
-/// relations, plus a `done` flag (`true` once nothing in scope is
-/// pending — what a build loop's self-retire check wants). A blocker that
-/// sits outside the filtered scope and never resolves lands its dependents
-/// in a final, unordered wave rather than looping forever.
-pub fn graph(ctx: &Ctx<'_>, project: Option<String>) -> Result<()> {
+pub struct GraphArgs {
+    pub project: Option<String>,
+    pub ids: Vec<String>,
+}
+
+/// `pm graph [--project P | --ids …]` (AC4; AGT-1380 AC1): tickets not yet
+/// in a `completed`-category state, grouped into readiness waves by their
+/// still-pending `blocks` relations, plus a `done` flag (`true` once
+/// nothing in scope is pending — what a build loop's self-retire check
+/// wants). `--ids` scopes exactly like `pm ready --ids`: an unknown id is
+/// exit `3`, and waves/`done` are computed over just that id set (a
+/// resolved id already archived, tombstoned or completed simply is not a
+/// pending node — matching what `--project` already did by never fetching
+/// those rows). Blockers are always resolved through the whole workspace,
+/// whatever the scope: a blocker outside it still counts, it is just never
+/// itself a node. A blocker that sits outside the scope and never
+/// resolves, or a dependency cycle, lands the rest of the graph in one
+/// final, unordered wave rather than looping forever.
+pub fn graph(ctx: &Ctx<'_>, args: GraphArgs) -> Result<()> {
     let (store, ws) = ctx.open()?;
-    let filter = TicketFilter {
-        project: project.clone().into_iter().collect(),
-        ..Default::default()
-    };
-    let tickets = store.tickets(&filter)?;
     let completed = |state: &str| {
         ws.state(state)
             .map(|s| s.category == StateCategory::Completed)
             .unwrap_or(false)
     };
+    let is_done = |t: &Ticket| t.deleted || t.archived_at.is_some() || completed(&t.state);
 
-    let pending: Vec<&Ticket> = tickets.iter().filter(|t| !completed(&t.state)).collect();
+    let ids: Option<BTreeSet<Ulid>> = if args.ids.is_empty() {
+        None
+    } else {
+        Some(
+            args.ids
+                .iter()
+                .map(|r| find(&store, &ws, r).map(|t| t.id))
+                .collect::<Result<BTreeSet<Ulid>>>()?,
+        )
+    };
+
+    let tickets: Vec<Ticket> = match &ids {
+        // The whole snapshot (tombstoned/archived included, same as
+        // `pm ready`'s `Scope::Ids`), filtered to the requested set — so a
+        // requested id that is already done still shows in `ids` below,
+        // just not as a pending node.
+        Some(id_set) => store
+            .all_tickets()?
+            .into_iter()
+            .filter(|t| id_set.contains(&t.id))
+            .collect(),
+        None => store.tickets(&TicketFilter {
+            project: args.project.clone().into_iter().collect(),
+            ..Default::default()
+        })?,
+    };
+
+    let pending: Vec<&Ticket> = tickets.iter().filter(|t| !is_done(t)).collect();
     let done = pending.is_empty();
 
     // Each pending ticket's still-pending blockers (a completed blocker
@@ -345,7 +380,7 @@ pub fn graph(ctx: &Ctx<'_>, project: Option<String>) -> Result<()> {
             // the loops went blind once a blocker was swept into the
             // archive), as does a tombstoned or absent blocker.
             let blocker_done = match store.ticket(r.from)? {
-                Some(b) => b.deleted || b.archived_at.is_some() || completed(&b.state),
+                Some(b) => is_done(&b),
                 None => true,
             };
             if !blocker_done {
@@ -375,7 +410,14 @@ pub fn graph(ctx: &Ctx<'_>, project: Option<String>) -> Result<()> {
     if ctx.json {
         print_json(&json!({
             "schema": SCHEMA,
-            "project": project,
+            "project": args.project,
+            "ids": ids.as_ref().map(|id_set| {
+                tickets
+                    .iter()
+                    .filter(|t| id_set.contains(&t.id))
+                    .map(|t| display_id(&ws, t))
+                    .collect::<Vec<_>>()
+            }),
             "waves": wave_ids,
             "done": done,
         }));

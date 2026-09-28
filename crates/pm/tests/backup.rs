@@ -278,6 +278,52 @@ fn restore_rebuilds_a_workspace_that_doctor_reports_clean_and_show_matches() {
     assert_code(&clobber, 1);
 }
 
+/// AGT-1380: `pm workspace gate-label` writes `workspace.gate_labels`
+/// directly (`pm-store::config::set_gate_labels`), the same column
+/// `pm backup`'s `ConfigSnapshot` already captures via `Store::workspace`
+/// and `--restore` already rewrites via `Store::init_workspace` — so a
+/// gate-label change needs no dedicated backup-side code, only proof it
+/// actually round-trips.
+#[test]
+fn restore_carries_a_custom_gate_label_over() {
+    let sb = Sandbox::initialized();
+    // `pm backup` refuses a target with a config snapshot but no op log
+    // (nothing to replay), so this needs at least one op committed —
+    // unrelated to the gate-label write itself, which is a direct config
+    // write with no op of its own.
+    sb.new_ticket("anchor");
+    assert_ok(&sb.pm(&["workspace", "gate-label", "add", "matt-gated"]));
+    let before = json(&sb.pm(&["workspace", "gate-label", "list", "--json"]));
+    assert_eq!(
+        before["gate_labels"],
+        serde_json::json!(["manual", "matt-gated"])
+    );
+
+    let remote = RemoteBackup::new();
+    assert_ok(&sb.pm(&["backup", "--to", remote.work.to_str().unwrap()]));
+
+    let restored = Sandbox::new();
+    assert_ok(&restored.run(
+        &[
+            "backup",
+            "--restore",
+            remote.work.to_str().unwrap(),
+            "--workspace",
+            restored.ws_str(),
+        ],
+        &[],
+    ));
+    let after = json(&restored.pm(&[
+        "workspace",
+        "gate-label",
+        "list",
+        "--workspace",
+        restored.ws_str(),
+        "--json",
+    ]));
+    assert_eq!(after["gate_labels"], before["gate_labels"]);
+}
+
 /// AGT-1344: a project's design doc is a `body.edit` op targeting a
 /// `doc_id` that lives alongside ticket ops in the same JSONL. Restore
 /// must reassign that id before replaying, and replay the op through

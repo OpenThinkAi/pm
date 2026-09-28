@@ -160,6 +160,24 @@ impl Store {
     pub fn projects(&self) -> Result<Vec<Project>> {
         load_projects(&self.conn, "", [])
     }
+
+    /// Sets the workspace's gate labels directly, leaving everything else
+    /// (prefix, states, model labels, template sections, stale days)
+    /// untouched — a direct write, not op-logged, like
+    /// [`Store::set_project_status`] (AGT-1380: `pm workspace gate-label
+    /// add|remove`). Already part of the [`Workspace`] `pm backup`
+    /// snapshots and `init_workspace` restores, so this round-trips
+    /// through backup/restore for free.
+    pub fn set_gate_labels(&mut self, labels: &BTreeSet<String>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE workspace SET gate_labels = ?1 WHERE singleton = 1",
+            params![json(labels)],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NoWorkspace);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn states(conn: &Connection) -> Result<Vec<State>> {
@@ -229,4 +247,67 @@ fn load_projects(
         });
     }
     Ok(projects)
+}
+
+#[cfg(test)]
+mod tests {
+    use pm_core::{State, StateCategory, Workspace};
+    use ulid::Ulid;
+
+    use super::*;
+    use crate::Store;
+
+    fn fresh() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
+        store
+            .init_workspace(&Workspace {
+                id: Ulid::new(),
+                prefix: "AGT".into(),
+                states: vec![State {
+                    name: "triage".into(),
+                    category: StateCategory::Unstarted,
+                    position: 0,
+                }],
+                gate_labels: ["manual".to_string()].into(),
+                model_labels: Default::default(),
+                template_sections: Vec::new(),
+                stale_days: 30,
+            })
+            .unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn set_gate_labels_replaces_the_set_and_leaves_everything_else_untouched() {
+        let (_dir, mut store) = fresh();
+        let before = store.workspace().unwrap().unwrap();
+        assert_eq!(before.gate_labels, ["manual".to_string()].into());
+
+        let wanted: BTreeSet<String> = ["manual".to_string(), "matt-gated".to_string()].into();
+        store.set_gate_labels(&wanted).unwrap();
+        let after = store.workspace().unwrap().unwrap();
+        assert_eq!(after.gate_labels, wanted);
+        // Nothing else moved.
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.prefix, before.prefix);
+        assert_eq!(after.states, before.states);
+        assert_eq!(after.stale_days, before.stale_days);
+
+        // Removing one (a caller reads, mutates, writes the whole set —
+        // there is no narrower "remove a member" SQL).
+        let narrowed: BTreeSet<String> = ["matt-gated".to_string()].into();
+        store.set_gate_labels(&narrowed).unwrap();
+        assert_eq!(store.workspace().unwrap().unwrap().gate_labels, narrowed);
+    }
+
+    #[test]
+    fn set_gate_labels_errors_when_no_workspace_exists_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
+        let err = store
+            .set_gate_labels(&["manual".to_string()].into())
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NoWorkspace), "{err:?}");
+    }
 }

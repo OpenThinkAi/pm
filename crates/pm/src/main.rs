@@ -229,8 +229,12 @@ enum Cmd {
     },
     /// Dependency waves of not-yet-done tickets, plus a done flag
     Graph {
-        #[arg(long)]
+        /// Only tickets in this project
+        #[arg(long, conflicts_with = "ids")]
         project: Option<String>,
+        /// Only these tickets (PM-N or ULID; repeat or comma-separate)
+        #[arg(long, value_name = "ID", value_delimiter = ',')]
+        ids: Vec<String>,
     },
     /// The ready frontier: unstarted, unassigned, unheld, ungated tickets whose blockers are all done (archived counts)
     Ready {
@@ -266,8 +270,11 @@ enum Cmd {
     /// List held tickets
     Holds {
         /// Only tickets in this project
-        #[arg(long)]
+        #[arg(long, conflicts_with = "ids")]
         project: Option<String>,
+        /// Only these tickets (PM-N or ULID; repeat or comma-separate)
+        #[arg(long, value_name = "ID", value_delimiter = ',')]
+        ids: Vec<String>,
     },
     /// Waive a hygiene rule for a ticket (e.g. `pm waive PM-N R1 "standalone: why"`)
     Waive {
@@ -321,6 +328,11 @@ enum Cmd {
     Project {
         #[command(subcommand)]
         cmd: project::ProjectCmd,
+    },
+    /// Workspace config verbs (direct writes, not op-logged): gate-label add/remove/list
+    Workspace {
+        #[command(subcommand)]
+        cmd: workspace::WorkspaceCmd,
     },
     /// Markdown vault tickets (legacy, reads ticket files directly)
     Ticket {
@@ -530,7 +542,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         ),
         Cmd::Log { id } => read::log(ctx, &id),
         Cmd::Status { project } => read::status(ctx, project),
-        Cmd::Graph { project } => read::graph(ctx, project),
+        Cmd::Graph { project, ids } => read::graph(ctx, read::GraphArgs { project, ids }),
         Cmd::Ready {
             project,
             ids,
@@ -550,7 +562,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             },
         ),
         Cmd::Hold { id, reason, clear } => markers::hold(ctx, &id, reason.as_deref(), clear),
-        Cmd::Holds { project } => markers::holds(ctx, project.as_deref()),
+        Cmd::Holds { project, ids } => markers::holds(ctx, markers::HoldsArgs { project, ids }),
         Cmd::Waive { id, rule, reason } => markers::waive(ctx, &id, &rule, &reason),
         Cmd::Check { project } => check::check(ctx, project.as_deref()),
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
@@ -572,6 +584,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             },
         } => export::md(ctx, &dir, legacy_markers),
         Cmd::Project { cmd } => project::run(ctx, cmd),
+        Cmd::Workspace { cmd } => workspace::run(ctx, cmd),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {
             Some(BackupCmd::InstallTimer { dir, no_load }) => {

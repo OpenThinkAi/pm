@@ -482,20 +482,27 @@ Flags: `--project <PROJECT>`.
 
 ### `pm graph`
 
-Flags: `--project <PROJECT>`.
+Flags: `--project <PROJECT>` (conflicts with `--ids`), `--ids <ID>`
+(repeatable/comma-separated; AGT-1380: scopes exactly like `pm ready
+--ids` — waves and `done` are computed over just that id set, not the
+whole workspace or project).
 
+- Exit `3`: an `--ids` entry does not exist.
 - `--json`:
   ```jsonc
   {
     "schema": 1,
     "project": "string" | null,
+    "ids": ["AGT-3", ...] | null,                    // display ids, only set when scoped by --ids
     "waves": [["AGT-1", "AGT-2"], ["AGT-3"], ...],  // display ids, not-yet-done tickets only
     "done": false                                    // true once nothing in scope is pending
   }
   ```
-  A blocker outside the filtered scope that never resolves, or a
-  dependency cycle, lands the rest of the graph in one final, unordered
-  wave rather than looping forever.
+  Blockers are always resolved through the whole workspace, whatever the
+  scope — a blocker outside the filtered scope (or outside the `--ids` set)
+  still counts as pending, it is just never itself a node. That blocker
+  never resolving, or a dependency cycle, lands the rest of the graph in
+  one final, unordered wave rather than looping forever.
 
 ### `pm ready`
 
@@ -551,9 +558,12 @@ a no-op, not an error, if the ticket was not held).
 
 ### `pm holds`
 
-Flags: `--project <PROJECT>`.
+Flags: `--project <PROJECT>` (conflicts with `--ids`), `--ids <ID>`
+(repeatable/comma-separated; AGT-1380: scopes exactly like `pm ready
+--ids` — only the held tickets among that id set are listed).
 
-- Exit `3`: `--project` names a project that does not exist.
+- Exit `3`: `--project` names a project that does not exist; an `--ids`
+  entry does not exist.
 - `--json`: `{"schema": 1, "tickets": [/* Ticket, held only */]}`.
 
 ### `pm waive <ID> <RULE> <REASON>`
@@ -823,6 +833,28 @@ Flags: `--from-file <PATH>` (required).
 
 - Exit `3`: unknown project.
 - `--json`: `{"schema": 1, "project": "id", "doc": "NAME"}`.
+
+### `pm workspace gate-label add|remove|list <LABEL>`
+
+No flags beyond the globals (`list` takes no `<LABEL>`). Direct writes to
+`Workspace::gate_labels` (AGT-1380), not op-logged — the same kind of write
+`pm project`'s metadata fields are (`crates/pm/src/project.rs` module doc).
+A workspace always starts with whatever its `--preset` seeded (`manual` for
+`--preset saltline`, nothing for `--preset default`); this is how a project
+adds its own, e.g. `matt-gated`, without hand-editing the database. `pm
+ready` and `pm claim --ready` read `Workspace::gate_labels` fresh on every
+call, so a label added here excludes a ticket (and, transitively,
+everything it blocks) immediately — the same as `manual` — without needing
+`--exclude-label` or a `pm hold` on every matching ticket. `add`/`remove`
+are idempotent: adding a label already present, or removing one that
+isn't, changes nothing and is not an error. Gate labels are part of the
+`Workspace` `pm backup` already snapshots and `--restore` already rewrites,
+so a gate-label change round-trips through backup/restore with no
+dedicated backup-side code.
+
+- `add`/`remove`: Exit `2`: empty `<LABEL>`.
+- `--json` (all three): `{"schema": 1, "gate_labels": ["manual", ...]}` —
+  the full set after the write (`list`: the current set).
 
 ### `pm ticket list <DIR>` / `pm ticket show <PATH>`
 

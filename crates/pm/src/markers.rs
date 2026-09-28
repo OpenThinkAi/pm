@@ -7,11 +7,14 @@
 //! Markers are ticket fields, never description text: every one is an op
 //! (`hold.set`, `hold.clear`, `field.set waivers|not_before|parked`).
 
+use std::collections::BTreeSet;
+
 use pm_core::markers::{MarkerError, date_from_ms, normalize_rule, with_waiver};
 use pm_core::op::{FieldSet, HoldSet};
 use pm_core::{Hlc, Hold, Payload, Ticket, Waiver};
 use pm_store::TicketFilter;
 use serde_json::json;
+use ulid::Ulid;
 
 use crate::exit::{CliError, Result};
 use crate::verbs::{Ctx, SCHEMA, Stamper, display_id, find, non_empty, print_json, ticket_json};
@@ -72,18 +75,45 @@ pub fn hold(ctx: &Ctx<'_>, reference: &str, reason: Option<&str>, clear: bool) -
     print_result(ctx, &store, &ws, ticket.id)
 }
 
-/// `pm holds [--project P]`: every live held ticket (tombstoned and
-/// archived ones excluded, as `Store::tickets` does), numbered order.
-pub fn holds(ctx: &Ctx<'_>, project: Option<&str>) -> Result<()> {
+pub struct HoldsArgs {
+    pub project: Option<String>,
+    pub ids: Vec<String>,
+}
+
+/// `pm holds [--project P | --ids …]` (AGT-1380 AC1): every live held
+/// ticket (tombstoned and archived ones excluded, as `Store::tickets`
+/// does), numbered order. `--ids` scopes exactly like `pm ready --ids`: an
+/// unknown id is exit `3`, and only the held tickets among that set are
+/// listed.
+pub fn holds(ctx: &Ctx<'_>, args: HoldsArgs) -> Result<()> {
     let (store, ws) = ctx.open()?;
-    if let Some(p) = project {
+    let ids: Option<BTreeSet<Ulid>> = if args.ids.is_empty() {
+        None
+    } else {
+        Some(
+            args.ids
+                .iter()
+                .map(|r| find(&store, &ws, r).map(|t| t.id))
+                .collect::<Result<BTreeSet<Ulid>>>()?,
+        )
+    };
+    if let Some(p) = &args.project {
         require_project(&store, p)?;
     }
-    let tickets = store.tickets(&TicketFilter {
-        project: project.map(str::to_string).into_iter().collect(),
-        held: true,
-        ..TicketFilter::default()
-    })?;
+    let tickets = match &ids {
+        Some(id_set) => store
+            .all_tickets()?
+            .into_iter()
+            .filter(|t| {
+                id_set.contains(&t.id) && !t.deleted && t.archived_at.is_none() && t.hold.is_some()
+            })
+            .collect::<Vec<_>>(),
+        None => store.tickets(&TicketFilter {
+            project: args.project.clone().into_iter().collect(),
+            held: true,
+            ..TicketFilter::default()
+        })?,
+    };
     if ctx.json {
         let tickets = tickets
             .iter()

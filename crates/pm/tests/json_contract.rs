@@ -363,6 +363,26 @@ fn every_verbs_json_output_matches_its_fixture() {
         &mut failures,
     );
 
+    // ---- pm workspace gate-label add/remove/list (AGT-1380) ----
+    cap(
+        "workspace_gate_label_add",
+        &["workspace", "gate-label", "add", "matt-gated", "--json"],
+        0,
+        &mut failures,
+    );
+    cap(
+        "workspace_gate_label_list",
+        &["workspace", "gate-label", "list", "--json"],
+        0,
+        &mut failures,
+    );
+    cap(
+        "workspace_gate_label_remove",
+        &["workspace", "gate-label", "remove", "matt-gated", "--json"],
+        0,
+        &mut failures,
+    );
+
     // ---- pm project new/list/show/doc ----
     cap(
         "project_new",
