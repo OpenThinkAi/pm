@@ -1,0 +1,36 @@
+{
+  "archived_at": null,
+  "assignee": null,
+  "blocked_by": [],
+  "created": {
+    "counter": 0,
+    "wall_ms": 0
+  },
+  "deleted": false,
+  "description": "## Section\n\nBody text for the section.",
+  "ext": {},
+  "hold": null,
+  "id": "AGT-1",
+  "labels": [
+    "bar"
+  ],
+  "linear": null,
+  "linked_github": null,
+  "linked_pr": null,
+  "not_before": null,
+  "number": 1,
+  "parked": null,
+  "priority": "critical",
+  "project": "pm",
+  "repo": "OpenThinkAi/pm",
+  "schema": 1,
+  "source": null,
+  "state": "in-progress",
+  "title": "Ticket A",
+  "ulid": "<ULID>",
+  "updated": {
+    "counter": 0,
+    "wall_ms": 0
+  },
+  "waivers": []
+}

@@ -348,9 +348,16 @@ fn status_counts_per_state_plus_held_and_parked() {
     let out = json(&sb.pm(&["status", "--project", "pm", "--json"]));
     assert_eq!(out["schema"], 1);
     assert_eq!(out["project"], "pm");
-    assert_eq!(out["states"]["triage"], 1);
-    assert_eq!(out["states"]["in-progress"], 1);
-    assert_eq!(out["states"]["done"], 0);
+    // AGT-1352: `states` is an ordered array (workflow order), not a map —
+    // keys used to sort alphabetically (AGT-1339 review).
+    assert_eq!(
+        out["states"],
+        serde_json::json!([
+            {"name": "triage", "category": "unstarted", "count": 1},
+            {"name": "in-progress", "category": "started", "count": 1},
+            {"name": "done", "category": "completed", "count": 0},
+        ])
+    );
     assert_eq!(out["held"], 0);
     assert_eq!(out["parked"], 0);
 

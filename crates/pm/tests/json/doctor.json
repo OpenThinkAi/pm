@@ -1,0 +1,30 @@
+{
+  "drift": {
+    "tables": []
+  },
+  "foreign_keys": [],
+  "healthy": true,
+  "integrity": [],
+  "op_count": 32,
+  "rebuilt": null,
+  "replay_error": null,
+  "schema": 1,
+  "schema_version": 3,
+  "tables": {
+    "actor": 1,
+    "backup_target": 0,
+    "comment": 2,
+    "marker": 2,
+    "ops": 32,
+    "project": 1,
+    "project_doc": 1,
+    "project_doc_view": 1,
+    "relation": 2,
+    "schema_version": 3,
+    "state": 3,
+    "ticket": 4,
+    "ticket_label": 3,
+    "ticket_view": 4,
+    "workspace": 1
+  }
+}

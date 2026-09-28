@@ -1,0 +1,101 @@
+[
+  {
+    "actor": "tester",
+    "hlc": {
+      "counter": 0,
+      "wall_ms": 0
+    },
+    "kind": "ticket.create",
+    "op_id": "<ULID>",
+    "schema": 1,
+    "summary": "created \"Ticket A\""
+  },
+  {
+    "actor": "tester",
+    "hlc": {
+      "counter": 0,
+      "wall_ms": 0
+    },
+    "kind": "label.add",
+    "op_id": "<ULID>",
+    "schema": 1,
+    "summary": "added label 'foo'"
+  },
+  {
+    "actor": "tester",
+    "hlc": {
+      "counter": 0,
+      "wall_ms": 0
+    },
+    "kind": "body.edit",
+    "op_id": "<ULID>",
+    "schema": 1,
+    "summary": "edited description"
+  },
+  {
+    "actor": "tester",
+    "hlc": {
+      "counter": 0,
+      "wall_ms": 0
+    },
+    "kind": "field.set",
+    "op_id": "<ULID>",
+    "schema": 1,
+    "summary": "numbered 1"
+  },
+  {
+    "actor": "tester",
+    "hlc": {
+      "counter": 0,
+      "wall_ms": 0
+    },
+    "kind": "field.set",
+    "op_id": "<ULID>",
+    "schema": 1,
+    "summary": "set priority to critical"
+  },
+  {
+    "actor": "tester",
+    "hlc": {
+      "counter": 0,
+      "wall_ms": 0
+    },
+    "kind": "label.add",
+    "op_id": "<ULID>",
+    "schema": 1,
+    "summary": "added label 'bar'"
+  },
+  {
+    "actor": "tester",
+    "hlc": {
+      "counter": 0,
+      "wall_ms": 0
+    },
+    "kind": "label.remove",
+    "op_id": "<ULID>",
+    "schema": 1,
+    "summary": "removed label 'foo'"
+  },
+  {
+    "actor": "tester",
+    "hlc": {
+      "counter": 0,
+      "wall_ms": 0
+    },
+    "kind": "comment.add",
+    "op_id": "<ULID>",
+    "schema": 1,
+    "summary": "commented: hello from the contract test"
+  },
+  {
+    "actor": "tester",
+    "hlc": {
+      "counter": 0,
+      "wall_ms": 0
+    },
+    "kind": "state.transition",
+    "op_id": "<ULID>",
+    "schema": 1,
+    "summary": "moved to 'in-progress'"
+  }
+]

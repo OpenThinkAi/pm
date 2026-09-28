@@ -1,0 +1,36 @@
+{
+  "archived_at": null,
+  "assignee": null,
+  "blocked_by": [],
+  "created": {
+    "counter": 0,
+    "wall_ms": 0
+  },
+  "deleted": false,
+  "description": "## Problem Statement\n\nFiled from a vault-format file.",
+  "ext": {},
+  "hold": null,
+  "id": "AGT-5",
+  "labels": [
+    "imported"
+  ],
+  "linear": null,
+  "linked_github": null,
+  "linked_pr": null,
+  "not_before": null,
+  "number": 5,
+  "parked": null,
+  "priority": "low",
+  "project": "pm",
+  "repo": null,
+  "schema": 1,
+  "source": null,
+  "state": "triage",
+  "title": "Imported ticket",
+  "ulid": "<ULID>",
+  "updated": {
+    "counter": 0,
+    "wall_ms": 0
+  },
+  "waivers": []
+}

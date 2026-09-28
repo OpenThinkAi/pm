@@ -1,0 +1,9 @@
+{
+  "committed": true,
+  "last_seq": 32,
+  "ops_appended": 32,
+  "pushed": false,
+  "remote": null,
+  "schema": 1,
+  "target": "<HOME>/backup-target"
+}
