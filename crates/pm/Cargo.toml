@@ -30,4 +30,6 @@ toml = "1.1"
 ulid = { version = "1.2", features = ["serde"] }
 
 [dev-dependencies]
+# Tests corrupt a materialized row directly to prove `pm doctor` catches it.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 tempfile = "3.27"
