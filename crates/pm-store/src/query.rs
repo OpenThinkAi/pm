@@ -144,7 +144,9 @@ impl Store {
             .map(|ops| ops.into_iter().map(|(_, op)| op).collect())
     }
 
-    fn load_tickets(&self, where_sql: &str, args: Vec<Value>) -> Result<Vec<Ticket>> {
+    /// Tickets matching `where_sql` (which may start with a JOIN against
+    /// the `ticket t` alias) in the order [`Store::tickets`] documents.
+    pub(crate) fn load_tickets(&self, where_sql: &str, args: Vec<Value>) -> Result<Vec<Ticket>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT id, number, title, state, priority, project, repo, assignee, description,
                     created_wall_ms, created_counter, updated_wall_ms, updated_counter,

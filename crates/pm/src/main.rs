@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 mod backup;
 mod batch;
+mod claim;
 mod doctor;
 mod edit;
 mod exit;
@@ -17,7 +18,8 @@ use ticket::{Filter, State, Ticket};
 
 /// pm - local-first ticketing for agents and humans
 ///
-/// Exit codes: 0 ok, 1 error (or an unhealthy database, for doctor), 2 usage, 3 not found.
+/// Exit codes: 0 ok, 1 error (or an unhealthy database, for doctor), 2 usage, 3 not found,
+/// 75 taken (claim).
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Cli {
@@ -157,6 +159,20 @@ enum Cmd {
         #[arg(long, value_parser = edit::parse_view)]
         view: Option<edit::View>,
     },
+    /// Take a ticket: unstarted and unassigned -> started, assigned to you (exit 75 if someone else has it)
+    Claim {
+        /// Ticket id (AGT-12) or ULID; omit with --ready
+        id: Option<String>,
+        /// Claim the lowest-numbered ready ticket instead (exit 3 if none)
+        #[arg(long, conflicts_with = "id")]
+        ready: bool,
+        /// With --ready: only tickets in this project
+        #[arg(long)]
+        project: Option<String>,
+        /// Record the git branch the work lands on (kept in the ticket's `ext.branch`)
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+    },
     /// Check the database: constraints, and that the ticket tables replay from the op log (exit 1 if not)
     Doctor {
         /// Regenerate the ticket tables from the op log first and print what changed
@@ -291,6 +307,20 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         ),
         Cmd::Unclaim { id } => mutate::unclaim(ctx, &id),
         Cmd::Edit { id, view } => edit::edit(ctx, &id, view),
+        Cmd::Claim {
+            id,
+            ready,
+            project,
+            branch,
+        } => claim::claim(
+            ctx,
+            claim::ClaimArgs {
+                id,
+                ready,
+                project,
+                branch,
+            },
+        ),
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {

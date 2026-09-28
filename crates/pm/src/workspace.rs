@@ -103,6 +103,12 @@ pub struct Config {
     /// `[edit]` (AGT-1345): `pm edit` defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit: Option<EditConfig>,
+    /// The pm-hub that arbitrates claims and numbers (README §Authority),
+    /// e.g. `https://pm-hub.example`. Unset means this machine's database
+    /// is the authority (phases 1–2). Until the hub protocol lands (P3),
+    /// setting it makes `pm claim` refuse rather than claim unconfirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub: Option<String>,
 }
 
 /// `[edit]` in config.toml.

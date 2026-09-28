@@ -10,6 +10,9 @@ use pm_store::StoreError;
 pub const ERROR: u8 = 1;
 pub const USAGE: u8 = 2;
 pub const NOT_FOUND: u8 = 3;
+/// The authority refused a conditional op (`pm claim`: someone else holds
+/// the ticket).
+pub const TAKEN: u8 = 75;
 
 #[derive(Debug)]
 pub struct CliError {
@@ -47,7 +50,8 @@ impl From<anyhow::Error> for CliError {
 }
 
 /// A store failure that names something missing (a project, a ticket, a
-/// state) is "not found"; anything else is a plain error.
+/// state) is "not found", a refused claim is "taken"; anything else is a
+/// plain error.
 impl From<StoreError> for CliError {
     fn from(err: StoreError) -> Self {
         let code = match err {
@@ -55,6 +59,7 @@ impl From<StoreError> for CliError {
             | StoreError::UnknownTicket { .. }
             | StoreError::UnknownState { .. }
             | StoreError::UnknownRelationTarget { .. } => NOT_FOUND,
+            StoreError::ClaimRejected(_) => TAKEN,
             _ => ERROR,
         };
         CliError {
