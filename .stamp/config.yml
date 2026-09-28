@@ -4,6 +4,15 @@ branches:
       - security
       - standards
       - product
+    required_checks:
+      - name: build
+        run: cargo build --locked
+      - name: test
+        run: cargo test --locked
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: fmt
+        run: cargo fmt --check
 reviewers:
   security:
     prompt: .stamp/reviewers/security.md
