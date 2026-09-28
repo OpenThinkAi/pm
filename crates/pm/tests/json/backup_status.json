@@ -1,0 +1,8 @@
+{
+  "age_seconds": 0,
+  "healthy": true,
+  "last_seq": 32,
+  "last_success": "<TIMESTAMP>",
+  "schema": 1,
+  "target": "<HOME>/backup-target"
+}

@@ -1,0 +1,25 @@
+{
+  "config": "<HOME>/.config/pm/config.toml",
+  "config_written": true,
+  "db": "<HOME>/ws/pm.sqlite",
+  "prefix": "AGT",
+  "schema": 1,
+  "states": [
+    {
+      "category": "unstarted",
+      "name": "triage",
+      "position": 0
+    },
+    {
+      "category": "started",
+      "name": "in-progress",
+      "position": 1
+    },
+    {
+      "category": "completed",
+      "name": "done",
+      "position": 2
+    }
+  ],
+  "workspace": "<HOME>/ws"
+}

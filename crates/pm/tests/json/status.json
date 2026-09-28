@@ -1,0 +1,23 @@
+{
+  "held": 0,
+  "parked": 0,
+  "project": "pm",
+  "schema": 1,
+  "states": [
+    {
+      "category": "unstarted",
+      "count": 3,
+      "name": "triage"
+    },
+    {
+      "category": "started",
+      "count": 1,
+      "name": "in-progress"
+    },
+    {
+      "category": "completed",
+      "count": 0,
+      "name": "done"
+    }
+  ]
+}

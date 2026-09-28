@@ -263,14 +263,21 @@ pub fn status(ctx: &Ctx<'_>, project: Option<String>) -> Result<()> {
     }
 
     if ctx.json {
-        let states: BTreeMap<&str, u64> = ws
+        // AGT-1339 review: a `BTreeMap` here serialized `states` with keys
+        // in alphabetical order, not workflow order (`ws.states` is
+        // `ORDER BY position, name` — pm-store::config::states). Since
+        // this ticket freezes `--json` shapes, an ordered array preserves
+        // workflow order and survives a schema change that makes `Value`
+        // an object instead of a bare `u64`.
+        let states: Vec<Value> = ws
             .states
             .iter()
             .map(|s| {
-                (
-                    s.name.as_str(),
-                    counts.get(s.name.as_str()).copied().unwrap_or(0),
-                )
+                json!({
+                    "name": s.name,
+                    "category": s.category,
+                    "count": counts.get(s.name.as_str()).copied().unwrap_or(0),
+                })
             })
             .collect();
         print_json(&json!({

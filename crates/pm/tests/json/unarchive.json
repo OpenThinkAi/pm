@@ -1,0 +1,38 @@
+{
+  "archived_at": null,
+  "assignee": null,
+  "blocked_by": [
+    "AGT-3"
+  ],
+  "created": {
+    "counter": 0,
+    "wall_ms": 0
+  },
+  "deleted": false,
+  "description": "",
+  "ext": {},
+  "hold": null,
+  "id": "AGT-4",
+  "labels": [
+    "batch"
+  ],
+  "linear": null,
+  "linked_github": null,
+  "linked_pr": null,
+  "not_before": null,
+  "number": 4,
+  "parked": null,
+  "priority": "medium",
+  "project": "pm",
+  "repo": null,
+  "schema": 1,
+  "source": null,
+  "state": "triage",
+  "title": "Batch B",
+  "ulid": "<ULID>",
+  "updated": {
+    "counter": 0,
+    "wall_ms": 0
+  },
+  "waivers": []
+}

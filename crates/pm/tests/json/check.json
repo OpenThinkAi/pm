@@ -1,0 +1,22 @@
+{
+  "count": 1,
+  "findings": [
+    {
+      "hold": {
+        "at": {
+          "counter": 0,
+          "wall_ms": 0
+        },
+        "by": "tester",
+        "reason": "needs review"
+      },
+      "message": "held: needs review (by tester, 2026-09-28)",
+      "rule": "held",
+      "tickets": [
+        "AGT-2"
+      ]
+    }
+  ],
+  "ok": false,
+  "schema": 1
+}

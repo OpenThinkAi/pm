@@ -1,0 +1,12 @@
+{
+  "at": {
+    "counter": 0,
+    "wall_ms": 0
+  },
+  "id": "AGT-3",
+  "reason": "ticket is in state 'in-progress', which is not unstarted",
+  "schema": 1,
+  "state": "in-progress",
+  "taken_by": "tester",
+  "ulid": "<ULID>"
+}
