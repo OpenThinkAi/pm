@@ -213,8 +213,14 @@ pub struct HoldSet {
 /// One text-CRDT update: the bytes of a [`crate::BodyUpdate`] (a Loro
 /// update or snapshot, AGT-1338). Opaque to the op log and to pm-hub; the
 /// view folds it in with [`crate::Body::apply`].
+///
+/// On the wire `update` is a base64 string (AGT-1378,
+/// [`crate::bytes::base64`]); an op written before that as an array of
+/// integers still parses. Op identity is `op_id`, never a hash of this
+/// JSON, so the two spellings are the same op.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BodyEdit {
+    #[serde(with = "crate::bytes::base64")]
     pub update: Vec<u8>,
 }
 
@@ -337,6 +343,22 @@ mod tests {
             json["payload"],
             serde_json::json!({"field": "priority", "value": "high"})
         );
+    }
+
+    /// AGT-1378: the update travels as base64, and the array form every op
+    /// log and backup carried before that still reads as the same op.
+    #[test]
+    fn body_edit_update_is_base64_on_the_wire_and_reads_the_legacy_array() {
+        let op = op(Payload::BodyEdit(BodyEdit {
+            update: b"loro".to_vec(),
+        }));
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(json["payload"], serde_json::json!({"update": "bG9ybw=="}));
+
+        let mut legacy = json.clone();
+        legacy["payload"] = serde_json::json!({"update": [108, 111, 114, 111]});
+        let back: Op = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back, op);
     }
 
     #[test]

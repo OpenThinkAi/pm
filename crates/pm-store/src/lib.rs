@@ -22,6 +22,8 @@
 //!   the doc-replay `doctor`/`rebuild` fold in
 //! - `import` — the number allocator's floor and project upserts for
 //!   `pm import vault` (AGT-1347)
+//! - `reencode` — migration 0005's in-place rewrite of byte payloads from
+//!   JSON arrays to base64 (AGT-1378)
 //! - [`StoreError`] — typed failures (R2/R4/R5 violations, claim rejection, …)
 
 mod backup;
@@ -35,6 +37,7 @@ mod import;
 mod project;
 mod query;
 mod ready;
+mod reencode;
 
 use std::path::Path;
 use std::time::Duration;
@@ -57,10 +60,16 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (2, include_str!("../migrations/0002_backup_agt1350.sql")),
     (3, include_str!("../migrations/0003_project_doc_bodies.sql")),
     (4, include_str!("../migrations/0004_number_floor.sql")),
+    (5, include_str!("../migrations/0005_compact_bytes.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
+
+/// The migration whose work is Rust, not SQL: after its (comment-only)
+/// SQL file runs, [`reencode::run`] rewrites every stored byte payload in
+/// the same transaction (AGT-1378).
+const COMPACT_BYTES_VERSION: u32 = 5;
 
 /// How long a writer waits for the database lock before giving up. Sized
 /// for many concurrent CLI invocations (build loops fan out), not for a
@@ -116,11 +125,24 @@ impl Store {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(sql)?;
+            let mut rewrote_rows = false;
+            if *version == COMPACT_BYTES_VERSION {
+                rewrote_rows = reencode::run(&tx)? != reencode::Rewritten::default();
+            }
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
                 [version],
             )?;
             tx.commit()?;
+            if rewrote_rows {
+                // The rewrite shrank every touched row but SQLite keeps
+                // the freed pages (the live 154 MB database came out of
+                // it at 174 MB); VACUUM cannot run inside the migration's
+                // transaction, so it follows it. Skipped when nothing was
+                // rewritten (every fresh database), where it would only
+                // cost a file rewrite.
+                self.conn.execute_batch("VACUUM")?;
+            }
         }
         Ok(())
     }

@@ -18,12 +18,14 @@
 //! - [`markers`] — strict marker dates, waiver rules (AGT-1342)
 //! - [`hlc`] — hybrid logical clock and the `(hlc, actor)` [`Stamp`]
 //! - [`op`] — the [`Op`] envelope and every payload
+//! - [`bytes`] — byte payloads as base64 on the wire, legacy arrays on read (AGT-1378)
 //! - [`merge`] — LWW register, OR-set, append-only comment log
 //! - [`ready`] — the ready frontier: verdicts, reasons and waves (AGT-1343)
 //! - [`view`] — [`TicketView`] and the pure [`apply`] function
 
 pub mod archive;
 pub mod body;
+pub mod bytes;
 pub mod check;
 pub mod doc;
 pub mod domain;

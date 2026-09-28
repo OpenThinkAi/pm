@@ -1,9 +1,12 @@
 {
   "committed": true,
   "last_seq": 32,
+  "legacy_migrated": null,
   "ops_appended": 32,
   "pushed": false,
   "remote": null,
   "schema": 1,
-  "target": "<HOME>/backup-target"
+  "shards": 1,
+  "target": "<HOME>/backup-target",
+  "warnings": []
 }
