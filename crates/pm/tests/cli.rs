@@ -443,7 +443,6 @@ fn set_validates_every_assignment_before_writing() {
     assert_ok(&sb.pm(&["new", "--title", "Keep"]));
     let before = sb.store().ops(ulid_of(&sb, "AGT-1")).unwrap().len();
 
-    assert_code(&sb.pm(&["set", "AGT-1", "title=X", "bogus=1"]), 2);
     assert_code(&sb.pm(&["set", "AGT-1", "title=X", "noequals"]), 2);
     assert_code(&sb.pm(&["set", "AGT-1", "title="]), 2);
     assert_code(&sb.pm(&["set", "AGT-1", "title=X", "project=missing"]), 3);
@@ -455,6 +454,208 @@ fn set_validates_every_assignment_before_writing() {
         stdout(&sb.pm(&["show", "AGT-1", "--field", "title"])),
         "Keep\n"
     );
+}
+
+/// AGT-1340 AC1: a key `pm set` does not know as a scalar field is not a
+/// usage error — it lands under `ext.<key>`, with a warning on stderr.
+#[test]
+fn set_unknown_field_lands_in_ext_with_a_warning() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+
+    let out = sb.pm(&[
+        "set",
+        "AGT-1",
+        "priority=high",
+        "merged_sha=abc123",
+        "--json",
+    ]);
+    assert_ok(&out);
+    assert!(
+        stderr(&out).contains("warning") && stderr(&out).contains("merged_sha"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    let v = json(&out);
+    assert_eq!(v["priority"], "high");
+    assert_eq!(v["ext"]["merged_sha"], "abc123");
+
+    // An empty value clears the ext key, same as an optional scalar field.
+    let out = sb.pm(&["set", "AGT-1", "merged_sha=", "--json"]);
+    let v = json(&out);
+    assert!(v["ext"].as_object().unwrap().get("merged_sha").is_none());
+}
+
+/// AGT-1340 AC1: `pm set` now also covers assignee, linked-github,
+/// linked-pr and linear (title/priority/project/repo were AGT-1336).
+#[test]
+fn set_covers_assignee_and_link_fields() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+
+    let out = sb.pm(&[
+        "set",
+        "AGT-1",
+        "assignee=matt",
+        "linked-github=https://github.com/OpenThinkAi/pm/issues/1",
+        "linked-pr=https://github.com/OpenThinkAi/pm/pull/2",
+        "linear=ANGL-1",
+        "--json",
+    ]);
+    let v = json(&out);
+    assert_eq!(v["assignee"], "matt");
+    assert_eq!(
+        v["linked_github"],
+        "https://github.com/OpenThinkAi/pm/issues/1"
+    );
+    assert_eq!(v["linked_pr"], "https://github.com/OpenThinkAi/pm/pull/2");
+    assert_eq!(v["linear"], "ANGL-1");
+
+    // Empty clears, same as project/repo.
+    let out = sb.pm(&["set", "AGT-1", "assignee=", "--json"]);
+    let v = json(&out);
+    assert!(v["assignee"].is_null());
+}
+
+// ---------------------------------------------- AGT-1340 AC1: pm label
+
+#[test]
+fn label_adds_and_removes() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T", "--label", "keep"]));
+
+    // `changes` accepts hyphen-prefixed values (`-y`), so global flags like
+    // `--json` must precede the subcommand rather than trail the list.
+    let v = json(&sb.pm(&["--json", "label", "AGT-1", "+x", "+y"]));
+    let mut labels: Vec<&str> = v["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect();
+    labels.sort();
+    assert_eq!(labels, ["keep", "x", "y"]);
+
+    let v = json(&sb.pm(&["--json", "label", "AGT-1", "-x", "+z"]));
+    let mut labels: Vec<&str> = v["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect();
+    labels.sort();
+    assert_eq!(labels, ["keep", "y", "z"]);
+}
+
+#[test]
+fn label_rejects_a_token_without_a_sign_as_usage() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_code(&sb.pm(&["label", "AGT-1", "x"]), 2);
+    assert_code(&sb.pm(&["label", "AGT-999", "+x"]), 3);
+}
+
+// -------------------------------------------- AGT-1340 AC2: pm comment
+
+#[test]
+fn comment_appends_with_actor_and_hlc() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_ok(&sb.pm(&["comment", "AGT-1", "hello there", "--as", "bob"]));
+
+    let comments = sb.store().comments(ulid_of(&sb, "AGT-1")).unwrap();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].body, "hello there");
+    assert_eq!(comments[0].author.as_str(), "bob");
+}
+
+#[test]
+fn comment_file_dash_reads_stdin() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    let out = sb.run_with_stdin(&["comment", "AGT-1", "--file", "-"], "from stdin\n");
+    assert_ok(&out);
+    let comments = sb.store().comments(ulid_of(&sb, "AGT-1")).unwrap();
+    assert_eq!(comments[0].body, "from stdin");
+}
+
+#[test]
+fn comment_requires_text_or_file_and_rejects_both() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_code(&sb.pm(&["comment", "AGT-1"]), 2);
+    assert_code(&sb.pm(&["comment", "AGT-1", "hi", "--file", "-"]), 2);
+    assert_code(&sb.pm(&["comment", "AGT-999", "hi"]), 3);
+}
+
+// -------------------------- AGT-1340 AC3: pm move / pm done / pm unclaim
+
+#[test]
+fn move_validates_the_state_exists() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+
+    let v = json(&sb.pm(&["move", "AGT-1", "in-progress", "--json"]));
+    assert_eq!(v["state"], "in-progress");
+
+    assert_code(&sb.pm(&["move", "AGT-1", "not-a-state"]), 3);
+    assert_code(&sb.pm(&["move", "AGT-999", "in-progress"]), 3);
+}
+
+#[test]
+fn done_transitions_and_records_note_and_links() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+
+    let v = json(&sb.pm(&[
+        "done",
+        "AGT-1",
+        "--note",
+        "shipped it",
+        "--merged-sha",
+        "abc123",
+        "--pr",
+        "https://github.com/OpenThinkAi/pm/pull/9",
+        "--json",
+    ]));
+    assert_eq!(v["state"], "done");
+    assert_eq!(v["linked_pr"], "https://github.com/OpenThinkAi/pm/pull/9");
+    assert_eq!(v["ext"]["merged_sha"], "abc123");
+
+    let comments = sb.store().comments(ulid_of(&sb, "AGT-1")).unwrap();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].body, "shipped it");
+}
+
+#[test]
+fn done_without_flags_just_transitions() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    let v = json(&sb.pm(&["done", "AGT-1", "--json"]));
+    assert_eq!(v["state"], "done");
+    assert!(v["ext"].as_object().unwrap().is_empty());
+    assert_code(&sb.pm(&["done", "AGT-999"]), 3);
+}
+
+#[test]
+fn unclaim_returns_a_started_ticket_to_unstarted_and_clears_assignee() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_ok(&sb.pm(&["move", "AGT-1", "in-progress"]));
+    assert_ok(&sb.pm(&["set", "AGT-1", "assignee=matt"]));
+
+    let v = json(&sb.pm(&["unclaim", "AGT-1", "--json"]));
+    assert_eq!(v["state"], "triage");
+    assert!(v["assignee"].is_null());
+}
+
+#[test]
+fn unclaim_refuses_a_ticket_that_is_not_started() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    // Still in triage: nothing to unclaim.
+    assert_code(&sb.pm(&["unclaim", "AGT-1"]), 1);
+    assert_code(&sb.pm(&["unclaim", "AGT-999"]), 3);
 }
 
 // ---------------------------------------------------------------- AC5

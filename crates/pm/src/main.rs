@@ -6,6 +6,7 @@ use std::process::ExitCode;
 mod batch;
 mod doctor;
 mod exit;
+mod mutate;
 mod ticket;
 mod verbs;
 mod workspace;
@@ -88,13 +89,63 @@ enum Cmd {
         #[arg(long, value_name = "NAME")]
         field: Option<String>,
     },
-    /// Set ticket fields: title, priority, project, repo (empty value clears)
+    /// Set ticket fields: title, priority, project, repo, assignee, linked-github, linked-pr,
+    /// linear (empty value clears; unknown keys land in ext with a warning)
     Set {
         /// Ticket id (AGT-12) or ULID
         id: String,
         /// key=value pairs
         #[arg(required = true, value_name = "KEY=VALUE")]
         assignments: Vec<String>,
+    },
+    /// Add or remove labels: +x adds, -y removes. Since `-y` looks like a flag,
+    /// put global flags (--json, --as, --workspace) before `label`, not after.
+    Label {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+        /// +label to add, -label to remove
+        #[arg(
+            required = true,
+            value_name = "+LABEL|-LABEL",
+            allow_hyphen_values = true
+        )]
+        changes: Vec<String>,
+    },
+    /// Append a comment
+    Comment {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+        /// Comment text; omit when using --file
+        text: Option<String>,
+        /// Read the comment body from a file, or `-` for stdin
+        #[arg(long, value_name = "PATH|-")]
+        file: Option<String>,
+    },
+    /// Move a ticket to a workflow state
+    Move {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+        /// A state this workspace defines
+        state: String,
+    },
+    /// Transition a ticket to the workspace's completed state
+    Done {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+        /// Appended as a comment
+        #[arg(long)]
+        note: Option<String>,
+        /// Recorded under ext.merged_sha
+        #[arg(long = "merged-sha", value_name = "SHA")]
+        merged_sha: Option<String>,
+        /// Recorded as linked-pr
+        #[arg(long, value_name = "URL")]
+        pr: Option<String>,
+    },
+    /// Return a started ticket to unstarted and clear its assignee
+    Unclaim {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
     },
     /// Check the database: constraints, and that the ticket tables replay from the op log (exit 1 if not)
     Doctor {
@@ -179,6 +230,26 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         ),
         Cmd::Show { id, field } => verbs::show(ctx, &id, field.as_deref()),
         Cmd::Set { id, assignments } => verbs::set(ctx, &id, &assignments),
+        Cmd::Label { id, changes } => mutate::label(ctx, &id, &changes),
+        Cmd::Comment { id, text, file } => {
+            mutate::comment(ctx, &id, text.as_deref(), file.as_deref())
+        }
+        Cmd::Move { id, state } => mutate::mv(ctx, &id, &state),
+        Cmd::Done {
+            id,
+            note,
+            merged_sha,
+            pr,
+        } => mutate::done(
+            ctx,
+            &id,
+            mutate::DoneArgs {
+                note,
+                merged_sha,
+                pr,
+            },
+        ),
+        Cmd::Unclaim { id } => mutate::unclaim(ctx, &id),
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
     }
