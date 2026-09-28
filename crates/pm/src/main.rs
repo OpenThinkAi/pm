@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod archive;
 mod backup;
 mod batch;
 mod check;
@@ -280,6 +281,23 @@ enum Cmd {
         #[arg(long)]
         rebuild: bool,
     },
+    /// Archive a ticket (`pm archive AGT-N`), or sweep for eligible tickets/projects (`--auto`)
+    Archive {
+        /// Ticket id (AGT-12) or ULID; omit with --auto
+        id: Option<String>,
+        /// Archive every completed ticket whose completion month has passed, and retire
+        /// every idle project, instead of one ticket
+        #[arg(long, conflicts_with = "id")]
+        auto: bool,
+        /// With --auto: print what would change without writing anything
+        #[arg(long, requires = "auto")]
+        dry_run: bool,
+    },
+    /// Clear a ticket's archived_at, undoing `pm archive`
+    Unarchive {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+    },
     /// Project verbs: new, show, list, edit, doc, delete
     Project {
         #[command(subcommand)]
@@ -479,6 +497,8 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         Cmd::Waive { id, rule, reason } => markers::waive(ctx, &id, &rule, &reason),
         Cmd::Check { project } => check::check(ctx, project.as_deref()),
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
+        Cmd::Archive { id, auto, dry_run } => archive::archive(ctx, id, auto, dry_run),
+        Cmd::Unarchive { id } => archive::unarchive(ctx, &id),
         Cmd::Project { cmd } => project::run(ctx, cmd),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {
