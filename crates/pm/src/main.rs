@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 mod batch;
+mod doctor;
 mod exit;
 mod ticket;
 mod verbs;
@@ -13,7 +14,7 @@ use ticket::{Filter, State, Ticket};
 
 /// pm - local-first ticketing for agents and humans
 ///
-/// Exit codes: 0 ok, 1 error, 2 usage, 3 not found.
+/// Exit codes: 0 ok, 1 error (or an unhealthy database, for doctor), 2 usage, 3 not found.
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Cli {
@@ -95,6 +96,12 @@ enum Cmd {
         #[arg(required = true, value_name = "KEY=VALUE")]
         assignments: Vec<String>,
     },
+    /// Check the database: constraints, and that the ticket tables replay from the op log (exit 1 if not)
+    Doctor {
+        /// Regenerate the ticket tables from the op log first and print what changed
+        #[arg(long)]
+        rebuild: bool,
+    },
     /// Markdown vault tickets (legacy, reads ticket files directly)
     Ticket {
         #[command(subcommand)]
@@ -172,6 +179,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         ),
         Cmd::Show { id, field } => verbs::show(ctx, &id, field.as_deref()),
         Cmd::Set { id, assignments } => verbs::set(ctx, &id, &assignments),
+        Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
     }
 }

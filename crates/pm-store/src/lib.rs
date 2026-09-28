@@ -13,11 +13,13 @@
 //! - `commit` — [`Store::commit`], [`Store::allocate_number`], materialization
 //! - `query` — by id / number / filtered list, comments, relations, ops
 //! - `config` — workspace + states, projects + docs
+//! - `doctor` — [`Store::doctor`] (verify) and [`Store::rebuild`] (replay the log)
 //! - [`StoreError`] — typed failures (R2/R4/R5 violations, claim rejection, …)
 
 mod codec;
 mod commit;
 mod config;
+mod doctor;
 mod error;
 mod query;
 
@@ -26,6 +28,9 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior};
 
+pub use doctor::{
+    ColumnChange, Diff, ForeignKeyViolation, Report, Row, RowChange, TICKET_TABLES, TableDiff,
+};
 pub use error::{Result, StoreError};
 pub use query::TicketFilter;
 

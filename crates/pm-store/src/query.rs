@@ -140,30 +140,8 @@ impl Store {
 
     /// The ticket's ops in the order this replica appended them.
     pub fn ops(&self, ticket: Ulid) -> Result<Vec<Op>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT op_id, hlc_wall_ms, hlc_counter, actor, entity, kind, payload, version
-             FROM ops WHERE entity = ?1 ORDER BY seq",
-        )?;
-        let rows = stmt.query_map(params![ticket.to_string()], |r| {
-            let envelope = serde_json::json!({
-                "op_id": r.get::<_, String>("op_id")?,
-                "hlc": hlc(r, "hlc_wall_ms", "hlc_counter")?,
-                "actor": r.get::<_, String>("actor")?,
-                "entity": r.get::<_, String>("entity")?,
-                "kind": r.get::<_, String>("kind")?,
-                "version": r.get::<_, u16>("version")?,
-            });
-            let payload: Option<String> = r.get("payload")?;
-            Ok((envelope, payload))
-        })?;
-        rows.map(|row| {
-            let (mut envelope, payload) = row?;
-            if let Some(payload) = payload {
-                envelope["payload"] = from_json("ops.payload", &payload)?;
-            }
-            serde_json::from_value(envelope).map_err(|e| StoreError::corrupt("ops row")(&e))
-        })
-        .collect()
+        read_ops(&self.conn, "WHERE entity = ?1", params![ticket.to_string()])
+            .map(|ops| ops.into_iter().map(|(_, op)| op).collect())
     }
 
     fn load_tickets(&self, where_sql: &str, args: Vec<Value>) -> Result<Vec<Ticket>> {
@@ -178,6 +156,40 @@ impl Store {
         let rows = stmt.query_map(params_from_iter(args), TicketRow::read)?;
         rows.map(|row| row?.into_ticket(&self.conn)).collect()
     }
+}
+
+/// Ops matching `where_sql` in `seq` order, each with its `seq`.
+pub(crate) fn read_ops(
+    conn: &Connection,
+    where_sql: &str,
+    args: impl rusqlite::Params,
+) -> Result<Vec<(i64, Op)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT seq, op_id, hlc_wall_ms, hlc_counter, actor, entity, kind, payload, version
+         FROM ops {where_sql} ORDER BY seq"
+    ))?;
+    let rows = stmt.query_map(args, |r| {
+        let envelope = serde_json::json!({
+            "op_id": r.get::<_, String>("op_id")?,
+            "hlc": hlc(r, "hlc_wall_ms", "hlc_counter")?,
+            "actor": r.get::<_, String>("actor")?,
+            "entity": r.get::<_, String>("entity")?,
+            "kind": r.get::<_, String>("kind")?,
+            "version": r.get::<_, u16>("version")?,
+        });
+        let payload: Option<String> = r.get("payload")?;
+        Ok((r.get::<_, i64>("seq")?, envelope, payload))
+    })?;
+    rows.map(|row| {
+        let (seq, mut envelope, payload) = row?;
+        if let Some(payload) = payload {
+            envelope["payload"] = from_json("ops.payload", &payload)?;
+        }
+        let op =
+            serde_json::from_value(envelope).map_err(|e| StoreError::corrupt("ops row")(&e))?;
+        Ok((seq, op))
+    })
+    .collect()
 }
 
 /// One `ticket` row as SQLite hands it over, before decoding.

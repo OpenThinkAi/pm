@@ -161,18 +161,37 @@ fn commit_in(
         return Err(StoreError::DuplicateOp { op_id: op.op_id });
     }
     ensure_actor(tx, &op.actor)?;
+    let view = next_view(tx, op, true)?;
+    append_op(tx, op)?;
+    between()?;
+    materialize(tx, &view, op)
+}
+
+/// Re-applies an op that is already in the log: the same load → apply →
+/// materialize path as [`commit_in`], without appending. `pm doctor
+/// --rebuild` runs this over `ops` in `seq` order against emptied ticket
+/// tables, so a rebuilt row is produced by exactly the code that produced
+/// the original.
+pub(crate) fn replay_in(tx: &Transaction<'_>, op: &Op) -> Result<Ticket> {
+    let view = next_view(tx, op, false)?;
+    materialize(tx, &view, op)
+}
+
+/// The ticket's view with `op` folded in. `admit_claims` runs the
+/// authority's conditional check on a `claim`; a replay skips it, since
+/// the claim was admitted when it was logged (README §Conflict semantics:
+/// "replicas apply admitted claims as plain LWW writes").
+fn next_view(tx: &Transaction<'_>, op: &Op, admit_claims: bool) -> Result<TicketView> {
     let mut view = match load_view(tx, op.entity)? {
         Some(view) => view,
         None if matches!(op.payload, Payload::TicketCreate(_)) => TicketView::new(op.entity),
         None => return Err(StoreError::UnknownTicket { ticket: op.entity }),
     };
-    if matches!(op.payload, Payload::Claim(_)) {
+    if admit_claims && matches!(op.payload, Payload::Claim(_)) {
         view.claim_admissible(&states(tx)?)?;
     }
     apply(&mut view, op)?;
-    append_op(tx, op)?;
-    between()?;
-    materialize(tx, &view, op)
+    Ok(view)
 }
 
 fn exists(conn: &Connection, sql: &str, key: &str) -> rusqlite::Result<bool> {

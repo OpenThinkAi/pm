@@ -34,6 +34,17 @@ pub enum StoreError {
     /// foreign writer or a schema bug can produce this.
     #[error("stored {what} is corrupt: {detail}")]
     Corrupt { what: &'static str, detail: String },
+    /// `pm doctor --rebuild` could not re-apply a logged op; the tables
+    /// were left as they were. Only a foreign writer (an edited op, a
+    /// dropped project or state) can produce this.
+    #[error("replaying op #{seq} ({op_id}, {kind}) failed: {source}")]
+    Replay {
+        seq: i64,
+        op_id: Ulid,
+        kind: &'static str,
+        #[source]
+        source: Box<StoreError>,
+    },
 }
 
 impl StoreError {
