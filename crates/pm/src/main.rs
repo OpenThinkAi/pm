@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod batch;
 mod exit;
 mod ticket;
 mod verbs;
@@ -30,6 +31,10 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// `New` carries every `pm new` flag (AGT-1346 AC5); clap enums are parsed
+// once per invocation, so the size difference from `Init`/`Show`/etc. is
+// not worth boxing fields over.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Create a workspace database (saltline states: triage, in-progress, done)
     Init {
@@ -37,10 +42,11 @@ enum Cmd {
         #[arg(long)]
         prefix: String,
     },
-    /// File a ticket and print its id
+    /// File a ticket (or several) and print their id(s)
     New {
+        /// Required unless --from-file or --batch is given
         #[arg(long)]
-        title: String,
+        title: Option<String>,
         /// Project id; the project must already exist
         #[arg(long)]
         project: Option<String>,
@@ -52,6 +58,26 @@ enum Cmd {
         /// Label to add; repeat or comma-separate for several
         #[arg(long = "label", value_name = "LABEL", value_delimiter = ',')]
         labels: Vec<String>,
+        /// Ticket description (markdown)
+        #[arg(long)]
+        description: Option<String>,
+        /// Read the description from a file, or `-` for stdin
+        #[arg(long = "description-file", value_name = "PATH|-")]
+        description_file: Option<String>,
+        /// Ticket(s) this one is blocked by: AGT-N or ULID, repeat or comma-separate
+        #[arg(long = "blocked-by", value_name = "ID", value_delimiter = ',')]
+        blocked_by: Vec<String>,
+        #[arg(long = "linked-github", value_name = "URL")]
+        linked_github: Option<String>,
+        /// type=manual|github|linear|jira|notion,url=…,id=…,fetched-at=…
+        #[arg(long, value_name = "type=…,url=…,id=…")]
+        source: Option<String>,
+        /// Parse a vault-format ticket file (frontmatter + sections) into one ticket
+        #[arg(long = "from-file", value_name = "PATH")]
+        from_file: Option<PathBuf>,
+        /// Create every ticket in a YAML batch spec, in one transaction
+        #[arg(long, value_name = "PATH")]
+        batch: Option<PathBuf>,
     },
     /// Print a ticket
     Show {
@@ -120,6 +146,13 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             repo,
             priority,
             labels,
+            description,
+            description_file,
+            blocked_by,
+            linked_github,
+            source,
+            from_file,
+            batch,
         } => verbs::new(
             ctx,
             verbs::NewArgs {
@@ -128,6 +161,13 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
                 repo,
                 priority,
                 labels,
+                description,
+                description_file,
+                blocked_by,
+                linked_github,
+                source,
+                from_file,
+                batch,
             },
         ),
         Cmd::Show { id, field } => verbs::show(ctx, &id, field.as_deref()),

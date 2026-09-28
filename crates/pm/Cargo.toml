@@ -13,6 +13,17 @@ pm-core = { path = "../pm-core" }
 pm-store = { path = "../pm-store" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# `pm new --from-file` / `--batch` (AGT-1346): vault ticket files and batch
+# specs are YAML. `serde_yaml` is deprecated (archived by dtolnay, Nov
+# 2024) with no further releases. Of the forks that stepped in:
+# `serde_yml` (sebastienrousseau) now ships its own crate-level notice
+# calling itself unmaintained and redirecting elsewhere — the exact
+# provenance risk this ticket asked to check for, so it is ruled out.
+# `serde_yaml_ng` is a straight fork by an identifiable, existing Rust
+# maintainer (acatton), keeps `serde_yaml`'s exact API (so this crate's
+# usage is a drop-in), stayed on the MIT license, and is the fork most
+# commonly pointed to as the migration target since the deprecation.
+serde_yaml_ng = "0.10"
 # `~/.config/pm/config.toml` (README §Surfaces). Later config keys
 # (`edit.view`, hub settings) land in the same file.
 toml = "1.1"
