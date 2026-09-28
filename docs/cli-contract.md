@@ -202,25 +202,47 @@ where it applies). `pm --help` and `pm <verb> --help` are the flags'
 authoritative source; this section names every one but does not repeat
 clap's per-flag help text verbatim.
 
-### `pm init --prefix <PREFIX>`
+### `pm init [--prefix <PREFIX>] [--preset <PRESET>]`
 
-Creates a workspace database (Saltline's three states: `triage`,
-`in-progress`, `done`). Flags: `--prefix <PREFIX>` (required; 1-16
-uppercase letters/digits, starting with a letter — else exit `2`).
+Creates a workspace database. Presets are data, not flavors of code path —
+`--preset` picks the seed, `--prefix` (still 1-16 uppercase letters/digits,
+starting with a letter — else exit `2`) always overrides that preset's
+default prefix when given.
+
+- `--preset default` (the default when `--preset` is omitted): a neutral
+  workspace for outside users. Prefix `PM`. States `backlog` (category
+  `backlog`), `todo` (`unstarted`), `in-progress` (`started`), `done`
+  (`completed`). No gate labels, no model labels. `pm ready`/`pm claim`
+  only ever pick up the `unstarted` category (`backlog` is not itself
+  claimable — file into `backlog` to park something below the frontier,
+  move it to `todo` to surface it), so `pm new` files a fresh ticket into
+  `todo`, not `backlog`.
+- `--preset saltline`: reproduces this repo's own workflow exactly as
+  before this flag existed. Prefix `AGT`. States `triage` (`unstarted`),
+  `in-progress` (`started`), `done` (`completed`). Gate label `manual`.
+  Any automation that depended on `pm init --prefix AGT` seeding those
+  states must now pass `--preset saltline` explicitly.
 
 - Exit `1` if the resolved directory is already a workspace.
-- `--json`:
+- `--json` (`--preset default`, no `--prefix`):
   ```jsonc
   {
     "schema": 1,
-    "prefix": "AGT",
+    "prefix": "PM",
     "workspace": "/abs/path",
     "db": "/abs/path/pm.sqlite",
-    "states": [{"name": "triage", "category": "unstarted", "position": 0}, ...],
+    "states": [
+      {"name": "backlog", "category": "backlog", "position": 0},
+      {"name": "todo", "category": "unstarted", "position": 1},
+      {"name": "in-progress", "category": "started", "position": 2},
+      {"name": "done", "category": "completed", "position": 3}
+    ],
     "config": "/abs/path/config.toml",
     "config_written": true            // false if config.toml already existed
   }
   ```
+  `--preset saltline --prefix AGT` prints the same shape with `"prefix":
+  "AGT"` and the three saltline states instead.
 
 ### `pm new`
 

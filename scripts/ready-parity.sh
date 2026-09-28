@@ -96,7 +96,7 @@ if [ -z "$WORKSPACE" ]; then
   export XDG_CONFIG_HOME="$TMP/home/.config"
   export XDG_DATA_HOME="$TMP/home/.local/share"
   mkdir -p "$HOME"
-  "$PM_BIN" init --prefix AGT --workspace "$WORKSPACE" >/dev/null
+  "$PM_BIN" init --prefix AGT --preset saltline --workspace "$WORKSPACE" >/dev/null
   PM_WORKSPACE="$WORKSPACE" "$PM_BIN" import vault "$VAULT" >"$TMP/import.txt"
   echo "imported $VAULT into $WORKSPACE ($(grep -c . "$TMP/import.txt") report lines)"
 fi

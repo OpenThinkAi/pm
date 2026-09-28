@@ -50,11 +50,14 @@ struct Cli {
 // not worth boxing fields over.
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
-    /// Create a workspace database (saltline states: triage, in-progress, done)
+    /// Create a workspace database (default: prefix PM, states backlog/todo/in-progress/done; `--preset saltline` for the triage/in-progress/done + `manual`-gate workflow)
     Init {
-        /// Ticket id prefix, e.g. AGT
+        /// Ticket id prefix; else the preset's default (`PM` for `default`, `AGT` for `saltline`)
         #[arg(long)]
-        prefix: String,
+        prefix: Option<String>,
+        /// Which seed to use: `default` (no saltline assumptions) or `saltline` (today's workflow)
+        #[arg(long, value_parser = verbs::parse_preset, default_value = "default")]
+        preset: verbs::Preset,
     },
     /// File a ticket (or several) and print their id(s)
     New {
@@ -78,7 +81,7 @@ enum Cmd {
         /// Read the description from a file, or `-` for stdin
         #[arg(long = "description-file", value_name = "PATH|-")]
         description_file: Option<String>,
-        /// Ticket(s) this one is blocked by: AGT-N or ULID, repeat or comma-separate
+        /// Ticket(s) this one is blocked by: PM-N or ULID, repeat or comma-separate
         #[arg(long = "blocked-by", value_name = "ID", value_delimiter = ',')]
         blocked_by: Vec<String>,
         #[arg(long = "linked-github", value_name = "URL")]
@@ -95,7 +98,7 @@ enum Cmd {
     },
     /// Print a ticket
     Show {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
         /// Print only this field's value
         #[arg(long, value_name = "NAME")]
@@ -108,7 +111,7 @@ enum Cmd {
     /// linear, not_before=YYYY-MM-DD, parked=YYYY-MM-DD|forever (empty value clears; unknown
     /// keys land in ext with a warning)
     Set {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
         /// key=value pairs
         #[arg(required = true, value_name = "KEY=VALUE")]
@@ -117,7 +120,7 @@ enum Cmd {
     /// Add or remove labels: +x adds, -y removes. Since `-y` looks like a flag,
     /// put global flags (--json, --as, --workspace) before `label`, not after.
     Label {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
         /// +label to add, -label to remove
         #[arg(
@@ -129,7 +132,7 @@ enum Cmd {
     },
     /// Append a comment
     Comment {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
         /// Comment text; omit when using --file
         text: Option<String>,
@@ -139,14 +142,14 @@ enum Cmd {
     },
     /// Move a ticket to a workflow state
     Move {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
         /// A state this workspace defines
         state: String,
     },
     /// Transition a ticket to the workspace's completed state
     Done {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
         /// Appended as a comment
         #[arg(long)]
@@ -160,12 +163,12 @@ enum Cmd {
     },
     /// Return a started ticket to unstarted and clear its assignee
     Unclaim {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
     },
     /// Edit a ticket in $EDITOR (frontmatter + markdown); the save becomes ops
     Edit {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
         /// editor ($EDITOR) or ui-leaf; default: config `edit.view`, else editor
         #[arg(long, value_parser = edit::parse_view)]
@@ -173,7 +176,7 @@ enum Cmd {
     },
     /// Take a ticket: unstarted and unassigned -> started, assigned to you (exit 75 if someone else has it)
     Claim {
-        /// Ticket id (AGT-12) or ULID; omit with --ready
+        /// Ticket id (e.g. PM-12) or ULID; omit with --ready
         id: Option<String>,
         /// Claim the lowest-numbered ready ticket instead (exit 3 if none)
         #[arg(long, conflicts_with = "id")]
@@ -212,7 +215,7 @@ enum Cmd {
     },
     /// List a ticket's ops, oldest first
     Log {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
     },
     /// Counts of tickets per state, plus held/parked
@@ -230,7 +233,7 @@ enum Cmd {
         /// Only tickets in this project
         #[arg(long, conflicts_with = "ids")]
         project: Option<String>,
-        /// Only these tickets (AGT-N or ULID; repeat or comma-separate)
+        /// Only these tickets (PM-N or ULID; repeat or comma-separate)
         #[arg(long, value_name = "ID", value_delimiter = ',')]
         ids: Vec<String>,
         /// At most this many ready tickets (waves are never cut)
@@ -246,9 +249,9 @@ enum Cmd {
         #[arg(long)]
         explain: bool,
     },
-    /// Hold a ticket for a human (`pm hold AGT-N "why"`), or release it (`--clear`)
+    /// Hold a ticket for a human (`pm hold PM-N "why"`), or release it (`--clear`)
     Hold {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
         /// Why the ticket is waiting on a human
         reason: Option<String>,
@@ -262,9 +265,9 @@ enum Cmd {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Waive a hygiene rule for a ticket (e.g. `pm waive AGT-N R1 "standalone: why"`)
+    /// Waive a hygiene rule for a ticket (e.g. `pm waive PM-N R1 "standalone: why"`)
     Waive {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
         /// The rule waived (R1, …)
         rule: String,
@@ -283,9 +286,9 @@ enum Cmd {
         #[arg(long)]
         rebuild: bool,
     },
-    /// Archive a ticket (`pm archive AGT-N`), or sweep for eligible tickets/projects (`--auto`)
+    /// Archive a ticket (`pm archive PM-N`), or sweep for eligible tickets/projects (`--auto`)
     Archive {
-        /// Ticket id (AGT-12) or ULID; omit with --auto
+        /// Ticket id (e.g. PM-12) or ULID; omit with --auto
         id: Option<String>,
         /// Archive every completed ticket whose completion month has passed, and retire
         /// every idle project, instead of one ticket
@@ -297,7 +300,7 @@ enum Cmd {
     },
     /// Clear a ticket's archived_at, undoing `pm archive`
     Unarchive {
-        /// Ticket id (AGT-12) or ULID
+        /// Ticket id (e.g. PM-12) or ULID
         id: String,
     },
     /// Import a markdown vault (tickets, archive, projects, docs) as ops; re-runs import only what changed
@@ -362,7 +365,7 @@ enum ImportCmd {
         #[arg(long = "dry-run")]
         dry_run: bool,
         /// Read a file that lost its frontmatter from a git object instead: PATH=REV
-        /// (relative to the vault); repeatable. AGT-806's 82a9982 is built in
+        /// (relative to the vault); repeatable
         #[arg(long = "recover", value_name = "PATH=REV")]
         recover: Vec<String>,
         /// Write a markdown parity report here: every imported ticket rendered back as
@@ -423,7 +426,7 @@ fn main() -> ExitCode {
 
 fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
     match cmd {
-        Cmd::Init { prefix } => verbs::init(ctx, &prefix),
+        Cmd::Init { prefix, preset } => verbs::init(ctx, preset, prefix.as_deref()),
         Cmd::New {
             title,
             project,

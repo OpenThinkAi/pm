@@ -120,21 +120,84 @@ pub(crate) fn print_json(value: &Value) {
 
 // ---------------------------------------------------------------- pm init
 
-/// Saltline's workflow (README §Data model "state").
-fn saltline_states() -> Vec<State> {
-    [
-        ("triage", StateCategory::Unstarted),
-        ("in-progress", StateCategory::Started),
-        ("done", StateCategory::Completed),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(position, (name, category))| State {
-        name: name.to_string(),
-        category,
-        position: position as u32,
-    })
-    .collect()
+/// Which seed `pm init` writes. Presets are data, not branching logic
+/// beyond this module: each names a default prefix, a workflow, and a
+/// gate-label set; everything else (template sections, stale_days) is
+/// shared (AGT-1373 design: "presets as data").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preset {
+    /// The neutral, no-flags default for outside users: prefix `PM`,
+    /// states `backlog`/`todo`/`in-progress`/`done`, no gate or model
+    /// labels.
+    Default,
+    /// Reproduces the workspace this repo's own build loops have always
+    /// used: prefix `AGT`, states `triage`/`in-progress`/`done`, and the
+    /// `manual` gate label.
+    Saltline,
+}
+
+impl Preset {
+    /// The prefix this preset seeds when `--prefix` is not given.
+    fn default_prefix(self) -> &'static str {
+        match self {
+            Preset::Default => "PM",
+            Preset::Saltline => "AGT",
+        }
+    }
+
+    /// This preset's workflow, in position order. `Default`'s `backlog`
+    /// state uses [`StateCategory::Backlog`], which `pm ready`/`pm claim`
+    /// (`pm_core::ready`) already treat as not-yet-claimable — only
+    /// `Unstarted` is a ready candidate, so filing into `backlog` doesn't
+    /// make a ticket claimable until it's moved to `todo`.
+    fn states(self) -> Vec<State> {
+        let named = match self {
+            Preset::Default => [
+                ("backlog", StateCategory::Backlog),
+                ("todo", StateCategory::Unstarted),
+                ("in-progress", StateCategory::Started),
+                ("done", StateCategory::Completed),
+            ]
+            .as_slice(),
+            Preset::Saltline => [
+                ("triage", StateCategory::Unstarted),
+                ("in-progress", StateCategory::Started),
+                ("done", StateCategory::Completed),
+            ]
+            .as_slice(),
+        };
+        named
+            .iter()
+            .enumerate()
+            .map(|(position, (name, category))| State {
+                name: name.to_string(),
+                category: *category,
+                position: position as u32,
+            })
+            .collect()
+    }
+
+    /// Labels that gate a ticket out of the ready frontier
+    /// ([`pm_core::ready::Rules::gate_labels`]). The default preset seeds
+    /// none — a public user hasn't adopted saltline's "manual" human-review
+    /// convention.
+    fn gate_labels(self) -> BTreeSet<String> {
+        match self {
+            Preset::Default => BTreeSet::new(),
+            Preset::Saltline => ["manual".to_string()].into(),
+        }
+    }
+}
+
+/// Clap value parser for `--preset`.
+pub fn parse_preset(s: &str) -> std::result::Result<Preset, String> {
+    match s {
+        "default" => Ok(Preset::Default),
+        "saltline" => Ok(Preset::Saltline),
+        other => Err(format!(
+            "unknown preset '{other}': expected one of default, saltline"
+        )),
+    }
 }
 
 fn validate_prefix(prefix: &str) -> Result<()> {
@@ -146,12 +209,13 @@ fn validate_prefix(prefix: &str) -> Result<()> {
         Ok(())
     } else {
         Err(CliError::usage(format!(
-            "invalid prefix '{prefix}': use 1-16 uppercase letters or digits, starting with a letter (e.g. AGT)"
+            "invalid prefix '{prefix}': use 1-16 uppercase letters or digits, starting with a letter (e.g. PM)"
         )))
     }
 }
 
-pub fn init(ctx: &Ctx<'_>, prefix: &str) -> Result<()> {
+pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>) -> Result<()> {
+    let prefix = prefix.unwrap_or_else(|| preset.default_prefix());
     validate_prefix(prefix)?;
     let dir = match ctx.workspace.or(ctx.env.pm_workspace.as_deref()) {
         Some(dir) => dir.to_path_buf(),
@@ -172,8 +236,8 @@ pub fn init(ctx: &Ctx<'_>, prefix: &str) -> Result<()> {
     let ws = Workspace {
         id: Ulid::new(),
         prefix: prefix.to_string(),
-        states: saltline_states(),
-        gate_labels: ["manual".to_string()].into(),
+        states: preset.states(),
+        gate_labels: preset.gate_labels(),
         model_labels: Default::default(),
         template_sections: vec!["Problem Statement".into(), "Acceptance Criteria".into()],
         stale_days: 30,

@@ -31,7 +31,15 @@ impl Sandbox {
     fn initialized() -> Self {
         let sb = Sandbox::new();
         let out = sb.run(
-            &["init", "--prefix", "AGT", "--workspace", sb.ws_str()],
+            &[
+                "init",
+                "--prefix",
+                "AGT",
+                "--preset",
+                "saltline",
+                "--workspace",
+                sb.ws_str(),
+            ],
             &[],
         );
         assert_ok(&out);
@@ -159,9 +167,9 @@ fn ulid_of(sb: &Sandbox, id: &str) -> Ulid {
 // ---------------------------------------------------------------- AC1
 
 #[test]
-fn init_creates_config_and_a_workspace_with_saltline_states() {
+fn init_creates_config_and_a_workspace_with_the_default_states() {
     let sb = Sandbox::new();
-    let out = sb.pm(&["init", "--prefix", "AGT", "--workspace", sb.ws_str()]);
+    let out = sb.pm(&["init", "--workspace", sb.ws_str()]);
     assert_ok(&out);
 
     let config = std::fs::read_to_string(sb.config_path()).unwrap();
@@ -173,7 +181,45 @@ fn init_creates_config_and_a_workspace_with_saltline_states() {
     );
 
     let workspace = sb.store().workspace().unwrap().unwrap();
+    assert_eq!(workspace.prefix, "PM");
+    assert!(workspace.gate_labels.is_empty());
+    assert!(workspace.model_labels.is_empty());
+    let states: Vec<(&str, StateCategory)> = workspace
+        .states
+        .iter()
+        .map(|s| (s.name.as_str(), s.category))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("backlog", StateCategory::Backlog),
+            ("todo", StateCategory::Unstarted),
+            ("in-progress", StateCategory::Started),
+            ("done", StateCategory::Completed),
+        ]
+    );
+}
+
+#[test]
+fn init_preset_saltline_reproduces_the_legacy_workspace() {
+    let sb = Sandbox::new();
+    let out = sb.pm(&[
+        "init",
+        "--prefix",
+        "AGT",
+        "--preset",
+        "saltline",
+        "--workspace",
+        sb.ws_str(),
+    ]);
+    assert_ok(&out);
+
+    let workspace = sb.store().workspace().unwrap().unwrap();
     assert_eq!(workspace.prefix, "AGT");
+    assert_eq!(
+        workspace.gate_labels,
+        std::collections::BTreeSet::from(["manual".to_string()])
+    );
     let states: Vec<(&str, StateCategory)> = workspace
         .states
         .iter()
@@ -187,6 +233,20 @@ fn init_creates_config_and_a_workspace_with_saltline_states() {
             ("done", StateCategory::Completed),
         ]
     );
+}
+
+#[test]
+fn init_preset_saltline_without_prefix_defaults_to_agt() {
+    let sb = Sandbox::new();
+    let v = json(&sb.pm(&[
+        "init",
+        "--preset",
+        "saltline",
+        "--workspace",
+        sb.ws_str(),
+        "--json",
+    ]));
+    assert_eq!(v["prefix"], "AGT");
 }
 
 #[test]
@@ -239,8 +299,23 @@ fn init_refuses_to_reinitialize_and_never_rewrites_config() {
 fn init_rejects_a_bad_prefix_as_usage() {
     let sb = Sandbox::new();
     assert_code(&sb.pm(&["init", "--prefix", "agt-1"]), 2);
-    assert_code(&sb.pm(&["init"]), 2);
     assert!(!sb.config_path().exists());
+}
+
+#[test]
+fn init_rejects_an_unknown_preset_as_usage() {
+    let sb = Sandbox::new();
+    assert_code(&sb.pm(&["init", "--preset", "anglepoint"]), 2);
+    assert!(!sb.config_path().exists());
+}
+
+/// AC1: `pm init` with no flags at all — the neutral default for outside
+/// users, no `--prefix` required.
+#[test]
+fn init_with_no_flags_uses_the_default_preset() {
+    let sb = Sandbox::new();
+    let v = json(&sb.pm(&["init", "--workspace", sb.ws_str(), "--json"]));
+    assert_eq!(v["prefix"], "PM");
 }
 
 // ---------------------------------------------------------------- AC2

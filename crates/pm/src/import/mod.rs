@@ -66,7 +66,7 @@ pub fn vault(
                 .map(|(p, rev)| (p.to_string(), rev.to_string()))
                 .ok_or_else(|| {
                     CliError::usage(format!(
-                        "--recover '{r}' is not PATH=REV (e.g. tickets/triage/AGT-806-….md=82a9982)"
+                        "--recover '{r}' is not PATH=REV (e.g. tickets/triage/AGT-123-….md=<sha>)"
                     ))
                 })
         })

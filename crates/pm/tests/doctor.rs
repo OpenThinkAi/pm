@@ -27,7 +27,15 @@ impl Sandbox {
         let ws = home.path().join("ws");
         let sb = Sandbox { home, ws };
         assert_code(
-            &sb.pm(&["init", "--prefix", "AGT", "--workspace", sb.ws_str()]),
+            &sb.pm(&[
+                "init",
+                "--prefix",
+                "AGT",
+                "--preset",
+                "saltline",
+                "--workspace",
+                sb.ws_str(),
+            ]),
             0,
         );
         sb.store()

@@ -29,7 +29,15 @@ impl Sandbox {
         let home = tempfile::tempdir().unwrap();
         let ws = home.path().join("ws");
         let sb = Sandbox { home, ws };
-        assert_ok(&sb.pm(&["init", "--prefix", "AGT", "--workspace", sb.ws_str()]));
+        assert_ok(&sb.pm(&[
+            "init",
+            "--prefix",
+            "AGT",
+            "--preset",
+            "saltline",
+            "--workspace",
+            sb.ws_str(),
+        ]));
         sb
     }
 
