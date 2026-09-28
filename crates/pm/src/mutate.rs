@@ -24,7 +24,8 @@ use crate::verbs::{
 
 /// `pm label AGT-N +x -y` (AC1): `+label` emits a `label.add`, `-label` a
 /// `label.remove` citing the add-tags this replica currently observes for
-/// it (README §Conflict semantics: OR-set, add-wins).
+/// it (README §Conflict semantics: OR-set, add-wins). One `commit_batch` so
+/// a multi-token invocation (`+x -y +z`) can never land partially.
 pub fn label(ctx: &Ctx<'_>, reference: &str, changes: &[String]) -> Result<()> {
     enum Change {
         Add(String),
@@ -47,9 +48,15 @@ pub fn label(ctx: &Ctx<'_>, reference: &str, changes: &[String]) -> Result<()> {
     let actor = ctx.actor()?;
     let (mut store, ws) = ctx.open()?;
     let ticket = find(&store, &ws, reference)?;
-    let view = store
-        .ticket_view(ticket.id)?
-        .ok_or_else(|| CliError::not_found(format!("no ticket {}", display_id(&ws, &ticket))))?;
+    // Only a `-label` token needs the current OR-set state (the add-tags it
+    // must cite); skip the fetch entirely for a pure-add invocation.
+    let view = if parsed.iter().any(|c| matches!(c, Change::Remove(_))) {
+        Some(store.ticket_view(ticket.id)?.ok_or_else(|| {
+            CliError::not_found(format!("no ticket {}", display_id(&ws, &ticket)))
+        })?)
+    } else {
+        None
+    };
 
     let mut stamper = Stamper::new(&store, actor)?;
     let ops: Vec<_> = parsed
@@ -57,7 +64,11 @@ pub fn label(ctx: &Ctx<'_>, reference: &str, changes: &[String]) -> Result<()> {
         .map(|change| match change {
             Change::Add(label) => stamper.op(ticket.id, Payload::LabelAdd(LabelAdd { label })),
             Change::Remove(label) => {
-                let observed = view.labels.observed(&label);
+                let observed = view
+                    .as_ref()
+                    .expect("a Remove change means view was fetched")
+                    .labels
+                    .observed(&label);
                 stamper.op(
                     ticket.id,
                     Payload::LabelRemove(LabelRemove { label, observed }),
@@ -65,9 +76,7 @@ pub fn label(ctx: &Ctx<'_>, reference: &str, changes: &[String]) -> Result<()> {
             }
         })
         .collect();
-    for op in &ops {
-        store.commit(op)?;
-    }
+    store.commit_batch(&ops, &[])?;
     print_ticket(ctx, &store, &ws, ticket.id)
 }
 
