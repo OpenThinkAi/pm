@@ -16,8 +16,13 @@ repository.workspace = true
 # In-memory only: no IO crates in its closure. `counter` is Loro's default
 # feature (a counter container pm does not use); turning defaults off drops it.
 loro = { version = "1.16.2", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+ulid = { version = "1.2", features = ["serde"] }
 
 [dev-dependencies]
+proptest = "1.7"
 # Comparison baseline for examples/text_crdt_bench.rs only. Pinned below
 # 0.27: yrs 0.27.0+ uses `if let` guards, which need rustc >= 1.95, and the
 # crate declares no rust-version, so it silently fails to build on the 1.94
