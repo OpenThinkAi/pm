@@ -240,6 +240,16 @@ fn list_and_combines_filters_and_prints_a_table_or_json() {
     assert_eq!(by_gh.as_array().unwrap().len(), 1);
     assert_eq!(by_gh[0]["id"], "AGT-3");
 
+    // --linked-github is an alias for --github, matching `pm new
+    // --linked-github`'s flag name for the same field.
+    let by_gh_alias = json(&sb.pm(&[
+        "list",
+        "--linked-github",
+        "https://github.com/OpenThinkAi/pm/issues/9",
+        "--json",
+    ]));
+    assert_eq!(by_gh_alias, by_gh);
+
     // --state (every ticket starts triage).
     let by_state = json(&sb.pm(&["list", "--state", "triage", "--json"]));
     assert_eq!(by_state.as_array().unwrap().len(), 3);

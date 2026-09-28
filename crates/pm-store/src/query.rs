@@ -56,7 +56,10 @@ impl Store {
     }
 
     /// Live tickets matching `filter`: numbered ones first in number
-    /// order, then unnumbered (`AGT-?`) ones in creation order.
+    /// order, then unnumbered (`AGT-?`) ones in creation order. Archived
+    /// tickets (`archived_at` set) are excluded unless `filter.archived` is
+    /// true — every caller, not just `pm list`, inherits that default; pass
+    /// `TicketFilter { archived: true, .. }` for the full non-tombstoned set.
     pub fn tickets(&self, filter: &TicketFilter) -> Result<Vec<Ticket>> {
         // Plain `?` placeholders bind in order, so each clause pushes its
         // values as it is added.

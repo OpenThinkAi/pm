@@ -192,7 +192,8 @@ enum Cmd {
         /// Only tickets with a hold set
         #[arg(long)]
         held: bool,
-        #[arg(long, value_delimiter = ',')]
+        /// Matches `linked-github` (`pm new`/`pm set`'s name for the same field)
+        #[arg(long, visible_alias = "linked-github", value_delimiter = ',')]
         github: Vec<String>,
         /// Case-insensitive substring match against title or description
         #[arg(long)]
