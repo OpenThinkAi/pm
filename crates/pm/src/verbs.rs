@@ -171,6 +171,7 @@ pub fn init(ctx: &Ctx<'_>, prefix: &str) -> Result<()> {
         Config {
             workspace: Some(dir.clone()),
             backup: None,
+            edit: None,
         }
         .write(&config_path)?;
     }

@@ -156,9 +156,16 @@ fn split_frontmatter(text: &str) -> Result<(&str, &str)> {
 pub fn load_frontmatter(path: &Path) -> Result<(FileFrontmatter, String)> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let (fm_text, body) = split_frontmatter(&text)?;
+    parse_frontmatter(&text)
+        .map_err(|e| CliError::usage(format!("{} in {}", e.error, path.display())))
+}
+
+/// [`load_frontmatter`] on text already in memory (`pm edit` parses the
+/// saved editor buffer with it).
+pub fn parse_frontmatter(text: &str) -> Result<(FileFrontmatter, String)> {
+    let (fm_text, body) = split_frontmatter(text)?;
     let fm: FileFrontmatter = serde_yaml_ng::from_str(fm_text)
-        .map_err(|e| CliError::usage(format!("parsing frontmatter in {}: {e}", path.display())))?;
+        .map_err(|e| CliError::usage(format!("parsing frontmatter: {e}")))?;
     Ok((fm, body.to_string()))
 }
 
