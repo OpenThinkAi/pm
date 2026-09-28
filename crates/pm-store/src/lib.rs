@@ -12,7 +12,7 @@
 //! - `migrations/*.sql` — versioned schema, applied by [`Store::open`]
 //! - `commit` — [`Store::commit`], [`Store::allocate_number`], materialization
 //! - `query` — by id / number / filtered list, comments, relations, ops
-//! - `ready` — [`Store::ready`], the ready frontier (`pm claim --ready`)
+//! - `ready` — [`Store::ready`] / [`Store::frontier`], the ready frontier (`pm claim --ready`, `pm ready`)
 //! - `config` — workspace + states, projects + docs
 //! - `check` — the snapshot `pm check` runs over ([`Store::check`])
 //! - `doctor` — [`Store::doctor`] (verify) and [`Store::rebuild`] (replay the log)

@@ -401,6 +401,27 @@ fn graph_groups_into_waves_by_blockers_and_reports_done() {
     assert!(human.contains("done: true"), "{human}");
 }
 
+#[test]
+fn graph_treats_an_archived_blocker_as_done() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "Base", "--project", "pm"]));
+    assert_ok(&sb.pm(&[
+        "new",
+        "--title",
+        "Depends on base",
+        "--project",
+        "pm",
+        "--blocked-by",
+        "AGT-1",
+    ]));
+    // Archived straight from `triage`: it leaves the graph and no longer
+    // holds AGT-2 back (AGT-1343: archive-as-done).
+    sb.archive(ulid_of(&sb, "AGT-1"));
+    let out = json(&sb.pm(&["graph", "--project", "pm", "--json"]));
+    assert_eq!(out["waves"], serde_json::json!([["AGT-2"]]));
+    assert_eq!(out["done"], false);
+}
+
 // ---------------------------------------------------------- pm show --section
 
 #[test]

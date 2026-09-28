@@ -18,6 +18,7 @@
 //! - [`hlc`] — hybrid logical clock and the `(hlc, actor)` [`Stamp`]
 //! - [`op`] — the [`Op`] envelope and every payload
 //! - [`merge`] — LWW register, OR-set, append-only comment log
+//! - [`ready`] — the ready frontier: verdicts, reasons and waves (AGT-1343)
 //! - [`view`] — [`TicketView`] and the pure [`apply`] function
 
 pub mod body;
@@ -28,6 +29,7 @@ pub mod hlc;
 pub mod markers;
 pub mod merge;
 pub mod op;
+pub mod ready;
 pub mod view;
 
 pub use body::{Body, BodyError, BodyUpdate};

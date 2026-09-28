@@ -220,7 +220,7 @@ fn relation_kind_str(kind: RelationKind) -> &'static str {
 /// (`pm_core::Priority` has neither) — the same approach `verbs::print_human`
 /// already uses for the same field. Coupled to `Priority`'s serde shape:
 /// if that ever changes, this display string changes with it.
-fn priority_str(p: &Priority) -> String {
+pub(crate) fn priority_str(p: &Priority) -> String {
     serde_json::to_value(p)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
@@ -334,8 +334,11 @@ pub fn graph(ctx: &Ctx<'_>, project: Option<String>) -> Result<()> {
             if r.kind != RelationKind::Blocks || r.to != t.id {
                 continue;
             }
+            // Archived counts as done whatever the state says (AGT-1343:
+            // the loops went blind once a blocker was swept into the
+            // archive), as does a tombstoned or absent blocker.
             let blocker_done = match store.ticket(r.from)? {
-                Some(b) => completed(&b.state),
+                Some(b) => b.deleted || b.archived_at.is_some() || completed(&b.state),
                 None => true,
             };
             if !blocker_done {
@@ -345,40 +348,21 @@ pub fn graph(ctx: &Ctx<'_>, project: Option<String>) -> Result<()> {
         blockers.insert(t.id, unresolved);
     }
 
-    let mut waves: Vec<Vec<Ulid>> = Vec::new();
-    let mut resolved: std::collections::BTreeSet<Ulid> = Default::default();
-    let mut remaining: Vec<Ulid> = pending.iter().map(|t| t.id).collect();
-    while !remaining.is_empty() {
-        let (ready, unready): (Vec<Ulid>, Vec<Ulid>) = remaining.into_iter().partition(|id| {
-            blockers
-                .get(id)
-                .map(|b| b.iter().all(|d| resolved.contains(d)))
-                .unwrap_or(true)
-        });
-        if ready.is_empty() {
-            // No progress possible: a dependency cycle, or a blocker
-            // outside `pending` that never became `resolved`.
-            waves.push(unready);
-            break;
-        }
-        resolved.extend(ready.iter().copied());
-        waves.push(ready);
-        remaining = unready;
+    // The wave routine `pm ready` uses too (`pm_core::ready::waves`);
+    // `pending` is already in `Store::tickets` order, which each wave
+    // keeps. No progress possible — a dependency cycle, or a blocker
+    // outside `pending` that never resolves — lands the rest in a final,
+    // unordered wave.
+    let pending_ids: Vec<Ulid> = pending.iter().map(|t| t.id).collect();
+    let pm_core::ready::Waves { mut waves, stuck } = pm_core::ready::waves(&pending_ids, &blockers);
+    if !stuck.is_empty() {
+        waves.push(stuck);
     }
-
-    // Print each wave in the same order `Store::tickets` already returns
-    // (numbered first, then unnumbered by creation), not the arbitrary
-    // `BTreeSet` order above.
+    let names: BTreeMap<Ulid, String> =
+        tickets.iter().map(|t| (t.id, display_id(&ws, t))).collect();
     let wave_ids: Vec<Vec<String>> = waves
         .iter()
-        .map(|wave| {
-            let set: std::collections::BTreeSet<Ulid> = wave.iter().copied().collect();
-            tickets
-                .iter()
-                .filter(|t| set.contains(&t.id))
-                .map(|t| display_id(&ws, t))
-                .collect()
-        })
+        .map(|wave| wave.iter().map(|id| names[id].clone()).collect())
         .collect();
 
     if ctx.json {

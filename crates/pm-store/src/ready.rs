@@ -1,24 +1,17 @@
-//! The ready frontier: which tickets an agent may pick up next
-//! (README §CLI verbs `pm ready`, `pm claim --ready`; AGT-1341 AC4). One
-//! definition, in the store, so every verb that asks "what is ready"
-//! agrees.
-//!
-//! A ticket is **ready** when all of these hold:
-//! - it is live (not tombstoned) and its state's category is `unstarted`;
-//! - nobody is assigned to it;
-//! - it carries no gate label (the workspace's `gate_labels`, e.g. `manual`);
-//! - it has no `hold`, and any `parked {until}` / `not_before {date}` is
-//!   today or earlier;
-//! - every ticket that `blocks` it is resolved: tombstoned, or in a state
-//!   whose category is `completed` or `canceled`.
+//! The ready frontier as the store serves it (`pm claim --ready`,
+//! `pm ready`; AGT-1341 AC4, AGT-1343). The definition lives in
+//! [`pm_core::ready`] — the one implementation every verb shares — and
+//! this module only feeds it the snapshot it needs: **every** ticket,
+//! tombstoned and archived ones included, since an archived blocker
+//! counts as done.
 
 use std::collections::BTreeSet;
 
-use pm_core::Ticket;
-use rusqlite::types::Value;
+use pm_core::ready::{Frontier, Rules, Scope, frontier};
+use pm_core::{Ticket, Workspace};
 
 use crate::Store;
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 
 /// The inputs to [`Store::ready`]. `today` is an ISO-8601 date
 /// (`YYYY-MM-DD`) the caller supplies, so the store never reads a clock.
@@ -38,65 +31,38 @@ impl Store {
     /// (so `.first()` is "the lowest-numbered ready ticket"), then
     /// unnumbered ones in creation order.
     pub fn ready(&self, query: &ReadyQuery) -> Result<Vec<Ticket>> {
-        let mut clauses = vec![
-            "t.deleted = 0",
-            "t.assignee IS NULL",
-            "s.category = 'unstarted'",
-            // Unresolved blocker: a live `from` ticket whose state is not
-            // completed/canceled. Relation rows are stored once per
-            // owning ticket, so the same edge may appear twice; EXISTS
-            // does not care.
-            "NOT EXISTS (
-                SELECT 1 FROM relation r
-                JOIN ticket b ON b.id = r.from_ticket
-                JOIN state bs ON bs.name = b.state
-                WHERE r.kind = 'blocks' AND r.to_ticket = t.id
-                  AND b.deleted = 0
-                  AND bs.category NOT IN ('completed', 'canceled'))",
-            "NOT EXISTS (SELECT 1 FROM marker m WHERE m.ticket = t.id AND m.kind = 'hold')",
-        ];
-        let mut args: Vec<Value> = Vec::new();
-        if let Some(project) = &query.project {
-            clauses.push("t.project = ?");
-            args.push(Value::from(project.clone()));
-        }
-        if !query.gate_labels.is_empty() {
-            clauses.push(
-                "NOT EXISTS (
-                    SELECT 1 FROM ticket_label l
-                    JOIN json_each(?) g ON g.value = l.label
-                    WHERE l.ticket = t.id)",
-            );
-            let gate: Vec<&str> = query.gate_labels.iter().map(String::as_str).collect();
-            args.push(Value::from(
-                serde_json::to_string(&gate).expect("a list of strings serializes"),
-            ));
-        }
-        let sql = format!(
-            "JOIN state s ON s.name = t.state WHERE {}",
-            clauses.join(" AND ")
-        );
-        let candidates = self.load_tickets(&sql, args)?;
-        // Date gates are decoded markers on the ticket; comparing them
-        // here keeps the ISO-date rule in one readable place.
-        Ok(candidates
+        let ws = self.workspace()?.ok_or(StoreError::NoWorkspace)?;
+        let scope = match &query.project {
+            Some(p) => Scope::Project(p.clone()),
+            None => Scope::All,
+        };
+        let rules = Rules {
+            today: query.today.clone(),
+            gate_labels: query.gate_labels.clone(),
+            model: None,
+        };
+        let (tickets, frontier) = self.frontier(&ws, &scope, &rules)?;
+        let ready: BTreeSet<_> = frontier.ready().into_iter().collect();
+        Ok(tickets
             .into_iter()
-            .filter(|t| !date_gated(t, &query.today))
+            .filter(|t| ready.contains(&t.id))
             .collect())
     }
-}
 
-/// Whether a `not_before` or `parked` marker holds the ticket past
-/// `today`. Dates compare as `YYYY-MM-DD` strings; a longer value (a
-/// datetime) is cut to its date part first.
-fn date_gated(t: &Ticket, today: &str) -> bool {
-    let day = |s: &str| s.trim().chars().take(10).collect::<String>();
-    let not_before = t.not_before.as_ref().map(|n| day(&n.date));
-    let parked = t.parked.as_ref().map(|p| day(&p.until));
-    [not_before, parked]
-        .into_iter()
-        .flatten()
-        .any(|gate| !gate.is_empty() && gate.as_str() > today)
+    /// [`pm_core::ready::frontier`] over this database, with the snapshot
+    /// it ran on (so a caller can render the ids it names without going
+    /// back to the store).
+    pub fn frontier(
+        &self,
+        ws: &Workspace,
+        scope: &Scope,
+        rules: &Rules,
+    ) -> Result<(Vec<Ticket>, Frontier)> {
+        let tickets = self.all_tickets()?;
+        let relations = self.all_relations()?;
+        let frontier = frontier(ws, &tickets, &relations, scope, rules);
+        Ok((tickets, frontier))
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +220,27 @@ mod tests {
     }
 
     #[test]
+    fn an_archived_blocker_counts_as_done_whatever_its_state() {
+        let (_dir, mut store) = fresh();
+        let mut seq = Seq(0);
+        let blocker = create(&mut store, &mut seq, Some("p"));
+        let dependent = create(&mut store, &mut seq, Some("p"));
+        block(&mut store, &mut seq, blocker, dependent);
+        assert_eq!(ready_ids(&store, &query()), vec![blocker]);
+
+        // Archived straight from `triage` (the sweep does not care about
+        // state): the dependent is unblocked and the archived ticket is
+        // not itself a candidate.
+        store
+            .commit(&seq.op(
+                blocker,
+                Payload::FieldSet(FieldSet::ArchivedAt(Some(Hlc::new(50, 0)))),
+            ))
+            .unwrap();
+        assert_eq!(ready_ids(&store, &query()), vec![dependent]);
+    }
+
+    #[test]
     fn started_assigned_held_gated_and_deleted_tickets_are_not_ready() {
         let (_dir, mut store) = fresh();
         let mut seq = Seq(0);
@@ -320,13 +307,13 @@ mod tests {
             .commit(&seq.op(
                 parked,
                 Payload::FieldSet(FieldSet::Parked(Some(Parked {
-                    until: "2026-09-28T09:00:00Z".into(),
+                    until: "2026-09-27".into(),
                 }))),
             ))
             .unwrap();
         let other = create(&mut store, &mut seq, Some("q"));
 
-        // Today: `later` is gated, `parked` (until today) is ready.
+        // Today: `later` is gated, `parked` (until yesterday) is ready.
         assert_eq!(ready_ids(&store, &query()), vec![parked, other]);
         // October: both are ready.
         let october = ReadyQuery {
