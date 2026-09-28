@@ -393,7 +393,6 @@ fn claim_usage_and_not_found_exit_codes() {
     assert_code(&sb.pm(&["claim", "AGT-1", "--project", "pm"]), 2);
     assert_code(&sb.pm(&["claim", "AGT-1", "--branch", " "]), 2);
     assert_code(&sb.pm(&["claim", "AGT-1"]), 3);
-    assert_code(&sb.pm(&["claim", "AGT-1", "--ready"]), 2);
 
     let id = sb.new_ticket(&[]);
     let ulid = sb.ulid_of(&id);

@@ -248,8 +248,8 @@ impl Claimer<'_> {
 }
 
 /// AC4: the lowest-numbered ready ticket, claimed. A candidate another
-/// process takes between the query and the claim is skipped and the
-/// next one tried; exit 3 when nothing is left.
+/// process takes — or tombstones — between the query and the claim is
+/// skipped and the next one tried; exit 3 when nothing is left.
 fn claim_ready(ctx: &Ctx<'_>, claimer: &mut Claimer<'_>, project: Option<&str>) -> Result<()> {
     let query = ReadyQuery {
         project: project.map(str::to_string),
@@ -273,8 +273,15 @@ fn claim_ready(ctx: &Ctx<'_>, claimer: &mut Claimer<'_>, project: Option<&str>) 
             )));
         };
         tried.insert(candidate.id);
-        if let Outcome::Claimed(ticket) = claimer.attempt(candidate.id)? {
-            return print_claimed(ctx, claimer.store, claimer.ws, &ticket);
+        match claimer.attempt(candidate.id) {
+            Ok(Outcome::Claimed(ticket)) => {
+                return print_claimed(ctx, claimer.store, claimer.ws, &ticket);
+            }
+            // Taken by someone else, or deleted (`attempt`'s not-found)
+            // inside the race window: neither is this call's failure.
+            Ok(Outcome::Taken(_)) => {}
+            Err(e) if e.code == exit::NOT_FOUND => {}
+            Err(e) => return Err(e),
         }
     }
 }
