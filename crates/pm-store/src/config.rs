@@ -85,7 +85,17 @@ impl Store {
         }))
     }
 
-    /// Inserts or replaces a project and its documents.
+    /// Inserts or replaces a project and its documents: a direct write, not
+    /// op-logged (AGT-1335). Unlike [`crate::Store::create_project`]
+    /// (AGT-1344, `pm project new`), this never assigns a design-doc
+    /// `doc_id` — `project.doc` written this way stays a plain cached
+    /// column with no `body.edit` history, so `pm doctor`'s replay leaves
+    /// it alone (it only ever touches rows with a `doc_id`,
+    /// `project.rs::replay_project_docs`) and `pm project edit` refuses it
+    /// until the project is recreated through `pm project new`. This path
+    /// exists for import and tests that construct a whole [`Project`] at
+    /// once; the CLI's own `pm project new` always goes through
+    /// `create_project` instead.
     pub fn put_project(&mut self, project: &Project) -> Result<()> {
         let tx = self
             .conn

@@ -12,6 +12,7 @@ mod edit;
 mod exit;
 mod markers;
 mod mutate;
+mod project;
 mod read;
 mod ticket;
 mod verbs;
@@ -257,6 +258,11 @@ enum Cmd {
         #[arg(long)]
         rebuild: bool,
     },
+    /// Project verbs: new, show, list, edit, doc, delete
+    Project {
+        #[command(subcommand)]
+        cmd: project::ProjectCmd,
+    },
     /// Markdown vault tickets (legacy, reads ticket files directly)
     Ticket {
         #[command(subcommand)]
@@ -433,6 +439,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         Cmd::Waive { id, rule, reason } => markers::waive(ctx, &id, &rule, &reason),
         Cmd::Check { project } => check::check(ctx, project.as_deref()),
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
+        Cmd::Project { cmd } => project::run(ctx, cmd),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {
             Some(BackupCmd::InstallTimer { dir, no_load }) => {

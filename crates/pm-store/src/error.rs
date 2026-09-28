@@ -2,7 +2,7 @@
 //! (R2, R4, R5) get their own variants; anything SQLite rejects that the
 //! store did not anticipate surfaces as [`StoreError::Sqlite`].
 
-use pm_core::{ApplyError, ClaimRejected};
+use pm_core::{ApplyError, ClaimRejected, DocApplyError};
 use rusqlite::ErrorCode;
 use ulid::Ulid;
 
@@ -30,6 +30,27 @@ pub enum StoreError {
     ClaimRejected(#[from] ClaimRejected),
     #[error(transparent)]
     Apply(#[from] ApplyError),
+    #[error(transparent)]
+    DocApply(#[from] DocApplyError),
+    /// AGT-1344 AC1: `pm project new` against an id that already exists.
+    #[error("project '{id}' already exists")]
+    DuplicateProject { id: String },
+    /// AGT-1344 AC3: `pm project doc add` against a name already taken.
+    #[error("document '{name}' already exists on project '{project}'")]
+    DuplicateDocument { project: String, name: String },
+    /// A `body.edit` targeting a `doc_id` no `project`/`project_doc` row
+    /// claims. Only a foreign writer or a schema bug can produce this: pm
+    /// always creates the row (with its `doc_id`) before committing an
+    /// edit against it.
+    #[error("document {doc_id} does not belong to any project")]
+    UnknownDocument { doc_id: Ulid },
+    /// AGT-1344 AC4 (R-style FK): a project cannot be deleted while a
+    /// ticket still references it.
+    #[error("project '{project}' has tickets; move or delete them first")]
+    ProjectHasTickets { project: String },
+    /// Same rule, for a child project's `parent` reference.
+    #[error("project '{project}' has child projects; reparent or delete them first")]
+    ProjectHasChildren { project: String },
     /// A stored column no longer decodes (a JSON blob or a ULID). Only a
     /// foreign writer or a schema bug can produce this.
     #[error("stored {what} is corrupt: {detail}")]

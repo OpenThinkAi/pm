@@ -274,7 +274,7 @@ fn doctor_reports_counts_and_is_healthy_on_a_fresh_store() {
     assert_eq!(report.tables["marker"], 0);
     assert_eq!(report.tables["project"], 1);
     assert_eq!(report.tables["state"], 3);
-    // One row per applied migration (AGT-1350 added a second).
+    // One row per applied migration (AGT-1350 and AGT-1344 each added one).
     assert_eq!(report.tables["schema_version"], u64::from(SCHEMA_VERSION));
     assert!(report.integrity.is_empty());
     assert!(report.foreign_keys.is_empty());

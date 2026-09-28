@@ -194,13 +194,15 @@ fn next_view(tx: &Transaction<'_>, op: &Op, admit_claims: bool) -> Result<Ticket
     Ok(view)
 }
 
-fn exists(conn: &Connection, sql: &str, key: &str) -> rusqlite::Result<bool> {
+/// `pub(crate)`: also used by [`crate::project`]'s `body.edit` commit path,
+/// which duplicates an op against a document rather than a ticket.
+pub(crate) fn exists(conn: &Connection, sql: &str, key: &str) -> rusqlite::Result<bool> {
     conn.query_row(&format!("SELECT EXISTS ({sql})"), params![key], |r| {
         r.get(0)
     })
 }
 
-fn ensure_actor(conn: &Connection, actor: &ActorId) -> rusqlite::Result<()> {
+pub(crate) fn ensure_actor(conn: &Connection, actor: &ActorId) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO actor (id, kind) VALUES (?1, ?2)",
         params![actor.as_str(), enum_name(&actor.kind())],
@@ -219,7 +221,9 @@ pub(crate) fn load_view(conn: &Connection, ticket: Ulid) -> Result<Option<Ticket
     crate::codec::opt_from_json("ticket_view.view", text)
 }
 
-fn append_op(conn: &Connection, op: &Op) -> Result<()> {
+/// `pub(crate)`: reused by [`crate::project::commit_doc_edit`] so a
+/// document's `body.edit` op lands in the same `ops` table, the same way.
+pub(crate) fn append_op(conn: &Connection, op: &Op) -> Result<()> {
     let mut envelope = serde_json::to_value(op).expect("an op serializes");
     let payload = envelope
         .as_object_mut()

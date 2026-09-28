@@ -26,7 +26,10 @@ pub struct Op {
     pub hlc: Hlc,
     pub actor: ActorId,
     /// The ticket (or, for `ticket.create`, the new ticket's id) this op
-    /// mutates.
+    /// mutates — or, for a `body.edit` targeting a project document
+    /// (AGT-1344), that document's `doc_id`, a Ulid pm-store stamps on the
+    /// `project` or `project_doc` row it belongs to. Never a project's own
+    /// kebab-case `id`.
     pub entity: Ulid,
     /// Serialized as the sibling keys `kind` and `payload`.
     #[serde(flatten)]
