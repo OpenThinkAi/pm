@@ -14,18 +14,30 @@ use crate::Store;
 use crate::codec::{enum_from_name, from_json, hlc, opt_from_json, opt_hlc, ulid};
 use crate::error::{Result, StoreError};
 
-/// Which tickets [`Store::tickets`] returns. Every field left unset
-/// matches all tickets; set fields must all match. Tombstoned tickets are
-/// never listed.
+/// Which tickets [`Store::tickets`] returns (projects/pm/README.md §CLI
+/// verbs, `pm list`). Every field left empty/`None`/`false` matches all
+/// tickets; set fields must all match (AND across fields). A value filter
+/// (`state`, `project`, `label`, `repo`, `assignee`, `github`) that carries
+/// several values matches any one of them (OR within the field) — the CLI
+/// builds these from `--state a,b`-style comma lists. Tombstoned tickets
+/// are never listed; archived tickets (`archived_at` set) are excluded
+/// unless `archived` is true.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TicketFilter {
-    pub state: Option<String>,
-    pub project: Option<String>,
-    pub label: Option<String>,
-    pub repo: Option<String>,
-    pub assignee: Option<ActorId>,
+    pub state: Vec<String>,
+    pub project: Vec<String>,
+    pub label: Vec<String>,
+    pub repo: Vec<String>,
+    pub assignee: Vec<ActorId>,
     /// Only tickets with a hold set.
     pub held: bool,
+    /// `linked_github` matches one of these URLs.
+    pub github: Vec<String>,
+    /// Case-insensitive substring match against title or description.
+    pub search: Option<String>,
+    /// Include archived tickets (`archived_at` set). By default they are
+    /// excluded.
+    pub archived: bool,
 }
 
 impl Store {
@@ -44,37 +56,61 @@ impl Store {
     }
 
     /// Live tickets matching `filter`: numbered ones first in number
-    /// order, then unnumbered (`AGT-?`) ones in creation order.
+    /// order, then unnumbered (`AGT-?`) ones in creation order. Archived
+    /// tickets (`archived_at` set) are excluded unless `filter.archived` is
+    /// true — every caller, not just `pm list`, inherits that default; pass
+    /// `TicketFilter { archived: true, .. }` for the full non-tombstoned set.
     pub fn tickets(&self, filter: &TicketFilter) -> Result<Vec<Ticket>> {
         // Plain `?` placeholders bind in order, so each clause pushes its
-        // value as it is added.
-        let mut clauses = vec!["t.deleted = 0"];
+        // values as it is added.
+        let mut clauses = vec!["t.deleted = 0".to_string()];
         let mut args: Vec<Value> = Vec::new();
-        if let Some(state) = &filter.state {
-            clauses.push("t.state = ?");
-            args.push(Value::from(state.clone()));
-        }
-        if let Some(project) = &filter.project {
-            clauses.push("t.project = ?");
-            args.push(Value::from(project.clone()));
-        }
-        if let Some(repo) = &filter.repo {
-            clauses.push("t.repo = ?");
-            args.push(Value::from(repo.clone()));
-        }
-        if let Some(assignee) = &filter.assignee {
-            clauses.push("t.assignee = ?");
-            args.push(Value::from(assignee.to_string()));
-        }
-        if let Some(label) = &filter.label {
-            clauses.push(
-                "EXISTS (SELECT 1 FROM ticket_label l WHERE l.ticket = t.id AND l.label = ?)",
-            );
-            args.push(Value::from(label.clone()));
+        in_clause("t.state", &filter.state, &mut clauses, &mut args, |s| {
+            Value::from(s.clone())
+        });
+        in_clause("t.project", &filter.project, &mut clauses, &mut args, |s| {
+            Value::from(s.clone())
+        });
+        in_clause("t.repo", &filter.repo, &mut clauses, &mut args, |s| {
+            Value::from(s.clone())
+        });
+        in_clause(
+            "t.assignee",
+            &filter.assignee,
+            &mut clauses,
+            &mut args,
+            |a| Value::from(a.to_string()),
+        );
+        in_clause(
+            "t.linked_github",
+            &filter.github,
+            &mut clauses,
+            &mut args,
+            |s| Value::from(s.clone()),
+        );
+        if !filter.label.is_empty() {
+            let placeholders = placeholders(filter.label.len());
+            clauses.push(format!(
+                "EXISTS (SELECT 1 FROM ticket_label l WHERE l.ticket = t.id AND l.label IN ({placeholders}))"
+            ));
+            args.extend(filter.label.iter().map(|s| Value::from(s.clone())));
         }
         if filter.held {
-            clauses
-                .push("EXISTS (SELECT 1 FROM marker m WHERE m.ticket = t.id AND m.kind = 'hold')");
+            clauses.push(
+                "EXISTS (SELECT 1 FROM marker m WHERE m.ticket = t.id AND m.kind = 'hold')"
+                    .to_string(),
+            );
+        }
+        if !filter.archived {
+            clauses.push("t.archived_wall_ms IS NULL".to_string());
+        }
+        if let Some(search) = &filter.search {
+            clauses.push(
+                "(t.title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\')".to_string(),
+            );
+            let pattern = like_pattern(search);
+            args.push(Value::from(pattern.clone()));
+            args.push(Value::from(pattern));
         }
         self.load_tickets(&format!("WHERE {}", clauses.join(" AND ")), args)
     }
@@ -159,6 +195,40 @@ impl Store {
         let rows = stmt.query_map(params_from_iter(args), TicketRow::read)?;
         rows.map(|row| row?.into_ticket(&self.conn)).collect()
     }
+}
+
+/// Pushes `column IN (?, ?, ...)` onto `clauses` and the encoded `values`
+/// onto `args`, unless `values` is empty — an unset filter must match
+/// everything, not nothing.
+fn in_clause<T>(
+    column: &str,
+    values: &[T],
+    clauses: &mut Vec<String>,
+    args: &mut Vec<Value>,
+    encode: impl Fn(&T) -> Value,
+) {
+    if values.is_empty() {
+        return;
+    }
+    clauses.push(format!("{column} IN ({})", placeholders(values.len())));
+    args.extend(values.iter().map(encode));
+}
+
+fn placeholders(n: usize) -> String {
+    vec!["?"; n].join(", ")
+}
+
+/// A `LIKE` pattern that matches `text` as a substring, with the pattern's
+/// own `%`, `_` and `\` escaped so user input can't smuggle in wildcards
+/// (paired with `ESCAPE '\'` at the call site). SQLite's `LIKE` is already
+/// case-insensitive for ASCII, so `pm list --search` needs no extra
+/// case-folding.
+fn like_pattern(text: &str) -> String {
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
 }
 
 /// Ops matching `where_sql` in `seq` order, each with its `seq`.

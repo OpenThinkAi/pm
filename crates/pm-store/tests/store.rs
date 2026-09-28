@@ -707,7 +707,7 @@ fn list_filters_by_state_project_label_repo_assignee_and_held() {
         ids(
             &store,
             TicketFilter {
-                state: Some("in-progress".into()),
+                state: vec!["in-progress".into()],
                 ..Default::default()
             }
         ),
@@ -717,7 +717,7 @@ fn list_filters_by_state_project_label_repo_assignee_and_held() {
         ids(
             &store,
             TicketFilter {
-                project: Some("think-3".into()),
+                project: vec!["think-3".into()],
                 ..Default::default()
             }
         ),
@@ -727,7 +727,7 @@ fn list_filters_by_state_project_label_repo_assignee_and_held() {
         ids(
             &store,
             TicketFilter {
-                label: Some("model:fable-5".into()),
+                label: vec!["model:fable-5".into()],
                 ..Default::default()
             }
         ),
@@ -737,7 +737,7 @@ fn list_filters_by_state_project_label_repo_assignee_and_held() {
         ids(
             &store,
             TicketFilter {
-                repo: Some("OpenThinkAi/pm".into()),
+                repo: vec!["OpenThinkAi/pm".into()],
                 ..Default::default()
             }
         ),
@@ -747,7 +747,7 @@ fn list_filters_by_state_project_label_repo_assignee_and_held() {
         ids(
             &store,
             TicketFilter {
-                assignee: Some(ActorId::new("claude:pm-build")),
+                assignee: vec![ActorId::new("claude:pm-build")],
                 ..Default::default()
             }
         ),
@@ -767,7 +767,7 @@ fn list_filters_by_state_project_label_repo_assignee_and_held() {
         ids(
             &store,
             TicketFilter {
-                state: Some("triage".into()),
+                state: vec!["triage".into()],
                 held: true,
                 ..Default::default()
             }
@@ -778,13 +778,24 @@ fn list_filters_by_state_project_label_repo_assignee_and_held() {
         ids(
             &store,
             TicketFilter {
-                state: Some("done".into()),
+                state: vec!["done".into()],
                 held: true,
                 ..Default::default()
             }
         )
         .is_empty(),
         "filters combine with AND"
+    );
+    assert_eq!(
+        ids(
+            &store,
+            TicketFilter {
+                state: vec!["triage".into(), "in-progress".into()],
+                ..Default::default()
+            }
+        ),
+        [c, a, b],
+        "a multi-value filter matches any one of its values (b is still triage, never claimed)"
     );
 
     store.commit(&op(b, 8, "matt", Payload::Tombstone)).unwrap();
@@ -796,6 +807,133 @@ fn list_filters_by_state_project_label_repo_assignee_and_held() {
     assert!(
         store.ticket(b).unwrap().unwrap().deleted,
         "but still readable by id"
+    );
+}
+
+/// `pm list --github`, `--search` and `--archived` (AGT-1339 AC1).
+#[test]
+fn list_filters_by_github_search_and_archived() {
+    let (_dir, mut store) = store();
+    let (a, b, c) = (Ulid::new(), Ulid::new(), Ulid::new());
+    store.commit(&create(a, 1, Some("pm"))).unwrap();
+    store.commit(&create(b, 2, Some("pm"))).unwrap();
+    store.commit(&create(c, 3, Some("pm"))).unwrap();
+    store
+        .commit(&op(
+            a,
+            4,
+            "matt",
+            Payload::FieldSet(FieldSet::LinkedGithub(Some(
+                "https://github.com/OpenThinkAi/pm/issues/1".into(),
+            ))),
+        ))
+        .unwrap();
+    store
+        .commit(&op(
+            b,
+            5,
+            "matt",
+            Payload::FieldSet(FieldSet::LinkedGithub(Some(
+                "https://github.com/OpenThinkAi/pm/issues/2".into(),
+            ))),
+        ))
+        .unwrap();
+    store
+        .commit(&op(
+            a,
+            6,
+            "matt",
+            Payload::BodyEdit(pm_core::op::BodyEdit {
+                update: {
+                    let mut body = pm_core::Body::new();
+                    body.diff_from_text("needle in the body")
+                        .unwrap()
+                        .into_bytes()
+                },
+            }),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        ids(
+            &store,
+            TicketFilter {
+                github: vec!["https://github.com/OpenThinkAi/pm/issues/1".into()],
+                ..Default::default()
+            }
+        ),
+        [a]
+    );
+    assert_eq!(
+        ids(
+            &store,
+            TicketFilter {
+                github: vec![
+                    "https://github.com/OpenThinkAi/pm/issues/1".into(),
+                    "https://github.com/OpenThinkAi/pm/issues/2".into(),
+                ],
+                ..Default::default()
+            }
+        ),
+        [a, b],
+        "a multi-value github filter matches either url"
+    );
+    assert_eq!(
+        ids(
+            &store,
+            TicketFilter {
+                search: Some("needle".into()),
+                ..Default::default()
+            }
+        ),
+        [a],
+        "search matches the description"
+    );
+    assert_eq!(
+        ids(
+            &store,
+            TicketFilter {
+                search: Some("TICKET".into()),
+                ..Default::default()
+            }
+        ),
+        [a, b, c],
+        "search is case-insensitive and matches the title"
+    );
+    assert!(
+        ids(
+            &store,
+            TicketFilter {
+                search: Some("nothing matches this".into()),
+                ..Default::default()
+            }
+        )
+        .is_empty()
+    );
+
+    store
+        .commit(&op(
+            c,
+            7,
+            "matt",
+            Payload::FieldSet(FieldSet::ArchivedAt(Some(Hlc::new(7, 0)))),
+        ))
+        .unwrap();
+    assert_eq!(
+        ids(&store, TicketFilter::default()),
+        [a, b],
+        "archived tickets are excluded by default"
+    );
+    assert_eq!(
+        ids(
+            &store,
+            TicketFilter {
+                archived: true,
+                ..Default::default()
+            }
+        ),
+        [a, b, c],
+        "--archived includes them"
     );
 }
 

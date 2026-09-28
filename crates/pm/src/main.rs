@@ -10,6 +10,7 @@ mod doctor;
 mod edit;
 mod exit;
 mod mutate;
+mod read;
 mod ticket;
 mod verbs;
 mod workspace;
@@ -92,6 +93,9 @@ enum Cmd {
         /// Print only this field's value
         #[arg(long, value_name = "NAME")]
         field: Option<String>,
+        /// Print only this markdown section of the description (e.g. "Acceptance Criteria")
+        #[arg(long, value_name = "NAME")]
+        section: Option<String>,
     },
     /// Set ticket fields: title, priority, project, repo, assignee, linked-github, linked-pr,
     /// linear (empty value clears; unknown keys land in ext with a warning)
@@ -172,6 +176,46 @@ enum Cmd {
         /// Record the git branch the work lands on (kept in the ticket's `ext.branch`)
         #[arg(long, value_name = "BRANCH")]
         branch: Option<String>,
+    },
+    /// List tickets, AND-combining whichever filters are given (each accepts comma-separated alternatives)
+    List {
+        #[arg(long, value_delimiter = ',')]
+        project: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        state: Vec<String>,
+        #[arg(long = "label", value_delimiter = ',')]
+        labels: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        repo: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        assignee: Vec<String>,
+        /// Only tickets with a hold set
+        #[arg(long)]
+        held: bool,
+        /// Matches `linked-github` (`pm new`/`pm set`'s name for the same field)
+        #[arg(long, visible_alias = "linked-github", value_delimiter = ',')]
+        github: Vec<String>,
+        /// Case-insensitive substring match against title or description
+        #[arg(long)]
+        search: Option<String>,
+        /// Include archived tickets
+        #[arg(long)]
+        archived: bool,
+    },
+    /// List a ticket's ops, oldest first
+    Log {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+    },
+    /// Counts of tickets per state, plus held/parked
+    Status {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Dependency waves of not-yet-done tickets, plus a done flag
+    Graph {
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Check the database: constraints, and that the ticket tables replay from the op log (exit 1 if not)
     Doctor {
@@ -284,7 +328,9 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
                 batch,
             },
         ),
-        Cmd::Show { id, field } => verbs::show(ctx, &id, field.as_deref()),
+        Cmd::Show { id, field, section } => {
+            verbs::show(ctx, &id, field.as_deref(), section.as_deref())
+        }
         Cmd::Set { id, assignments } => verbs::set(ctx, &id, &assignments),
         Cmd::Label { id, changes } => mutate::label(ctx, &id, &changes),
         Cmd::Comment { id, text, file } => {
@@ -321,6 +367,33 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
                 branch,
             },
         ),
+        Cmd::List {
+            project,
+            state,
+            labels,
+            repo,
+            assignee,
+            held,
+            github,
+            search,
+            archived,
+        } => read::list(
+            ctx,
+            read::ListArgs {
+                project,
+                state,
+                label: labels,
+                repo,
+                assignee,
+                held,
+                github,
+                search,
+                archived,
+            },
+        ),
+        Cmd::Log { id } => read::log(ctx, &id),
+        Cmd::Status { project } => read::status(ctx, project),
+        Cmd::Graph { project } => read::graph(ctx, project),
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {

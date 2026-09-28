@@ -52,6 +52,8 @@ impl Ctx<'_> {
         .ok_or_else(|| CliError::usage("no actor: set PM_ACTOR, pass --as <actor>, or set USER"))
     }
 
+    /// `pub(crate)`: the read verbs (`crate::read`) open a workspace too,
+    /// but never resolve an actor — reads never write an op.
     pub(crate) fn open(&self) -> Result<(Store, Workspace)> {
         workspace::open(&workspace::resolve(self.workspace, self.env)?)
     }
@@ -92,6 +94,8 @@ pub fn parse_priority(s: &str) -> std::result::Result<Priority, String> {
         .map_err(|_| format!("unknown priority '{s}': expected one of low, medium, high, critical"))
 }
 
+/// `pub(crate)`: `crate::read` prints JSON for `pm list`/`pm log`/
+/// `pm status`/`pm graph` too.
 pub(crate) fn print_json(value: &Value) {
     println!(
         "{}",
@@ -787,7 +791,8 @@ fn print_batch_result(
 
 // ---------------------------------------------------------------- pm show
 
-/// `AGT-12`, or `AGT-?` before the authority numbers it.
+/// `AGT-12`, or `AGT-?` before the authority numbers it. `pub(crate)`:
+/// `crate::read` prints display ids for `pm list`/`pm graph` too.
 pub(crate) fn display_id(ws: &Workspace, t: &Ticket) -> String {
     match t.number {
         Some(n) => format!("{}-{n}", ws.prefix),
@@ -830,7 +835,8 @@ pub(crate) fn find(store: &Store, ws: &Workspace, reference: &str) -> Result<Tic
 /// `id` the human id (`AGT-12`) and the ULID under `ulid`, plus `schema`
 /// and `blocked_by` (the tickets that block this one, by display id —
 /// AC5: "`pm show --json` reflects all" the flags `pm new` accepts,
-/// including `--blocked-by`).
+/// including `--blocked-by`). `pub(crate)`: `crate::read` reuses this for
+/// `pm list --json`.
 pub(crate) fn ticket_json(ws: &Workspace, store: &Store, t: &Ticket) -> Result<Value> {
     let Value::Object(fields) = serde_json::to_value(t).expect("a ticket serializes") else {
         unreachable!("a ticket serializes to an object");
@@ -951,9 +957,25 @@ fn print_field(ctx: &Ctx<'_>, ticket: &Value, field: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn show(ctx: &Ctx<'_>, reference: &str, field: Option<&str>) -> Result<()> {
+/// `--field` and `--section` (AGT-1339 AC2) are mutually exclusive: each
+/// prints exactly one thing, and combining them would leave one silently
+/// ignored.
+pub fn show(
+    ctx: &Ctx<'_>,
+    reference: &str,
+    field: Option<&str>,
+    section: Option<&str>,
+) -> Result<()> {
+    if field.is_some() && section.is_some() {
+        return Err(CliError::usage(
+            "--field and --section are mutually exclusive",
+        ));
+    }
     let (store, ws) = ctx.open()?;
     let ticket = find(&store, &ws, reference)?;
+    if let Some(section) = section {
+        return crate::read::print_section(ctx, &ticket, section);
+    }
     match field {
         Some(field) => print_field(ctx, &ticket_json(&ws, &store, &ticket)?, field)?,
         None if ctx.json => print_json(&ticket_json(&ws, &store, &ticket)?),
