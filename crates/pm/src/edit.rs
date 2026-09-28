@@ -424,8 +424,10 @@ pub(crate) fn plan(
 
 /// Runs `$VISUAL`, else `$EDITOR`, else `vi` on `path` through `sh -c`, so
 /// a value with arguments (`code --wait`) works. `Ok(false)` is a non-zero
-/// exit: an abort.
-fn run_editor(path: &Path) -> Result<bool> {
+/// exit: an abort. `pub(crate)`: `crate::project`'s `pm project edit`
+/// (AGT-1344) opens a document's text the same way a ticket's is opened
+/// here, so it reuses this rather than a second editor-launch path.
+pub(crate) fn run_editor(path: &Path) -> Result<bool> {
     let editor = ["VISUAL", "EDITOR"]
         .into_iter()
         .filter_map(|k| std::env::var(k).ok())
@@ -453,14 +455,15 @@ fn error_file(ws_id: &str, error: &str, saved: &str) -> String {
     out
 }
 
-/// A temp file the editor opens; removed on drop unless kept.
-struct TempFile {
+/// A temp file the editor opens; removed on drop unless kept. `pub(crate)`
+/// alongside [`run_editor`], for the same reason.
+pub(crate) struct TempFile {
     path: PathBuf,
     keep: bool,
 }
 
 impl TempFile {
-    fn create(label: &str, contents: &str) -> Result<Self> {
+    pub(crate) fn create(label: &str, contents: &str) -> Result<Self> {
         let path = std::env::temp_dir().join(format!("pm-edit-{label}-{}.md", Ulid::new()));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -474,12 +477,16 @@ impl TempFile {
         Ok(TempFile { path, keep: false })
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     fn write(&self, contents: &str) -> Result<()> {
         Ok(fs::write(&self.path, contents)
             .with_context(|| format!("writing {}", self.path.display()))?)
     }
 
-    fn read(&self) -> Result<String> {
+    pub(crate) fn read(&self) -> Result<String> {
         Ok(fs::read_to_string(&self.path)
             .with_context(|| format!("reading {}", self.path.display()))?)
     }

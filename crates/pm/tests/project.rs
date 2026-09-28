@@ -1,8 +1,9 @@
 //! `pm project new/show/list/edit/doc/delete` driven through the built
 //! binary (AGT-1344). Sandbox as in `tests/cli.rs`: temp HOME, cleared
 //! env, no stdin — a command that tried to prompt would read EOF rather
-//! than hang, and `pm project edit` never even tries (it requires $EDITOR
-//! instead of falling back to a default terminal editor).
+//! than hang. `pm project edit` launches `$EDITOR` the same way `pm edit`
+//! does (`crate::edit`, AGT-1345), so PATH is kept (needed for the `sh -c`
+//! it shells through) the way `tests/edit.rs`'s sandbox keeps it.
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -42,6 +43,9 @@ impl Sandbox {
             .env_clear()
             .env("HOME", self.home.path())
             .env("USER", "tester")
+            // `pm project edit` shells out to `sh -c` to launch $EDITOR
+            // (crate::edit::run_editor); keep PATH so `sh` resolves.
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
             .stdin(Stdio::null());
         for (k, v) in extra {
             cmd.env(k, v);
@@ -185,13 +189,32 @@ fn new_rejects_a_duplicate_id_and_checks_the_parent_exists() {
 
 // -------------------------------------------------------------------- AC2
 
+/// `run_editor` (crate::edit, AGT-1345) is `$VISUAL`, then `$EDITOR`, then
+/// `vi` — pm itself never prompts, so there is no separate "$EDITOR unset"
+/// usage error to test here (mirroring `tests/edit.rs`, which does not
+/// test the `vi` fallback either: it depends on what's installed). What
+/// *is* deterministic, and the same abort path a missing $EDITOR that
+/// somehow launched something broken would hit, is a non-zero exit.
 #[test]
-fn edit_requires_editor_set() {
+fn edit_aborts_when_the_editor_exits_non_zero() {
     let sb = Sandbox::initialized();
     assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
-    let out = sb.run(&["project", "edit", "pm"], &[("EDITOR", "")]);
-    assert_code(&out, 2);
-    assert!(stderr(&out).contains("$EDITOR"), "{}", stderr(&out));
+    let editor = sb.home.path().join("failing-editor.sh");
+    std::fs::write(&editor, "#!/bin/sh\nexit 3\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let out = sb.run(
+        &["project", "edit", "pm"],
+        &[("EDITOR", editor.to_str().unwrap())],
+    );
+    assert_code(&out, 1);
+    assert!(stderr(&out).contains("non-zero"), "{}", stderr(&out));
+    assert!(sb.store().design_doc_id("pm").unwrap().is_some());
+    let v = json(&sb.pm(&["project", "show", "pm", "--json"]));
+    assert_eq!(v["doc"], "", "a non-zero exit commits nothing");
 }
 
 #[test]

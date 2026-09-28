@@ -10,18 +10,17 @@
 //! [`pm_core::Body`] CRDT a ticket's description uses (AGT-1338): there is
 //! exactly one body format in the op log, ever.
 //!
-//! `pm project edit` never prompts on its own (README §Constraints: "No
-//! command may prompt when stdin is not a TTY") — it requires `$EDITOR` to
-//! be set and fails with a usage error otherwise, rather than falling back
-//! to some default terminal editor that would hang or fail without one.
-//! Tests exercise it by pointing `$EDITOR` at a script that rewrites the
-//! file non-interactively; that needs no TTY either, since pm itself never
-//! prompts and the script doesn't read one.
+//! `pm project edit` opens the design doc the same way `pm edit` opens a
+//! ticket (`crate::edit::{run_editor, TempFile}`, AGT-1345): `$VISUAL`,
+//! then `$EDITOR`, then `vi`, launched through `sh -c`. pm itself never
+//! prompts (README §Constraints: "No command may prompt when stdin is not
+//! a TTY") — a non-interactive `vi` just fails fast, which `run_editor`
+//! reports as a non-zero exit, an abort. Tests exercise it by pointing
+//! `$EDITOR` at a script that rewrites the file non-interactively.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 use anyhow::Context;
 use clap::Subcommand;
@@ -31,6 +30,7 @@ use pm_store::Store;
 use serde_json::{Map, Value, json};
 use ulid::Ulid;
 
+use crate::edit;
 use crate::exit::{CliError, Result};
 use crate::verbs::{Ctx, SCHEMA, Stamper, non_empty, print_json};
 
@@ -203,23 +203,7 @@ fn list(ctx: &Ctx<'_>, status: Option<ProjectStatus>) -> Result<()> {
 
 // ------------------------------------------------------------------- edit
 
-/// `$EDITOR`, required: pm never falls back to a default terminal editor
-/// (README §Constraints, module docs above).
-fn require_editor() -> Result<String> {
-    std::env::var("EDITOR")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            CliError::usage(
-                "pm project edit requires $EDITOR to be set (pm never prompts on its own); \
-                 use `pm project doc add --from-file` for a non-interactive document instead",
-            )
-        })
-}
-
 fn edit(ctx: &Ctx<'_>, id: &str) -> Result<()> {
-    let editor = require_editor()?;
     let actor = ctx.actor()?;
     let (mut store, _ws) = ctx.open()?;
     let project = store.project(id)?.ok_or_else(|| not_found(id))?;
@@ -230,28 +214,20 @@ fn edit(ctx: &Ctx<'_>, id: &str) -> Result<()> {
         ))
     })?;
 
-    let path = std::env::temp_dir().join(format!("pm-project-doc-{}.md", Ulid::new()));
-    fs::write(&path, &project.doc)
-        .with_context(|| format!("writing scratch file {}", path.display()))?;
-    let status = Command::new(&editor)
-        .arg(&path)
-        .status()
-        .with_context(|| format!("running $EDITOR ({editor})"));
-    let status = match status {
-        Ok(status) => status,
-        Err(e) => {
-            let _ = fs::remove_file(&path);
-            return Err(e.into());
-        }
-    };
-    if !status.success() {
-        let _ = fs::remove_file(&path);
-        return Err(CliError::error(format!("$EDITOR exited with {status}")));
+    // Same editor launch as `pm edit` (crate::edit, AGT-1345): $VISUAL,
+    // then $EDITOR, then `vi`, run through `sh -c` and never a fallback pm
+    // prompts for itself — a non-interactive `vi` just fails fast rather
+    // than hang, which is how README's "no command may prompt when stdin
+    // is not a TTY" is satisfied here too.
+    let file = edit::TempFile::create(id, &project.doc)?;
+    if !edit::run_editor(file.path())? {
+        return Err(CliError::error("edit aborted (the editor exited non-zero)"));
     }
-    let new_text =
-        fs::read_to_string(&path).with_context(|| format!("reading back {}", path.display()))?;
-    let _ = fs::remove_file(&path);
-
+    let new_text = file.read()?;
+    // The whole file is captured in `new_text` now, so the temp file (Drop
+    // removes it) has nothing left to hold onto, unlike `pm edit`'s
+    // reopen-on-parse-error loop, where the file stays the live source of
+    // truth across editor invocations.
     if new_text == project.doc {
         return print_project(ctx, &store, &project);
     }
@@ -261,7 +237,11 @@ fn edit(ctx: &Ctx<'_>, id: &str) -> Result<()> {
     // cached snapshot, if any body.edit has ever landed) before diffing to
     // the editor's text, so the update is a minimal, correctly-merging
     // edit rather than a from-scratch replacement (pm-core::Body docs).
-    let mut body = Body::new();
+    // The session gets its own Loro peer (crate::edit::session_peer) so two
+    // concurrent `pm project edit`s by the same actor never collide the way
+    // a shared peer would (crate::edit module docs, AGT-1345).
+    let mut body = Body::with_peer(edit::session_peer(Ulid::new()))
+        .map_err(|e| CliError::error(format!("starting project doc session: {e}")))?;
     if let Some(view) = store.doc_view(doc_id)? {
         let snapshot = view
             .body
