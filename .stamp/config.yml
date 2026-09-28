@@ -8,9 +8,9 @@ branches:
       - name: build
         run: cargo build --locked
       - name: test
-        run: cargo test --locked
+        run: cargo test --locked --workspace
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: fmt
         run: cargo fmt --check
 reviewers:

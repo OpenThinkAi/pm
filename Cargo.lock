@@ -131,6 +131,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pm-core"
+version = "0.1.0"
+
+[[package]]
+name = "pm-store"
+version = "0.1.0"
+dependencies = [
+ "pm-core",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"

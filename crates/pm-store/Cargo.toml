@@ -1,0 +1,14 @@
+[package]
+name = "pm-store"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Stubbed in AGT-1333: pm-store holds no schema yet. It becomes the SQLite
+# (rusqlite, bundled, WAL mode) op log + materialized-table store in a
+# later ticket per projects/pm/README.md §Architecture — do not add
+# rusqlite here until that ticket lands.
+[dependencies]
+pm-core = { path = "../pm-core" }

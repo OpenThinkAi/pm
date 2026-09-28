@@ -1,8 +1,16 @@
-[package]
-name = "pm"
+[workspace]
+resolver = "2"
+members = ["crates/pm-core", "crates/pm-store", "crates/pm"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+description = "pm — local-first, relational ticketing (the vault, as a database)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/OpenThinkAi/pm"
 
-[dependencies]
-anyhow = "1.0.104"
-clap = { version = "4.6.7", features = ["derive"] }
+# Used by `cargo dist` in a later ticket; kept here now so the profile exists
+# alongside the license/description metadata this ticket adds.
+[profile.dist]
+inherits = "release"
+lto = "thin"

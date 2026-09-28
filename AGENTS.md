@@ -55,8 +55,8 @@ anything else) goes through the normal stamp flow.
 ### Where things live
 
 - `.stamp/config.yml` — branch rules (which reviewers are required, optional `required_checks`).
-  `main` requires four pre-merge checks: `cargo build --locked`, `cargo test --locked`,
-  `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check`. These run on the
+  `main` requires four pre-merge checks: `cargo build --locked`, `cargo test --locked --workspace`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check`. These run on the
   post-merge tree at `stamp merge` time (not at `stamp status`); a non-zero exit blocks
   and rolls back the merge — see "When stamp blocks you" below.
 - `.stamp/reviewers/*.md` — reviewer prompt files; this is your project's review policy as code
