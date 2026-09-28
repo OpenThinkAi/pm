@@ -81,7 +81,7 @@ impl Stamper {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -903,13 +903,11 @@ fn print_human(ws: &Workspace, t: &Ticket) {
             println!("{name}: {value}");
         }
     }
-    if let Some(hold) = &t.hold {
-        println!("hold:      {} (by {})", hold.reason, hold.by);
-    }
     if t.deleted {
         println!("deleted:   true");
     }
     println!("ulid:      {}", t.id);
+    crate::markers::print_block(t);
     if !t.description.is_empty() {
         println!();
         print!("{}", t.description);
@@ -1012,6 +1010,16 @@ fn parse_assignment(assignment: &str) -> Result<FieldSet> {
         "linked-github" => Ok(FieldSet::LinkedGithub(optional(value))),
         "linked-pr" => Ok(FieldSet::LinkedPr(optional(value))),
         "linear" => Ok(FieldSet::Linear(optional(value))),
+        "not_before" | "not-before" => Ok(FieldSet::NotBefore(
+            optional(value)
+                .map(|v| pm_core::markers::parse_not_before(&v))
+                .transpose()?,
+        )),
+        "parked" => Ok(FieldSet::Parked(
+            optional(value)
+                .map(|v| pm_core::markers::parse_parked(&v))
+                .transpose()?,
+        )),
         other => {
             eprintln!("pm: warning: unknown field '{other}'; stored under ext.{other}");
             Ok(FieldSet::Ext {

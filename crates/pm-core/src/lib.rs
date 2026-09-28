@@ -10,20 +10,25 @@
 //!
 //! Layout (projects/pm/README.md §Data model, §Op log, §Conflict semantics):
 //! - [`body`] — ticket/project-doc text as a Loro CRDT (AGT-1338)
+//! - [`check`] — the `pm check` invariants, over a ticket snapshot (AGT-1342)
 //! - [`domain`] — entity types (`Ticket`, `Project`, markers, …)
+//! - [`markers`] — strict marker dates, waiver rules (AGT-1342)
 //! - [`hlc`] — hybrid logical clock and the `(hlc, actor)` [`Stamp`]
 //! - [`op`] — the [`Op`] envelope and every payload
 //! - [`merge`] — LWW register, OR-set, append-only comment log
 //! - [`view`] — [`TicketView`] and the pure [`apply`] function
 
 pub mod body;
+pub mod check;
 pub mod domain;
 pub mod hlc;
+pub mod markers;
 pub mod merge;
 pub mod op;
 pub mod view;
 
 pub use body::{Body, BodyError, BodyUpdate};
+pub use check::Finding;
 pub use domain::{
     Actor, ActorId, ActorKind, Comment, Hold, NotBefore, Parked, Priority, Project, ProjectStatus,
     Relation, RelationKind, Source, State, StateCategory, Ticket, Waiver, Workspace,
