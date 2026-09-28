@@ -1,0 +1,115 @@
+//! `pm check [--project P]` (AGT-1342; README §CLI verbs, replacing
+//! vault-sweep §4 and the hygiene 30-second check). Runs every invariant in
+//! [`pm_core::check`] and prints one line per finding; exit 1 if there is
+//! any finding, 0 when clean. `--json` prints
+//! `{schema, ok, count, findings: [{rule, tickets, message, …}]}` either way.
+
+use std::collections::BTreeMap;
+
+use pm_core::{Finding, Workspace};
+use serde_json::{Value, json};
+use ulid::Ulid;
+
+use crate::exit::{CliError, Result};
+use crate::markers::{describe_hold, require_project};
+use crate::verbs::{Ctx, SCHEMA, display_id, now_ms, print_json};
+
+pub fn check(ctx: &Ctx<'_>, project: Option<&str>) -> Result<()> {
+    let (store, ws) = ctx.open()?;
+    if let Some(p) = project {
+        require_project(&store, p)?;
+    }
+    // One snapshot serves both the checker and the id → AGT-N names.
+    let tickets = store.all_tickets()?;
+    let findings = pm_core::check::check(&ws, &tickets, &store.all_relations()?, now_ms(), project);
+    let names: BTreeMap<Ulid, String> =
+        tickets.iter().map(|t| (t.id, display_id(&ws, t))).collect();
+    let name = |id: &Ulid| names.get(id).cloned().unwrap_or_else(|| id.to_string());
+
+    if ctx.json {
+        let rendered: Vec<Value> = findings
+            .iter()
+            .map(|f| finding_json(f, &ws, &name))
+            .collect();
+        print_json(&json!({
+            "schema": SCHEMA,
+            "ok": findings.is_empty(),
+            "count": findings.len(),
+            "findings": rendered,
+        }));
+    } else {
+        for f in &findings {
+            let ids: Vec<String> = f.tickets().iter().map(&name).collect();
+            println!(
+                "{:<18} {:<14} {}",
+                f.rule(),
+                ids.join(","),
+                message(f, &ws, &name)
+            );
+        }
+        if findings.is_empty() {
+            println!("ok: no findings");
+        }
+    }
+    if findings.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::error(format!("{} finding(s)", findings.len())))
+    }
+}
+
+fn finding_json(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) -> Value {
+    let tickets: Vec<String> = f.tickets().iter().map(name).collect();
+    let mut out = json!({
+        "rule": f.rule(),
+        "tickets": tickets,
+        "message": message(f, ws, name),
+    });
+    let extra = match f {
+        Finding::Stale { days, .. } => json!({ "days": days, "stale_days": ws.stale_days }),
+        Finding::Held { hold, .. } => json!({ "hold": hold }),
+        Finding::DanglingRelation { relation, missing } => json!({
+            "relation": {
+                "kind": relation.kind,
+                "from": name(&relation.from),
+                "to": name(&relation.to),
+            },
+            "missing": name(missing),
+        }),
+        Finding::NoProject { .. } | Finding::BlockerCycle { .. } => json!({}),
+    };
+    if let (Value::Object(out), Value::Object(extra)) = (&mut out, extra) {
+        out.extend(extra);
+    }
+    out
+}
+
+fn message(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) -> String {
+    match f {
+        Finding::NoProject { .. } => {
+            "no project and no R1 waiver (`pm set <id> project=…` or `pm waive <id> R1 \"why\"`)"
+                .to_string()
+        }
+        Finding::Stale { days, .. } => format!(
+            "unstarted and not updated for {days} days (stale_days = {})",
+            ws.stale_days
+        ),
+        Finding::Held { hold, .. } => format!("held: {}", describe_hold(hold)),
+        Finding::BlockerCycle { tickets } => {
+            let ids: Vec<String> = tickets.iter().map(name).collect();
+            format!("blocker cycle: {} block each other", ids.join(", "))
+        }
+        Finding::DanglingRelation { relation, missing } => {
+            let kind = serde_json::to_value(relation.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            format!(
+                "{} {kind} {}, but {} is tombstoned or missing",
+                name(&relation.from),
+                name(&relation.to),
+                name(missing)
+            )
+        }
+    }
+}

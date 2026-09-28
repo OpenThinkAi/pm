@@ -5,10 +5,12 @@ use std::process::ExitCode;
 
 mod backup;
 mod batch;
+mod check;
 mod claim;
 mod doctor;
 mod edit;
 mod exit;
+mod markers;
 mod mutate;
 mod read;
 mod ticket;
@@ -19,8 +21,8 @@ use ticket::{Filter, State, Ticket};
 
 /// pm - local-first ticketing for agents and humans
 ///
-/// Exit codes: 0 ok, 1 error (or an unhealthy database, for doctor), 2 usage, 3 not found,
-/// 75 taken (claim).
+/// Exit codes: 0 ok, 1 error (or an unhealthy database, for doctor; findings, for check), 2 usage,
+/// 3 not found, 75 taken (claim).
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Cli {
@@ -98,7 +100,8 @@ enum Cmd {
         section: Option<String>,
     },
     /// Set ticket fields: title, priority, project, repo, assignee, linked-github, linked-pr,
-    /// linear (empty value clears; unknown keys land in ext with a warning)
+    /// linear, not_before=YYYY-MM-DD, parked=YYYY-MM-DD|forever (empty value clears; unknown
+    /// keys land in ext with a warning)
     Set {
         /// Ticket id (AGT-12) or ULID
         id: String,
@@ -214,6 +217,37 @@ enum Cmd {
     },
     /// Dependency waves of not-yet-done tickets, plus a done flag
     Graph {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Hold a ticket for a human (`pm hold AGT-N "why"`), or release it (`--clear`)
+    Hold {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+        /// Why the ticket is waiting on a human
+        reason: Option<String>,
+        /// Clear the hold instead of setting one
+        #[arg(long)]
+        clear: bool,
+    },
+    /// List held tickets
+    Holds {
+        /// Only tickets in this project
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Waive a hygiene rule for a ticket (e.g. `pm waive AGT-N R1 "standalone: why"`)
+    Waive {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+        /// The rule waived (R1, …)
+        rule: String,
+        /// Why
+        reason: String,
+    },
+    /// Report invariant findings: R1, stale, held, blocker cycles, dangling relations (exit 1 if any)
+    Check {
+        /// Only findings touching this project's tickets
         #[arg(long)]
         project: Option<String>,
     },
@@ -394,6 +428,10 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         Cmd::Log { id } => read::log(ctx, &id),
         Cmd::Status { project } => read::status(ctx, project),
         Cmd::Graph { project } => read::graph(ctx, project),
+        Cmd::Hold { id, reason, clear } => markers::hold(ctx, &id, reason.as_deref(), clear),
+        Cmd::Holds { project } => markers::holds(ctx, project.as_deref()),
+        Cmd::Waive { id, rule, reason } => markers::waive(ctx, &id, &rule, &reason),
+        Cmd::Check { project } => check::check(ctx, project.as_deref()),
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {

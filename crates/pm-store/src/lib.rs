@@ -14,11 +14,13 @@
 //! - `query` — by id / number / filtered list, comments, relations, ops
 //! - `ready` — [`Store::ready`], the ready frontier (`pm claim --ready`)
 //! - `config` — workspace + states, projects + docs
+//! - `check` — the snapshot `pm check` runs over ([`Store::check`])
 //! - `doctor` — [`Store::doctor`] (verify) and [`Store::rebuild`] (replay the log)
 //! - `backup` — [`Store::ops_since`] and per-target progress (AGT-1350)
 //! - [`StoreError`] — typed failures (R2/R4/R5 violations, claim rejection, …)
 
 mod backup;
+mod check;
 mod codec;
 mod commit;
 mod config;
