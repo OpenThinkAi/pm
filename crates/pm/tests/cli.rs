@@ -733,6 +733,153 @@ fn unclaim_refuses_a_ticket_that_is_not_started() {
     assert_code(&sb.pm(&["unclaim", "AGT-999"]), 3);
 }
 
+/// AGT-1379: an already-stranded ticket (unstarted/backlog but still
+/// assigned, e.g. from `pm move --keep-assignee` or from before this
+/// fix) has no state to un-start — `pm unclaim` clears just the stray
+/// assignee, with a stderr note, and leaves the state alone.
+#[test]
+fn unclaim_on_an_already_unstarted_assigned_ticket_clears_only_the_assignee() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_ok(&sb.pm(&["set", "AGT-1", "assignee=matt"]));
+
+    let out = sb.pm(&["unclaim", "AGT-1", "--json"]);
+    assert_ok(&out);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["state"], "triage");
+    assert!(v["assignee"].is_null());
+    assert!(
+        stderr(&out).contains("already unstarted") && stderr(&out).contains("cleared"),
+        "{}",
+        stderr(&out)
+    );
+
+    // Now unassigned and unstarted: truly nothing to unclaim.
+    assert_code(&sb.pm(&["unclaim", "AGT-1"]), 1);
+}
+
+// -------------------------------------------------- AGT-1379: pm move
+// into an unstarted state must not strand an assigned ticket
+
+#[test]
+fn move_into_unstarted_clears_assignee_and_says_so_on_stderr() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_ok(&sb.pm(&["move", "AGT-1", "in-progress"]));
+    assert_ok(&sb.pm(&["set", "AGT-1", "assignee=matt"]));
+
+    let out = sb.pm(&["move", "AGT-1", "triage", "--json"]);
+    assert_ok(&out);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["state"], "triage");
+    assert!(v["assignee"].is_null());
+    assert!(
+        stderr(&out).contains("cleared assignee"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn move_keep_assignee_opts_out() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_ok(&sb.pm(&["move", "AGT-1", "in-progress"]));
+    assert_ok(&sb.pm(&["set", "AGT-1", "assignee=matt"]));
+
+    let out = sb.pm(&["move", "AGT-1", "triage", "--keep-assignee", "--json"]);
+    assert_ok(&out);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["state"], "triage");
+    assert_eq!(v["assignee"], "matt");
+    assert!(!stderr(&out).contains("cleared assignee"));
+}
+
+#[test]
+fn move_without_an_assignee_is_silent_and_move_into_started_keeps_it() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+
+    // No assignee to clear: no stderr noise.
+    let out = sb.pm(&["move", "AGT-1", "triage"]);
+    assert_ok(&out);
+    assert_eq!(stderr(&out), "");
+
+    // Moving into a *started* state never touches the assignee.
+    assert_ok(&sb.pm(&["move", "AGT-1", "in-progress"]));
+    assert_ok(&sb.pm(&["set", "AGT-1", "assignee=matt"]));
+    let out = sb.pm(&["move", "AGT-1", "in-progress", "--json"]);
+    assert_ok(&out);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["assignee"], "matt");
+    assert_eq!(stderr(&out), "");
+}
+
+/// AC3: a ticket claimed, then moved back to `triage` (the fix keeps it
+/// from being stranded assigned-but-unstarted), is claimable again by a
+/// different actor.
+#[test]
+fn claim_move_triage_then_claim_by_another_actor_succeeds() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_code(&sb.run(&["claim", "AGT-1"], &[("PM_ACTOR", "alice")]), 0);
+
+    let out = sb.pm(&["move", "AGT-1", "triage"]);
+    assert_ok(&out);
+
+    let out = sb.run(&["claim", "AGT-1", "--json"], &[("PM_ACTOR", "bob")]);
+    assert_ok(&out);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["assignee"], "bob");
+    assert_eq!(v["state"], "in-progress");
+}
+
+#[test]
+fn check_reports_assigned_unstarted_and_ready_explain_names_it_distinctly() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    // Simulate an already-stranded ticket from before this fix: assignee
+    // set directly on an unstarted ticket, bypassing `pm move`'s clear.
+    assert_ok(&sb.pm(&["set", "AGT-1", "assignee=matt"]));
+
+    let out = sb.pm(&["check", "--json"]);
+    assert_code(&out, 1);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings = v["findings"].as_array().unwrap();
+    let found = findings
+        .iter()
+        .find(|f| f["rule"] == "assigned-unstarted")
+        .unwrap_or_else(|| panic!("no assigned-unstarted finding in {findings:?}"));
+    assert_eq!(found["tickets"], serde_json::json!(["AGT-1"]));
+    assert_eq!(found["assignee"], "matt");
+    assert_eq!(found["state"], "triage");
+
+    // `pm ready --explain` names the same ticket distinctly from a
+    // `started` exclusion (which never mentions "assigned").
+    let v = json(&sb.pm(&["ready", "--json"]));
+    let excluded = v["excluded"].as_array().unwrap();
+    let reason = excluded
+        .iter()
+        .find(|e| e["id"] == "AGT-1")
+        .unwrap_or_else(|| panic!("AGT-1 not excluded in {excluded:?}"));
+    assert_eq!(reason["reason"], "assigned");
+    assert!(
+        reason["message"].as_str().unwrap().contains("assigned"),
+        "{reason:?}"
+    );
+
+    assert_ok(&sb.pm(&["new", "--title", "started"]));
+    assert_ok(&sb.pm(&["move", "AGT-2", "in-progress"]));
+    let v = json(&sb.pm(&["ready", "--json"]));
+    let excluded = v["excluded"].as_array().unwrap();
+    let started_reason = excluded
+        .iter()
+        .find(|e| e["id"] == "AGT-2")
+        .unwrap_or_else(|| panic!("AGT-2 not excluded in {excluded:?}"));
+    assert_eq!(started_reason["reason"], "state");
+    assert_ne!(started_reason["reason"], reason["reason"]);
+}
+
 // ---------------------------------------------------------------- AC5
 
 fn actors(sb: &Sandbox, id: &str) -> Vec<ActorId> {

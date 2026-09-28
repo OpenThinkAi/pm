@@ -124,23 +124,46 @@ pub fn comment(
 
 /// `pm move AGT-N <state>` (AC3): validates the state exists in this
 /// workspace before emitting a `state.transition`.
-pub fn mv(ctx: &Ctx<'_>, reference: &str, state: &str) -> Result<()> {
+///
+/// AGT-1379: moving an assigned ticket into an `unstarted`-or-`backlog`
+/// state clears the assignee in the same batch, exactly like `pm
+/// unclaim` — otherwise the ticket is stranded (unstarted but assigned:
+/// `pm ready` excludes it, `pm claim` refuses it) until someone runs `pm
+/// set assignee=`. `--keep-assignee` opts out.
+pub fn mv(ctx: &Ctx<'_>, reference: &str, state: &str, keep_assignee: bool) -> Result<()> {
     let state = non_empty("state", state)?;
     let actor = ctx.actor()?;
     let (mut store, ws) = ctx.open()?;
     let ticket = find(&store, &ws, reference)?;
-    if ws.state(&state).is_none() {
+    let target = ws.state(&state).ok_or_else(|| {
         let known: Vec<&str> = ws.states.iter().map(|s| s.name.as_str()).collect();
-        return Err(CliError::not_found(format!(
+        CliError::not_found(format!(
             "no such state '{state}': expected one of {}",
             known.join(", ")
-        )));
-    }
+        ))
+    })?;
+
     let mut stamper = Stamper::new(&store, actor)?;
-    store.commit(&stamper.op(
+    let mut ops = vec![stamper.op(
         ticket.id,
-        Payload::StateTransition(StateTransition { state }),
-    ))?;
+        Payload::StateTransition(StateTransition {
+            state: state.clone(),
+        }),
+    )];
+    let clear_assignee =
+        !keep_assignee && target.category.is_unstarted_or_backlog() && ticket.assignee.is_some();
+    if clear_assignee {
+        ops.push(stamper.op(ticket.id, Payload::FieldSet(FieldSet::Assignee(None))));
+        eprintln!(
+            "pm: cleared assignee ({}) moving {} to '{state}'; pass --keep-assignee to keep it",
+            ticket
+                .assignee
+                .as_ref()
+                .expect("clear_assignee implies Some"),
+            display_id(&ws, &ticket),
+        );
+    }
+    store.commit_batch(&ops, &[])?;
     print_ticket(ctx, &store, &ws, ticket.id)
 }
 
@@ -202,33 +225,50 @@ pub fn done(ctx: &Ctx<'_>, reference: &str, args: DoneArgs) -> Result<()> {
 // ------------------------------------------------------------- pm unclaim
 
 /// `pm unclaim AGT-N` (AC3): a started ticket returns to the workspace's
-/// initial unstarted state with its assignee cleared. Refuses a ticket that
-/// is not currently in a `started` state — there is nothing to unclaim.
-/// State transition and assignee clear land in one `commit_batch` so the
-/// ticket is never observed half-unclaimed (state changed, assignee still
-/// set, or vice versa).
+/// initial unstarted state with its assignee cleared, the two landing in
+/// one `commit_batch` so the ticket is never observed half-unclaimed
+/// (state changed, assignee still set, or vice versa).
+///
+/// AGT-1379: a ticket that is already `unstarted`-or-`backlog` but still
+/// carries an assignee (the `pm check` `assigned-unstarted` finding —
+/// stranded before this fix, or left that way by `pm move
+/// --keep-assignee`) has no state to un-start, so this is the one case
+/// that clears the assignee alone, with a stderr note. Anything else
+/// (unstarted-and-unassigned, completed, canceled) refuses: there is
+/// nothing to unclaim.
 pub fn unclaim(ctx: &Ctx<'_>, reference: &str) -> Result<()> {
     let actor = ctx.actor()?;
     let (mut store, ws) = ctx.open()?;
     let ticket = find(&store, &ws, reference)?;
-    let category = ws.state(&ticket.state).map(|s| &s.category);
-    if category != Some(&StateCategory::Started) {
+    let category = ws.state(&ticket.state).map(|s| s.category);
+
+    let mut stamper = Stamper::new(&store, actor)?;
+    let ops = if category == Some(StateCategory::Started) {
+        let unstarted = initial_state(&ws)?;
+        vec![
+            stamper.op(
+                ticket.id,
+                Payload::StateTransition(StateTransition { state: unstarted }),
+            ),
+            stamper.op(ticket.id, Payload::FieldSet(FieldSet::Assignee(None))),
+        ]
+    } else if category.is_some_and(StateCategory::is_unstarted_or_backlog)
+        && ticket.assignee.is_some()
+    {
+        eprintln!(
+            "pm: {} is already unstarted (state '{}'); cleared the stray assignee ({})",
+            display_id(&ws, &ticket),
+            ticket.state,
+            ticket.assignee.as_ref().expect("checked Some above"),
+        );
+        vec![stamper.op(ticket.id, Payload::FieldSet(FieldSet::Assignee(None)))]
+    } else {
         return Err(CliError::error(format!(
             "{} is not started (state '{}'); nothing to unclaim",
             display_id(&ws, &ticket),
             ticket.state
         )));
-    }
-    let unstarted = initial_state(&ws)?;
-
-    let mut stamper = Stamper::new(&store, actor)?;
-    let ops = vec![
-        stamper.op(
-            ticket.id,
-            Payload::StateTransition(StateTransition { state: unstarted }),
-        ),
-        stamper.op(ticket.id, Payload::FieldSet(FieldSet::Assignee(None))),
-    ];
+    };
     store.commit_batch(&ops, &[])?;
     print_ticket(ctx, &store, &ws, ticket.id)
 }

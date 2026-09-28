@@ -68,6 +68,11 @@ fn finding_json(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) ->
     let extra = match f {
         Finding::Stale { days, .. } => json!({ "days": days, "stale_days": ws.stale_days }),
         Finding::Held { hold, .. } => json!({ "hold": hold }),
+        Finding::AssignedUnstarted {
+            assignee, state, ..
+        } => {
+            json!({ "assignee": assignee, "state": state })
+        }
         Finding::DanglingRelation { relation, missing } => json!({
             "relation": {
                 "kind": relation.kind,
@@ -95,6 +100,13 @@ fn message(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) -> Stri
             ws.stale_days
         ),
         Finding::Held { hold, .. } => format!("held: {}", describe_hold(hold)),
+        Finding::AssignedUnstarted {
+            assignee, state, ..
+        } => format!(
+            "assigned to {assignee} but in unstarted state '{state}'; \
+             `pm claim` refuses it and `pm ready` excludes it — run \
+             `pm unclaim <id>` to clear the stray assignee"
+        ),
         Finding::BlockerCycle { tickets } => {
             let ids: Vec<String> = tickets.iter().map(name).collect();
             format!("blocker cycle: {} block each other", ids.join(", "))

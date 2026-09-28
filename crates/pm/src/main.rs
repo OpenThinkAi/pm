@@ -146,6 +146,10 @@ enum Cmd {
         id: String,
         /// A state this workspace defines
         state: String,
+        /// Keep the assignee even when moving into an unstarted/backlog
+        /// state (default: clear it, like `pm unclaim`)
+        #[arg(long)]
+        keep_assignee: bool,
     },
     /// Transition a ticket to the workspace's completed state
     Done {
@@ -465,7 +469,11 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         Cmd::Comment { id, text, file } => {
             mutate::comment(ctx, &id, text.as_deref(), file.as_deref())
         }
-        Cmd::Move { id, state } => mutate::mv(ctx, &id, &state),
+        Cmd::Move {
+            id,
+            state,
+            keep_assignee,
+        } => mutate::mv(ctx, &id, &state, keep_assignee),
         Cmd::Done {
             id,
             note,

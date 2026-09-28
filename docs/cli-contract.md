@@ -326,10 +326,18 @@ Flags: `--file <PATH|->` (mutually exclusive with the positional `TEXT`;
 
 ### `pm move <ID> <STATE>`
 
-No flags beyond the globals.
+Flags: `--keep-assignee` (opt out of the assignee clear below).
+
+Moving into a state whose category is `unstarted` or `backlog` clears the
+ticket's `assignee` in the same batch as the state transition — exactly
+like `pm unclaim` — and prints a `pm: cleared assignee (…) …` line to
+stderr when it does (AGT-1379: otherwise the ticket is stranded, unstarted
+but still assigned, until someone runs `pm unclaim <id>` or `pm set <id>
+assignee=`). `--keep-assignee` skips this.
 
 - Exit `3`: `STATE` is not a state this workspace defines.
-- `--json`: **Ticket**.
+- `--json`: **Ticket** (`assignee: null` after the clear, unless
+  `--keep-assignee`).
 
 ### `pm done <ID>`
 
@@ -344,10 +352,18 @@ Flags: `--note <TEXT>` (appended as a comment), `--merged-sha <SHA>`
 
 No flags beyond the globals.
 
-- Exit `1`: the ticket is not currently in a `started`-category state (a
-  clearer error than silently no-op-ing).
-- `--json`: **Ticket**, back in the workspace's initial unstarted state,
-  `assignee: null`.
+A `started`-category ticket returns to the workspace's initial unstarted
+state with its assignee cleared. AGT-1379: a ticket that is already
+`unstarted`-or-`backlog` but still carries an assignee (the `pm check`
+`assigned-unstarted` finding — stranded before AGT-1379's `pm move` fix,
+or left that way by `pm move --keep-assignee`) has no state to un-start,
+so this is the one case that clears the assignee alone, with a stderr
+note, and leaves the state untouched.
+
+- Exit `1`: the ticket is not `started`-category, and not
+  `unstarted`-or-`backlog`-and-assigned either — nothing to unclaim.
+- `--json`: **Ticket**, `assignee: null`; `state` the workspace's initial
+  unstarted state (moved there) or unchanged (assignee-only clear).
 
 ### `pm edit <ID>`
 
@@ -562,12 +578,16 @@ tickets).
     "count": 1,
     "findings": [
       {
-        "rule": "R1" | "stale" | "held" | "blocker-cycle" | "dangling-relation",
+        "rule": "R1" | "stale" | "held" | "assigned-unstarted" | "blocker-cycle"
+              | "dangling-relation",
         "tickets": ["AGT-2", ...],
         "message": "string",
         /* plus rule-specific fields: stale -> {days, stale_days}; held -> {hold};
-           dangling-relation -> {relation: {kind: "blocks" | "parent" | "superseded_by",
-           from, to}, missing}. R1 is "no project and no R1/standalone waiver". */
+           assigned-unstarted -> {assignee, state} (an unstarted-or-backlog ticket
+           that still carries an assignee: `pm claim` refuses it, `pm ready`
+           excludes it — AGT-1379); dangling-relation ->
+           {relation: {kind: "blocks" | "parent" | "superseded_by", from, to},
+           missing}. R1 is "no project and no R1/standalone waiver". */
       },
       ...
     ]

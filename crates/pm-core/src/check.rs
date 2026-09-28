@@ -8,6 +8,11 @@
 //! - **stale** — a live ticket in an `unstarted` state not updated for
 //!   more than `stale_days` (0 disables), unless it is parked or date-gated.
 //! - **held** — a live ticket with a hold: it is waiting on a human.
+//! - **assigned-unstarted** (AGT-1379) — a live ticket in an
+//!   `unstarted`-or-`backlog` state that still carries an `assignee`:
+//!   `pm ready` excludes it and `pm claim` refuses it, so it is stranded
+//!   until the assignee is cleared (`pm unclaim` now does this in place,
+//!   without a state change, when it finds one already in this shape).
 //! - **blocker cycle** — tickets that (transitively) block each other.
 //! - **dangling relation** — a relation between a live ticket and one that
 //!   is tombstoned or absent.
@@ -20,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use ulid::Ulid;
 
-use crate::domain::{Hold, Relation, RelationKind, StateCategory, Ticket, Workspace};
+use crate::domain::{ActorId, Hold, Relation, RelationKind, StateCategory, Ticket, Workspace};
 use crate::markers::{date_from_ms, waives_r1};
 
 const DAY_MS: u64 = 86_400_000;
@@ -36,6 +41,16 @@ pub enum Finding {
     Stale { ticket: Ulid, days: u64 },
     /// Held for a human.
     Held { ticket: Ulid, hold: Hold },
+    /// Unstarted or backlog, but still carrying an `assignee` (AGT-1379):
+    /// `pm ready` excludes it (assigned) and `pm claim` refuses it
+    /// (already assigned), so it is stranded until someone clears the
+    /// assignee — `pm move` now does this itself, but a ticket that was
+    /// already stranded before that fix needs `pm check` to find it.
+    AssignedUnstarted {
+        ticket: Ulid,
+        assignee: ActorId,
+        state: String,
+    },
     /// Every ticket in one strongly connected component of the `blocks`
     /// graph, sorted.
     BlockerCycle { tickets: Vec<Ulid> },
@@ -49,7 +64,8 @@ impl Finding {
         match self {
             Finding::NoProject { ticket }
             | Finding::Stale { ticket, .. }
-            | Finding::Held { ticket, .. } => vec![*ticket],
+            | Finding::Held { ticket, .. }
+            | Finding::AssignedUnstarted { ticket, .. } => vec![*ticket],
             Finding::BlockerCycle { tickets } => tickets.clone(),
             Finding::DanglingRelation { relation, .. } => vec![relation.from, relation.to],
         }
@@ -61,6 +77,7 @@ impl Finding {
             Finding::NoProject { .. } => "R1",
             Finding::Stale { .. } => "stale",
             Finding::Held { .. } => "held",
+            Finding::AssignedUnstarted { .. } => "assigned-unstarted",
             Finding::BlockerCycle { .. } => "blocker-cycle",
             Finding::DanglingRelation { .. } => "dangling-relation",
         }
@@ -73,8 +90,10 @@ impl Finding {
 /// `project`, only findings naming at least one ticket in that project are
 /// kept (so R1 findings, which have no project, never appear).
 ///
-/// Order: R1, stale, held (each in `tickets` order), then cycles, then
-/// dangling relations (in relation order: kind, from, to).
+/// Order: R1, stale (each in `tickets` order), then held and
+/// assigned-unstarted interleaved per ticket (each in `tickets` order),
+/// then cycles, then dangling relations (in relation order: kind, from,
+/// to).
 pub fn check(
     ws: &Workspace,
     tickets: &[Ticket],
@@ -112,6 +131,18 @@ pub fn check(
                 ticket: t.id,
                 hold: hold.clone(),
             });
+        }
+        if let Some(assignee) = &t.assignee {
+            let unstarted_like = ws
+                .state(&t.state)
+                .is_some_and(|s| s.category.is_unstarted_or_backlog());
+            if unstarted_like {
+                findings.push(Finding::AssignedUnstarted {
+                    ticket: t.id,
+                    assignee: assignee.clone(),
+                    state: t.state.clone(),
+                });
+            }
         }
     }
 
@@ -407,6 +438,57 @@ mod tests {
         assert_eq!(
             check(&ws(30), &[t.clone()], &[], NOW, None),
             [Finding::Held { ticket: t.id, hold }]
+        );
+    }
+
+    /// AGT-1379: an assigned ticket is only a finding while it is
+    /// unstarted-or-backlog — the ready/claim stranding this rule exists
+    /// to catch never happens once a ticket has actually started.
+    #[test]
+    fn assigned_unstarted_covers_backlog_and_unstarted_but_not_started() {
+        let state = |name: &str, category, position| State {
+            name: name.into(),
+            category,
+            position,
+        };
+        let mut with_backlog = ws(30);
+        with_backlog.states = vec![
+            state("backlog", StateCategory::Backlog, 0),
+            state("triage", StateCategory::Unstarted, 1),
+            state("in-progress", StateCategory::Started, 2),
+            state("done", StateCategory::Completed, 3),
+        ];
+
+        let mut backlog = ticket(1, Some("pm"));
+        backlog.state = "backlog".into();
+        backlog.assignee = Some(ActorId::new("matt"));
+        let mut unstarted = ticket(2, Some("pm"));
+        unstarted.assignee = Some(ActorId::new("matt"));
+        let mut started = ticket(3, Some("pm"));
+        started.state = "in-progress".into();
+        started.assignee = Some(ActorId::new("matt"));
+        let unassigned = ticket(4, Some("pm"));
+
+        assert_eq!(
+            check(
+                &with_backlog,
+                &[backlog.clone(), unstarted.clone(), started, unassigned],
+                &[],
+                NOW,
+                None
+            ),
+            [
+                Finding::AssignedUnstarted {
+                    ticket: backlog.id,
+                    assignee: ActorId::new("matt"),
+                    state: "backlog".into(),
+                },
+                Finding::AssignedUnstarted {
+                    ticket: unstarted.id,
+                    assignee: ActorId::new("matt"),
+                    state: "triage".into(),
+                },
+            ]
         );
     }
 
