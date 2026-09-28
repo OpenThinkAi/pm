@@ -92,7 +92,7 @@ pub fn parse_priority(s: &str) -> std::result::Result<Priority, String> {
         .map_err(|_| format!("unknown priority '{s}': expected one of low, medium, high, critical"))
 }
 
-fn print_json(value: &Value) {
+pub(crate) fn print_json(value: &Value) {
     println!(
         "{}",
         serde_json::to_string_pretty(value).expect("a JSON value serializes")
@@ -170,6 +170,7 @@ pub fn init(ctx: &Ctx<'_>, prefix: &str) -> Result<()> {
     if config_written {
         Config {
             workspace: Some(dir.clone()),
+            backup: None,
         }
         .write(&config_path)?;
     }

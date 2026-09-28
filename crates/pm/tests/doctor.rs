@@ -158,7 +158,12 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     let out = sb.pm(&["doctor"]);
     assert_code(&out, 0);
     let text = stdout(&out);
-    assert!(text.contains("schema version  1\n"), "{text}");
+    // AGT-1350 added migration 0002 (backup_target); the exact number here
+    // just needs to track pm_store::SCHEMA_VERSION, not stay pinned to 1.
+    assert!(
+        text.contains(&format!("schema version  {}\n", pm_store::SCHEMA_VERSION)),
+        "{text}"
+    );
     assert!(text.contains("ops             9\n"), "{text}");
     assert!(text.contains("ticket 1"), "{text}");
     assert!(text.contains("ticket_label 2"), "{text}");
@@ -170,7 +175,7 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     let v = json(&sb.pm(&["doctor", "--json"]));
     assert_eq!(v["schema"], 1);
     assert_eq!(v["healthy"], true);
-    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["schema_version"], pm_store::SCHEMA_VERSION);
     assert_eq!(v["op_count"], 9);
     assert_eq!(v["tables"]["ticket"], 1);
     assert_eq!(v["tables"]["ops"], 9);
