@@ -6,6 +6,7 @@ use std::process::ExitCode;
 mod backup;
 mod batch;
 mod doctor;
+mod edit;
 mod exit;
 mod mutate;
 mod ticket;
@@ -148,6 +149,14 @@ enum Cmd {
         /// Ticket id (AGT-12) or ULID
         id: String,
     },
+    /// Edit a ticket in $EDITOR (frontmatter + markdown); the save becomes ops
+    Edit {
+        /// Ticket id (AGT-12) or ULID
+        id: String,
+        /// editor ($EDITOR) or ui-leaf; default: config `edit.view`, else editor
+        #[arg(long, value_parser = edit::parse_view)]
+        view: Option<edit::View>,
+    },
     /// Check the database: constraints, and that the ticket tables replay from the op log (exit 1 if not)
     Doctor {
         /// Regenerate the ticket tables from the op log first and print what changed
@@ -281,6 +290,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             },
         ),
         Cmd::Unclaim { id } => mutate::unclaim(ctx, &id),
+        Cmd::Edit { id, view } => edit::edit(ctx, &id, view),
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {

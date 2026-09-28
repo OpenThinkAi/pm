@@ -100,6 +100,18 @@ pub struct Config {
     /// when `--to` is not given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<BackupConfig>,
+    /// `[edit]` (AGT-1345): `pm edit` defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<EditConfig>,
+}
+
+/// `[edit]` in config.toml.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct EditConfig {
+    /// `edit.view = "editor" | "ui-leaf"`: the view `pm edit` opens when
+    /// `--view` is not given. Validated by `edit::parse_view`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
 }
 
 /// `pm backup`'s config section (AGT-1350 AC1: "default dir from config
