@@ -347,6 +347,8 @@ fn every_verbs_json_output_matches_its_fixture() {
             "init",
             "--prefix",
             "AGT",
+            "--preset",
+            "saltline",
             "--workspace",
             sb.ws_str(),
             "--json",
@@ -820,9 +822,17 @@ fn legacy_ticket_verbs_ignore_the_json_flag() {
 fn status_states_is_an_array_in_workflow_order_not_an_alphabetical_map() {
     let sb = Sandbox::new();
     assert_eq!(
-        sb.pm(&["init", "--prefix", "AGT", "--workspace", sb.ws_str()])
-            .status
-            .code(),
+        sb.pm(&[
+            "init",
+            "--prefix",
+            "AGT",
+            "--preset",
+            "saltline",
+            "--workspace",
+            sb.ws_str(),
+        ])
+        .status
+        .code(),
         Some(0)
     );
     sb.put_project("pm");

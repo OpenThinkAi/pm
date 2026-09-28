@@ -27,7 +27,15 @@ impl Sandbox {
     fn initialized() -> Self {
         let sb = Sandbox::new();
         assert_ok(&sb.run(
-            &["init", "--prefix", "AGT", "--workspace", sb.ws_str()],
+            &[
+                "init",
+                "--prefix",
+                "AGT",
+                "--preset",
+                "saltline",
+                "--workspace",
+                sb.ws_str(),
+            ],
             &[],
         ));
         sb

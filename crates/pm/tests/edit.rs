@@ -26,7 +26,18 @@ impl Sandbox {
         let ws = home.path().join("ws");
         let sb = Sandbox { home, ws };
         let ws = sb.ws.to_str().unwrap().to_string();
-        assert_ok(&sb.run(&["init", "--prefix", "AGT", "--workspace", &ws], None));
+        assert_ok(&sb.run(
+            &[
+                "init",
+                "--prefix",
+                "AGT",
+                "--preset",
+                "saltline",
+                "--workspace",
+                &ws,
+            ],
+            None,
+        ));
         let mut store = sb.store();
         for id in ["pm", "other"] {
             store
