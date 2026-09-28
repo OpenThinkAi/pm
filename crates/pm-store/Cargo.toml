@@ -6,9 +6,17 @@ description.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Stubbed in AGT-1333: pm-store holds no schema yet. It becomes the SQLite
-# (rusqlite, bundled, WAL mode) op log + materialized-table store in a
-# later ticket per projects/pm/README.md §Architecture — do not add
-# rusqlite here until that ticket lands.
+# The SQLite op log + materialized tables (projects/pm/README.md §Op log,
+# AGT-1335). SQLite is statically linked (`bundled`) so `pm` stays a single
+# binary; defaults are off to keep the wasm-only ffi shim and the statement
+# cache (`hashlink`) out of the dependency closure.
 [dependencies]
 pm-core = { path = "../pm-core" }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+ulid = { version = "1.2", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3.27"

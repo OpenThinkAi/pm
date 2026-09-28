@@ -29,6 +29,36 @@ impl ActorId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The actor a command runs as, from the three places it can come from
+    /// (README §Data model "actor"): `PM_ACTOR`, then `--as`, then `$USER`.
+    /// The environment wins over the flag so a build loop that exports
+    /// `PM_ACTOR=claude:pm-build` attributes every nested invocation to
+    /// itself. Blank values count as unset. Pure: the caller reads the
+    /// environment and passes the strings in.
+    pub fn resolve(
+        pm_actor: Option<&str>,
+        as_flag: Option<&str>,
+        user: Option<&str>,
+    ) -> Option<Self> {
+        [pm_actor, as_flag, user]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .map(ActorId::new)
+    }
+
+    /// Agent sessions are namespaced, `<agent>:<session>`
+    /// (`claude:think-3-build`); a bare id (`matt`, from `$USER`) is a
+    /// human.
+    pub fn kind(&self) -> ActorKind {
+        if self.0.contains(':') {
+            ActorKind::Agent
+        } else {
+            ActorKind::Human
+        }
+    }
 }
 
 impl fmt::Display for ActorId {
@@ -369,6 +399,34 @@ mod tests {
             r#""in-progress""#
         );
         assert!(Priority::Low < Priority::Critical);
+    }
+
+    #[test]
+    fn actor_resolves_env_then_flag_then_user() {
+        let claude = Some("claude:pm-build");
+        assert_eq!(
+            ActorId::resolve(claude, Some("bob"), Some("matt")),
+            Some(ActorId::new("claude:pm-build"))
+        );
+        assert_eq!(
+            ActorId::resolve(None, Some("bob"), Some("matt")),
+            Some(ActorId::new("bob"))
+        );
+        assert_eq!(
+            ActorId::resolve(Some("  "), Some(""), Some(" matt ")),
+            Some(ActorId::new("matt")),
+            "blank values are unset and the winner is trimmed"
+        );
+        assert_eq!(ActorId::resolve(None, None, None), None);
+    }
+
+    #[test]
+    fn actor_kind_follows_the_session_namespace() {
+        assert_eq!(
+            ActorId::new("claude:think-3-build").kind(),
+            ActorKind::Agent
+        );
+        assert_eq!(ActorId::new("matt").kind(), ActorKind::Human);
     }
 
     #[test]
