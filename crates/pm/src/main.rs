@@ -11,6 +11,7 @@ mod claim;
 mod doctor;
 mod edit;
 mod exit;
+mod import;
 mod markers;
 mod mutate;
 mod project;
@@ -298,6 +299,11 @@ enum Cmd {
         /// Ticket id (AGT-12) or ULID
         id: String,
     },
+    /// Import a markdown vault (tickets, archive, projects, docs) as ops; re-runs import only what changed
+    Import {
+        #[command(subcommand)]
+        cmd: ImportCmd,
+    },
     /// Project verbs: new, show, list, edit, doc, delete
     Project {
         #[command(subcommand)]
@@ -337,6 +343,22 @@ enum BackupCmd {
         /// Which target to report on (default: config `backup.repo`)
         #[arg(long = "to", value_name = "DIR")]
         to: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ImportCmd {
+    /// A saltline-style vault: tickets/**, archive/20*/**, projects/*/README.md and their docs
+    Vault {
+        /// The vault's root directory (read only; never written)
+        path: PathBuf,
+        /// Read and plan everything, print the report, write nothing
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Read a file that lost its frontmatter from a git object instead: PATH=REV
+        /// (relative to the vault); repeatable. AGT-806's 82a9982 is built in
+        #[arg(long = "recover", value_name = "PATH=REV")]
+        recover: Vec<String>,
     },
 }
 
@@ -499,6 +521,14 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
         Cmd::Archive { id, auto, dry_run } => archive::archive(ctx, id, auto, dry_run),
         Cmd::Unarchive { id } => archive::unarchive(ctx, &id),
+        Cmd::Import {
+            cmd:
+                ImportCmd::Vault {
+                    path,
+                    dry_run,
+                    recover,
+                },
+        } => import::vault(ctx, &path, dry_run, &recover),
         Cmd::Project { cmd } => project::run(ctx, cmd),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {

@@ -546,7 +546,7 @@ report what changed, then run the same report).
     "schema": 1,
     "healthy": true,
     "rebuilt": {"tables": [...]} | null,   // a Diff, only present with --rebuild
-    "schema_version": 3,
+    "schema_version": 4,
     "op_count": 30,
     "tables": {"ticket": 5, "comment": 2, ...},
     "integrity": [],                        // SQLite integrity_check messages, if any
@@ -586,6 +586,59 @@ No flags beyond the globals. Clears `archived_at`.
 
 - Exit `3`: unknown ticket.
 - `--json`: **Ticket**, `archived_at: null`.
+
+### `pm import vault <PATH>`
+
+A lossless, incremental import of a saltline-style markdown vault
+(AGT-1347): `tickets/**`, `archive/20*/**` (→ `archived_at` = the folder
+month), `projects/*/README.md` and `archive/projects/*/README.md` (project
+metadata + the README verbatim as the design doc), sibling `.md` files and
+`ideation/IDEA-*` as named documents. Ops are dated from each file's
+`created`/`updated` under actor `import` (a comment's op carries its vault
+author). Keyed on the vault id, never the path: an unchanged file is zero
+ops; a changed one yields only the matching ops. The vault is only read.
+Flags: `--dry-run` (read and plan everything, print the report, write
+nothing), `--recover <PATH=REV>` (repeatable: read a vault file that lost
+its frontmatter from `git show REV:PATH` instead, appending whatever
+comment entries the working-tree file still holds; AGT-806's `82a9982` is
+built in).
+
+- Exit `1`: a `--recover` git object cannot be read; a store failure
+  mid-import (already-committed tickets stay, a re-run resumes since they
+  diff to nothing).
+- Exit `2`: `PATH` has no `tickets/` directory; a file that does not
+  parse — the message names `path:line` (no frontmatter, unparseable
+  YAML, missing `id`/`title`/`state`/`created`/`updated`, an id that is
+  not `<PREFIX>-<n>`, a state this workspace lacks, a bad date); a
+  `--recover` value that is not `PATH=REV`. Nothing is written.
+- `--json` (the report, with or without `--dry-run`):
+  ```jsonc
+  {
+    "schema": 1,
+    "dry_run": false,
+    "vault": "/path/given",
+    "prefix": "AGT",
+    "files": 1373,                           // ticket files read
+    "tickets": {"created": 0, "changed": 0, "unchanged": 0, "skipped": 0},
+    "archived": 1137,                        // files under archive/20*/
+    "projects": 69,                          // READMEs read (live + retired)
+    "project_stubs": ["id", ...],            // projects a ticket names that have no README; created empty, abandoned
+    "docs": {"created": 0, "updated": 0, "unchanged": 0},
+    "ops": 0,                                // committed (or, with --dry-run, planned)
+    "ops_by_kind": {"ticket.create": 0, "field.set": 0, ...},
+    "comments": 0,                           // comment.add ops among them
+    "markers": {"waiver": 0, "hold": 0, "parked": 0},   // markers found in the files
+    "migrated": ["AGT-834 waiver: waived: standalone — ...", ...],  // one per marker, text as it stood
+    "changes": ["AGT-834: state", ...],      // re-imported tickets with ops, and which kinds
+    "anomalies": ["path: ...", ...],         // recoveries, duplicate ids, tombstoned/skipped files
+    "renumbered": ["AGT-1377 (was AGT-846)", ...],  // duplicate-id files given a fresh number
+    "non_template": {"category": ["path:line", ...], ...},  // e.g. "source.type: audit", "priority: critical"
+    "ext_keys": {"team": 756, ...},          // frontmatter keys preserved in ext, by file count
+    "max_number": 1376,                      // greatest vault number seen
+    "number_floor": 1376,                    // the allocator floor after this run (next number is above it)
+    "elapsed_ms": 0
+  }
+  ```
 
 ### `pm project new <ID>`
 

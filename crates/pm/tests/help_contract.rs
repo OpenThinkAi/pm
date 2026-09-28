@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// Every command and subcommand path `main.rs`'s `Cmd`/`ProjectCmd`/
-/// `BackupCmd`/`TicketCmd` define. Kept as a flat list (rather than
+/// Every command and subcommand path `main.rs`'s `Cmd`/`ImportCmd`/
+/// `ProjectCmd`/`BackupCmd`/`TicketCmd` define. Kept as a flat list (rather than
 /// re-deriving it from clap) so this test fails loudly — a path missing
 /// here, or a path here clap no longer has — the moment either one drifts,
 /// rather than silently checking less than it claims to.
@@ -39,6 +39,8 @@ const PATHS: &[&[&str]] = &[
     &["doctor"],
     &["archive"],
     &["unarchive"],
+    &["import"],
+    &["import", "vault"],
     &["project"],
     &["project", "new"],
     &["project", "show"],

@@ -171,6 +171,11 @@ fn normalize_value(v: &mut Value) {
                         *val = Value::String("<TODAY>".into());
                         continue;
                     }
+                    // `pm import vault`: how long the run took.
+                    "elapsed_ms" => {
+                        *val = Value::from(0);
+                        continue;
+                    }
                     _ => {}
                 }
                 normalize_value(val);
@@ -309,6 +314,20 @@ labels: [imported]
 
 Filed from a vault-format file.
 ";
+
+/// A miniature vault for `pm import vault`: one ticket in `tickets/triage`
+/// naming a project with a README and a sibling document.
+const MINI_VAULT: &[(&str, &str)] = &[
+    (
+        "tickets/triage/AGT-900-vaulted.md",
+        "---\nid: AGT-900\ntitle: Vaulted ticket\nstate: triage\ncreated: 2026-09-01\nupdated: 2026-09-02\nproject: vaulted\nrepo: \nblocked-by: []\nlinked-github: \nlinked-pr: \npriority: medium\nlabels: [contract]\nsource: { type: manual, url: \"\", id: \"\", fetched-at: \"\" }\nteam: product\n---\n\n## Problem Statement\n\nImported from a vault.\n\n## Comments\n\n### 2026-09-02 — Filed\nwaived: standalone — contract fixture\n",
+    ),
+    (
+        "projects/vaulted/README.md",
+        "---\nid: vaulted\ntitle: \"Vaulted\"\nstatus: active\nparent-project:\nrepos: []\n---\n\n# vaulted\n",
+    ),
+    ("projects/vaulted/NOTES.md", "# Notes\n"),
+];
 
 /// Drives every `--json`-producing verb once, in dependency order, against
 /// one sandbox — later steps rely on tickets/projects earlier ones
@@ -698,6 +717,36 @@ fn every_verbs_json_output_matches_its_fixture() {
     cap(
         "new_from_file",
         &["new", "--from-file", from_file.to_str().unwrap(), "--json"],
+        0,
+        &mut failures,
+    );
+
+    // ---- pm import vault ----
+    // Last: the import raises the number allocator floor to the vault's
+    // maximum, which would renumber everything filed after it. A two-file
+    // vault in the sandbox (one ticket with a marker, one project with a
+    // named doc); the real fixture vault is exercised in tests/import.rs.
+    let vault = sb.path("mini-vault");
+    for (rel, text) in MINI_VAULT {
+        let path = vault.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    cap(
+        "import_vault_dry_run",
+        &[
+            "import",
+            "vault",
+            vault.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ],
+        0,
+        &mut failures,
+    );
+    cap(
+        "import_vault",
+        &["import", "vault", vault.to_str().unwrap(), "--json"],
         0,
         &mut failures,
     );
