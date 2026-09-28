@@ -1,0 +1,246 @@
+//! Hybrid logical clock (Kulkarni et al., "Logical Physical Clocks and
+//! Consistent Snapshots in Globally Distributed Databases", 2014).
+//!
+//! An [`Hlc`] is `(wall_ms, counter)`: the largest physical time observed so
+//! far, plus a counter that breaks ties when several events share that
+//! millisecond. Ordering is lexicographic, so every op stamped by one
+//! [`Clock`] is strictly greater than the previous one *and* than every
+//! remote stamp it has received — which is what makes LWW merges agree
+//! across replicas regardless of arrival order.
+//!
+//! This crate never reads the system clock: callers pass `now_ms` in, so the
+//! logic is pure and the CLI, the hub and tests all drive the same code.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::domain::ActorId;
+
+/// A hybrid logical timestamp. Derived `Ord` compares `wall_ms` first, then
+/// `counter`, which is exactly the HLC order.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct Hlc {
+    /// Physical component: milliseconds since the Unix epoch, as observed
+    /// (never ahead of the greatest `now_ms` or remote `wall_ms` seen).
+    pub wall_ms: u64,
+    /// Logical component: resets to 0 whenever `wall_ms` advances.
+    pub counter: u32,
+}
+
+impl Hlc {
+    pub const ZERO: Hlc = Hlc {
+        wall_ms: 0,
+        counter: 0,
+    };
+
+    pub fn new(wall_ms: u64, counter: u32) -> Self {
+        Hlc { wall_ms, counter }
+    }
+}
+
+impl fmt::Display for Hlc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.wall_ms, self.counter)
+    }
+}
+
+/// Per-replica clock state: the last timestamp this replica issued or
+/// observed. Persist `latest()` and restore it with [`Clock::from_latest`]
+/// so restarts never re-issue an old stamp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clock {
+    latest: Hlc,
+}
+
+impl Clock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_latest(latest: Hlc) -> Self {
+        Clock { latest }
+    }
+
+    pub fn latest(&self) -> Hlc {
+        self.latest
+    }
+
+    /// Stamp a local event ("send" / "local" in the paper). The result is
+    /// strictly greater than every stamp this clock has issued or received.
+    pub fn send(&mut self, now_ms: u64) -> Hlc {
+        let Hlc { wall_ms, counter } = self.latest;
+        self.latest = if now_ms > wall_ms {
+            Hlc::new(now_ms, 0)
+        } else {
+            Hlc::new(wall_ms, counter + 1)
+        };
+        self.latest
+    }
+
+    /// Fold a remote stamp into this clock and stamp the receive event. The
+    /// result is strictly greater than both `remote` and this clock's
+    /// previous stamp.
+    pub fn receive(&mut self, remote: Hlc, now_ms: u64) -> Hlc {
+        let local = self.latest;
+        let wall_ms = now_ms.max(local.wall_ms).max(remote.wall_ms);
+        let counter = if wall_ms == local.wall_ms && wall_ms == remote.wall_ms {
+            local.counter.max(remote.counter) + 1
+        } else if wall_ms == local.wall_ms {
+            local.counter + 1
+        } else if wall_ms == remote.wall_ms {
+            remote.counter + 1
+        } else {
+            0
+        };
+        self.latest = Hlc::new(wall_ms, counter);
+        self.latest
+    }
+}
+
+/// The total order every merge rule uses: HLC first, actor id as the
+/// tie-break. Two ops from different actors can share an `Hlc`; two ops
+/// from the same actor never can (its clock is strictly monotonic), so
+/// `Stamp` is unique per op and `Ord` is total.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Stamp {
+    pub hlc: Hlc,
+    pub actor: ActorId,
+}
+
+impl Stamp {
+    pub fn new(hlc: Hlc, actor: ActorId) -> Self {
+        Stamp { hlc, actor }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn send_advances_with_wall_clock_and_resets_counter() {
+        let mut c = Clock::new();
+        assert_eq!(c.send(10), Hlc::new(10, 0));
+        assert_eq!(c.send(10), Hlc::new(10, 1));
+        assert_eq!(c.send(9), Hlc::new(10, 2)); // wall clock went backwards
+        assert_eq!(c.send(11), Hlc::new(11, 0));
+    }
+
+    #[test]
+    fn receive_adopts_the_greatest_component() {
+        let mut c = Clock::from_latest(Hlc::new(10, 3));
+        // remote ahead in wall time
+        assert_eq!(c.receive(Hlc::new(20, 5), 15), Hlc::new(20, 6));
+        // physical clock ahead of both
+        assert_eq!(c.receive(Hlc::new(20, 9), 30), Hlc::new(30, 0));
+        // same wall time on both sides: max counter + 1
+        assert_eq!(c.receive(Hlc::new(30, 7), 25), Hlc::new(30, 8));
+        // local ahead of remote and physical
+        assert_eq!(c.receive(Hlc::new(1, 1), 1), Hlc::new(30, 9));
+    }
+
+    #[test]
+    fn hlc_serde_round_trips() {
+        let h = Hlc::new(1_700_000_000_000, 42);
+        let json = serde_json::to_string(&h).unwrap();
+        assert_eq!(json, r#"{"wall_ms":1700000000000,"counter":42}"#);
+        assert_eq!(serde_json::from_str::<Hlc>(&json).unwrap(), h);
+    }
+
+    #[test]
+    fn stamp_orders_by_hlc_then_actor() {
+        let a = Stamp::new(Hlc::new(5, 0), ActorId::new("alice"));
+        let b = Stamp::new(Hlc::new(5, 0), ActorId::new("bob"));
+        let later = Stamp::new(Hlc::new(5, 1), ActorId::new("aaron"));
+        assert!(a < b);
+        assert!(b < later);
+        assert!(a < later);
+    }
+
+    /// One replica's inputs: a physical-clock reading (possibly going
+    /// backwards) and, optionally, a remote stamp to fold in.
+    #[derive(Clone, Debug)]
+    enum Event {
+        Send(u64),
+        Receive(u64, Hlc),
+    }
+
+    fn event() -> impl Strategy<Value = Event> {
+        prop_oneof![
+            (0u64..1000).prop_map(Event::Send),
+            ((0u64..1000), (0u64..1000), (0u32..8))
+                .prop_map(|(now, w, c)| Event::Receive(now, Hlc::new(w, c))),
+        ]
+    }
+
+    proptest! {
+        /// Every stamp a clock issues is strictly greater than the previous
+        /// one and than any remote stamp it received, even when the wall
+        /// clock runs backwards.
+        #[test]
+        fn clock_is_strictly_monotonic(events in prop::collection::vec(event(), 1..64)) {
+            let mut clock = Clock::new();
+            let mut prev = Hlc::ZERO;
+            for ev in events {
+                let next = match ev {
+                    Event::Send(now) => {
+                        let h = clock.send(now);
+                        prop_assert!(h.wall_ms >= now);
+                        h
+                    }
+                    Event::Receive(now, remote) => {
+                        let h = clock.receive(remote, now);
+                        prop_assert!(h > remote);
+                        prop_assert!(h.wall_ms >= now);
+                        h
+                    }
+                };
+                prop_assert!(next > prev, "{next} must exceed {prev}");
+                prop_assert_eq!(clock.latest(), next);
+                prev = next;
+            }
+        }
+
+        /// Two replicas exchanging stamps in arbitrary order never produce
+        /// equal (hlc, actor) pairs, and the pairs sort into one total order
+        /// on which every replica agrees.
+        #[test]
+        fn stamps_form_a_total_order_with_actor_tie_break(
+            steps in prop::collection::vec((0u64..50, any::<bool>(), any::<bool>()), 1..64)
+        ) {
+            let actors = [ActorId::new("a"), ActorId::new("b")];
+            let mut clocks = [Clock::new(), Clock::new()];
+            let mut stamps: Vec<Stamp> = Vec::new();
+            for (now, who, exchange) in steps {
+                let i = usize::from(who);
+                let hlc = clocks[i].send(now);
+                stamps.push(Stamp::new(hlc, actors[i].clone()));
+                if exchange {
+                    let hlc = clocks[1 - i].receive(hlc, now);
+                    stamps.push(Stamp::new(hlc, actors[1 - i].clone()));
+                }
+            }
+            let mut sorted = stamps.clone();
+            sorted.sort();
+            sorted.dedup();
+            prop_assert_eq!(sorted.len(), stamps.len(), "stamps must be unique");
+            for pair in sorted.windows(2) {
+                prop_assert!(pair[0] < pair[1]);
+                if pair[0].hlc == pair[1].hlc {
+                    prop_assert!(pair[0].actor < pair[1].actor);
+                }
+            }
+            // Ord is antisymmetric and consistent with equality.
+            for x in &stamps {
+                for y in &stamps {
+                    prop_assert_eq!(x.cmp(y), y.cmp(x).reverse());
+                    prop_assert_eq!(x.cmp(y).is_eq(), x == y);
+                }
+            }
+        }
+    }
+}
