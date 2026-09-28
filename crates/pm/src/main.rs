@@ -391,8 +391,8 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             },
         ),
         Cmd::Log { id } => read::log(ctx, &id),
-        Cmd::Status { project } => read::status(ctx, read::StatusArgs { project }),
-        Cmd::Graph { project } => read::graph(ctx, read::GraphArgs { project }),
+        Cmd::Status { project } => read::status(ctx, project),
+        Cmd::Graph { project } => read::graph(ctx, project),
         Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {

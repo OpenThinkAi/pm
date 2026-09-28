@@ -216,6 +216,10 @@ fn relation_kind_str(kind: RelationKind) -> &'static str {
     }
 }
 
+/// Round-trips through `serde_json` rather than a `Display`/`as_str` impl
+/// (`pm_core::Priority` has neither) — the same approach `verbs::print_human`
+/// already uses for the same field. Coupled to `Priority`'s serde shape:
+/// if that ever changes, this display string changes with it.
 fn priority_str(p: &Priority) -> String {
     serde_json::to_value(p)
         .ok()
@@ -235,16 +239,12 @@ fn truncate(s: &str, max: usize) -> String {
 
 // -------------------------------------------------------------- pm status
 
-pub struct StatusArgs {
-    pub project: Option<String>,
-}
-
 /// `pm status [--project]` (AC4): counts per workflow state (every state
 /// listed, even at 0), plus how many are held or parked.
-pub fn status(ctx: &Ctx<'_>, args: StatusArgs) -> Result<()> {
+pub fn status(ctx: &Ctx<'_>, project: Option<String>) -> Result<()> {
     let (store, ws) = ctx.open()?;
     let filter = TicketFilter {
-        project: args.project.clone().into_iter().collect(),
+        project: project.clone().into_iter().collect(),
         ..Default::default()
     };
     let tickets = store.tickets(&filter)?;
@@ -275,7 +275,7 @@ pub fn status(ctx: &Ctx<'_>, args: StatusArgs) -> Result<()> {
             .collect();
         print_json(&json!({
             "schema": SCHEMA,
-            "project": args.project,
+            "project": project,
             "states": states,
             "held": held,
             "parked": parked,
@@ -303,20 +303,16 @@ pub fn status(ctx: &Ctx<'_>, args: StatusArgs) -> Result<()> {
 
 // --------------------------------------------------------------- pm graph
 
-pub struct GraphArgs {
-    pub project: Option<String>,
-}
-
 /// `pm graph [--project]` (AC4): tickets not yet in a `completed`-category
 /// state, grouped into readiness waves by their still-pending `blocks`
 /// relations, plus a `done` flag (`true` once nothing in scope is
 /// pending — what a build loop's self-retire check wants). A blocker that
 /// sits outside the filtered scope and never resolves lands its dependents
 /// in a final, unordered wave rather than looping forever.
-pub fn graph(ctx: &Ctx<'_>, args: GraphArgs) -> Result<()> {
+pub fn graph(ctx: &Ctx<'_>, project: Option<String>) -> Result<()> {
     let (store, ws) = ctx.open()?;
     let filter = TicketFilter {
-        project: args.project.clone().into_iter().collect(),
+        project: project.clone().into_iter().collect(),
         ..Default::default()
     };
     let tickets = store.tickets(&filter)?;
@@ -365,7 +361,7 @@ pub fn graph(ctx: &Ctx<'_>, args: GraphArgs) -> Result<()> {
             waves.push(unready);
             break;
         }
-        resolved.extend(&ready);
+        resolved.extend(ready.iter().copied());
         waves.push(ready);
         remaining = unready;
     }
@@ -388,7 +384,7 @@ pub fn graph(ctx: &Ctx<'_>, args: GraphArgs) -> Result<()> {
     if ctx.json {
         print_json(&json!({
             "schema": SCHEMA,
-            "project": args.project,
+            "project": project,
             "waves": wave_ids,
             "done": done,
         }));
