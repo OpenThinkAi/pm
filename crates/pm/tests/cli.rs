@@ -4,6 +4,7 @@
 //! reads or writes the real `~/.config/pm`, and stdin is `/dev/null`, so a
 //! command that tried to prompt would read EOF rather than hang.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -63,6 +64,36 @@ impl Sandbox {
 
     fn pm(&self, args: &[&str]) -> Output {
         self.run(args, &[])
+    }
+
+    /// Like [`Sandbox::run`], but pipes `input` to the child's stdin
+    /// instead of closing it (AGT-1346: `--description-file -`).
+    fn run_with_stdin(&self, args: &[&str], input: &str) -> Output {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pm"))
+            .args(args)
+            .env_clear()
+            .env("HOME", self.home.path())
+            .env("USER", "tester")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// Writes `contents` to `name` under the sandbox's home dir and
+    /// returns its path — a fixture file for `--from-file` / `--batch`.
+    fn fixture(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.home.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
     }
 
     /// Projects have no CLI verb yet; they are config rows written
@@ -551,4 +582,353 @@ fn legacy_ticket_commands_still_read_markdown() {
         .unwrap();
     assert_ok(&out);
     assert!(stdout(&out).contains("Legacy"), "{}", stdout(&out));
+}
+
+// ------------------------------------------------------------- AGT-1346
+
+/// The array's strings, sorted — `blocked_by`'s SQL order is by ULID, not
+/// batch/file order, so tests compare it as a set.
+fn sorted_strings(v: &Value) -> Vec<String> {
+    let mut xs: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    xs.sort();
+    xs
+}
+
+// AC1: --from-file parses a vault-format ticket file into a create op set.
+
+#[test]
+fn from_file_parses_a_real_shaped_vault_ticket() {
+    let sb = Sandbox::initialized();
+    let fixture = sb.fixture(
+        "AGT-1003.md",
+        r#"---
+id: AGT-1003
+title: "Decide the feature-flag contract before building it"
+state: triage
+created: 2026-08-15
+updated: 2026-08-15
+project: pm
+repo: MicroMediaSites/bloom-cms
+blocked-by: []
+linked-github:
+linked-pr:
+priority: high
+labels: [x, y]
+source: { type: manual, url: "", id: "", fetched-at: "" }
+team: engineering
+---
+
+## Problem Statement
+
+The feature-flags project has four open design questions that change what
+every other ticket builds.
+
+## Acceptance Criteria
+
+1. Decided, with a one-line reason.
+"#,
+    );
+    let v = json(&sb.pm(&["new", "--from-file", fixture.to_str().unwrap(), "--json"]));
+    assert_eq!(v["id"], "AGT-1");
+    assert_eq!(
+        v["title"],
+        "Decide the feature-flag contract before building it"
+    );
+    assert_eq!(v["state"], "triage");
+    assert_eq!(v["priority"], "high");
+    assert_eq!(v["project"], "pm");
+    assert_eq!(v["repo"], "MicroMediaSites/bloom-cms");
+    assert_eq!(v["labels"], serde_json::json!(["x", "y"]));
+    assert_eq!(v["linked_github"], Value::Null);
+    assert_eq!(v["source"]["type"], "manual");
+    assert_eq!(v["blocked_by"], serde_json::json!([]));
+    // Unknown frontmatter keys land in ext (AC1); id/state/created/updated
+    // are known keys pm computes itself and are dropped, not preserved.
+    assert_eq!(v["ext"], serde_json::json!({"team": "engineering"}));
+    let description = v["description"].as_str().unwrap();
+    assert!(
+        description.starts_with("## Problem Statement"),
+        "{description}"
+    );
+    assert!(description.contains("Acceptance Criteria"), "{description}");
+}
+
+#[test]
+fn from_file_requires_a_title_and_rejects_missing_fences() {
+    let sb = Sandbox::initialized();
+    let no_title = sb.fixture("no-title.md", "---\nproject: pm\n---\nbody\n");
+    assert_code(
+        &sb.pm(&["new", "--from-file", no_title.to_str().unwrap()]),
+        2,
+    );
+
+    let no_fences = sb.fixture("no-fences.md", "title: T\n");
+    assert_code(
+        &sb.pm(&["new", "--from-file", no_fences.to_str().unwrap()]),
+        2,
+    );
+    assert!(sb.store().tickets(&Default::default()).unwrap().is_empty());
+}
+
+#[test]
+fn from_file_cannot_be_combined_with_batch_or_other_new_flags() {
+    let sb = Sandbox::initialized();
+    let fixture = sb.fixture("x.md", "---\ntitle: X\nproject: pm\n---\n");
+    let empty_batch = sb.fixture("empty.yaml", "tickets: []\n");
+    assert_code(
+        &sb.pm(&[
+            "new",
+            "--from-file",
+            fixture.to_str().unwrap(),
+            "--batch",
+            empty_batch.to_str().unwrap(),
+        ]),
+        2,
+    );
+    assert_code(
+        &sb.pm(&[
+            "new",
+            "--from-file",
+            fixture.to_str().unwrap(),
+            "--title",
+            "nope",
+        ]),
+        2,
+    );
+}
+
+// AC2-4: --batch creates N tickets with symbolic @ref blockers, atomically.
+
+#[test]
+fn batch_creates_tickets_with_symbolic_refs_in_one_transaction() {
+    let sb = Sandbox::initialized();
+    let fixture = sb.fixture(
+        "batch.yaml",
+        r#"
+tickets:
+  - ref: core
+    title: "Core domain types"
+    project: pm
+    priority: high
+    labels: [x]
+  - ref: schema
+    title: "SQLite schema"
+    project: pm
+    blocked-by: ["@core"]
+  - title: "CLI verbs"
+    project: pm
+    blocked-by: ["@core", "@schema"]
+    linked-github: "https://github.com/OpenThinkAi/pm/pull/1"
+    description: |
+      Wires the ops to clap.
+"#,
+    );
+    let v = json(&sb.pm(&["new", "--batch", fixture.to_str().unwrap(), "--json"]));
+    assert_eq!(v["schema"], 1);
+    assert_eq!(
+        v["refs"],
+        serde_json::json!({"@core": "AGT-1", "@schema": "AGT-2"})
+    );
+    let tickets = v["tickets"].as_array().unwrap();
+    assert_eq!(tickets.len(), 3);
+    assert_eq!(tickets[0]["id"], "AGT-1");
+    assert_eq!(tickets[0]["priority"], "high");
+    assert_eq!(tickets[0]["labels"], serde_json::json!(["x"]));
+    assert_eq!(tickets[1]["id"], "AGT-2");
+    assert_eq!(sorted_strings(&tickets[1]["blocked_by"]), ["AGT-1"]);
+    assert_eq!(tickets[2]["id"], "AGT-3");
+    assert_eq!(
+        sorted_strings(&tickets[2]["blocked_by"]),
+        ["AGT-1", "AGT-2"]
+    );
+    assert_eq!(
+        tickets[2]["linked_github"],
+        "https://github.com/OpenThinkAi/pm/pull/1"
+    );
+    assert!(
+        tickets[2]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Wires the ops")
+    );
+
+    // pm show --json reflects it too (AC5's "reflects all", extended to
+    // the batch path).
+    let shown = json(&sb.pm(&["show", "AGT-3", "--json"]));
+    assert_eq!(sorted_strings(&shown["blocked_by"]), ["AGT-1", "AGT-2"]);
+}
+
+#[test]
+fn batch_with_an_unresolvable_ref_fails_and_creates_nothing() {
+    let sb = Sandbox::initialized();
+    let fixture = sb.fixture(
+        "bad-ref.yaml",
+        r#"
+tickets:
+  - ref: core
+    title: "Core"
+    project: pm
+  - title: "Depends on a typo'd ref"
+    project: pm
+    blocked-by: ["@cor"]
+"#,
+    );
+    let out = sb.pm(&["new", "--batch", fixture.to_str().unwrap()]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("@cor"), "{}", stderr(&out));
+    assert!(
+        sb.store().tickets(&Default::default()).unwrap().is_empty(),
+        "a bad ref must create nothing"
+    );
+}
+
+#[test]
+fn batch_with_a_nonexistent_plain_blocker_id_fails_with_exit_2() {
+    let sb = Sandbox::initialized();
+    let fixture = sb.fixture(
+        "bad-id.yaml",
+        r#"
+tickets:
+  - title: "Blocked by nothing real"
+    project: pm
+    blocked-by: ["AGT-999"]
+"#,
+    );
+    let out = sb.pm(&["new", "--batch", fixture.to_str().unwrap()]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("AGT-999"), "{}", stderr(&out));
+    assert!(sb.store().tickets(&Default::default()).unwrap().is_empty());
+}
+
+#[test]
+fn batch_rejects_duplicate_refs_and_missing_projects_without_creating_anything() {
+    let sb = Sandbox::initialized();
+    let dup = sb.fixture(
+        "dup.yaml",
+        "tickets:\n  - ref: core\n    title: A\n    project: pm\n  - ref: core\n    title: B\n    project: pm\n",
+    );
+    let out = sb.pm(&["new", "--batch", dup.to_str().unwrap()]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("core"), "{}", stderr(&out));
+
+    let missing_project = sb.fixture(
+        "missing-project.yaml",
+        "tickets:\n  - title: A\n    project: pm\n  - title: B\n    project: nope\n",
+    );
+    let out = sb.pm(&["new", "--batch", missing_project.to_str().unwrap()]);
+    assert_code(&out, 3);
+    assert!(sb.store().tickets(&Default::default()).unwrap().is_empty());
+}
+
+#[test]
+fn batch_with_no_tickets_is_a_usage_error() {
+    let sb = Sandbox::initialized();
+    let empty = sb.fixture("empty.yaml", "tickets: []\n");
+    assert_code(&sb.pm(&["new", "--batch", empty.to_str().unwrap()]), 2);
+}
+
+// AC5: --description/--description-file/--blocked-by/--linked-github/--source
+
+#[test]
+fn description_file_dash_reads_stdin() {
+    let sb = Sandbox::initialized();
+    let out = sb.run_with_stdin(
+        &["new", "--title", "Stdin desc", "--description-file", "-"],
+        "Body from stdin.\n",
+    );
+    assert_ok(&out);
+    let id = stdout(&out).trim().to_string();
+    let v = json(&sb.pm(&["show", &id, "--json"]));
+    assert_eq!(v["description"], "Body from stdin.");
+}
+
+#[test]
+fn description_file_reads_a_path() {
+    let sb = Sandbox::initialized();
+    let path = sb.fixture("desc.md", "# Heading\n\nText from a file.\n");
+    let out = sb.pm(&[
+        "new",
+        "--title",
+        "From file",
+        "--description-file",
+        path.to_str().unwrap(),
+    ]);
+    assert_ok(&out);
+    let v = json(&sb.pm(&["show", "AGT-1", "--json"]));
+    assert_eq!(v["description"], "# Heading\n\nText from a file.");
+}
+
+#[test]
+fn description_and_description_file_are_mutually_exclusive() {
+    let sb = Sandbox::initialized();
+    assert_code(
+        &sb.pm(&[
+            "new",
+            "--title",
+            "T",
+            "--description",
+            "a",
+            "--description-file",
+            "-",
+        ]),
+        2,
+    );
+}
+
+#[test]
+fn single_ticket_flags_cover_blocked_by_linked_github_and_source() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "Blocker"]));
+    let out = sb.pm(&[
+        "new",
+        "--title",
+        "Blocked",
+        "--blocked-by",
+        "AGT-1",
+        "--linked-github",
+        "https://github.com/OpenThinkAi/pm/issues/9",
+        "--source",
+        "type=github,url=https://github.com/x,id=9",
+        "--description",
+        "Inline desc",
+        "--json",
+    ]);
+    let v = json(&out);
+    assert_eq!(v["id"], "AGT-2");
+    assert_eq!(sorted_strings(&v["blocked_by"]), ["AGT-1"]);
+    assert_eq!(
+        v["linked_github"],
+        "https://github.com/OpenThinkAi/pm/issues/9"
+    );
+    assert_eq!(v["source"]["type"], "github");
+    assert_eq!(v["source"]["url"], "https://github.com/x");
+    assert_eq!(v["source"]["id"], "9");
+    assert_eq!(v["description"], "Inline desc");
+
+    // pm show --json reflects it all too.
+    let shown = json(&sb.pm(&["show", "AGT-2", "--json"]));
+    assert_eq!(sorted_strings(&shown["blocked_by"]), ["AGT-1"]);
+    assert_eq!(shown["source"]["type"], "github");
+}
+
+#[test]
+fn blocked_by_names_an_unknown_ticket_as_not_found() {
+    let sb = Sandbox::initialized();
+    let out = sb.pm(&["new", "--title", "T", "--blocked-by", "AGT-99"]);
+    assert_code(&out, 3);
+    assert!(sb.store().tickets(&Default::default()).unwrap().is_empty());
+}
+
+#[test]
+fn source_flag_requires_a_type() {
+    let sb = Sandbox::initialized();
+    assert_code(
+        &sb.pm(&["new", "--title", "T", "--source", "url=https://x"]),
+        2,
+    );
 }

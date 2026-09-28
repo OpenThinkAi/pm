@@ -52,38 +52,39 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<Option<i64>> = tx
-            .query_row(
-                "SELECT number FROM ticket WHERE id = ?1",
-                params![ticket.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        match current {
-            None => return Err(StoreError::UnknownTicket { ticket }),
-            Some(Some(number)) => {
-                return Err(StoreError::AlreadyNumbered {
-                    ticket,
-                    number: number as u64,
-                });
-            }
-            Some(None) => {}
-        }
-        let next: i64 =
-            tx.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM ticket", [], |r| {
-                r.get(0)
-            })?;
-        let hlc = Clock::from_latest(latest_hlc(&tx)?).send(now_ms());
-        let op = Op::new(
-            Ulid::new(),
-            hlc,
-            actor.clone(),
-            ticket,
-            Payload::FieldSet(FieldSet::Number(next as u64)),
-        );
-        commit_in(&tx, &op, || Ok(()))?;
+        let next = allocate_number_in(&tx, ticket, actor)?;
         tx.commit()?;
-        Ok(next as u64)
+        Ok(next)
+    }
+
+    /// Commits every op in `ops`, in order, then allocates a human number
+    /// for each ticket in `to_number` (also in order) — all inside **one**
+    /// transaction (AGT-1346 AC2: `pm new --batch` is all-or-nothing across
+    /// every ticket it mints). A failure at any point — a bad relation
+    /// target, an unknown project, a duplicate op — rolls the whole batch
+    /// back; nothing partially lands.
+    ///
+    /// Returns the numbered tickets, in the same order as `to_number`.
+    pub fn commit_batch(
+        &mut self,
+        ops: &[Op],
+        to_number: &[(Ulid, ActorId)],
+    ) -> Result<Vec<Ticket>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for op in ops {
+            commit_in(&tx, op, || Ok(()))?;
+        }
+        let mut tickets = Vec::with_capacity(to_number.len());
+        for (ticket, actor) in to_number {
+            allocate_number_in(&tx, *ticket, actor)?;
+            let view =
+                load_view(&tx, *ticket)?.ok_or(StoreError::UnknownTicket { ticket: *ticket })?;
+            tickets.push(view.snapshot());
+        }
+        tx.commit()?;
+        Ok(tickets)
     }
 
     /// The greatest HLC in the log ([`Hlc::ZERO`] when empty): what a
@@ -91,6 +92,41 @@ impl Store {
     pub fn latest_hlc(&self) -> Result<Hlc> {
         latest_hlc(&self.conn)
     }
+}
+
+/// The body of [`Store::allocate_number`], shared with [`Store::commit_batch`]
+/// so both run inside whichever transaction the caller already holds.
+fn allocate_number_in(tx: &Transaction<'_>, ticket: Ulid, actor: &ActorId) -> Result<u64> {
+    let current: Option<Option<i64>> = tx
+        .query_row(
+            "SELECT number FROM ticket WHERE id = ?1",
+            params![ticket.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match current {
+        None => return Err(StoreError::UnknownTicket { ticket }),
+        Some(Some(number)) => {
+            return Err(StoreError::AlreadyNumbered {
+                ticket,
+                number: number as u64,
+            });
+        }
+        Some(None) => {}
+    }
+    let next: i64 = tx.query_row("SELECT COALESCE(MAX(number), 0) + 1 FROM ticket", [], |r| {
+        r.get(0)
+    })?;
+    let hlc = Clock::from_latest(latest_hlc(tx)?).send(now_ms());
+    let op = Op::new(
+        Ulid::new(),
+        hlc,
+        actor.clone(),
+        ticket,
+        Payload::FieldSet(FieldSet::Number(next as u64)),
+    );
+    commit_in(tx, &op, || Ok(()))?;
+    Ok(next as u64)
 }
 
 fn now_ms() -> u64 {

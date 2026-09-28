@@ -7,18 +7,23 @@
 //! redirected behaves exactly as it does at a terminal (README §Constraints:
 //! "No command may prompt when stdin is not a TTY").
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use pm_core::op::{FieldSet, LabelAdd, TicketCreate};
-use pm_core::{ActorId, Clock, Op, Payload, Priority, State, StateCategory, Ticket, Workspace};
+use pm_core::op::{BodyEdit, FieldSet, LabelAdd, RelationAdd, TicketCreate};
+use pm_core::{
+    ActorId, Body, Clock, Op, Payload, Priority, Relation, RelationKind, Source, State,
+    StateCategory, Ticket, Workspace,
+};
 use pm_store::Store;
 use serde_json::{Map, Value, json};
 use ulid::Ulid;
 
+use crate::batch::{self, BatchEntry, SourceFm};
 use crate::exit::{CliError, Result};
 use crate::workspace::{self, Config, DB_FILE, Env};
 
@@ -205,11 +210,18 @@ pub fn init(ctx: &Ctx<'_>, prefix: &str) -> Result<()> {
 // ----------------------------------------------------------------- pm new
 
 pub struct NewArgs {
-    pub title: String,
+    pub title: Option<String>,
     pub project: Option<String>,
     pub repo: Option<String>,
     pub priority: Option<Priority>,
     pub labels: Vec<String>,
+    pub description: Option<String>,
+    pub description_file: Option<String>,
+    pub blocked_by: Vec<String>,
+    pub linked_github: Option<String>,
+    pub source: Option<String>,
+    pub from_file: Option<PathBuf>,
+    pub batch: Option<PathBuf>,
 }
 
 fn non_empty(flag: &str, value: &str) -> Result<String> {
@@ -230,8 +242,218 @@ fn require_project(store: &Store, project: &str) -> Result<()> {
     Ok(())
 }
 
+/// The workspace's initial (unstarted) state — where every new ticket
+/// starts.
+fn initial_state(ws: &Workspace) -> Result<String> {
+    Ok(ws
+        .states
+        .iter()
+        .filter(|s| s.category == StateCategory::Unstarted)
+        .min_by_key(|s| s.position)
+        .ok_or_else(|| CliError::error("this workspace has no unstarted state to file into"))?
+        .name
+        .clone())
+}
+
+/// `--description` / `--description-file <path|->` (AC5): at most one,
+/// `-` reads stdin.
+fn read_description(
+    description: Option<String>,
+    description_file: Option<String>,
+) -> Result<Option<String>> {
+    match (description, description_file) {
+        (Some(_), Some(_)) => Err(CliError::usage(
+            "--description and --description-file are mutually exclusive",
+        )),
+        (Some(text), None) => Ok(Some(text)),
+        (None, Some(path)) if path == "-" => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading --description-file - from stdin")?;
+            Ok(Some(buf))
+        }
+        (None, Some(path)) => {
+            Ok(Some(fs::read_to_string(&path).with_context(|| {
+                format!("reading --description-file {path}")
+            })?))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// `--source type=…,url=…,id=…[,fetched-at=…]` (AC5).
+fn parse_source_flag(spec: &str) -> Result<Source> {
+    let mut kind = String::new();
+    let mut url = String::new();
+    let mut id = String::new();
+    let mut fetched_at = String::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = part.split_once('=') else {
+            return Err(CliError::usage(format!(
+                "--source: '{part}' is not key=value (expected type=…,url=…,id=…)"
+            )));
+        };
+        match key.trim() {
+            "type" => kind = value.trim().to_string(),
+            "url" => url = value.trim().to_string(),
+            "id" => id = value.trim().to_string(),
+            "fetched-at" | "fetched_at" => fetched_at = value.trim().to_string(),
+            other => {
+                return Err(CliError::usage(format!(
+                    "--source: unknown key '{other}': expected type, url, id or fetched-at"
+                )));
+            }
+        }
+    }
+    if kind.is_empty() {
+        return Err(CliError::usage(
+            "--source requires type=… (e.g. manual, github, linear, jira, notion)",
+        ));
+    }
+    Ok(Source {
+        kind,
+        url,
+        id,
+        fetched_at,
+    })
+}
+
+/// Builds the op set for one new ticket: create, labels, blocked-by
+/// relations, linked-github/pr, and a body.edit for the description —
+/// every op AC1/AC2/AC5 need, shared by the single-ticket, `--from-file`
+/// and `--batch` paths.
+#[allow(clippy::too_many_arguments)]
+fn build_create_ops(
+    stamper: &mut Stamper,
+    id: Ulid,
+    state: &str,
+    title: String,
+    priority: Priority,
+    project: Option<String>,
+    repo: Option<String>,
+    source: Option<Source>,
+    ext: BTreeMap<String, Value>,
+    labels: BTreeSet<String>,
+    blocked_by: Vec<Ulid>,
+    description: Option<String>,
+    linked_github: Option<String>,
+    linked_pr: Option<String>,
+) -> Result<Vec<Op>> {
+    let mut ops = vec![stamper.op(
+        id,
+        Payload::TicketCreate(TicketCreate {
+            title,
+            state: state.to_string(),
+            priority,
+            project,
+            repo,
+            source,
+            ext,
+        }),
+    )];
+    for label in labels {
+        ops.push(stamper.op(id, Payload::LabelAdd(LabelAdd { label })));
+    }
+    // `blocked-by` reads "this ticket is blocked by <blocker>": the
+    // relation's `from` is the blocker, `to` is the ticket being created
+    // (RelationKind::Blocks: "from blocks to").
+    for blocker in blocked_by {
+        ops.push(stamper.op(
+            id,
+            Payload::RelationAdd(RelationAdd {
+                relation: Relation {
+                    kind: RelationKind::Blocks,
+                    from: blocker,
+                    to: id,
+                },
+            }),
+        ));
+    }
+    if let Some(github) = linked_github {
+        ops.push(stamper.op(id, Payload::FieldSet(FieldSet::LinkedGithub(Some(github)))));
+    }
+    if let Some(pr) = linked_pr {
+        ops.push(stamper.op(id, Payload::FieldSet(FieldSet::LinkedPr(Some(pr)))));
+    }
+    if let Some(text) = description
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+    {
+        let mut body = Body::new();
+        let update = body
+            .diff_from_text(&text)
+            .map_err(|e| CliError::error(format!("building description: {e}")))?;
+        ops.push(stamper.op(
+            id,
+            Payload::BodyEdit(BodyEdit {
+                update: update.into_bytes(),
+            }),
+        ));
+    }
+    Ok(ops)
+}
+
+fn print_created_ticket(
+    ctx: &Ctx<'_>,
+    store: &Store,
+    ws: &Workspace,
+    ticket: &Ticket,
+) -> Result<()> {
+    if ctx.json {
+        print_json(&ticket_json(ws, store, ticket)?);
+    } else {
+        println!("{}", display_id(ws, ticket));
+    }
+    Ok(())
+}
+
+/// Dispatches `pm new` across its three mutually exclusive modes: plain
+/// flags, `--from-file <path>` (AC1) and `--batch <path>` (AC2-4).
 pub fn new(ctx: &Ctx<'_>, args: NewArgs) -> Result<()> {
-    let title = non_empty("--title", &args.title)?;
+    let single_flags_set = args.title.is_some()
+        || args.project.is_some()
+        || args.repo.is_some()
+        || args.priority.is_some()
+        || !args.labels.is_empty()
+        || args.description.is_some()
+        || args.description_file.is_some()
+        || !args.blocked_by.is_empty()
+        || args.linked_github.is_some()
+        || args.source.is_some();
+    const CONFLICT: &str = "cannot be combined with --title/--project/--repo/--priority/--label/\
+--description/--description-file/--blocked-by/--linked-github/--source";
+    match (&args.from_file, &args.batch) {
+        (Some(_), Some(_)) => Err(CliError::usage(
+            "--from-file and --batch are mutually exclusive",
+        )),
+        (Some(path), None) => {
+            if single_flags_set {
+                return Err(CliError::usage(format!("--from-file {CONFLICT}")));
+            }
+            new_from_file(ctx, path)
+        }
+        (None, Some(path)) => {
+            if single_flags_set {
+                return Err(CliError::usage(format!("--batch {CONFLICT}")));
+            }
+            new_batch(ctx, path)
+        }
+        (None, None) => new_single(ctx, args),
+    }
+}
+
+fn new_single(ctx: &Ctx<'_>, args: NewArgs) -> Result<()> {
+    let title = non_empty(
+        "--title",
+        args.title
+            .as_deref()
+            .ok_or_else(|| CliError::usage("--title is required (or use --from-file / --batch)"))?,
+    )?;
     let project = args
         .project
         .as_deref()
@@ -247,51 +469,315 @@ pub fn new(ctx: &Ctx<'_>, args: NewArgs) -> Result<()> {
         .iter()
         .map(|l| non_empty("--label", l))
         .collect::<Result<_>>()?;
+    let description = read_description(args.description, args.description_file)?;
+    let source = args.source.as_deref().map(parse_source_flag).transpose()?;
+    let linked_github = args
+        .linked_github
+        .as_deref()
+        .map(|g| non_empty("--linked-github", g))
+        .transpose()?;
     let actor = ctx.actor()?;
 
     let (mut store, ws) = ctx.open()?;
-    let state = ws
-        .states
-        .iter()
-        .filter(|s| s.category == StateCategory::Unstarted)
-        .min_by_key(|s| s.position)
-        .ok_or_else(|| CliError::error("this workspace has no unstarted state to file into"))?
-        .name
-        .clone();
+    let state = initial_state(&ws)?;
     // Checked up front so a missing project fails before any op lands
     // (the store would reject the create too, as R2).
     if let Some(project) = &project {
         require_project(&store, project)?;
     }
+    let blocked_by: Vec<Ulid> = args
+        .blocked_by
+        .iter()
+        .map(|r| find(&store, &ws, r).map(|t| t.id))
+        .collect::<Result<_>>()?;
 
     let id = Ulid::new();
     let mut stamper = Stamper::new(&store, actor.clone())?;
-    store.commit(&stamper.op(
+    let ops = build_create_ops(
+        &mut stamper,
         id,
-        Payload::TicketCreate(TicketCreate {
-            title,
-            state,
-            priority: args.priority.unwrap_or_default(),
-            project,
-            repo,
-            source: None,
-            ext: Default::default(),
-        }),
-    ))?;
-    for label in labels {
-        store.commit(&stamper.op(id, Payload::LabelAdd(LabelAdd { label })))?;
-    }
+        &state,
+        title,
+        args.priority.unwrap_or_default(),
+        project,
+        repo,
+        source,
+        Default::default(),
+        labels,
+        blocked_by,
+        description,
+        linked_github,
+        None,
+    )?;
     // Phase 1: this database is the numbering authority (README §Conflict
     // semantics).
-    store.allocate_number(id, &actor)?;
-
-    let ticket = store
-        .ticket(id)?
+    let tickets = store.commit_batch(&ops, &[(id, actor)])?;
+    let ticket = tickets
+        .into_iter()
+        .next()
         .ok_or_else(|| CliError::error(format!("ticket {id} vanished after create")))?;
+    print_created_ticket(ctx, &store, &ws, &ticket)
+}
+
+/// `pm new --from-file <path>` (AC1): a vault-format ticket file
+/// (frontmatter + sections) becomes one create op set. Unknown frontmatter
+/// keys land in `ext`; the body (everything after the frontmatter) becomes
+/// the description verbatim.
+fn new_from_file(ctx: &Ctx<'_>, path: &Path) -> Result<()> {
+    let (fm, body) = batch::load_frontmatter(path)?;
+    let title = non_empty("title (frontmatter)", fm.title.as_deref().unwrap_or(""))?;
+    let project = fm
+        .project
+        .as_deref()
+        .map(|p| non_empty("project (frontmatter)", p))
+        .transpose()?;
+    let repo = fm
+        .repo
+        .as_deref()
+        .map(|r| non_empty("repo (frontmatter)", r))
+        .transpose()?;
+    let labels: BTreeSet<String> = fm
+        .labels
+        .iter()
+        .map(|l| non_empty("labels (frontmatter)", l))
+        .collect::<Result<_>>()?;
+    let linked_github = fm.linked_github.filter(|s| !s.trim().is_empty());
+    let linked_pr = fm.linked_pr.filter(|s| !s.trim().is_empty());
+    let source = fm.source.map(SourceFm::into_source);
+    let ext = batch::ext_to_json(fm.ext)?;
+    let actor = ctx.actor()?;
+
+    let (mut store, ws) = ctx.open()?;
+    let state = initial_state(&ws)?;
+    if let Some(project) = &project {
+        require_project(&store, project)?;
+    }
+    let blocked_by: Vec<Ulid> = fm
+        .blocked_by
+        .iter()
+        .map(|r| find(&store, &ws, r).map(|t| t.id))
+        .collect::<Result<_>>()?;
+
+    let id = Ulid::new();
+    let mut stamper = Stamper::new(&store, actor.clone())?;
+    let description = (!body.is_empty()).then_some(body);
+    let ops = build_create_ops(
+        &mut stamper,
+        id,
+        &state,
+        title,
+        fm.priority.unwrap_or_default(),
+        project,
+        repo,
+        source,
+        ext,
+        labels,
+        blocked_by,
+        description,
+        linked_github,
+        linked_pr,
+    )?;
+    let tickets = store.commit_batch(&ops, &[(id, actor)])?;
+    let ticket = tickets
+        .into_iter()
+        .next()
+        .ok_or_else(|| CliError::error(format!("ticket {id} vanished after create")))?;
+    print_created_ticket(ctx, &store, &ws, &ticket)
+}
+
+/// One batch entry after every field has been validated and every
+/// `blocked-by` reference resolved — the point past which nothing can
+/// fail before the transaction opens (AC2: a batch is all-or-nothing).
+struct ValidatedEntry {
+    id: Ulid,
+    title: String,
+    project: Option<String>,
+    repo: Option<String>,
+    priority: Priority,
+    labels: BTreeSet<String>,
+    blocked_by: Vec<Ulid>,
+    description: Option<String>,
+    linked_github: Option<String>,
+    linked_pr: Option<String>,
+    source: Option<Source>,
+    ext: BTreeMap<String, Value>,
+}
+
+fn batch_entry_label(index: usize, entry: &BatchEntry) -> String {
+    match &entry.ticket_ref {
+        Some(r) => format!("ref '@{r}'"),
+        None => format!("entry {}", index + 1),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_batch_entry(
+    store: &Store,
+    ws: &Workspace,
+    refs: &BTreeMap<String, Ulid>,
+    id: Ulid,
+    label: &str,
+    entry: &BatchEntry,
+) -> Result<ValidatedEntry> {
+    let title = non_empty(&format!("{label}: title"), &entry.title)?;
+    let project = entry
+        .project
+        .as_deref()
+        .map(|p| non_empty(&format!("{label}: project"), p))
+        .transpose()?;
+    if let Some(project) = &project {
+        require_project(store, project)?;
+    }
+    let repo = entry
+        .repo
+        .as_deref()
+        .map(|r| non_empty(&format!("{label}: repo"), r))
+        .transpose()?;
+    let labels: BTreeSet<String> = entry
+        .labels
+        .iter()
+        .map(|l| non_empty(&format!("{label}: label"), l))
+        .collect::<Result<_>>()?;
+    let blocked_by: Vec<Ulid> = entry
+        .blocked_by
+        .iter()
+        .map(|r| batch::resolve_blocker(store, ws, refs, r))
+        .collect::<Result<_>>()?;
+    let linked_github = entry.linked_github.clone().filter(|s| !s.trim().is_empty());
+    let linked_pr = entry.linked_pr.clone().filter(|s| !s.trim().is_empty());
+    let source = entry.source.clone().map(SourceFm::into_source);
+    let ext = batch::ext_to_json(entry.ext.clone())?;
+    Ok(ValidatedEntry {
+        id,
+        title,
+        project,
+        repo,
+        priority: entry.priority.unwrap_or_default(),
+        labels,
+        blocked_by,
+        description: entry.description.clone(),
+        linked_github,
+        linked_pr,
+        source,
+        ext,
+    })
+}
+
+/// `pm new --batch <path>` (AC2-4): mints every id up front so
+/// `blocked-by: [@ref]` can point anywhere in the file, validates every
+/// entry (so a bad `@ref` fails before any op is built), then commits the
+/// whole file in one transaction.
+fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<()> {
+    let file = batch::load_batch_file(path)?;
+    if file.tickets.is_empty() {
+        return Err(CliError::usage(format!(
+            "batch file {} has no tickets",
+            path.display()
+        )));
+    }
+
+    let ids: Vec<Ulid> = file.tickets.iter().map(|_| Ulid::new()).collect();
+    let mut refs: BTreeMap<String, Ulid> = BTreeMap::new();
+    for (entry, id) in file.tickets.iter().zip(&ids) {
+        if let Some(name) = &entry.ticket_ref {
+            let name = name.trim_start_matches('@').trim().to_string();
+            if name.is_empty() {
+                return Err(CliError::usage("a batch entry's `ref` must not be empty"));
+            }
+            if refs.insert(name.clone(), *id).is_some() {
+                return Err(CliError::usage(format!(
+                    "duplicate ref '@{name}' in {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    let actor = ctx.actor()?;
+    let (mut store, ws) = ctx.open()?;
+    let state = initial_state(&ws)?;
+
+    // Every entry is validated — including every `blocked-by` ref — before
+    // any op is built, so a single bad entry never leaves a partial batch
+    // (AC4: exit 2 naming the ref, nothing created).
+    let validated: Vec<ValidatedEntry> = file
+        .tickets
+        .iter()
+        .zip(&ids)
+        .enumerate()
+        .map(|(i, (entry, id))| {
+            let label = batch_entry_label(i, entry);
+            validate_batch_entry(&store, &ws, &refs, *id, &label, entry)
+        })
+        .collect::<Result<_>>()?;
+
+    let mut stamper = Stamper::new(&store, actor.clone())?;
+    let mut ops = Vec::new();
+    let mut to_number = Vec::with_capacity(validated.len());
+    for v in validated {
+        to_number.push((v.id, actor.clone()));
+        ops.extend(build_create_ops(
+            &mut stamper,
+            v.id,
+            &state,
+            v.title,
+            v.priority,
+            v.project,
+            v.repo,
+            v.source,
+            v.ext,
+            v.labels,
+            v.blocked_by,
+            v.description,
+            v.linked_github,
+            v.linked_pr,
+        )?);
+    }
+
+    // One transaction across every ticket's ops and number allocation
+    // (AC2): a failure here creates nothing.
+    let tickets = store.commit_batch(&ops, &to_number)?;
+    print_batch_result(ctx, &store, &ws, &refs, &tickets)
+}
+
+fn print_batch_result(
+    ctx: &Ctx<'_>,
+    store: &Store,
+    ws: &Workspace,
+    refs: &BTreeMap<String, Ulid>,
+    tickets: &[Ticket],
+) -> Result<()> {
+    let shown = |id: Ulid| -> String {
+        tickets
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| display_id(ws, t))
+            .unwrap_or_else(|| id.to_string())
+    };
     if ctx.json {
-        print_json(&ticket_json(&ws, &ticket));
+        let mut refs_json = Map::new();
+        for (name, id) in refs {
+            refs_json.insert(format!("@{name}"), json!(shown(*id)));
+        }
+        let mut out = Vec::with_capacity(tickets.len());
+        for t in tickets {
+            out.push(ticket_json(ws, store, t)?);
+        }
+        print_json(&json!({
+            "schema": SCHEMA,
+            "refs": Value::Object(refs_json),
+            "tickets": out,
+        }));
     } else {
-        println!("{}", display_id(&ws, &ticket));
+        for t in tickets {
+            println!("{}  {}", display_id(ws, t), t.title);
+        }
+        if !refs.is_empty() {
+            println!("refs:");
+            for (name, id) in refs {
+                println!("  @{name} -> {}", shown(*id));
+            }
+        }
     }
     Ok(())
 }
@@ -307,7 +793,7 @@ fn display_id(ws: &Workspace, t: &Ticket) -> String {
 }
 
 /// A ticket named on the command line: `<PREFIX>-<n>` or its ULID.
-fn find(store: &Store, ws: &Workspace, reference: &str) -> Result<Ticket> {
+pub(crate) fn find(store: &Store, ws: &Workspace, reference: &str) -> Result<Ticket> {
     let r = reference.trim();
     if let Some((prefix, digits)) = r.rsplit_once('-')
         && !digits.is_empty()
@@ -338,8 +824,11 @@ fn find(store: &Store, ws: &Workspace, reference: &str) -> Result<Ticket> {
 }
 
 /// The `--json` shape of a ticket: every `pm_core::Ticket` field, with
-/// `id` the human id (`AGT-12`) and the ULID under `ulid`, plus `schema`.
-fn ticket_json(ws: &Workspace, t: &Ticket) -> Value {
+/// `id` the human id (`AGT-12`) and the ULID under `ulid`, plus `schema`
+/// and `blocked_by` (the tickets that block this one, by display id —
+/// AC5: "`pm show --json` reflects all" the flags `pm new` accepts,
+/// including `--blocked-by`).
+fn ticket_json(ws: &Workspace, store: &Store, t: &Ticket) -> Result<Value> {
     let Value::Object(fields) = serde_json::to_value(t).expect("a ticket serializes") else {
         unreachable!("a ticket serializes to an object");
     };
@@ -353,7 +842,19 @@ fn ticket_json(ws: &Workspace, t: &Ticket) -> Value {
         }
     }
     out.insert("id".into(), json!(display_id(ws, t)));
-    Value::Object(out)
+    let blocked_by = store
+        .relations(t.id)?
+        .into_iter()
+        .filter(|r| r.kind == RelationKind::Blocks && r.to == t.id)
+        .map(|r| {
+            Ok(match store.ticket(r.from)? {
+                Some(other) => display_id(ws, &other),
+                None => r.from.to_string(),
+            })
+        })
+        .collect::<Result<Vec<String>>>()?;
+    out.insert("blocked_by".into(), json!(blocked_by));
+    Ok(Value::Object(out))
 }
 
 fn print_human(ws: &Workspace, t: &Ticket) {
@@ -451,8 +952,8 @@ pub fn show(ctx: &Ctx<'_>, reference: &str, field: Option<&str>) -> Result<()> {
     let (store, ws) = ctx.open()?;
     let ticket = find(&store, &ws, reference)?;
     match field {
-        Some(field) => print_field(ctx, &ticket_json(&ws, &ticket), field)?,
-        None if ctx.json => print_json(&ticket_json(&ws, &ticket)),
+        Some(field) => print_field(ctx, &ticket_json(&ws, &store, &ticket)?, field)?,
+        None if ctx.json => print_json(&ticket_json(&ws, &store, &ticket)?),
         None => print_human(&ws, &ticket),
     }
     Ok(())
@@ -507,7 +1008,7 @@ pub fn set(ctx: &Ctx<'_>, reference: &str, assignments: &[String]) -> Result<()>
         .ticket(ticket.id)?
         .ok_or_else(|| CliError::error(format!("ticket {} vanished after set", ticket.id)))?;
     if ctx.json {
-        print_json(&ticket_json(&ws, &ticket));
+        print_json(&ticket_json(&ws, &store, &ticket)?);
     } else {
         println!("{}", display_id(&ws, &ticket));
     }
