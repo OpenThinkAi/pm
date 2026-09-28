@@ -12,6 +12,7 @@
 //! - `migrations/*.sql` — versioned schema, applied by [`Store::open`]
 //! - `commit` — [`Store::commit`], [`Store::allocate_number`], materialization
 //! - `query` — by id / number / filtered list, comments, relations, ops
+//! - `ready` — [`Store::ready`], the ready frontier (`pm claim --ready`)
 //! - `config` — workspace + states, projects + docs
 //! - `doctor` — [`Store::doctor`] (verify) and [`Store::rebuild`] (replay the log)
 //! - `backup` — [`Store::ops_since`] and per-target progress (AGT-1350)
@@ -24,6 +25,7 @@ mod config;
 mod doctor;
 mod error;
 mod query;
+mod ready;
 
 use std::path::Path;
 use std::time::Duration;
@@ -36,6 +38,7 @@ pub use doctor::{
 };
 pub use error::{Result, StoreError};
 pub use query::TicketFilter;
+pub use ready::ReadyQuery;
 
 /// Embedded migrations, in order. Each runs once, inside its own
 /// transaction, and is recorded in `schema_version`.

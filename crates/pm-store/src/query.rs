@@ -144,13 +144,16 @@ impl Store {
             .map(|ops| ops.into_iter().map(|(_, op)| op).collect())
     }
 
-    fn load_tickets(&self, where_sql: &str, args: Vec<Value>) -> Result<Vec<Ticket>> {
+    /// Tickets matching `tail_sql` — everything after `FROM ticket t`, so
+    /// a `WHERE …`, optionally preceded by JOINs against the `t` alias —
+    /// in the order [`Store::tickets`] documents.
+    pub(crate) fn load_tickets(&self, tail_sql: &str, args: Vec<Value>) -> Result<Vec<Ticket>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT id, number, title, state, priority, project, repo, assignee, description,
                     created_wall_ms, created_counter, updated_wall_ms, updated_counter,
                     archived_wall_ms, archived_counter, deleted, linked_github, linked_pr,
                     linear, source, ext
-             FROM ticket t {where_sql}
+             FROM ticket t {tail_sql}
              ORDER BY t.number IS NULL, t.number, t.created_wall_ms, t.created_counter, t.id"
         ))?;
         let rows = stmt.query_map(params_from_iter(args), TicketRow::read)?;

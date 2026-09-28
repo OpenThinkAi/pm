@@ -48,6 +48,16 @@ pub enum StoreError {
 }
 
 impl StoreError {
+    /// SQLite could not get the lock in time (`SQLITE_BUSY` / `SQLITE_LOCKED`).
+    /// Nothing was written; the same call can simply be retried.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == ErrorCode::DatabaseBusy || e.code == ErrorCode::DatabaseLocked
+        )
+    }
+
     pub(crate) fn corrupt(what: &'static str) -> impl FnOnce(&dyn std::fmt::Display) -> Self {
         move |detail| StoreError::Corrupt {
             what,

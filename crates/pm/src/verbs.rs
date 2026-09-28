@@ -172,6 +172,7 @@ pub fn init(ctx: &Ctx<'_>, prefix: &str) -> Result<()> {
             workspace: Some(dir.clone()),
             backup: None,
             edit: None,
+            hub: None,
         }
         .write(&config_path)?;
     }
@@ -235,7 +236,7 @@ pub(crate) fn non_empty(flag: &str, value: &str) -> Result<String> {
     }
 }
 
-fn require_project(store: &Store, project: &str) -> Result<()> {
+pub(crate) fn require_project(store: &Store, project: &str) -> Result<()> {
     if store.project(project)?.is_none() {
         return Err(CliError::not_found(format!(
             "project '{project}' does not exist; create it before filing tickets against it"
