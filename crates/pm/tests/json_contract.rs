@@ -750,6 +750,34 @@ fn every_verbs_json_output_matches_its_fixture() {
         0,
         &mut failures,
     );
+    // ---- pm import vault --report / pm export md (AGT-1348) ----
+    let parity = sb.path("parity.md");
+    cap(
+        "import_vault_report",
+        &[
+            "import",
+            "vault",
+            vault.to_str().unwrap(),
+            "--report",
+            parity.to_str().unwrap(),
+            "--json",
+        ],
+        0,
+        &mut failures,
+    );
+    let export_dir = sb.path("export");
+    cap(
+        "export_md",
+        &[
+            "export",
+            "md",
+            export_dir.to_str().unwrap(),
+            "--legacy-markers",
+            "--json",
+        ],
+        0,
+        &mut failures,
+    );
 
     assert!(
         failures.is_empty(),

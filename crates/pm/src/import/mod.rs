@@ -14,11 +14,15 @@
 //!   first write. Re-running on an unchanged vault commits nothing.
 //! - [`report`] prints what happened, including every migrated marker
 //!   and every non-template value (AC3, AC6).
+//! - [`parity`] (`--report <file>`, AGT-1348) renders every imported
+//!   ticket back the way `pm export md --legacy-markers` does and diffs
+//!   it against its source file: the round-trip evidence.
 //!
 //! The vault is only ever read (and `git show`n); pm never writes to it.
 //! Project design docs stay owned by the vault until P4 (README A3): what
 //! lands here is a snapshot, refreshed by re-importing.
 
+mod parity;
 mod plan;
 mod prose;
 mod report;
@@ -27,6 +31,7 @@ mod vault;
 use std::path::Path;
 use std::time::Instant;
 
+use anyhow::Context;
 use pm_core::op::BodyEdit;
 use pm_core::{ActorId, Body, Clock, Payload, ProjectStatus};
 use pm_store::Store;
@@ -44,8 +49,14 @@ use crate::verbs::Ctx;
 /// already-imported tickets diff to nothing.
 const CHUNK: usize = 500;
 
-/// `pm import vault <path> [--dry-run] [--recover PATH=REV]…`.
-pub fn vault(ctx: &Ctx<'_>, path: &Path, dry_run: bool, recover: &[String]) -> Result<()> {
+/// `pm import vault <path> [--dry-run] [--recover PATH=REV]… [--report FILE]`.
+pub fn vault(
+    ctx: &Ctx<'_>,
+    path: &Path,
+    dry_run: bool,
+    recover: &[String],
+    report_path: Option<&Path>,
+) -> Result<()> {
     let started = Instant::now();
     let recover: Vec<(String, String)> = recover
         .iter()
@@ -182,6 +193,7 @@ pub fn vault(ctx: &Ctx<'_>, path: &Path, dry_run: bool, recover: &[String]) -> R
                     update: update.into_bytes(),
                 }),
                 phase: Phase::Ticket,
+                dated: false,
             });
         }
     }
@@ -199,6 +211,7 @@ pub fn vault(ctx: &Ctx<'_>, path: &Path, dry_run: bool, recover: &[String]) -> R
 
     if dry_run {
         report.number_floor = store.number_floor()?.max(plan.max_number);
+        write_parity(&store, &ws, &snapshot, &mut report, report_path)?;
         report.elapsed_ms = started.elapsed().as_millis();
         report.print(ctx.json);
         return Ok(());
@@ -211,6 +224,13 @@ pub fn vault(ctx: &Ctx<'_>, path: &Path, dry_run: bool, recover: &[String]) -> R
         .filter(|(op, _)| store.is_known_doc_id(op.entity).unwrap_or(false))
         .map(|(op, _)| op.entity)
         .collect();
+    // Every `ticket.create` goes first: a comment keeps its entry's date
+    // even when that is before the ticket's `created` (`plan` module
+    // docs), so in stamp order it can precede the create the store needs
+    // to have seen. The view folds ops in any order (LWW by stamp;
+    // `created` is the create's own stamp), so committing the create
+    // ahead of an older-stamped comment reads exactly as the file does.
+    let mut creates = Vec::new();
     let mut ticket_ops = Vec::with_capacity(stamped.len());
     let mut relation_ops = Vec::new();
     for (op, phase) in stamped {
@@ -218,10 +238,13 @@ pub fn vault(ctx: &Ctx<'_>, path: &Path, dry_run: bool, recover: &[String]) -> R
             store.commit_doc_edit(op.entity, &op)?;
         } else if phase == Phase::Relation {
             relation_ops.push(op);
+        } else if matches!(op.payload, Payload::TicketCreate(_)) {
+            creates.push(op);
         } else {
             ticket_ops.push(op);
         }
     }
+    commit_chunks(&mut store, &creates)?;
     commit_chunks(&mut store, &ticket_ops)?;
     commit_chunks(&mut store, &relation_ops)?;
 
@@ -237,8 +260,37 @@ pub fn vault(ctx: &Ctx<'_>, path: &Path, dry_run: bool, recover: &[String]) -> R
         }
     }
 
+    write_parity(&store, &ws, &snapshot, &mut report, report_path)?;
     report.elapsed_ms = started.elapsed().as_millis();
     report.print(ctx.json);
+    Ok(())
+}
+
+/// `--report`: the parity comparison against what is in the store now —
+/// after this run's commits, or, with `--dry-run`, whatever an earlier
+/// run left there (a file with no ticket in pm is reported as missing).
+fn write_parity(
+    store: &Store,
+    ws: &pm_core::Workspace,
+    snapshot: &vault::Snapshot,
+    report: &mut Report,
+    report_path: Option<&Path>,
+) -> Result<()> {
+    let Some(path) = report_path else {
+        return Ok(());
+    };
+    let parity = parity::run(
+        store,
+        ws,
+        snapshot,
+        &report.anomalies,
+        &report.changes,
+        &report.non_template,
+        path,
+    )?;
+    std::fs::write(path, &parity.markdown)
+        .with_context(|| format!("writing {}", path.display()))?;
+    report.parity = Some(parity.summary);
     Ok(())
 }
 

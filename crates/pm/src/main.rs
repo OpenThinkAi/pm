@@ -11,6 +11,7 @@ mod claim;
 mod doctor;
 mod edit;
 mod exit;
+mod export;
 mod import;
 mod markers;
 mod mutate;
@@ -304,6 +305,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ImportCmd,
     },
+    /// Write every ticket and project out as files: `md` for vault-format markdown
+    Export {
+        #[command(subcommand)]
+        cmd: ExportCmd,
+    },
     /// Project verbs: new, show, list, edit, doc, delete
     Project {
         #[command(subcommand)]
@@ -359,6 +365,24 @@ enum ImportCmd {
         /// (relative to the vault); repeatable. AGT-806's 82a9982 is built in
         #[arg(long = "recover", value_name = "PATH=REV")]
         recover: Vec<String>,
+        /// Write a markdown parity report here: every imported ticket rendered back as
+        /// `pm export md --legacy-markers` would and diffed against its source file
+        #[arg(long = "report", value_name = "FILE")]
+        report: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ExportCmd {
+    /// Vault-format markdown: tickets/<state>/ and archive/<YYYY-MM>/ ticket files, projects/<id>/
+    /// READMEs and documents, frontmatter in the template's key order
+    Md {
+        /// The directory to write into (created if missing; existing files are overwritten)
+        dir: PathBuf,
+        /// Write waivers, holds and parked as the vault's prose lines (`waived: …`,
+        /// `⚠ NEEDS-HUMAN: …`, `parked: …`) in the body instead of frontmatter keys
+        #[arg(long = "legacy-markers")]
+        legacy_markers: bool,
     },
 }
 
@@ -527,8 +551,15 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
                     path,
                     dry_run,
                     recover,
+                    report,
                 },
-        } => import::vault(ctx, &path, dry_run, &recover),
+        } => import::vault(ctx, &path, dry_run, &recover, report.as_deref()),
+        Cmd::Export {
+            cmd: ExportCmd::Md {
+                dir,
+                legacy_markers,
+            },
+        } => export::md(ctx, &dir, legacy_markers),
         Cmd::Project { cmd } => project::run(ctx, cmd),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {

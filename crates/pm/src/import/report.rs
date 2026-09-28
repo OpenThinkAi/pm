@@ -41,6 +41,10 @@ pub struct Report {
     pub ext_keys: BTreeMap<String, usize>,
     pub max_number: u64,
     pub number_floor: u64,
+    /// `--report`: the parity comparison's summary (AGT-1348); absent
+    /// without the flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parity: Option<super::parity::Summary>,
     pub elapsed_ms: u128,
 }
 
@@ -111,6 +115,16 @@ impl Report {
             "numbers:    max {}-{}, allocator floor {}",
             self.prefix, self.max_number, self.number_floor
         );
+        if let Some(p) = &self.parity {
+            println!(
+                "parity:     {} compared, {} missing, {} unexplained diff(s), {} explained class(es) → {}",
+                p.compared,
+                p.missing,
+                p.unexplained,
+                p.explained.len(),
+                p.report
+            );
+        }
         println!("time:       {} ms", self.elapsed_ms);
 
         section("non-template values", &flatten(&self.non_template));

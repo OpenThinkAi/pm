@@ -125,6 +125,8 @@ impl Findings {
 /// Everything read from the vault.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
+    /// The vault's canonical root.
+    pub root: PathBuf,
     pub tickets: Vec<VaultTicket>,
     pub projects: Vec<VaultProject>,
     pub findings: Findings,
@@ -147,7 +149,10 @@ pub fn read(root: &Path, ws: &Workspace, recover: &[(String, String)]) -> Result
         .copied()
         .chain(recover.iter().map(|(p, r)| (p.as_str(), r.as_str())))
         .collect();
-    let mut snapshot = Snapshot::default();
+    let mut snapshot = Snapshot {
+        root: root.clone(),
+        ..Snapshot::default()
+    };
     for path in ticket_files(&root)? {
         let rel = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
         let ticket = read_ticket(&root, &rel, ws, &recover, &mut snapshot.findings)?;
@@ -295,8 +300,22 @@ fn read_ticket(
         ));
         (recovered, Some(text))
     };
+    parse_ticket(&text, appended.as_deref(), rel, ws, findings)
+}
 
-    let (fm_text, body) = batch::split_frontmatter(&text)
+/// Parses one ticket file's text (`pub(super)`: the parity report parses
+/// `pm export md`'s output with exactly this). `appended` is the text of
+/// a clobbered working-tree file whose comment entries are added to the
+/// recovered `text`.
+pub(super) fn parse_ticket(
+    text: &str,
+    appended: Option<&str>,
+    rel: &Path,
+    ws: &Workspace,
+    findings: &mut Findings,
+) -> Result<VaultTicket> {
+    let shown = rel.display().to_string();
+    let (fm_text, body) = batch::split_frontmatter(text)
         .map_err(|e| CliError::usage(format!("{shown}:1: {:#}", e.error)))?;
     let normalized = quote_bare_scalars(fm_text, &shown, findings);
     let fm: FileFrontmatter = serde_yaml_ng::from_str(&normalized).map_err(|e| {
@@ -389,13 +408,36 @@ fn read_ticket(
     let mut markers = Markers::default();
     let mut migrated = Vec::new();
     // A `waived:` frontmatter key (AGT-1093) is the same marker in a
-    // different place.
-    if let Some(serde_yaml_ng::Value::String(w)) = ext_yaml.remove("waived") {
-        migrated.push(Migrated {
-            kind: prose::MarkerKind::Waiver,
-            text: format!("waived: {w}"),
-        });
-        markers.waivers.push(prose::parse_waiver(&w));
+    // different place; `hold:` and `parked:` keys are how `pm export md`
+    // writes the structured markers back without `--legacy-markers`.
+    // Each is read exactly like its prose form.
+    for (key, kind) in [
+        ("waived", prose::MarkerKind::Waiver),
+        ("hold", prose::MarkerKind::Hold),
+        ("parked", prose::MarkerKind::Parked),
+    ] {
+        let values: Vec<String> = match ext_yaml.remove(key) {
+            Some(serde_yaml_ng::Value::String(s)) => vec![s],
+            Some(serde_yaml_ng::Value::Sequence(items)) => items
+                .into_iter()
+                .filter_map(|v| match v {
+                    serde_yaml_ng::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        for value in values.iter().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            migrated.push(Migrated {
+                kind,
+                text: format!("{key}: {value}"),
+            });
+            match kind {
+                prose::MarkerKind::Waiver => markers.waivers.push(prose::parse_waiver(value)),
+                prose::MarkerKind::Hold => markers.holds.push(value.to_string()),
+                prose::MarkerKind::Parked => markers.parked.push(value.to_string()),
+            }
+        }
     }
     for key in ext_yaml.keys() {
         *findings.ext_keys.entry(key.clone()).or_default() += 1;
@@ -431,6 +473,11 @@ fn read_ticket(
             body,
         });
     }
+    // The same marker text twice (a comment that was nothing but a
+    // `waived:` line keeps its text *and* becomes a waiver, so an
+    // exported file carries it in both places) is one marker.
+    dedup(&mut markers.waivers);
+    dedup(&mut markers.holds);
     let hold = (!markers.holds.is_empty()).then(|| markers.holds.join("; "));
     let parked = markers.parked.last().map(|p| prose::parked_until(p));
     if let Some((_, Some(reason))) = &parked {
@@ -480,6 +527,17 @@ fn read_ticket(
         migrated,
         recovered,
     })
+}
+
+/// Drops later repeats, keeping first occurrences in order.
+fn dedup<T: PartialEq>(items: &mut Vec<T>) {
+    let mut kept: Vec<T> = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        if !kept.contains(&item) {
+            kept.push(item);
+        }
+    }
+    *items = kept;
 }
 
 /// `archive/2026-08/…` → `(2026, 8)`.
@@ -576,7 +634,7 @@ pub fn quote_bare_scalars(fm_text: &str, shown: &str, findings: &mut Findings) -
 }
 
 /// `key: value` at column 0, when `key` looks like a frontmatter key.
-fn top_level_key(line: &str) -> Option<(&str, &str)> {
+pub(super) fn top_level_key(line: &str) -> Option<(&str, &str)> {
     let (key, value) = line.split_once(':')?;
     let ok = !key.is_empty()
         && key
