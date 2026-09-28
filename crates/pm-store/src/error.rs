@@ -12,6 +12,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("schema version {found} is newer than this build supports ({supported})")]
     SchemaTooNew { found: u32, supported: u32 },
+    #[error("the database has no workspace; run `pm init`")]
+    NoWorkspace,
     #[error("op {op_id} is already in the log")]
     DuplicateOp { op_id: Ulid },
     #[error("ticket {ticket} does not exist; only ticket.create can start a ticket")]

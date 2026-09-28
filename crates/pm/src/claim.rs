@@ -13,8 +13,9 @@
 //! (AC3; the hub client is P3).
 
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use pm_core::markers::date_from_ms;
 use pm_core::op::{Claim, FieldSet};
 use pm_core::{ActorId, ClaimRejected, Hlc, Payload, StateCategory, Ticket, Workspace};
 use pm_store::{ReadyQuery, Store, StoreError};
@@ -261,7 +262,7 @@ impl Claimer<'_> {
 fn claim_ready(ctx: &Ctx<'_>, claimer: &mut Claimer<'_>, project: Option<&str>) -> Result<()> {
     let query = ReadyQuery {
         project: project.map(str::to_string),
-        today: today_utc(),
+        today: date_from_ms(verbs::now_ms()),
         gate_labels: claimer.ws.gate_labels.clone(),
     };
     // A rejected candidate leaves the ready set by definition; tracking
@@ -323,51 +324,4 @@ fn is_busy(e: &CliError) -> bool {
     e.error
         .downcast_ref::<StoreError>()
         .is_some_and(StoreError::is_busy)
-}
-
-/// Today as `YYYY-MM-DD` in UTC, for the ready query's date gates.
-fn today_utc() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-/// Days since 1970-01-01 to a proleptic Gregorian `(year, month, day)`
-/// (Howard Hinnant's `civil_from_days`).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn civil_from_days_matches_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(365), (1971, 1, 1));
-        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
-        assert_eq!(civil_from_days(20_724), (2026, 9, 28));
-        assert_eq!(civil_from_days(-1), (1969, 12, 31));
-    }
-
-    #[test]
-    fn today_is_an_iso_date() {
-        let today = today_utc();
-        assert_eq!(today.len(), 10, "{today}");
-        assert_eq!(today.as_bytes()[4], b'-');
-        assert_eq!(today.as_bytes()[7], b'-');
-    }
 }

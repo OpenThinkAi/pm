@@ -14,6 +14,7 @@ mod markers;
 mod mutate;
 mod project;
 mod read;
+mod ready;
 mod ticket;
 mod verbs;
 mod workspace;
@@ -220,6 +221,27 @@ enum Cmd {
     Graph {
         #[arg(long)]
         project: Option<String>,
+    },
+    /// The ready frontier: unstarted, unassigned, unheld, ungated tickets whose blockers are all done (archived counts)
+    Ready {
+        /// Only tickets in this project
+        #[arg(long, conflicts_with = "ids")]
+        project: Option<String>,
+        /// Only these tickets (AGT-N or ULID; repeat or comma-separate)
+        #[arg(long, value_name = "ID", value_delimiter = ',')]
+        ids: Vec<String>,
+        /// At most this many ready tickets (waves are never cut)
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Only tickets built on this model (`sonnet-5` = label `model:sonnet-5`; no label = opus-5)
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Treat this label like a gate label (`manual`); repeat or comma-separate
+        #[arg(long = "exclude-label", value_name = "LABEL", value_delimiter = ',')]
+        exclude_labels: Vec<String>,
+        /// Also list every excluded ticket with its first reason
+        #[arg(long)]
+        explain: bool,
     },
     /// Hold a ticket for a human (`pm hold AGT-N "why"`), or release it (`--clear`)
     Hold {
@@ -434,6 +456,24 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         Cmd::Log { id } => read::log(ctx, &id),
         Cmd::Status { project } => read::status(ctx, project),
         Cmd::Graph { project } => read::graph(ctx, project),
+        Cmd::Ready {
+            project,
+            ids,
+            limit,
+            model,
+            exclude_labels,
+            explain,
+        } => ready::ready(
+            ctx,
+            ready::ReadyArgs {
+                project,
+                ids,
+                limit,
+                model,
+                exclude_labels,
+                explain,
+            },
+        ),
         Cmd::Hold { id, reason, clear } => markers::hold(ctx, &id, reason.as_deref(), clear),
         Cmd::Holds { project } => markers::holds(ctx, project.as_deref()),
         Cmd::Waive { id, rule, reason } => markers::waive(ctx, &id, &rule, &reason),
