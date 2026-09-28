@@ -61,7 +61,8 @@ impl Ctx<'_> {
 
 /// Stamps this command's ops. The clock is seeded from the log's newest
 /// HLC so a stamp is never re-issued, and fed the wall clock here — pm-core
-/// never reads it.
+/// never reads it. `pub(crate)`: `crate::mutate` and `crate::project`
+/// (AGT-1344) stamp their own ops the same way.
 pub(crate) struct Stamper {
     clock: Clock,
     actor: ActorId,

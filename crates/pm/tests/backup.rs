@@ -246,6 +246,83 @@ fn restore_rebuilds_a_workspace_that_doctor_reports_clean_and_show_matches() {
     assert_code(&clobber, 1);
 }
 
+/// AGT-1344: a project's design doc is a `body.edit` op targeting a
+/// `doc_id` that lives alongside ticket ops in the same JSONL. Restore
+/// must reassign that id before replaying, and replay the op through
+/// `Store::commit_any` rather than the ticket-only `Store::commit`
+/// (backup.rs's `ConfigSnapshot::project_doc_ids`/`named_doc_ids`) — this
+/// proves both halves of that fix, not just that restore doesn't crash.
+#[test]
+fn restore_preserves_a_projects_design_doc_and_its_edit_history() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "proj", "--title", "Proj"]));
+
+    let script = sb.home.path().join("editor.sh");
+    std::fs::write(&script, "#!/bin/sh\necho 'design v1' > \"$1\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_ok(&sb.run(
+        &["project", "edit", "proj"],
+        &[("EDITOR", script.to_str().unwrap())],
+    ));
+    let before = json(&sb.pm(&["project", "show", "proj", "--json"]));
+    assert_eq!(before["doc"], "design v1\n");
+
+    let remote = RemoteBackup::new();
+    assert_ok(&sb.pm(&["backup", "--to", remote.work.to_str().unwrap()]));
+
+    let restored = Sandbox::new();
+    let out = restored.run(
+        &[
+            "backup",
+            "--restore",
+            remote.work.to_str().unwrap(),
+            "--workspace",
+            restored.ws_str(),
+            "--json",
+        ],
+        &[],
+    );
+    assert_ok(&out);
+
+    assert_ok(&restored.pm(&["doctor", "--workspace", restored.ws_str()]));
+    let after = json(&restored.pm(&[
+        "project",
+        "show",
+        "proj",
+        "--workspace",
+        restored.ws_str(),
+        "--json",
+    ]));
+    assert_eq!(after["doc"], "design v1\n");
+
+    // The restored doc_id still accepts further edits (proving it's a
+    // real, continuing CRDT replica, not just a copied string).
+    let script2 = restored.home.path().join("editor2.sh");
+    std::fs::write(&script2, "#!/bin/sh\necho 'design v2' > \"$1\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script2, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_ok(&restored.run(
+        &["project", "edit", "proj", "--workspace", restored.ws_str()],
+        &[("EDITOR", script2.to_str().unwrap())],
+    ));
+    let edited_again = json(&restored.pm(&[
+        "project",
+        "show",
+        "proj",
+        "--workspace",
+        restored.ws_str(),
+        "--json",
+    ]));
+    assert_eq!(edited_again["doc"], "design v2\n");
+}
+
 #[test]
 fn status_is_unhealthy_before_the_first_backup_and_healthy_right_after() {
     let sb = Sandbox::initialized();

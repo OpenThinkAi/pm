@@ -8,18 +8,27 @@
 //! the code that materialized the rows in the first place, so a clean
 //! table and a rebuilt table are produced identically.
 //!
-//! Configuration tables (workspace, state, project, project_doc, actor)
-//! are not op-logged (`config.rs`), so a rebuild leaves them alone: only
-//! [`TICKET_TABLES`] are emptied and replayed.
+//! Configuration tables (workspace, state, actor, and a project's own
+//! title/status/parent/repos) are not op-logged (`config.rs`), so a
+//! rebuild leaves them alone: only [`TICKET_TABLES`] are emptied and
+//! replayed. A project's *document bodies* are the exception (AGT-1344,
+//! `project.rs`): `project.doc`, `project_doc.body` and
+//! `PROJECT_DOC_TABLES`'s `project_doc_view` are derived from `body.edit`
+//! ops the same way `ticket.description` is, and [`crate::project`]'s own
+//! replay folds into the same [`Diff`] this module produces — scoped to
+//! rows with a `doc_id`, so a document written directly (`put_project`'s
+//! bulk `documents` map, before one is assigned) is left alone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::types::Value as Sql;
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use ulid::Ulid;
 
 use crate::Store;
+use crate::codec::ulid;
 use crate::commit::replay_in;
 use crate::error::{Result, StoreError};
 use crate::query::read_ops;
@@ -34,6 +43,14 @@ pub const TICKET_TABLES: [&str; 6] = [
     "comment",
     "marker",
 ];
+
+/// The tables a project document's `body.edit` ops touch (AGT-1344):
+/// `project` and `project_doc` for their cached `doc`/`body` text, and
+/// `project_doc_view` (the document analogue of `ticket_view`), which is
+/// fully derived. [`crate::project::replay_project_docs`] only ever writes
+/// rows with a `doc_id`, so drift in a doc-id-less row (written directly)
+/// never appears here.
+pub const PROJECT_DOC_TABLES: [&str; 3] = ["project", "project_doc", "project_doc_view"];
 
 /// What `pm doctor` found. Healthy when [`Report::is_healthy`].
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -171,12 +188,38 @@ impl Store {
     }
 }
 
+/// Every entity a `ticket.create` op has ever named, straight from the
+/// log — never affected by a row's current state (a ticket's tombstone,
+/// a project document's deletion), unlike a materialized-table lookup.
+fn ticket_create_entities(tx: &Transaction<'_>) -> Result<BTreeSet<Ulid>> {
+    let mut stmt = tx.prepare("SELECT DISTINCT entity FROM ops WHERE kind = ?1")?;
+    let rows = stmt.query_map(params!["ticket.create"], |r| r.get::<_, String>(0))?;
+    rows.map(|row| ulid("ops.entity", &row?)).collect()
+}
+
 fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
-    let before = snapshot(tx)?;
+    let before = snapshot(tx, &TICKET_TABLES)?;
     for table in TICKET_TABLES.iter().rev() {
         tx.execute(&format!("DELETE FROM {table}"), [])?;
     }
+    // The op log shares one `entity` namespace between tickets and project
+    // documents (AGT-1344): a `body.edit` whose entity is a document, not
+    // a ticket, belongs to `crate::project::replay_project_docs` below,
+    // not here — replaying it as a ticket op would report `UnknownTicket`.
+    //
+    // Told apart structurally, not by `known_doc_ids` (live doc_ids on
+    // `project`/`project_doc` right now): only a ticket ever gets a
+    // `ticket.create` op, so an entity with none is never a ticket. This
+    // stays correct after `Store::delete_project` removes a document's
+    // doc_id from those rows — its old `body.edit` ops are still in the
+    // log (never pruned) but no longer "known"; `known_doc_ids` would
+    // wrongly let them fall through to `replay_in` here. A ticket-create
+    // check has no such blind spot: it depends only on the log itself.
+    let ticket_entities = ticket_create_entities(tx)?;
     for (seq, op) in read_ops(tx, "", [])? {
+        if op.kind() == "body.edit" && !ticket_entities.contains(&op.entity) {
+            continue;
+        }
         replay_in(tx, &op).map_err(|source| StoreError::Replay {
             seq,
             op_id: op.op_id,
@@ -184,15 +227,25 @@ fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
             source: Box::new(source),
         })?;
     }
-    let after = snapshot(tx)?;
-    Ok(diff(before, after))
+    let after = snapshot(tx, &TICKET_TABLES)?;
+    let mut diff = diff(before, after);
+
+    // AGT-1344: a project document's body is derived from `body.edit` ops
+    // the same way a ticket's description is; fold its replay's drift into
+    // the same report rather than reporting it separately.
+    let doc_diff = crate::project::replay_project_docs(tx)?;
+    diff.tables.extend(doc_diff.tables);
+    Ok(diff)
 }
 
-/// Every row of every ticket table, keyed by primary key.
-type Snapshot = Vec<(&'static str, BTreeMap<String, Row>)>;
+/// Every row of `tables`, keyed by primary key. `pub(crate)` so
+/// [`crate::project::replay_project_docs`] can snapshot
+/// [`PROJECT_DOC_TABLES`] before/after its own replay the same way this
+/// module does for [`TICKET_TABLES`].
+pub(crate) type Snapshot = Vec<(&'static str, BTreeMap<String, Row>)>;
 
-fn snapshot(conn: &Connection) -> Result<Snapshot> {
-    TICKET_TABLES
+pub(crate) fn snapshot(conn: &Connection, tables: &[&'static str]) -> Result<Snapshot> {
+    tables
         .iter()
         .map(|table| Ok((*table, rows(conn, table)?)))
         .collect()
@@ -238,7 +291,7 @@ fn json_cell(value: Sql) -> Value {
     }
 }
 
-fn diff(before: Snapshot, after: Snapshot) -> Diff {
+pub(crate) fn diff(before: Snapshot, after: Snapshot) -> Diff {
     let mut tables = Vec::new();
     for ((table, mut before), (_, after)) in before.into_iter().zip(after) {
         let mut missing = Vec::new();

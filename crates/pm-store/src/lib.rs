@@ -17,6 +17,9 @@
 //! - `check` — the snapshot `pm check` runs over ([`Store::check`])
 //! - `doctor` — [`Store::doctor`] (verify) and [`Store::rebuild`] (replay the log)
 //! - `backup` — [`Store::ops_since`] and per-target progress (AGT-1350)
+//! - `project` — project document bodies as `body.edit` ops (AGT-1344):
+//!   creation, named documents, deletion (refused with live tickets), and
+//!   the doc-replay `doctor`/`rebuild` fold in
 //! - [`StoreError`] — typed failures (R2/R4/R5 violations, claim rejection, …)
 
 mod backup;
@@ -26,6 +29,7 @@ mod commit;
 mod config;
 mod doctor;
 mod error;
+mod project;
 mod query;
 mod ready;
 
@@ -36,7 +40,8 @@ use rusqlite::{Connection, TransactionBehavior};
 
 pub use backup::BackupStatus;
 pub use doctor::{
-    ColumnChange, Diff, ForeignKeyViolation, Report, Row, RowChange, TICKET_TABLES, TableDiff,
+    ColumnChange, Diff, ForeignKeyViolation, PROJECT_DOC_TABLES, Report, Row, RowChange,
+    TICKET_TABLES, TableDiff,
 };
 pub use error::{Result, StoreError};
 pub use query::TicketFilter;
@@ -47,10 +52,11 @@ pub use ready::ReadyQuery;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_schema_v1.sql")),
     (2, include_str!("../migrations/0002_backup_agt1350.sql")),
+    (3, include_str!("../migrations/0003_project_doc_bodies.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// How long a writer waits for the database lock before giving up. Sized
 /// for many concurrent CLI invocations (build loops fan out), not for a

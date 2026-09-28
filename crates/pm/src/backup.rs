@@ -25,7 +25,7 @@
 //! path — not in the backup git repo itself, so `pm backup status` never
 //! needs to touch git.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,7 @@ use pm_core::{Op, Project, Workspace};
 use pm_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use ulid::Ulid;
 
 use crate::exit::{CliError, Result};
 use crate::verbs::{Ctx, SCHEMA, print_json};
@@ -52,6 +53,18 @@ struct ConfigSnapshot {
     schema: u32,
     workspace: Workspace,
     projects: Vec<Project>,
+    /// A project's design-doc id, by project id (AGT-1344): present only
+    /// for a project created through `pm project new`, whose design doc's
+    /// `body.edit` ops in the JSONL target it. Restore must reassign the
+    /// same id to the recreated row *before* those ops replay
+    /// ([`Store::commit_any`]'s only way to recognize them as document
+    /// edits, not ticket ops) — `#[serde(default)]` so a backup written
+    /// before this ticket restores fine, just without any doc history.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    project_doc_ids: BTreeMap<String, Ulid>,
+    /// A named document's id, by project id then document name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    named_doc_ids: BTreeMap<String, BTreeMap<String, Ulid>>,
 }
 
 /// The absolute form of `path`, without requiring it (or any ancestor) to
@@ -169,10 +182,29 @@ pub fn run(ctx: &Ctx<'_>, to: Option<PathBuf>) -> Result<()> {
     // tables (workspace settings, project docs) are not op-logged
     // (README §Op log), so this snapshot is the only way `--restore`
     // learns them, and it changes independently of the op count.
+    let projects = store.projects()?;
+    let mut project_doc_ids = BTreeMap::new();
+    let mut named_doc_ids: BTreeMap<String, BTreeMap<String, Ulid>> = BTreeMap::new();
+    for project in &projects {
+        if let Some(doc_id) = store.design_doc_id(&project.id)? {
+            project_doc_ids.insert(project.id.clone(), doc_id);
+        }
+        let mut names = BTreeMap::new();
+        for name in project.documents.keys() {
+            if let Some(doc_id) = store.named_doc_id(&project.id, name)? {
+                names.insert(name.clone(), doc_id);
+            }
+        }
+        if !names.is_empty() {
+            named_doc_ids.insert(project.id.clone(), names);
+        }
+    }
     let snapshot = ConfigSnapshot {
         schema: SNAPSHOT_SCHEMA,
         workspace: ws.clone(),
-        projects: store.projects()?,
+        projects,
+        project_doc_ids,
+        named_doc_ids,
     };
     fs::write(
         &config_path,
@@ -364,6 +396,18 @@ pub fn restore(ctx: &Ctx<'_>, dir: &Path) -> Result<()> {
     for project in topo_sorted(snapshot.projects)? {
         store.put_project(&project)?;
     }
+    // Reassign each document's original doc_id before any op replays
+    // (AGT-1344): a `body.edit` in the JSONL below targets it, and
+    // `Store::commit_any` only recognizes a document edit by finding its
+    // doc_id already on a `project`/`project_doc` row.
+    for (project, doc_id) in &snapshot.project_doc_ids {
+        store.set_design_doc_id(project, *doc_id)?;
+    }
+    for (project, names) in &snapshot.named_doc_ids {
+        for (name, doc_id) in names {
+            store.set_named_doc_id(project, name, *doc_id)?;
+        }
+    }
 
     let text = fs::read_to_string(&jsonl_path)
         .with_context(|| format!("reading {}", jsonl_path.display()))?;
@@ -374,7 +418,9 @@ pub fn restore(ctx: &Ctx<'_>, dir: &Path) -> Result<()> {
         }
         let op: Op = serde_json::from_str(line)
             .with_context(|| format!("parsing {}:{}", jsonl_path.display(), lineno + 1))?;
-        store.commit(&op)?;
+        // A document's body.edit (AGT-1344) and a ticket op both live in
+        // this one log; commit_any tells them apart by entity.
+        store.commit_any(&op)?;
         replayed += 1;
     }
 

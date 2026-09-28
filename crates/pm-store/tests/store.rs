@@ -138,6 +138,7 @@ fn open_creates_a_wal_database_with_every_table_and_records_the_migration() {
         "marker",
         "project",
         "project_doc",
+        "project_doc_view",
         "actor",
         "ops",
         "ticket_view",

@@ -158,8 +158,9 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     let out = sb.pm(&["doctor"]);
     assert_code(&out, 0);
     let text = stdout(&out);
-    // AGT-1350 added migration 0002 (backup_target); the exact number here
-    // just needs to track pm_store::SCHEMA_VERSION, not stay pinned to 1.
+    // Each of AGT-1350 (backup_target) and AGT-1344 (project doc bodies)
+    // added a migration; the exact number here just needs to track
+    // pm_store::SCHEMA_VERSION, not stay pinned to 1.
     assert!(
         text.contains(&format!("schema version  {}\n", pm_store::SCHEMA_VERSION)),
         "{text}"
