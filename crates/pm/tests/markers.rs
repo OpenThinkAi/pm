@@ -149,6 +149,35 @@ fn hold_sets_clears_and_lists() {
     assert_code(&sb.pm(&["hold", "AGT-999", "why"]), 3);
 }
 
+#[test]
+fn holds_ids_scopes_like_ready_ids_and_unknown_id_is_not_found() {
+    let sb = Sandbox::new();
+    let a = sb.new_ticket(&["--project", "pm"]);
+    let b = sb.new_ticket(&["--project", "pm"]);
+    let c = sb.new_ticket(&["--project", "pm"]);
+    assert_code(&sb.pm(&["hold", &a, "needs Matt's call"]), 0);
+    assert_code(&sb.pm(&["hold", &b, "also needs Matt"]), 0);
+
+    // Scoped to a and c: only a is held and in scope, so only it is
+    // listed (b is held but out of scope; c is in scope but not held).
+    let listed = json(&sb.pm(&["holds", "--ids", &format!("{a},{c}"), "--json"]));
+    let ids: Vec<&str> = listed["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [a.as_str()]);
+
+    // An unknown id is exit 3, same as `pm ready --ids`.
+    assert_code(&sb.pm(&["holds", "--ids", "AGT-999", "--json"]), 3);
+    // `--project` and `--ids` conflict (clap), exit 2.
+    assert_code(
+        &sb.pm(&["holds", "--project", "pm", "--ids", &a, "--json"]),
+        2,
+    );
+}
+
 // ---------------------------------------------------------------- AC2
 
 #[test]

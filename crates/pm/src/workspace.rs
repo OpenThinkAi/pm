@@ -206,3 +206,84 @@ pub fn open(dir: &Path) -> Result<(Store, Workspace)> {
     let workspace = store.workspace()?.ok_or_else(not_a_workspace)?;
     Ok((store, workspace))
 }
+
+// ----------------------------------------------------------- pm workspace
+
+/// `pm workspace gate-label add|remove|list <label>` (AGT-1380 AC2): the
+/// workspace's gate labels (`Rules::gate_labels`, `Workspace::gate_labels`)
+/// are a direct config write, like project metadata (`crate::project`
+/// module doc) — no op logs them. `pm ready`/`pm claim --ready` already
+/// read `Workspace::gate_labels` fresh on every call and exclude a
+/// gate-labelled ticket transitively (everything it blocks too), the same
+/// way they treat `manual`, so a label added here takes effect
+/// immediately with no other code change. It is also already part of the
+/// `Workspace` `pm backup` snapshots and `init_workspace` restores, so a
+/// gate-label change round-trips through backup/restore for free.
+#[derive(clap::Subcommand, Debug)]
+pub enum WorkspaceCmd {
+    /// Manage the workspace's gate labels
+    GateLabel {
+        #[command(subcommand)]
+        cmd: GateLabelCmd,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum GateLabelCmd {
+    /// Add a label (excludes it from `pm ready`/`pm claim --ready`, transitively)
+    Add { label: String },
+    /// Remove a label
+    Remove { label: String },
+    /// List every gate label
+    List,
+}
+
+pub fn run(ctx: &crate::verbs::Ctx<'_>, cmd: WorkspaceCmd) -> Result<()> {
+    match cmd {
+        WorkspaceCmd::GateLabel { cmd } => gate_label(ctx, cmd),
+    }
+}
+
+fn gate_label(ctx: &crate::verbs::Ctx<'_>, cmd: GateLabelCmd) -> Result<()> {
+    match cmd {
+        GateLabelCmd::Add { label } => {
+            let label = crate::verbs::non_empty("gate label", &label)?;
+            let (mut store, ws) = ctx.open()?;
+            let mut labels = ws.gate_labels;
+            labels.insert(label);
+            store.set_gate_labels(&labels)?;
+            print_gate_labels(ctx, &labels)
+        }
+        GateLabelCmd::Remove { label } => {
+            let label = crate::verbs::non_empty("gate label", &label)?;
+            let (mut store, ws) = ctx.open()?;
+            let mut labels = ws.gate_labels;
+            labels.remove(&label);
+            store.set_gate_labels(&labels)?;
+            print_gate_labels(ctx, &labels)
+        }
+        GateLabelCmd::List => {
+            let (_store, ws) = ctx.open()?;
+            print_gate_labels(ctx, &ws.gate_labels)
+        }
+    }
+}
+
+fn print_gate_labels(
+    ctx: &crate::verbs::Ctx<'_>,
+    labels: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if ctx.json {
+        crate::verbs::print_json(&serde_json::json!({
+            "schema": crate::verbs::SCHEMA,
+            "gate_labels": labels,
+        }));
+    } else if labels.is_empty() {
+        eprintln!("no gate labels");
+    } else {
+        for l in labels {
+            println!("{l}");
+        }
+    }
+    Ok(())
+}
