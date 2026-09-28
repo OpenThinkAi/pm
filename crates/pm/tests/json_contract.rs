@@ -161,6 +161,12 @@ fn normalize_value(v: &mut Value) {
                         *val = Value::from(0);
                         continue;
                     }
+                    // `pm backup status`: a backup file's size, which
+                    // moves with HLC counter widths and Loro's encoding.
+                    "bytes" => {
+                        *val = Value::from(0);
+                        continue;
+                    }
                     // `pm backup status`: an RFC 3339 timestamp of "now".
                     "last_success" if val.is_string() => {
                         *val = Value::String("<TIMESTAMP>".into());

@@ -1,0 +1,24 @@
+-- AGT-1378: byte payloads are stored as base64 strings, not JSON arrays of
+-- integers. `body.edit`'s `update` (ops.payload), the Loro snapshot in
+-- ticket_view.view and project_doc_view.view (`body`) were all written by
+-- serde's default `Vec<u8>` encoding — `[108,111,114,111,…]`, ~3.6 bytes
+-- of JSON per payload byte — which put the first live backup's JSONL at
+-- 87 MB and the same weight in this database.
+--
+-- The rewrite itself is Rust, not SQL (`src/reencode.rs`, run by
+-- `Store::open` right after this file): each row is parsed with the
+-- readers that accept both forms and written back with the writer that
+-- now produces base64 — the exact code `Store::commit` runs — so a
+-- re-encoded row is byte-identical to what a fresh commit or a `pm doctor
+-- --rebuild` replay writes, and doctor's byte-for-byte drift check stays
+-- clean across the change.
+--
+-- This touches `ops`, which is otherwise append-only. It is a change of
+-- *representation*, not of content: `op_id`, `hlc`, `actor`, `entity`,
+-- `kind` and `version` are untouched, the decoded update bytes are
+-- identical, and nothing in pm (op identity, merge, backup high-water
+-- marks) hashes or compares the JSON text of a payload — the same op
+-- already round-trips through `pm backup`/`--restore` in whichever
+-- spelling the writing binary used. Rows already in the new form are left
+-- alone, so re-running is a no-op.
+SELECT 1 WHERE 0;

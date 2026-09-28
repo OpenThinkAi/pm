@@ -1,8 +1,19 @@
 {
   "age_seconds": 0,
+  "files": [
+    {
+      "bytes": 0,
+      "path": "ops/agt.config.json"
+    },
+    {
+      "bytes": 0,
+      "path": "ops/agt/000001.jsonl"
+    }
+  ],
   "healthy": true,
   "last_seq": 32,
   "last_success": "<TIMESTAMP>",
   "schema": 1,
-  "target": "<HOME>/backup-target"
+  "target": "<HOME>/backup-target",
+  "warnings": []
 }

@@ -11,7 +11,7 @@
   },
   "replay_error": null,
   "schema": 1,
-  "schema_version": 4,
+  "schema_version": 5,
   "tables": {
     "actor": 1,
     "backup_target": 0,
@@ -22,7 +22,7 @@
     "project_doc": 1,
     "project_doc_view": 1,
     "relation": 2,
-    "schema_version": 4,
+    "schema_version": 5,
     "state": 3,
     "ticket": 4,
     "ticket_label": 3,

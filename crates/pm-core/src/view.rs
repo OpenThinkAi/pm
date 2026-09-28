@@ -69,7 +69,9 @@ pub struct TicketView {
 ///   visible in either the text or the comparison.
 /// - **Serde** persists the Loro *snapshot* (`Body::snapshot`), which keeps
 ///   the full history so a restored view goes on merging later updates.
-///   The bytes serialize like `BodyEdit::update` does (a byte sequence).
+///   The bytes serialize like `BodyEdit::update` does: a base64 string
+///   ([`crate::bytes::base64`], AGT-1378), with the byte-array form a
+///   view row was written in before that still accepted.
 /// - **Clone** goes through the same snapshot/restore path.
 ///
 /// The alternative — keeping the raw update log on the view and
@@ -145,13 +147,13 @@ impl Eq for BodyState {}
 impl Serialize for BodyState {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let snap = self.snapshot().map_err(serde::ser::Error::custom)?;
-        snap.as_bytes().serialize(serializer)
+        crate::bytes::base64::serialize(snap.as_bytes(), serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for BodyState {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        let bytes = crate::bytes::base64::deserialize(deserializer)?;
         Self::from_snapshot(&bytes).map_err(serde::de::Error::custom)
     }
 }
@@ -713,6 +715,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(back.snapshot().description, "v1 v2");
+    }
+
+    /// AGT-1378: the view row persists its snapshot as base64, and a row
+    /// written before that (a JSON array of bytes) still loads.
+    #[test]
+    fn body_serializes_as_base64_and_reads_the_legacy_array() {
+        let ticket = Ulid::new();
+        let update = Body::with_peer(1)
+            .unwrap()
+            .diff_from_text("persisted")
+            .unwrap();
+        let mut view = TicketView::new(ticket);
+        apply(&mut view, &create(ticket, 1)).unwrap();
+        apply(
+            &mut view,
+            &body_edit(ticket, 2, "matt", update.into_bytes()),
+        )
+        .unwrap();
+
+        let mut json = serde_json::to_value(&view).unwrap();
+        let encoded = json["body"]
+            .as_str()
+            .expect("body is a base64 string")
+            .to_string();
+        let snapshot = crate::bytes::decode(&encoded).unwrap();
+        assert_eq!(snapshot, view.body.snapshot().unwrap().into_bytes());
+
+        json["body"] = Value::Array(snapshot.into_iter().map(Value::from).collect());
+        let legacy: TicketView = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy, view);
+        assert_eq!(legacy.body.text(), "persisted");
     }
 
     #[test]

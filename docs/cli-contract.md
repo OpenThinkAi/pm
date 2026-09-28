@@ -430,6 +430,17 @@ No flags beyond the globals.
     ...
   ]
   ```
+  `pm log` never prints an op's `payload`. Where a full op *is* written
+  as JSON — the backup JSONL below, and the `ops.payload` column — every
+  byte payload (`body.edit`'s `update`, the Loro snapshot a `ticket_view`
+  / `project_doc_view` row holds as `body`) is a **base64 string**
+  (standard alphabet, padded; `pm_core::bytes`) since AGT-1378. Before
+  that it was serde's default for `Vec<u8>`, a JSON array of integers
+  (`[108,111,114,111,…]`, ~3.6 bytes per byte). Readers accept both
+  spellings, so a backup or database written either way still loads; a
+  database written the old way is rewritten in place to base64 by schema
+  migration 0005 on first open (a change of representation only — op ids,
+  stamps and the decoded bytes are untouched).
 
 ### `pm status`
 
@@ -576,7 +587,7 @@ report what changed, then run the same report).
     "schema": 1,
     "healthy": true,
     "rebuilt": {"tables": [...]} | null,   // a Diff, only present with --rebuild
-    "schema_version": 4,
+    "schema_version": 5,                    // 5 since AGT-1378 (byte payloads stored as base64)
     "op_count": 30,
     "tables": {"ticket": 5, "comment": 2, ...},
     "integrity": [],                        // SQLite integrity_check messages, if any
@@ -813,34 +824,56 @@ Flags: `--to <DIR>` (default: `backup.repo` in config.toml), `--restore
 
 - Exit `2`: no `--to` and no `backup.repo` configured (plain `pm backup`
   form only).
+- Layout under `<dir>` (AGT-1378; GitHub rejects any file over 100 MB):
+  - `ops/<prefix>/<NNNNNN>.jsonl` — the op log, one op per line in `seq`
+    order, **sharded by size**: an op that would push the newest shard
+    past 16 MiB starts the next one (`000001.jsonl`, `000002.jsonl`, …).
+    Only the newest shard is ever appended to. Byte payloads are base64
+    (see `pm log` above).
+  - `ops/<prefix>.config.json` — the workspace + project config snapshot
+    (`schema: 1`), rewritten every run. The text of a document body the
+    op log already carries (one with a `doc_id`, i.e. every `pm project
+    new` design doc and `pm project doc add` document) is written as `""`
+    — restore refills it from its `body.edit` ops.
+  - `ops/<prefix>.jsonl` — the pre-AGT-1378 single-file log. Read by
+    `--restore`; never written. The first `pm backup` against a target
+    that has one migrates it in place (same ops, same order, re-encoded
+    into shards) and removes it in that run's commit.
 - `--json` (plain form): appends every op committed since this target's
-  last backup to `<dir>/ops/<prefix>.jsonl`, rewrites
-  `<dir>/ops/<prefix>.config.json` (workspace + project config snapshot),
-  commits, and pushes if the target has a remote:
+  last backup, rewrites the config snapshot, commits, and pushes if the
+  target has a remote:
   ```jsonc
   {
     "schema": 1,
     "target": "/abs/path",
     "ops_appended": 12,
     "last_seq": 30,
+    "shards": 1,                    // number of the newest shard (= how many exist)
+    "legacy_migrated": 12531 | null, // ops carried over from ops/<prefix>.jsonl this run
     "committed": true,
     "pushed": false,
-    "remote": "string" | null
+    "remote": "string" | null,
+    "warnings": ["string", ...]     // any file over 50 MB, as `pm backup status` reports it
   }
   ```
+  Human output prints each warning on stderr as `warning: …`.
 - `--json --restore DIR`:
   ```jsonc
   { "schema": 1, "workspace": "/abs/path", "prefix": "AGT", "ops_replayed": 30 }
   ```
-  Exit `1` if the resolved `--workspace` is already an initialized
-  workspace (refuses to overwrite).
+  Reads either layout (when both a legacy file and shards exist, the
+  legacy file wins: it is what an interrupted migration's shards were
+  derived from). Exit `1` if the resolved `--workspace` is already an
+  initialized workspace (refuses to overwrite). Exit `3` if `DIR` has no
+  `ops/<prefix>.config.json`, or no ops file beside it.
 
 ### `pm backup status`
 
 Flags: `--to <DIR>` (default: `backup.repo`).
 
 - Exit `1`: the target has never backed up successfully, or its last
-  success is more than 24h old.
+  success is more than 24h old. A size warning alone never changes the
+  exit code.
 - `--json`:
   ```jsonc
   {
@@ -849,9 +882,19 @@ Flags: `--to <DIR>` (default: `backup.repo`).
     "last_seq": 30,
     "last_success": "2026-09-28T07:19:56.122Z" | null,
     "age_seconds": 12.4 | null,
-    "healthy": true
+    "healthy": true,
+    "files": [                                        // every file of this workspace's layout that exists
+      {"path": "ops/agt.config.json", "bytes": 4096}, // path relative to target; config, legacy log, then shards in order
+      {"path": "ops/agt/000001.jsonl", "bytes": 15728640},
+      ...
+    ],
+    "warnings": [                                     // one per file over 50 MB (half GitHub's 100 MB limit)
+      "ops/agt.jsonl is 87.1 MB, over the 50 MB warning threshold (GitHub rejects files over 100 MB)"
+    ]
   }
   ```
+  Human output lists each file as `file: <path> (<MB>)` and each warning
+  as `warning: …`.
 
 ### `pm backup install-timer`
 
