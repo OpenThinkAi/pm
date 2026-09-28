@@ -43,7 +43,7 @@ pub struct Ctx<'a> {
 impl Ctx<'_> {
     /// The actor every op of this command records: `PM_ACTOR`, then
     /// `--as`, then `$USER` (README §Data model "actor").
-    fn actor(&self) -> Result<ActorId> {
+    pub(crate) fn actor(&self) -> Result<ActorId> {
         ActorId::resolve(
             self.env.pm_actor.as_deref(),
             self.as_flag,
@@ -52,7 +52,7 @@ impl Ctx<'_> {
         .ok_or_else(|| CliError::usage("no actor: set PM_ACTOR, pass --as <actor>, or set USER"))
     }
 
-    fn open(&self) -> Result<(Store, Workspace)> {
+    pub(crate) fn open(&self) -> Result<(Store, Workspace)> {
         workspace::open(&workspace::resolve(self.workspace, self.env)?)
     }
 }
@@ -60,20 +60,20 @@ impl Ctx<'_> {
 /// Stamps this command's ops. The clock is seeded from the log's newest
 /// HLC so a stamp is never re-issued, and fed the wall clock here — pm-core
 /// never reads it.
-struct Stamper {
+pub(crate) struct Stamper {
     clock: Clock,
     actor: ActorId,
 }
 
 impl Stamper {
-    fn new(store: &Store, actor: ActorId) -> Result<Self> {
+    pub(crate) fn new(store: &Store, actor: ActorId) -> Result<Self> {
         Ok(Stamper {
             clock: Clock::from_latest(store.latest_hlc()?),
             actor,
         })
     }
 
-    fn op(&mut self, entity: Ulid, payload: Payload) -> Op {
+    pub(crate) fn op(&mut self, entity: Ulid, payload: Payload) -> Op {
         let hlc = self.clock.send(now_ms());
         Op::new(Ulid::new(), hlc, self.actor.clone(), entity, payload)
     }
@@ -92,7 +92,7 @@ pub fn parse_priority(s: &str) -> std::result::Result<Priority, String> {
         .map_err(|_| format!("unknown priority '{s}': expected one of low, medium, high, critical"))
 }
 
-fn print_json(value: &Value) {
+pub(crate) fn print_json(value: &Value) {
     println!(
         "{}",
         serde_json::to_string_pretty(value).expect("a JSON value serializes")
@@ -224,7 +224,7 @@ pub struct NewArgs {
     pub batch: Option<PathBuf>,
 }
 
-fn non_empty(flag: &str, value: &str) -> Result<String> {
+pub(crate) fn non_empty(flag: &str, value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
         Err(CliError::usage(format!("{flag} must not be empty")))
@@ -244,7 +244,7 @@ fn require_project(store: &Store, project: &str) -> Result<()> {
 
 /// The workspace's initial (unstarted) state — where every new ticket
 /// starts.
-fn initial_state(ws: &Workspace) -> Result<String> {
+pub(crate) fn initial_state(ws: &Workspace) -> Result<String> {
     Ok(ws
         .states
         .iter()
@@ -785,7 +785,7 @@ fn print_batch_result(
 // ---------------------------------------------------------------- pm show
 
 /// `AGT-12`, or `AGT-?` before the authority numbers it.
-fn display_id(ws: &Workspace, t: &Ticket) -> String {
+pub(crate) fn display_id(ws: &Workspace, t: &Ticket) -> String {
     match t.number {
         Some(n) => format!("{}-{n}", ws.prefix),
         None => format!("{}-?", ws.prefix),
@@ -828,7 +828,7 @@ pub(crate) fn find(store: &Store, ws: &Workspace, reference: &str) -> Result<Tic
 /// and `blocked_by` (the tickets that block this one, by display id —
 /// AC5: "`pm show --json` reflects all" the flags `pm new` accepts,
 /// including `--blocked-by`).
-fn ticket_json(ws: &Workspace, store: &Store, t: &Ticket) -> Result<Value> {
+pub(crate) fn ticket_json(ws: &Workspace, store: &Store, t: &Ticket) -> Result<Value> {
     let Value::Object(fields) = serde_json::to_value(t).expect("a ticket serializes") else {
         unreachable!("a ticket serializes to an object");
     };
@@ -961,7 +961,10 @@ pub fn show(ctx: &Ctx<'_>, reference: &str, field: Option<&str>) -> Result<()> {
 
 // ----------------------------------------------------------------- pm set
 
-/// Parses one `key=value`. Empty values clear optional fields.
+/// Parses one `key=value`. Empty values clear optional fields. A key this
+/// crate does not know as a scalar field is not an error (AC1): it lands in
+/// `ext` under that key, with a warning to stderr so a typo is still
+/// noticeable.
 fn parse_assignment(assignment: &str) -> Result<FieldSet> {
     let Some((key, value)) = assignment.split_once('=') else {
         return Err(CliError::usage(format!(
@@ -972,16 +975,25 @@ fn parse_assignment(assignment: &str) -> Result<FieldSet> {
         let v = v.trim();
         (!v.is_empty()).then(|| v.to_string())
     };
-    match key.trim() {
+    let key = key.trim();
+    match key {
         "title" => Ok(FieldSet::Title(non_empty("title", value)?)),
         "priority" => Ok(FieldSet::Priority(
             parse_priority(value.trim()).map_err(CliError::usage)?,
         )),
         "project" => Ok(FieldSet::Project(optional(value))),
         "repo" => Ok(FieldSet::Repo(optional(value))),
-        other => Err(CliError::usage(format!(
-            "unsupported field '{other}': pm set accepts title, priority, project, repo"
-        ))),
+        "assignee" => Ok(FieldSet::Assignee(optional(value).map(ActorId::new))),
+        "linked-github" => Ok(FieldSet::LinkedGithub(optional(value))),
+        "linked-pr" => Ok(FieldSet::LinkedPr(optional(value))),
+        "linear" => Ok(FieldSet::Linear(optional(value))),
+        other => {
+            eprintln!("pm: warning: unknown field '{other}'; stored under ext.{other}");
+            Ok(FieldSet::Ext {
+                key: other.to_string(),
+                value: optional(value).map(Value::String),
+            })
+        }
     }
 }
 
