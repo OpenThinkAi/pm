@@ -640,11 +640,14 @@ fn fmt_opt(v: &Option<String>) -> String {
     v.clone().unwrap_or_else(|| "(none)".into())
 }
 
-/// The first line of `s`, cut to a readable width.
+/// The first line of `s`, cut to a readable width, control characters
+/// dropped (the report is markdown; a comment body is untrusted text).
 fn short(s: &str) -> String {
     let line = s.lines().next().unwrap_or_default();
-    let mut out: String = line.chars().take(100).collect();
-    if out.len() < line.len() || s.lines().count() > 1 {
+    let chars: Vec<char> = line.chars().filter(|c| !c.is_control()).collect();
+    let cut = chars.len() > 100 || s.lines().count() > 1;
+    let mut out: String = chars.into_iter().take(100).collect();
+    if cut {
         out.push('…');
     }
     format!("`{out}`")
@@ -794,5 +797,6 @@ mod tests {
             ["AGT-806", "AGT-12"]
         );
         assert_eq!(short("one\ntwo"), "`one…`");
+        assert_eq!(short("a\u{7}b\tc"), "`abc`");
     }
 }

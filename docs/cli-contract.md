@@ -688,7 +688,10 @@ each named document as `<name>.md` beside it. Flags: `--legacy-markers`
 default `waived:`/`hold:`/`parked:` frontmatter keys; `pm import vault`
 reads both forms back to the same fields).
 
-- Exit `1`: `DIR` or a file under it cannot be written.
+- Exit `1`: `DIR` or a file under it cannot be written; a ticket's state,
+  a project id or a document name would not make a plain path segment
+  under `DIR` (contains `..`, is absolute or empty) — every path the
+  export writes stays inside `DIR`.
 - A ticket with no number yet (`AGT-?`) has no vault id and is not
   written; it is counted under `unnumbered` (and noted on stderr in the
   human output).

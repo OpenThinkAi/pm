@@ -26,7 +26,7 @@
 //! with each named document beside it (`<name>.md`, `ideation/IDEA-*.md`).
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
 use pm_core::markers::{PARKED_FOREVER, date_from_ms};
@@ -34,7 +34,7 @@ use pm_core::{Project, ProjectStatus, RelationKind, Ticket, Workspace};
 use pm_store::Store;
 use serde_json::{Value, json};
 
-use crate::exit::Result;
+use crate::exit::{CliError, Result};
 use crate::verbs::{Ctx, SCHEMA, display_id, print_json};
 
 /// `ext` key the importer fills from a prose `parked:` value that is
@@ -79,7 +79,7 @@ pub fn md(ctx: &Ctx<'_>, dir: &Path, legacy_markers: bool) -> Result<()> {
     let mut projects = 0usize;
     let mut documents = 0usize;
     for p in store.projects()? {
-        let rendered = render_project(&p);
+        let rendered = render_project(&p)?;
         documents += rendered.len() - 1;
         for r in &rendered {
             write(dir, r)?;
@@ -127,8 +127,9 @@ fn write(root: &Path, r: &Rendered) -> Result<()> {
 
 // -------------------------------------------------------------- tickets
 
-/// Where a ticket's file goes, relative to the export root.
-pub(crate) fn ticket_path(ws: &Workspace, t: &Ticket) -> PathBuf {
+/// Where a ticket's file goes, relative to the export root. The state
+/// folder is a workspace state name, checked as a path segment too.
+pub(crate) fn ticket_path(ws: &Workspace, t: &Ticket) -> Result<PathBuf> {
     let id = display_id(ws, t);
     let slug = slug(&t.title);
     let name = if slug.is_empty() {
@@ -136,12 +137,42 @@ pub(crate) fn ticket_path(ws: &Workspace, t: &Ticket) -> PathBuf {
     } else {
         format!("{id}-{slug}.md")
     };
-    match t.archived_at {
+    Ok(match t.archived_at {
         Some(at) => {
             let month = date_from_ms(at.wall_ms);
             Path::new("archive").join(&month[..7]).join(name)
         }
-        None => Path::new("tickets").join(&t.state).join(name),
+        None => {
+            if ws.state(&t.state).is_none() {
+                return Err(CliError::error(format!(
+                    "{id}: state '{}' is not a workflow state",
+                    t.state
+                )));
+            }
+            Path::new("tickets")
+                .join(segment(&t.state, "state")?)
+                .join(name)
+        }
+    })
+}
+
+/// A path built from ticket or project data (`state`, a project id, a
+/// document name such as `ideation/IDEA-1`) must stay under the export
+/// root: only plain components, so no `..`, no `.`, no leading `/`, no
+/// empty segment, and nothing a filesystem cannot take.
+pub(crate) fn segment<'a>(value: &'a str, what: &str) -> Result<&'a str> {
+    let ok = !value.is_empty()
+        && !value.contains('\0')
+        && !value.ends_with('/')
+        && Path::new(value)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+    if ok {
+        Ok(value)
+    } else {
+        Err(CliError::error(format!(
+            "{what} '{value}' is not a safe path segment (must be plain names without `..`)"
+        )))
     }
 }
 
@@ -292,7 +323,7 @@ pub(crate) fn render_ticket(
         format!("---\n{fm}---\n\n{body}\n")
     };
     Ok(Rendered {
-        path: ticket_path(ws, t),
+        path: ticket_path(ws, t)?,
         text,
     })
 }
@@ -471,11 +502,12 @@ fn yaml_flow_value(v: &Value) -> String {
 
 /// A project's folder: the README (its design doc), then each named
 /// document.
-pub(crate) fn render_project(p: &Project) -> Vec<Rendered> {
+pub(crate) fn render_project(p: &Project) -> Result<Vec<Rendered>> {
+    let id = segment(&p.id, "project id")?;
     let base = if p.status == ProjectStatus::InProgress {
-        Path::new("projects").join(&p.id)
+        Path::new("projects").join(id)
     } else {
-        Path::new("archive").join("projects").join(&p.id)
+        Path::new("archive").join("projects").join(id)
     };
     let readme = if p.doc.trim().is_empty() {
         // A project pm created without a doc (an import stub): a README
@@ -500,12 +532,13 @@ pub(crate) fn render_project(p: &Project) -> Vec<Rendered> {
         text: readme,
     }];
     for (name, text) in &p.documents {
+        let name = segment(name, "document name")?;
         out.push(Rendered {
             path: base.join(format!("{name}.md")),
             text: text.clone(),
         });
     }
-    out
+    Ok(out)
 }
 
 /// The tickets a `pm export md` run writes, for callers that want the
@@ -535,6 +568,36 @@ mod tests {
         // The cut never leaves a trailing dash.
         let s = slug(&format!("{} b", "a".repeat(49)));
         assert_eq!(s, "a".repeat(49));
+    }
+
+    #[test]
+    fn data_derived_path_segments_stay_under_the_root() {
+        for ok in [
+            "triage",
+            "in-progress",
+            "pm",
+            "ideation/IDEA-001-first-idea",
+            "a.b",
+        ] {
+            assert_eq!(segment(ok, "x").unwrap(), ok);
+        }
+        for bad in [
+            "",
+            "..",
+            "../../.ssh",
+            "a/../b",
+            "/etc",
+            "./a",
+            "a/",
+            "a\0b",
+        ] {
+            let err = segment(bad, "state").unwrap_err();
+            assert_eq!(err.code, crate::exit::ERROR, "{bad}");
+            assert!(
+                err.error.to_string().contains("not a safe path segment"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
