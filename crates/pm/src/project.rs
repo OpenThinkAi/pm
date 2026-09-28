@@ -26,7 +26,6 @@ use anyhow::Context;
 use clap::Subcommand;
 use pm_core::op::BodyEdit;
 use pm_core::{Body, Payload, Project, ProjectStatus};
-use pm_store::Store;
 use serde_json::{Map, Value, json};
 use ulid::Ulid;
 
@@ -153,7 +152,7 @@ fn new(ctx: &Ctx<'_>, id: &str, title: &str, repos: &[String], parent: Option<&s
     let project = store
         .project(id)?
         .ok_or_else(|| CliError::error(format!("project '{id}' vanished after create")))?;
-    print_project(ctx, &store, &project)
+    print_project(ctx, &project)
 }
 
 // ------------------------------------------------------------------- show
@@ -176,7 +175,7 @@ fn show(ctx: &Ctx<'_>, id: &str, doc: Option<&str>) -> Result<()> {
             }
             Ok(())
         }
-        None => print_project(ctx, &store, &project),
+        None => print_project(ctx, &project),
     }
 }
 
@@ -209,8 +208,7 @@ fn edit(ctx: &Ctx<'_>, id: &str) -> Result<()> {
     let project = store.project(id)?.ok_or_else(|| not_found(id))?;
     let doc_id = store.design_doc_id(id)?.ok_or_else(|| {
         CliError::error(format!(
-            "project '{id}' has no design-doc id; it was created before AGT-1344 or written \
-             directly (`put_project`) — recreate it with `pm project new` to get one"
+            "project '{id}' has no design doc to edit; recreate it with `pm project new` to get one"
         ))
     })?;
 
@@ -229,7 +227,7 @@ fn edit(ctx: &Ctx<'_>, id: &str) -> Result<()> {
     // reopen-on-parse-error loop, where the file stays the live source of
     // truth across editor invocations.
     if new_text == project.doc {
-        return print_project(ctx, &store, &project);
+        return print_project(ctx, &project);
     }
 
     // Continue this document's causal history rather than diffing from an
@@ -265,7 +263,7 @@ fn edit(ctx: &Ctx<'_>, id: &str) -> Result<()> {
     let project = store
         .project(id)?
         .ok_or_else(|| CliError::error(format!("project '{id}' vanished after edit")))?;
-    print_project(ctx, &store, &project)
+    print_project(ctx, &project)
 }
 
 // ----------------------------------------------------------------- delete
@@ -335,7 +333,7 @@ fn project_json(p: &Project) -> Value {
     Value::Object(out)
 }
 
-fn print_project(ctx: &Ctx<'_>, _store: &Store, project: &Project) -> Result<()> {
+fn print_project(ctx: &Ctx<'_>, project: &Project) -> Result<()> {
     if ctx.json {
         print_json(&project_json(project));
         return Ok(());
