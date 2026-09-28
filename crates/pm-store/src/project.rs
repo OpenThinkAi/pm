@@ -143,6 +143,37 @@ impl Store {
         load_doc_view(&self.conn, doc_id)
     }
 
+    /// The latest `body.edit` stamp across a project's design doc and every
+    /// named document — "no doc edit in `stale_days`" (AGT-1351 AC1).
+    /// `None` means the project has no document that has ever been edited
+    /// through a `body.edit` op (including one imported via
+    /// [`Store::put_project`], which never assigns a `doc_id` at all), so
+    /// there is no recency to measure — a caller treating that as "stale"
+    /// (`pm_core::archive::project_idle`) is deliberate, not a gap.
+    pub fn project_doc_last_edit(&self, project: &str) -> Result<Option<pm_core::Hlc>> {
+        let mut doc_ids: Vec<Ulid> = Vec::new();
+        if let Some(id) = self.design_doc_id(project)? {
+            doc_ids.push(id);
+        }
+        let names: Vec<String> = self
+            .conn
+            .prepare("SELECT name FROM project_doc WHERE project = ?1")?
+            .query_map(params![project], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for name in names {
+            if let Some(id) = self.named_doc_id(project, &name)? {
+                doc_ids.push(id);
+            }
+        }
+        let mut latest: Option<pm_core::Hlc> = None;
+        for doc_id in doc_ids {
+            if let Some(stamp) = self.doc_view(doc_id)?.and_then(|v| v.updated) {
+                latest = Some(latest.map_or(stamp.hlc, |l| l.max(stamp.hlc)));
+            }
+        }
+        Ok(latest)
+    }
+
     /// Appends a `body.edit` op and re-materializes the document it
     /// targets, in one transaction — the document analogue of
     /// [`crate::Store::commit`]. Returns the document's text as it now

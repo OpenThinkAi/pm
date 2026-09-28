@@ -9,6 +9,7 @@
 //! this crate's `src/` for IO modules.
 //!
 //! Layout (projects/pm/README.md §Data model, §Op log, §Conflict semantics):
+//! - [`archive`] — selection logic for `pm archive --auto` (AGT-1351)
 //! - [`body`] — ticket/project-doc text as a Loro CRDT (AGT-1338)
 //! - [`check`] — the `pm check` invariants, over a ticket snapshot (AGT-1342)
 //! - [`doc`] — [`DocView`], the same text CRDT keyed for a project document
@@ -21,6 +22,7 @@
 //! - [`ready`] — the ready frontier: verdicts, reasons and waves (AGT-1343)
 //! - [`view`] — [`TicketView`] and the pure [`apply`] function
 
+pub mod archive;
 pub mod body;
 pub mod check;
 pub mod doc;
@@ -32,6 +34,7 @@ pub mod op;
 pub mod ready;
 pub mod view;
 
+pub use archive::{month_key, project_idle, ticket_archivable};
 pub use body::{Body, BodyError, BodyUpdate};
 pub use check::Finding;
 pub use doc::{DocApplyError, DocView, apply_doc};

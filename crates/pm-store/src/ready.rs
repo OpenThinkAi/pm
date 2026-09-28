@@ -333,4 +333,14 @@ mod tests {
         };
         assert!(ready_ids(&store, &none).is_empty());
     }
+
+    // AGT-1351 AC2 ("archived tickets ... count as done for `pm ready`") is
+    // covered above by `an_archived_blocker_counts_as_done_whatever_its_state`
+    // (AGT-1343) — `Store::ready` delegates entirely to
+    // `pm_core::ready::frontier`, which treats `archived_at` as done
+    // regardless of state (see that module's `Graph::done`), so there is
+    // nothing left for this crate to pin down beyond what AGT-1343 already
+    // does. `crates/pm/tests/archive.rs` adds the AC2 proof at the level
+    // AGT-1351 owns: `pm archive` (the real command, not a re-derived op)
+    // followed by `pm ready`.
 }

@@ -80,6 +80,20 @@ impl Stamper {
         let hlc = self.clock.send(now_ms());
         Op::new(Ulid::new(), hlc, self.actor.clone(), entity, payload)
     }
+
+    /// Like [`Stamper::op`], but for the one payload shape that needs to
+    /// carry its own stamp as data: `FieldSet::ArchivedAt(Some(hlc))`
+    /// (`crate::archive`) records the HLC an archive op landed at, so the
+    /// value must be exactly the op's own `hlc` rather than a second,
+    /// slightly later one from calling [`Stamper::op`] a second time.
+    pub(crate) fn op_with_hlc(
+        &mut self,
+        entity: Ulid,
+        payload: impl FnOnce(pm_core::Hlc) -> Payload,
+    ) -> Op {
+        let hlc = self.clock.send(now_ms());
+        Op::new(Ulid::new(), hlc, self.actor.clone(), entity, payload(hlc))
+    }
 }
 
 pub(crate) fn now_ms() -> u64 {

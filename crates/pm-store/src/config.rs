@@ -139,6 +139,23 @@ impl Store {
         Ok(found.pop())
     }
 
+    /// Sets a project's `status` directly, leaving everything else (title,
+    /// parent, repos, docs) untouched — project metadata is a direct write,
+    /// not op-logged (AGT-1335 module doc). Used by `pm archive --auto` to
+    /// retire an idle project to `complete` (AGT-1351 AC1).
+    pub fn set_project_status(&mut self, id: &str, status: pm_core::ProjectStatus) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE project SET status = ?1 WHERE id = ?2",
+            params![enum_name(&status), id],
+        )?;
+        if n == 0 {
+            return Err(StoreError::UnknownProject {
+                project: id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Every project, by id.
     pub fn projects(&self) -> Result<Vec<Project>> {
         load_projects(&self.conn, "", [])
