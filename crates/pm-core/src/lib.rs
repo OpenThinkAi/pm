@@ -11,6 +11,10 @@
 //! types (ticket entities, the op log, HLC, merge rules) land in later
 //! tickets per projects/pm/README.md §Architecture.
 
+pub mod body;
+
+pub use body::{Body, BodyError, BodyUpdate};
+
 /// This crate's own version, exposed so dependents can sanity-check they
 /// are linked against the crate they expect.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
