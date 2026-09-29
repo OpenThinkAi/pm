@@ -1,7 +1,7 @@
 //! Reads: plain queries over the materialized tables. Nothing here
 //! touches the op log except [`Store::ops`], which reads it back verbatim.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pm_core::{
     ActorId, Comment, Hlc, Hold, NotBefore, Op, Parked, Relation, Ticket, TicketView, Waiver,
@@ -147,6 +147,32 @@ impl Store {
             })
         })
         .collect()
+    }
+
+    /// The greatest HLC counter already used at each of `wall_ms_values`,
+    /// across every op in the log regardless of entity or kind. A day
+    /// missing from the result has no op at all yet. An incremental
+    /// import seeds its own file-dated stamp sequence from this so a
+    /// newly appended same-day comment always sorts after whatever the
+    /// log already holds for that millisecond (AGT-1381).
+    pub fn max_counters(&self, wall_ms_values: &BTreeSet<u64>) -> Result<BTreeMap<u64, u32>> {
+        if wall_ms_values.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let sql = format!(
+            "SELECT hlc_wall_ms, MAX(hlc_counter) FROM ops
+             WHERE hlc_wall_ms IN ({}) GROUP BY hlc_wall_ms",
+            placeholders(wall_ms_values.len())
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let args: Vec<Value> = wall_ms_values
+            .iter()
+            .map(|w| Value::from(*w as i64))
+            .collect();
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, u32>(1)?))
+        })?;
+        rows.map(|row| row.map_err(StoreError::from)).collect()
     }
 
     /// Every relation with `ticket` at either end, whichever ticket's op

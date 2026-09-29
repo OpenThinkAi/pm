@@ -218,7 +218,8 @@ pub fn vault(
     }
 
     let mut clock = Clock::from_latest(store.latest_hlc()?);
-    let stamped = plan::stamp(intents, &mut clock);
+    let floor_counters = store.max_counters(&plan::dated_days(&intents))?;
+    let stamped = plan::stamp(intents, &mut clock, &floor_counters);
     let doc_ids: std::collections::BTreeSet<Ulid> = stamped
         .iter()
         .filter(|(op, _)| store.is_known_doc_id(op.entity).unwrap_or(false))

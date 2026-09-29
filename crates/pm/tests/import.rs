@@ -586,6 +586,128 @@ fn re_import_emits_only_the_ops_for_what_changed() {
     assert_ok(&sb.pm(&["doctor"]));
 }
 
+/// AGT-1381: a comment an incremental import appends must sort after
+/// every existing same-day comment, not before it. Reproduced as a
+/// fixture (the frozen real vault can't be re-imported live): two
+/// same-day comments land on the first import, a third same-day comment
+/// is appended to the file, and a re-import must read them back in file
+/// order — with the parity report showing 0 unexplained.
+#[test]
+fn a_same_day_comment_appended_by_a_later_import_sorts_after_the_existing_ones() {
+    let sb = Sandbox::initialized();
+    let vault = sb.vault_copy();
+    let rel = "tickets/triage/AGT-21-comment-order.md";
+    let ticket = |comments: &str| {
+        format!(
+            "---\n\
+             id: AGT-21\n\
+             title: Comment order across incremental imports\n\
+             state: triage\n\
+             created: 2026-09-01\n\
+             updated: 2026-09-28\n\
+             project: alpha\n\
+             repo: \n\
+             blocked-by: []\n\
+             linked-github: \n\
+             linked-pr: \n\
+             priority: low\n\
+             labels: []\n\
+             source: {{ type: manual, url: \"\", id: \"\", fetched-at: \"\" }}\n\
+             ---\n\
+             \n\
+             ## Problem Statement\n\
+             \n\
+             P.\n\
+             \n\
+             ## Comments\n\
+             \n\
+             {comments}"
+        )
+    };
+    std::fs::write(
+        vault.join(rel),
+        ticket(
+            "### 2026-09-28 — Alice\n\
+             First same-day comment.\n\
+             \n\
+             ### 2026-09-28 — Bob\n\
+             Second same-day comment.\n",
+        ),
+    )
+    .unwrap();
+    let report = sb.import(&vault);
+    assert_eq!(report["tickets"]["created"], 8, "{report}");
+    assert_eq!(
+        comments(&sb, "AGT-21"),
+        [
+            ("Alice".to_string(), "First same-day comment.".to_string()),
+            ("Bob".to_string(), "Second same-day comment.".to_string()),
+        ]
+    );
+
+    // Append a third same-day comment, as a live incremental re-import
+    // would see after the vault gained a new entry for the same day.
+    std::fs::write(
+        vault.join(rel),
+        ticket(
+            "### 2026-09-28 — Alice\n\
+             First same-day comment.\n\
+             \n\
+             ### 2026-09-28 — Bob\n\
+             Second same-day comment.\n\
+             \n\
+             ### 2026-09-28 — Carol\n\
+             Third same-day comment, appended later.\n",
+        ),
+    )
+    .unwrap();
+    let report_path = sb.home.path().join("parity.md");
+    let report = json(&sb.pm(&[
+        "import",
+        "vault",
+        vault.to_str().unwrap(),
+        "--report",
+        report_path.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(report["changes"], json!(["AGT-21: comment"]), "{report}");
+
+    // pm's order matches the file's order — the bug appended Carol
+    // ahead of Alice and Bob because the day's counter restarted at 0.
+    assert_eq!(
+        comments(&sb, "AGT-21"),
+        [
+            ("Alice".to_string(), "First same-day comment.".to_string()),
+            ("Bob".to_string(), "Second same-day comment.".to_string()),
+            (
+                "Carol".to_string(),
+                "Third same-day comment, appended later.".to_string()
+            ),
+        ]
+    );
+
+    // The HLCs themselves are strictly increasing: Carol's stamp for the
+    // shared day continues past Bob's rather than resetting to 0.
+    let ulid: ulid::Ulid = sb.show("AGT-21")["ulid"].as_str().unwrap().parse().unwrap();
+    let hlcs: Vec<_> = sb
+        .store()
+        .comments(ulid)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.hlc)
+        .collect();
+    assert!(
+        hlcs.windows(2).all(|w| w[0] < w[1]),
+        "comment stamps not increasing: {hlcs:?}"
+    );
+    assert_eq!(hlcs[0].wall_ms, hlcs[1].wall_ms);
+    assert_eq!(hlcs[1].wall_ms, hlcs[2].wall_ms);
+
+    // The parity report has nothing unexplained: file order and pm's
+    // order agree exactly.
+    assert_eq!(report["parity"]["unexplained"], 0, "{report}");
+}
+
 // ------------------------------------------------------------- errors
 
 #[test]

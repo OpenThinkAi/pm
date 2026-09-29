@@ -107,7 +107,7 @@ const CLASSES: &[Class] = &[
     },
     Class {
         name: "comments: reordered by date",
-        why: "Entries left the file out of date order; pm orders comments by date, and same-date entries keep file order. Every entry's date, author and text are identical.",
+        why: "Entries left the file out of date order, or an incremental import's own stamping reordered same-date entries against each other (AGT-1381: a newly appended same-date comment is stamped after every existing one for that day, which can still differ from the file's own intra-day order). pm orders comments by date; every entry's date, author and text are identical.",
     },
     Class {
         name: "comments: empty entry dropped",
@@ -502,9 +502,7 @@ fn compare(
         .collect();
     let ex_entries: Vec<_> = ex.comments.iter().map(entry).collect();
     if src_entries != ex_entries {
-        let mut sorted = src_entries.clone();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        if sorted == ex_entries {
+        if day_groups(&src_entries) == day_groups(&ex_entries) {
             o.explain(
                 "comments: reordered by date",
                 format!("comments: {} entries re-sorted by date", src_entries.len()),
@@ -638,6 +636,29 @@ fn flow_items(v: &str) -> Option<Vec<String>> {
 
 fn fmt_opt(v: &Option<String>) -> String {
     v.clone().unwrap_or_else(|| "(none)".into())
+}
+
+/// `(date, author, body)` triples grouped by date, each group's entries
+/// sorted so two groups with the same members compare equal regardless
+/// of order. Two comment sequences that group equal this way carry the
+/// same entries on the same days; the intra-day order is free to differ
+/// (AGT-1381: an incremental import's own same-day stamping — appending
+/// after every existing same-date comment — can reorder entries within
+/// a day without losing or misdating any of them).
+fn day_groups(entries: &[(String, String, String)]) -> Vec<(String, Vec<(String, String)>)> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for (date, author, body) in sorted {
+        match groups.last_mut() {
+            Some((d, items)) if *d == date => items.push((author, body)),
+            _ => groups.push((date, vec![(author, body)])),
+        }
+    }
+    for (_, items) in &mut groups {
+        items.sort();
+    }
+    groups
 }
 
 /// The first line of `s`, cut to a readable width, control characters
