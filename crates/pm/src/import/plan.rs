@@ -739,16 +739,32 @@ fn diff_intents(
 /// so an LWW write against a register the store already holds lands
 /// after it and the file's value wins (README §Conflict semantics).
 /// Stamps are unique within a run and strictly increasing within each
-/// clock; two runs may reuse a dated stamp, which only ever ties two
-/// comments' order (broken by author, then op id).
-pub fn stamp(intents: Vec<Intent>, clock: &mut Clock) -> Vec<(Op, Phase)> {
+/// clock. `floor_counters` is the greatest counter the log already used
+/// at each wall-clock millisecond any dated intent in this run carries
+/// (`Store::max_counters`, keyed on the same millisecond); the first
+/// dated intent to land on a given millisecond this run continues from
+/// there instead of restarting at 0, so a comment an earlier run already
+/// stamped for that day can never be outrun by one this run appends
+/// (AGT-1381) — an incremental import's own same-day comments still sort
+/// by file order among themselves, same as always.
+pub fn stamp(
+    intents: Vec<Intent>,
+    clock: &mut Clock,
+    floor_counters: &BTreeMap<u64, u32>,
+) -> Vec<(Op, Phase)> {
     let mut dated = Clock::new();
+    let mut seeded: BTreeSet<u64> = BTreeSet::new();
     let mut indexed: Vec<(usize, Intent)> = intents.into_iter().enumerate().collect();
     indexed.sort_by_key(|(i, intent)| (intent.at_ms, *i));
     indexed
         .into_iter()
         .map(|(_, intent)| {
             let hlc = if intent.dated {
+                if seeded.insert(intent.at_ms)
+                    && let Some(&counter) = floor_counters.get(&intent.at_ms)
+                {
+                    dated = Clock::from_latest(Hlc::new(intent.at_ms, counter));
+                }
                 dated.send(intent.at_ms)
             } else {
                 clock.send(intent.at_ms)
@@ -762,6 +778,18 @@ pub fn stamp(intents: Vec<Intent>, clock: &mut Clock) -> Vec<(Op, Phase)> {
                 intent.phase,
             )
         })
+        .collect()
+}
+
+/// The wall-clock millisecond of every [`Intent::dated`] intent in
+/// `intents`: what [`stamp`] needs seeded via [`Store::max_counters`]
+/// (`pm_store::Store`) before it runs, so a comment appended this run
+/// can never sort ahead of one the log already holds for the same day.
+pub fn dated_days(intents: &[Intent]) -> BTreeSet<u64> {
+    intents
+        .iter()
+        .filter(|i| i.dated)
+        .map(|i| i.at_ms)
         .collect()
 }
 
@@ -790,7 +818,7 @@ mod tests {
             intent(a, 700),
             intent(b, 100),
         ];
-        let ops = stamp(intents, &mut Clock::new());
+        let ops = stamp(intents, &mut Clock::new(), &BTreeMap::new());
         let stamps: Vec<Hlc> = ops.iter().map(|(op, _)| op.hlc).collect();
         assert_eq!(
             stamps,
@@ -812,9 +840,42 @@ mod tests {
         let ops = stamp(
             vec![intent(a, 500), kept],
             &mut Clock::from_latest(Hlc::new(900, 3)),
+            &BTreeMap::new(),
         );
         assert_eq!(ops[0].0.hlc, Hlc::new(900, 4));
         assert_eq!(ops[1].0.hlc, Hlc::new(500, 0));
+    }
+
+    /// AGT-1381: a comment appended by a later import run must sort after
+    /// every comment an earlier run already stamped for the same day —
+    /// never restart the day's counter at 0 just because this run's
+    /// `dated` clock is fresh.
+    #[test]
+    fn dated_stamps_continue_past_a_floor_from_an_earlier_run() {
+        let (a, b) = (Ulid::new(), Ulid::new());
+        let mut appended = intent(a, 1_000);
+        appended.dated = true;
+        // A same-day dated intent for an unrelated ticket, with no floor
+        // for its day, still starts at counter 0.
+        let mut unrelated = intent(b, 2_000);
+        unrelated.dated = true;
+        let mut floor = BTreeMap::new();
+        floor.insert(1_000, 66);
+        let ops = stamp(vec![appended, unrelated], &mut Clock::new(), &floor);
+        let stamps: Vec<Hlc> = ops.iter().map(|(op, _)| op.hlc).collect();
+        assert_eq!(stamps, [Hlc::new(1_000, 67), Hlc::new(2_000, 0)]);
+
+        // Two dated intents landing on the seeded day in the same run
+        // still order by file position (index tie-break) among
+        // themselves, continuing from the floor rather than each other's
+        // fresh count.
+        let mut first = intent(a, 1_000);
+        first.dated = true;
+        let mut second = intent(a, 1_000);
+        second.dated = true;
+        let ops = stamp(vec![first, second], &mut Clock::new(), &floor);
+        let stamps: Vec<Hlc> = ops.iter().map(|(op, _)| op.hlc).collect();
+        assert_eq!(stamps, [Hlc::new(1_000, 67), Hlc::new(1_000, 68)]);
     }
 
     #[test]
