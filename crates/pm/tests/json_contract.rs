@@ -144,6 +144,32 @@ fn looks_like_ulid(s: &str) -> bool {
             .all(|b| ALPHABET.contains(b.to_ascii_uppercase() as char))
 }
 
+/// Replaces every `YYYY-MM-DD` run in `s` with `<DATE>`.
+fn mask_dates(s: &str) -> String {
+    let b = s.as_bytes();
+    let is_date = |i: usize| {
+        i + 10 <= b.len()
+            && b[i..i + 4].iter().all(u8::is_ascii_digit)
+            && b[i + 4] == b'-'
+            && b[i + 5..i + 7].iter().all(u8::is_ascii_digit)
+            && b[i + 7] == b'-'
+            && b[i + 8..i + 10].iter().all(u8::is_ascii_digit)
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if is_date(i) {
+            out.push_str("<DATE>");
+            i += 10;
+        } else {
+            let ch = s[i..].chars().next().expect("in-bounds char");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 fn normalize_value(v: &mut Value) {
     match v {
         Value::Object(map) => {
@@ -180,6 +206,13 @@ fn normalize_value(v: &mut Value) {
                     // `pm import vault`: how long the run took.
                     "elapsed_ms" => {
                         *val = Value::from(0);
+                        continue;
+                    }
+                    // Human-readable messages (e.g. `pm check`'s held
+                    // finding) embed the run date: "(by tester, 2026-09-28)".
+                    "message" if val.is_string() => {
+                        let masked = mask_dates(val.as_str().unwrap_or_default());
+                        *val = Value::String(masked);
                         continue;
                     }
                     _ => {}
