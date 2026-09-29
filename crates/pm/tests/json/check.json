@@ -10,7 +10,7 @@
         "by": "tester",
         "reason": "needs review"
       },
-      "message": "held: needs review (by tester, 2026-09-28)",
+      "message": "held: needs review (by tester, <DATE>)",
       "rule": "held",
       "tickets": [
         "AGT-2"
