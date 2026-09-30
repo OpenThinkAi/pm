@@ -545,6 +545,19 @@ pub(crate) struct TempFile {
 
 impl TempFile {
     pub(crate) fn create(label: &str, contents: &str) -> Result<Self> {
+        // The label is a ticket or project id that may have arrived through
+        // a synced op: keep it to plain filename characters.
+        let label: String = label
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(64)
+            .collect();
         let path = std::env::temp_dir().join(format!("pm-edit-{label}-{}.md", Ulid::new()));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);

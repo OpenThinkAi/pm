@@ -21,11 +21,16 @@ nothing (think-hub precedent). A wrong method on a real route is that
 ## `GET /health` (open)
 
 ```json
-{"status": "ok", "schema_version": 3, "op_version": 1}
+{"status": "ok", "schema_version": 3, "op_version": 1, "build": "<git sha>"}
 ```
 
 `schema_version` is read live from the database; `op_version` is the
-`pm_core::OP_VERSION` this build writes and understands.
+`pm_core::OP_VERSION` this build writes and understands. `build` is the
+git sha the binary was built from (`PM_HUB_BUILD_SHA` at build time;
+`"unknown"` when unset). `scripts/deploy-hub.sh` writes the sha to
+`.build-sha` in the upload (`railway up` ships no `.git` and takes no
+build args), the Dockerfile passes it to cargo, and the script waits for
+`/health` to report it.
 
 ## `GET /w/{workspace}/whoami`
 

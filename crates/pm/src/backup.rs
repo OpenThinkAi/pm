@@ -425,6 +425,7 @@ pub fn run(ctx: &Ctx<'_>, to: Option<PathBuf>) -> Result<()> {
 
     let ops_dir = dir.join("ops");
     fs::create_dir_all(&ops_dir).with_context(|| format!("creating {}", ops_dir.display()))?;
+    crate::ids::safe_component(&ws.prefix, "workspace prefix")?;
     let layout = Layout::new(&dir, &ws.prefix.to_ascii_lowercase());
 
     // A target last written by a pre-AGT-1378 binary: same ops, sharded.
@@ -608,6 +609,7 @@ fn find_backup(dir: &Path) -> Result<Layout> {
             dir.display()
         ))),
         [stem] => {
+            crate::ids::safe_component(stem, "backup workspace name")?;
             let layout = Layout::new(dir, stem);
             if layout.op_files()?.is_empty() {
                 return Err(CliError::not_found(format!(
@@ -788,6 +790,7 @@ pub fn status(ctx: &Ctx<'_>, to: Option<PathBuf>) -> Result<()> {
         .as_ref()
         .and_then(|s| s.age_seconds)
         .is_some_and(|age| age < STALE_AFTER_SECONDS);
+    crate::ids::safe_component(&ws.prefix, "workspace prefix")?;
     let files = Layout::new(&dir, &ws.prefix.to_ascii_lowercase()).files(&dir)?;
     let warnings = size_warnings(&files);
 

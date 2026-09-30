@@ -245,7 +245,16 @@ struct Health {
     status: &'static str,
     schema_version: i32,
     op_version: u16,
+    /// Git sha this binary was built from (`PM_HUB_BUILD_SHA` at build
+    /// time, see scripts/deploy-hub.sh), or "unknown".
+    build: &'static str,
 }
+
+/// The build's git sha, baked in at compile time.
+const BUILD_SHA: &str = match option_env!("PM_HUB_BUILD_SHA") {
+    Some(sha) if !sha.is_empty() => sha,
+    _ => "unknown",
+};
 
 /// 200 with the schema version read live from the database (so a hub that
 /// cannot reach Postgres fails its health check), 503 otherwise.
@@ -258,5 +267,6 @@ async fn health(State(db): State<Db>) -> Result<Json<Health>, StatusCode> {
         status: "ok",
         schema_version,
         op_version: pm_core::OP_VERSION,
+        build: BUILD_SHA,
     }))
 }

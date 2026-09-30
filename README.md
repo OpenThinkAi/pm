@@ -103,6 +103,14 @@ hand from the CLI's source and kept honest by two test suites
 (`crates/pm/tests/json_contract.rs`, `crates/pm/tests/help_contract.rs`);
 where the doc and `pm --help` disagree, the code is the bug.
 
+## Data retention
+
+Deleting a ticket or project only tombstones it: titles, comments, hold
+reasons and removed body text remain in the op log, the Loro body history,
+the hub and any git backups, and there is no purge command today. See
+**[`docs/data-retention.md`](./docs/data-retention.md)** before storing
+anything sensitive.
+
 ## License
 
 MIT OR Apache-2.0.
