@@ -48,8 +48,8 @@ pub use config::{
 };
 pub use doc::{DocApplyError, DocView, apply_doc, apply_doc_persisted};
 pub use domain::{
-    Actor, ActorId, ActorKind, Comment, Hold, NotBefore, Parked, Priority, Project, ProjectStatus,
-    Relation, RelationKind, Source, State, StateCategory, Ticket, Waiver, Workspace,
+    Actor, ActorId, ActorKind, Comment, DocsOwner, Hold, NotBefore, Parked, Priority, Project,
+    ProjectStatus, Relation, RelationKind, Source, State, StateCategory, Ticket, Waiver, Workspace,
 };
 pub use hlc::{Clock, Hlc, Stamp};
 pub use op::{OP_VERSION, Op, Payload};

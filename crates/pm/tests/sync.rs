@@ -1346,6 +1346,7 @@ fn seed_refusals_exit_1_and_change_nothing() {
             model_labels: Default::default(),
             template_sections: Vec::new(),
             stale_days: 30,
+            docs_owned_by: Default::default(),
         };
         store.init_workspace(&ws, &ActorId::new("y")).unwrap();
     }

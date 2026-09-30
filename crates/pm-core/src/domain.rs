@@ -128,6 +128,43 @@ pub struct Workspace {
     pub template_sections: Vec<String>,
     /// Days without an update before `pm check` flags a ticket as stale.
     pub stale_days: u32,
+    /// Who owns project design docs (AGT-1406); `pm import vault` leaves
+    /// them alone once pm does.
+    #[serde(default)]
+    pub docs_owned_by: DocsOwner,
+}
+
+/// Which side owns project design docs (`projects/*/README.md` and their
+/// siblings): the vault, which `pm import vault` refreshes from, or pm,
+/// where they are edited and a re-import must not overwrite them.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DocsOwner {
+    #[default]
+    Vault,
+    Pm,
+}
+
+impl DocsOwner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocsOwner::Vault => "vault",
+            DocsOwner::Pm => "pm",
+        }
+    }
+}
+
+impl std::str::FromStr for DocsOwner {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "vault" => Ok(DocsOwner::Vault),
+            "pm" => Ok(DocsOwner::Pm),
+            other => Err(format!("unknown docs owner '{other}' (vault or pm)")),
+        }
+    }
 }
 
 impl Workspace {
@@ -328,6 +365,7 @@ mod tests {
             model_labels: [("model:fable-5".to_string(), "fable".to_string())].into(),
             template_sections: vec!["Problem Statement".into(), "Acceptance Criteria".into()],
             stale_days: 30,
+            docs_owned_by: Default::default(),
         });
         round_trip(&Project {
             id: "pm".into(),

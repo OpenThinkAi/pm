@@ -232,6 +232,7 @@ fn workspace_summary(w: &pm_core::op::WorkspaceSet) -> String {
             format!("set template sections to [{}]", v.join(", "))
         }
         WorkspaceSet::StaleDays(d) => format!("set stale days to {d}"),
+        WorkspaceSet::DocsOwnedBy(o) => format!("set project docs owner to {}", o.as_str()),
     }
 }
 

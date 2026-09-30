@@ -1,0 +1,13 @@
+-- AGT-1406: who owns project design docs, `vault` (default) or `pm`. A
+-- `workspace.set docs_owned_by` op folds into the workspace view and this
+-- column is materialized from it like the rest of the row (rewritten by
+-- `pm doctor --rebuild`); `pm import vault` reads it to decide whether to
+-- refresh `projects/*/README.md` and sibling docs.
+--
+-- The column itself is added in Rust (`src/config.rs::add_docs_owned_by_column`,
+-- run by `Store::open` in this migration's transaction): SQLite has no
+-- `ADD COLUMN IF NOT EXISTS`, and every migration from 0005 on must be
+-- re-runnable against a database that already has its shape. The effect is:
+--
+--   ALTER TABLE workspace ADD COLUMN docs_owned_by TEXT NOT NULL DEFAULT 'vault'
+--       CHECK (docs_owned_by IN ('vault', 'pm'));

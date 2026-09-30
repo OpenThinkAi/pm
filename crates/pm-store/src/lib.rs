@@ -82,10 +82,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (7, include_str!("../migrations/0007_config_ops.sql")),
     (8, include_str!("../migrations/0008_doc_identity.sql")),
     (9, include_str!("../migrations/0009_sync_seeded.sql")),
+    (10, include_str!("../migrations/0010_docs_owned_by.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// The migration whose work is Rust, not SQL: after its (comment-only)
 /// SQL file runs, [`reencode::run`] rewrites every stored byte payload in
@@ -107,6 +108,10 @@ const DOC_IDENTITY_VERSION: u32 = 8;
 /// `sync_state.seeded` only if it is not there yet, so the migration can
 /// run again against a database that already has it.
 const SYNC_SEEDED_VERSION: u32 = 9;
+
+/// And for `workspace.docs_owned_by` (AGT-1406): the column is added by
+/// [`config::add_docs_owned_by_column`], idempotently.
+const DOCS_OWNED_BY_VERSION: u32 = 10;
 
 /// How long a writer waits for the database lock before giving up. Sized
 /// for many concurrent CLI invocations (build loops fan out), not for a
@@ -174,6 +179,9 @@ impl Store {
             }
             if *version == SYNC_SEEDED_VERSION {
                 sync::add_seeded_column(&tx)?;
+            }
+            if *version == DOCS_OWNED_BY_VERSION {
+                config::add_docs_owned_by_column(&tx)?;
             }
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",

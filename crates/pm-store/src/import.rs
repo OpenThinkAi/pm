@@ -105,6 +105,7 @@ mod tests {
                     model_labels: Default::default(),
                     template_sections: Vec::new(),
                     stale_days: 30,
+                    docs_owned_by: Default::default(),
                 },
                 &matt(),
             )

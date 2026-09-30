@@ -163,7 +163,7 @@ fn imports_every_file_field_comment_and_doc() {
     assert_eq!(report["project_stubs"], json!([]));
     assert_eq!(
         report["docs"],
-        json!({"created": 6, "updated": 0, "unchanged": 0})
+        json!({"created": 6, "updated": 0, "unchanged": 0, "skipped": []})
     );
     assert_eq!(report["max_number"], 15);
     assert_eq!(report["number_floor"], 15);
@@ -877,4 +877,62 @@ fn recovers_a_clobbered_file_from_a_git_object() {
     ]);
     assert_code(&out, 2);
     assert!(stderr(&out).contains("PATH=REV"));
+}
+
+// ------------------------------------------------------------ AGT-1406
+
+/// `docs_owned_by = pm`: projects and tickets still import, but no
+/// README or sibling doc is read into pm; each is reported as skipped.
+#[test]
+fn docs_owned_by_pm_skips_project_docs_and_reports_them() {
+    let sb = Sandbox::initialized();
+    let shown = |out: &Output| stdout(out).trim().to_string();
+    assert_eq!(shown(&sb.pm(&["workspace", "docs-owned-by"])), "vault");
+    assert_ok(&sb.pm(&["workspace", "docs-owned-by", "pm"]));
+    assert_eq!(shown(&sb.pm(&["workspace", "docs-owned-by"])), "pm");
+
+    let report = sb.import(Path::new(FIXTURE));
+    assert_eq!(report["tickets"]["created"], 7);
+    assert_eq!(report["projects"], 4);
+    let docs = &report["docs"];
+    assert_eq!(docs["created"], 0);
+    assert_eq!(docs["updated"], 0);
+    assert_eq!(docs["unchanged"], 0);
+    let skipped = strings(&docs["skipped"]);
+    assert_eq!(skipped.len(), 6, "{skipped:?}");
+    assert!(skipped.iter().all(|p| p.starts_with("projects/")));
+    assert!(skipped.contains("projects/alpha/README.md"), "{skipped:?}");
+    // Metadata and tickets landed; document text did not.
+    let alpha = sb.project("alpha");
+    assert_eq!(alpha["id"], "alpha");
+    assert!(sb.store().project("alpha").unwrap().unwrap().doc.is_empty());
+    assert_eq!(sb.store().all_tickets().unwrap().len(), 7);
+
+    let human = stdout(&sb.pm(&["import", "vault", FIXTURE]));
+    assert!(human.contains("6 skipped (owned by pm)"), "{human}");
+    assert!(human.contains("projects/alpha/README.md"), "{human}");
+
+    // Flipping back resumes refreshing the docs.
+    assert_ok(&sb.pm(&["workspace", "docs-owned-by", "vault"]));
+    let report = sb.import(Path::new(FIXTURE));
+    assert_eq!(report["docs"]["created"], 6);
+    assert_eq!(report["docs"]["skipped"], json!([]));
+
+    // And a bad value is a usage error.
+    assert_code(&sb.pm(&["workspace", "docs-owned-by", "nobody"]), 2);
+    assert_ok(&sb.pm(&["doctor"]));
+    assert_ok(&sb.pm(&["doctor", "--rebuild"]));
+    assert_eq!(shown(&sb.pm(&["workspace", "docs-owned-by"])), "vault");
+}
+
+/// An owner set with `pm` survives `doctor --rebuild`: the column is
+/// re-derived from the `workspace.set` op.
+#[test]
+fn docs_owned_by_survives_doctor_rebuild() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["workspace", "docs-owned-by", "pm"]));
+    assert_ok(&sb.pm(&["doctor", "--rebuild"]));
+    let v = json(&sb.pm(&["workspace", "docs-owned-by", "--json"]));
+    assert_eq!(v["docs_owned_by"], "pm");
+    assert_ok(&sb.pm(&["doctor"]));
 }

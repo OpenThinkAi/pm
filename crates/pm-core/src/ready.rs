@@ -561,6 +561,7 @@ mod tests {
             model_labels: [("model:fable-5".to_string(), "fable".to_string())].into(),
             template_sections: vec![],
             stale_days: 30,
+            docs_owned_by: Default::default(),
         }
     }
 

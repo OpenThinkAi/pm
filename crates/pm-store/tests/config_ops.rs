@@ -40,6 +40,7 @@ fn workspace() -> Workspace {
         model_labels: [("model:fable-5".to_string(), "fable".to_string())].into(),
         template_sections: vec!["Problem Statement".into()],
         stale_days: 30,
+        docs_owned_by: Default::default(),
     }
 }
 

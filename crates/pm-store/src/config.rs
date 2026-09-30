@@ -60,8 +60,8 @@ use pm_core::op::{
     ActorUpsert, ProjectCreate, ProjectDocAdd, ProjectSet, StateUpsert, WorkspaceSet,
 };
 use pm_core::{
-    ActorId, ActorKind, Clock, Op, Payload, Project, ProjectStatus, ProjectView, State, Workspace,
-    WorkspaceView, apply_project, apply_workspace,
+    ActorId, ActorKind, Clock, DocsOwner, Op, Payload, Project, ProjectStatus, ProjectView, State,
+    Workspace, WorkspaceView, apply_project, apply_workspace,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use ulid::Ulid;
@@ -260,6 +260,28 @@ impl Store {
         load_projects(&self.conn, "", [])
     }
 
+    /// `workspace.set docs_owned_by` (AGT-1406) and nothing else: who owns
+    /// project design docs. A no-op (no op committed) when already `owner`.
+    pub fn set_docs_owned_by(&mut self, owner: DocsOwner, actor: &ActorId) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id: Option<String> = tx
+            .query_row("SELECT workspace FROM workspace_view", [], |r| r.get(0))
+            .optional()?;
+        let Some(id) = id else {
+            return Err(StoreError::NoWorkspace);
+        };
+        let id = ulid("workspace_view.workspace", &id)?;
+        let view = load_workspace_view(&tx, id)?.ok_or(StoreError::NoWorkspace)?;
+        let mut target = view.snapshot();
+        target.docs_owned_by = owner;
+        let payloads = workspace_diff(Some(&view), &target);
+        commit_payloads(&tx, id, actor, payloads)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Sets the workspace's gate labels to exactly `labels` with
     /// `workspace.set gate_label_add` / `gate_label_remove` ops under
     /// `actor` (AGT-1380: `pm workspace gate-label add|remove`), leaving
@@ -427,12 +449,12 @@ fn materialize_workspace(tx: &Transaction<'_>, view: &WorkspaceView) -> Result<(
     let ws = view.snapshot();
     if view.prefix.stamp.is_some() {
         tx.execute(
-            "INSERT INTO workspace (singleton, id, prefix, gate_labels, model_labels, template_sections, stale_days)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO workspace (singleton, id, prefix, gate_labels, model_labels, template_sections, stale_days, docs_owned_by)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(singleton) DO UPDATE SET
                id = excluded.id, prefix = excluded.prefix, gate_labels = excluded.gate_labels,
                model_labels = excluded.model_labels, template_sections = excluded.template_sections,
-               stale_days = excluded.stale_days",
+               stale_days = excluded.stale_days, docs_owned_by = excluded.docs_owned_by",
             params![
                 ws.id.to_string(),
                 ws.prefix,
@@ -440,6 +462,7 @@ fn materialize_workspace(tx: &Transaction<'_>, view: &WorkspaceView) -> Result<(
                 json(&ws.model_labels),
                 json(&ws.template_sections),
                 ws.stale_days,
+                ws.docs_owned_by.as_str(),
             ],
         )?;
     }
@@ -800,6 +823,13 @@ pub fn workspace_diff(current: Option<&WorkspaceView>, target: &Workspace) -> Ve
             target.stale_days,
         )));
     }
+    // Emitted only on a change: a workspace that never chose an owner has
+    // the default (vault) and needs no op to say so.
+    if view.docs_owned_by.value != target.docs_owned_by {
+        out.push(Payload::WorkspaceSet(WorkspaceSet::DocsOwnedBy(
+            target.docs_owned_by,
+        )));
+    }
     for label in &target.gate_labels {
         if !view.gate_labels.contains(label) {
             out.push(Payload::WorkspaceSet(WorkspaceSet::GateLabelAdd(
@@ -978,9 +1008,24 @@ pub(crate) fn project_ulid(conn: &Connection, slug: &str) -> Result<Option<Ulid>
 }
 
 pub(crate) fn workspace_row(conn: &Connection) -> Result<Option<Workspace>> {
+    // Migrations 0007/0008 read the workspace (their backfills) before
+    // migration 0010 adds `docs_owned_by`; until then the owner is the
+    // default, `vault`.
+    let has_owner: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('workspace') WHERE name = 'docs_owned_by'",
+        [],
+        |r| r.get(0),
+    )?;
+    let owner_column = if has_owner {
+        "docs_owned_by"
+    } else {
+        "'vault'"
+    };
     let row = conn
         .query_row(
-            "SELECT id, prefix, gate_labels, model_labels, template_sections, stale_days FROM workspace",
+            &format!(
+                "SELECT id, prefix, gate_labels, model_labels, template_sections, stale_days, {owner_column} FROM workspace"
+            ),
             [],
             |r| {
                 Ok((
@@ -990,11 +1035,14 @@ pub(crate) fn workspace_row(conn: &Connection) -> Result<Option<Workspace>> {
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, u32>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((id, prefix, gate_labels, model_labels, template_sections, stale_days)) = row else {
+    let Some((id, prefix, gate_labels, model_labels, template_sections, stale_days, docs_owned_by)) =
+        row
+    else {
         return Ok(None);
     };
     Ok(Some(Workspace {
@@ -1005,7 +1053,25 @@ pub(crate) fn workspace_row(conn: &Connection) -> Result<Option<Workspace>> {
         model_labels: from_json("workspace.model_labels", &model_labels)?,
         template_sections: from_json("workspace.template_sections", &template_sections)?,
         stale_days,
+        docs_owned_by: enum_from_name("workspace.docs_owned_by", docs_owned_by)?,
     }))
+}
+
+/// Migration 0010's one step (AGT-1406): adds `workspace.docs_owned_by`
+/// unless the table already has it (migrations from 0005 on must be
+/// re-runnable).
+pub(crate) fn add_docs_owned_by_column(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('workspace') WHERE name = 'docs_owned_by'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch(
+            "ALTER TABLE workspace ADD COLUMN docs_owned_by TEXT NOT NULL DEFAULT 'vault' CHECK (docs_owned_by IN ('vault', 'pm'))",
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn states(conn: &Connection) -> Result<Vec<State>> {
@@ -1118,6 +1184,7 @@ mod tests {
             model_labels: [("model:fable-5".to_string(), "fable".to_string())].into(),
             template_sections: Vec::new(),
             stale_days: 30,
+            docs_owned_by: Default::default(),
         }
     }
 

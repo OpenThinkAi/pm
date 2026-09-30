@@ -569,6 +569,14 @@ fn every_verbs_json_output_matches_its_fixture() {
         &mut failures,
     );
 
+    // ---- pm workspace docs-owned-by (AGT-1406) ----
+    cap(
+        "workspace_docs_owned_by",
+        &["workspace", "docs-owned-by", "--json"],
+        0,
+        &mut failures,
+    );
+
     // ---- pm project new/list/show/doc ----
     cap(
         "project_new",
