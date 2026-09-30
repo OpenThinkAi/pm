@@ -12,27 +12,31 @@ job, calling `pm` the way it calls `git`.
 
 ## Install
 
-```sh
-npm i -g @openthink/pm
-```
-
-or the shell installer:
+pm is not published to npm or a release channel yet. Install it from
+source with Cargo:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/OpenThinkAi/pm/releases/latest/download/pm-installer.sh | sh
+cargo install --locked --git https://github.com/OpenThinkAi/pm pm
 ```
 
-Both put a `pm` binary on your `PATH`. There's no separate daemon or
+This puts a `pm` binary in `~/.cargo/bin`. There's no separate daemon or
 service to run.
 
-Building from source (needs a current stable Rust toolchain):
+**Rust toolchain:** stable Rust 1.85 or newer (the workspace uses edition
+2024, which needs 1.85). The workspace declares no `rust-version`, and the
+minimum is not CI-verified; it is known to build on 1.91 and current
+stable.
+
+Or build from a clone:
 
 ```sh
 git clone https://github.com/OpenThinkAi/pm && cd pm
 cargo build --release --locked
 ./target/release/pm --version
 ```
+
+**Coming with the first release:** `npm i -g @openthink/pm` and a shell
+installer (`pm-installer.sh`). Neither exists yet; don't look for them.
 
 ## First workspace
 
