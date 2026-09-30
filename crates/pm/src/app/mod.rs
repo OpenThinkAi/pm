@@ -6,8 +6,11 @@
 //! **What it is.** An axum server inside the `pm` process, bound to
 //! `127.0.0.1` on a random port. It serves the ticket, project, list and
 //! ready JSON the CLI already prints (the same renderers: `ticket_json`,
-//! `project_json`, `ready::compute`), accepts field sets, label changes,
-//! state moves and `body.edit` updates as POSTs, and streams every op that
+//! `project_json`, `ready::compute`), serves ticket descriptions and
+//! project documents as CRDT bodies, accepts field sets, label changes,
+//! state moves, `body.edit` updates (on tickets and on project documents'
+//! `doc_id`s) and new tickets (`pm new`'s own path, AGT-1405) as POSTs,
+//! and streams every op that
 //! lands in the log — from this API, from a CLI in another process, from
 //! `pm sync` — over SSE (`events`). Writes take the CLI verbs' own paths
 //! (`Stamper`, `Store::commit_batch`), so they land in the outbox and sync
@@ -89,6 +92,10 @@ pub struct AppArgs {
 pub(crate) struct AppState {
     /// The workspace directory every request opens.
     dir: PathBuf,
+    /// The launching command's environment: `POST /tickets` numbers a new
+    /// ticket the way `pm new` would on this machine
+    /// (`hub::numbers_are_hub_assigned` reads config.toml through it).
+    env: workspace::Env,
     /// The actor every op this server commits records.
     actor: ActorId,
     token: String,
@@ -244,7 +251,8 @@ pub fn app(ctx: &Ctx<'_>, args: AppArgs) -> Result<()> {
 }
 
 /// `pm edit <id>` in ui-leaf: the ticket view, until its window closes.
-/// `id` must already be resolved (a display id that exists).
+/// `id` must already be resolved: a ticket that exists, named by its ref
+/// (the display id, or the ULID while its number is pending).
 pub(crate) fn edit_ticket(ctx: &Ctx<'_>, runtime: Runtime, id: &str) -> Result<Ended> {
     let launch = Launch::resolve(ctx, &[], LAUNCHED_IDLE_SECS)?;
     serve(
@@ -253,6 +261,22 @@ pub(crate) fn edit_ticket(ctx: &Ctx<'_>, runtime: Runtime, id: &str) -> Result<E
         Mode::View {
             runtime,
             target: Target::Ticket { id: id.to_string() },
+        },
+    )
+}
+
+/// `pm project edit <id>` in ui-leaf (AGT-1405): the project view — its
+/// design doc and named documents in the CRDT editor, its tickets, and
+/// "New ticket" — until its window closes. `id` must be a project that
+/// exists.
+pub(crate) fn edit_project(ctx: &Ctx<'_>, runtime: Runtime, id: &str) -> Result<Ended> {
+    let launch = Launch::resolve(ctx, &[], LAUNCHED_IDLE_SECS)?;
+    serve(
+        ctx,
+        launch,
+        Mode::View {
+            runtime,
+            target: Target::Project { id: id.to_string() },
         },
     )
 }
@@ -282,6 +306,7 @@ fn serve(ctx: &Ctx<'_>, launch: Launch, mode: Mode) -> Result<Ended> {
         let (events, _) = broadcast::channel(events::BUFFER);
         let state = Arc::new(AppState {
             dir: launch.dir.clone(),
+            env: ctx.env.clone(),
             actor: launch.actor.clone(),
             token: token.clone(),
             port,

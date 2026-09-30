@@ -642,42 +642,87 @@ fn new_single(ctx: &Ctx<'_>, args: NewArgs) -> Result<()> {
     let actor = ctx.actor()?;
 
     let (mut store, ws) = ctx.open()?;
-    let state = initial_state(&ws)?;
+    let ticket = file_ticket(
+        &mut store,
+        &ws,
+        ctx.env,
+        &actor,
+        NewTicket {
+            title,
+            project,
+            repo,
+            priority: args.priority.unwrap_or_default(),
+            labels,
+            description,
+            blocked_by: args.blocked_by,
+            source,
+            linked_github,
+        },
+    )?;
+    print_created_ticket(ctx, &store, &ws, &ticket)
+}
+
+/// One ticket to file, its flags already validated (trimmed, non-empty).
+pub(crate) struct NewTicket {
+    pub title: String,
+    pub project: Option<String>,
+    pub repo: Option<String>,
+    pub priority: Priority,
+    pub labels: BTreeSet<String>,
+    pub description: Option<String>,
+    /// Blocker refs as given (display ids or ULIDs), resolved here.
+    pub blocked_by: Vec<String>,
+    pub source: Option<Source>,
+    pub linked_github: Option<String>,
+}
+
+/// Files one ticket exactly as plain `pm new` does — the initial state,
+/// the project checked before any op, blockers resolved, the op set
+/// [`build_create_ops`] builds, numbered by [`commit_new`] (locally, or
+/// left pending when a hub is configured) — and returns it. `pub(crate)`:
+/// `pm app`'s `POST /tickets` (AGT-1405) files through this same path.
+pub(crate) fn file_ticket(
+    store: &mut Store,
+    ws: &Workspace,
+    env: &Env,
+    actor: &ActorId,
+    spec: NewTicket,
+) -> Result<Ticket> {
+    let state = initial_state(ws)?;
     // Checked up front so a missing project fails before any op lands
     // (the store would reject the create too, as R2).
-    if let Some(project) = &project {
-        require_project(&store, project)?;
+    if let Some(project) = &spec.project {
+        require_project(store, project)?;
     }
-    let blocked_by: Vec<Ulid> = args
+    let blocked_by: Vec<Ulid> = spec
         .blocked_by
         .iter()
-        .map(|r| find(&store, &ws, r).map(|t| t.id))
+        .map(|r| find(store, ws, r).map(|t| t.id))
         .collect::<Result<_>>()?;
 
     let id = Ulid::new();
-    let mut stamper = Stamper::new(&store, actor.clone())?;
+    let mut stamper = Stamper::new(store, actor.clone())?;
     let ops = build_create_ops(
         &mut stamper,
         id,
         &state,
-        title,
-        args.priority.unwrap_or_default(),
-        project,
-        repo,
-        source,
+        spec.title,
+        spec.priority,
+        spec.project,
+        spec.repo,
+        spec.source,
         Default::default(),
-        labels,
+        spec.labels,
         blocked_by,
-        description,
-        linked_github,
+        spec.description,
+        spec.linked_github,
         None,
     )?;
-    let tickets = commit_new(&mut store, ctx.env, &ops, &[id], &actor)?;
-    let ticket = tickets
+    let tickets = commit_new(store, env, &ops, &[id], actor)?;
+    tickets
         .into_iter()
         .next()
-        .ok_or_else(|| CliError::error(format!("ticket {id} vanished after create")))?;
-    print_created_ticket(ctx, &store, &ws, &ticket)
+        .ok_or_else(|| CliError::error(format!("ticket {id} vanished after create")))
 }
 
 /// `pm new --from-file <path>` (AC1): a vault-format ticket file

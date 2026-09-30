@@ -23,10 +23,12 @@ export type Mutate = (name: string, args?: unknown) => Promise<unknown>;
 /** The `data` pm mounts every view with. Nothing secret lives here. */
 export interface ViewData {
   schema: number;
-  /** `board` or `ticket`. */
+  /** `board`, `ticket` or `project`. */
   view: string;
-  /** The ticket a `ticket` view shows (a display id, e.g. `AGT-12`). */
+  /** The ticket a `ticket` view shows (a display id, e.g. `AGT-12`, or the ULID while its number is pending). */
   ticket?: string;
+  /** The project a `project` view shows (its id, e.g. `pm`). */
+  project?: string;
 }
 
 /** What ui-leaf hands a view. */

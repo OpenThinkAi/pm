@@ -10,7 +10,7 @@
 //! written temp directory, so a present directory is always complete and
 //! two `pm`s unpacking at once cannot tear it.
 //!
-//! `views/vendor/` is third-party code the ticket editor bundles —
+//! `views/vendor/` is third-party code the editors (ticket and project) bundle —
 //! `loro-crdt` (its wasm inlined as base64, ~4.7 MB) and CodeMirror with
 //! `loro-codemirror` — generated from pinned versions by
 //! `crates/pm/views-vendor/build.ts` and committed, so neither building nor
@@ -34,7 +34,10 @@ use crate::workspace::Env;
 pub(crate) const FILES: &[(&str, &str)] = &[
     ("board.tsx", include_str!("../../views/board.tsx")),
     ("ticket.tsx", include_str!("../../views/ticket.tsx")),
+    ("project.tsx", include_str!("../../views/project.tsx")),
     ("lib/board.ts", include_str!("../../views/lib/board.ts")),
+    ("lib/project.ts", include_str!("../../views/lib/project.ts")),
+    ("lib/editor.tsx", include_str!("../../views/lib/editor.tsx")),
     ("lib/pm.ts", include_str!("../../views/lib/pm.ts")),
     ("lib/body.ts", include_str!("../../views/lib/body.ts")),
     ("vendor/loro.js", include_str!("../../views/vendor/loro.js")),

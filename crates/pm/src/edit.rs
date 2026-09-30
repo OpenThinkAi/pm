@@ -54,7 +54,7 @@ use std::process::Command;
 
 use anyhow::Context;
 use pm_core::op::{BodyEdit, FieldSet, LabelAdd, LabelRemove};
-use pm_core::{ActorId, Body, Payload, Priority, Source, TicketView, Workspace};
+use pm_core::{ActorId, Body, BodyState, Payload, Priority, Source, TicketView, Workspace};
 use pm_store::Store;
 use serde_json::Value;
 use serde_yaml_ng::{Mapping, Value as Yaml};
@@ -66,7 +66,7 @@ use crate::app::{
 };
 use crate::batch;
 use crate::exit::{CliError, Result};
-use crate::verbs::{Ctx, Stamper, display_id, find, print_json, ticket_json};
+use crate::verbs::{Ctx, Stamper, display_id, find, print_json, ref_id, ticket_json};
 use crate::workspace::{Config, Env};
 
 /// How many times a save that does not parse re-opens the editor before
@@ -134,8 +134,9 @@ fn configured_view(env: &Env) -> Result<Option<View>> {
 
 /// `--view`, then config's `edit.view`, else ui-leaf — and whether the
 /// choice was explicit (a flag or config), which decides whether a
-/// headless fallback is worth a note.
-fn resolve_view(flag: Option<View>, env: &Env) -> Result<(View, bool)> {
+/// headless fallback is worth a note. `pub(crate)`: `pm project edit`
+/// (AGT-1405) chooses between the project view and `$EDITOR` the same way.
+pub(crate) fn resolve_view(flag: Option<View>, env: &Env) -> Result<(View, bool)> {
     if let Some(view) = flag {
         return Ok((view, true));
     }
@@ -154,29 +155,48 @@ fn default_may_launch(explicit: bool, interactive: bool) -> bool {
     explicit || interactive
 }
 
-/// The ui-leaf path of `pm edit`: `Ok(true)` when the view opened and has
-/// closed (the command is done), `Ok(false)` to continue with `$EDITOR`.
-fn edit_in_ui_leaf(ctx: &Ctx<'_>, reference: &str, explicit: bool) -> Result<bool> {
+/// The ui-leaf runtime to open a view in, or `None` for the `$EDITOR`
+/// flow: [`default_may_launch`] for this invocation's terminals, then
+/// [`launch::choose`], printing its fallback note (if any) as one stderr
+/// line prefixed with `command`. Shared by `pm edit` and `pm project edit`.
+pub(crate) fn ui_leaf_runtime(
+    ctx: &Ctx<'_>,
+    explicit: bool,
+    command: &str,
+) -> Result<Option<launch::Runtime>> {
     use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !default_may_launch(explicit, interactive) {
-        return Ok(false);
+        return Ok(None);
     }
-    let runtime = match launch::choose(ctx.env, explicit)? {
-        Choice::Launch(runtime) => runtime,
+    match launch::choose(ctx.env, explicit)? {
+        Choice::Launch(runtime) => Ok(Some(runtime)),
         Choice::Fallback(note) => {
             if let Some(note) = note {
-                eprintln!("pm: {note}; using $EDITOR (set edit.view = \"editor\" to skip ui-leaf)");
+                eprintln!(
+                    "{command}: {note}; using $EDITOR (set edit.view = \"editor\" to skip ui-leaf)"
+                );
             }
-            return Ok(false);
+            Ok(None)
         }
+    }
+}
+
+/// The ui-leaf path of `pm edit`: `Ok(true)` when the view opened and has
+/// closed (the command is done), `Ok(false)` to continue with `$EDITOR`.
+fn edit_in_ui_leaf(ctx: &Ctx<'_>, reference: &str, explicit: bool) -> Result<bool> {
+    let Some(runtime) = ui_leaf_runtime(ctx, explicit, "pm")? else {
+        return Ok(false);
     };
     // Resolve the ticket first: a bad id is exit 3 before any window.
     let (store, ws) = ctx.open()?;
     let ticket = find(&store, &ws, reference)?;
     let shown = display_id(&ws, &ticket);
+    // The view names the ticket to the API: the ULID while its number is
+    // pending, since `AGT-?` names nothing.
+    let reference = ref_id(&ws, &ticket);
     drop(store);
-    match app::edit_ticket(ctx, runtime, &shown)? {
+    match app::edit_ticket(ctx, runtime, &reference)? {
         Ended::Closed => {}
         Ended::Failed(why) => {
             eprintln!("pm: ui-leaf could not open {shown} ({why}); using $EDITOR");
@@ -459,22 +479,23 @@ pub(crate) fn plan(
 
     if before.body != after.body {
         out.push(Payload::BodyEdit(BodyEdit {
-            update: body_update(view, &after.body, peer)?,
+            update: body_update(&view.body, &after.body, peer)?,
         }));
     }
     Ok(out)
 }
 
-/// The `body.edit` update that turns `view`'s description into `text`,
-/// minted under `peer` (one fresh [`session_peer`] per editing session —
-/// see the module docs): a [`Body`] rebuilt from the view's Loro snapshot,
-/// then `diff_from_text`, so the update is relative to the state that was
-/// edited and merges with anything that landed meanwhile. `pub(crate)`:
-/// `pm app`'s body endpoint (AGT-1401) takes whole text the same way.
-pub(crate) fn body_update(view: &TicketView, text: &str, peer: u64) -> Result<Vec<u8>> {
-    let body_err = |e: pm_core::BodyError| CliError::error(format!("editing description: {e}"));
+/// The `body.edit` update that turns `state` (a ticket's description or a
+/// project document) into `text`, minted under `peer` (one fresh
+/// [`session_peer`] per editing session — see the module docs): a [`Body`]
+/// rebuilt from the state's Loro snapshot, then `diff_from_text`, so the
+/// update is relative to the state that was edited and merges with
+/// anything that landed meanwhile. `pub(crate)`: `pm app`'s body endpoints
+/// (AGT-1401, AGT-1405) take whole text the same way.
+pub(crate) fn body_update(state: &BodyState, text: &str, peer: u64) -> Result<Vec<u8>> {
+    let body_err = |e: pm_core::BodyError| CliError::error(format!("editing body: {e}"));
     let mut body = Body::with_peer(peer).map_err(body_err)?;
-    body.apply(&view.body.snapshot().map_err(body_err)?)
+    body.apply(&state.snapshot().map_err(body_err)?)
         .map_err(body_err)?;
     let update = body.diff_from_text(text).map_err(body_err)?;
     Ok(update.into_bytes())

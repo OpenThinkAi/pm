@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router, middleware};
 use pm_core::op::{BodyEdit, FieldSet};
-use pm_core::{Body, BodyUpdate, Payload, Ticket, Workspace};
+use pm_core::{Body, BodyState, BodyUpdate, Payload, Priority, Ticket, Workspace};
 use pm_store::{Store, TicketFilter};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -22,15 +22,15 @@ use ulid::Ulid;
 use super::{AppState, auth, events};
 use crate::exit::{self, CliError, Result};
 use crate::verbs::{
-    SCHEMA, Stamper, display_id, find, parse_assignment, require_project, ticket_json,
-    ticket_json_with_comments,
+    NewTicket, SCHEMA, Stamper, display_id, file_ticket, find, non_empty, parse_assignment,
+    require_project, ticket_json, ticket_json_with_comments,
 };
 use crate::{mutate, project, ready, workspace};
 
 pub(crate) fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/workspace", get(workspace_info))
-        .route("/tickets", get(list))
+        .route("/tickets", get(list).post(create))
         .route("/tickets/{id}", get(ticket))
         .route("/tickets/{id}/body", get(body).post(body_edit))
         .route("/tickets/{id}/fields", axum::routing::post(fields))
@@ -38,6 +38,14 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/tickets/{id}/state", axum::routing::post(state_move))
         .route("/projects", get(projects))
         .route("/projects/{id}", get(project_show))
+        .route(
+            "/projects/{id}/body",
+            get(design_doc_body).post(design_doc_edit),
+        )
+        .route(
+            "/projects/{id}/docs/{name}/body",
+            get(named_doc_body).post(named_doc_edit),
+        )
         .route("/ready", get(ready_frontier))
         .route("/events", get(events::events))
         .fallback(not_found)
@@ -230,19 +238,48 @@ struct BodyQuery {
     since: Option<String>,
 }
 
+/// `since=`, decoded: a `+` a client forgot to percent-encode arrives as a
+/// space.
+fn since_version(q: BodyQuery) -> Result<Option<Vec<u8>>> {
+    q.since
+        .map(|b64| {
+            pm_core::bytes::decode(&b64.replace(' ', "+"))
+                .map_err(|e| CliError::usage(format!("since: not a base64 version vector: {e}")))
+        })
+        .transpose()
+}
+
+/// Adds `text` and either `snapshot` (no `since`) or `update` (the ops
+/// `since` lacks) for `body` to `out` — the one body answer every body
+/// endpoint (a ticket's description, a project document) gives.
+fn body_answer(out: &mut Value, body: &BodyState, since: Option<Vec<u8>>) -> Result<()> {
+    out["text"] = json!(body.text());
+    match since {
+        None => {
+            let snapshot = body
+                .snapshot()
+                .map_err(|e| CliError::error(format!("reading body history: {e}")))?;
+            out["snapshot"] = json!(pm_core::bytes::encode(snapshot.as_bytes()));
+        }
+        Some(version) => {
+            let update = body.updates_since(&version).map_err(|e| match e {
+                pm_core::BodyError::Import(e) => {
+                    CliError::usage(format!("since: not a Loro version vector: {e}"))
+                }
+                e => CliError::error(format!("reading body history: {e}")),
+            })?;
+            out["update"] = json!(pm_core::bytes::encode(update.as_bytes()));
+        }
+    }
+    Ok(())
+}
+
 async fn body(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(q): Query<BodyQuery>,
 ) -> ApiResult {
-    // A `+` a client forgot to percent-encode arrives as a space.
-    let since = q
-        .since
-        .map(|b64| {
-            pm_core::bytes::decode(&b64.replace(' ', "+"))
-                .map_err(|e| CliError::usage(format!("since: not a base64 version vector: {e}")))
-        })
-        .transpose()?;
+    let since = since_version(q)?;
     with_store(&state, move |store, ws| {
         let t = find(store, ws, &id)?;
         let view = store
@@ -252,26 +289,8 @@ async fn body(
             "schema": SCHEMA,
             "id": display_id(ws, &t),
             "ulid": t.id.to_string(),
-            "text": view.body.text(),
         });
-        match since {
-            None => {
-                let snapshot = view
-                    .body
-                    .snapshot()
-                    .map_err(|e| CliError::error(format!("reading description history: {e}")))?;
-                out["snapshot"] = json!(pm_core::bytes::encode(snapshot.as_bytes()));
-            }
-            Some(version) => {
-                let update = view.body.updates_since(&version).map_err(|e| match e {
-                    pm_core::BodyError::Import(e) => {
-                        CliError::usage(format!("since: not a Loro version vector: {e}"))
-                    }
-                    e => CliError::error(format!("reading description history: {e}")),
-                })?;
-                out["update"] = json!(pm_core::bytes::encode(update.as_bytes()));
-            }
-        }
+        body_answer(&mut out, &view.body, since)?;
         Ok(Json(out))
     })
     .await
@@ -316,6 +335,147 @@ async fn project_show(State(state): State<Arc<AppState>>, Path(id): Path<String>
         Ok(Json(project::project_json(&p)))
     })
     .await
+}
+
+// ---------------------------------------------------------- project docs
+
+/// A project document: the design doc (`name` = `None`) or a named one.
+/// Its `doc_id` — the entity its `body.edit` ops target (AGT-1344/1413) —
+/// and its merge state (empty until its first edit).
+struct ProjectDoc {
+    project: String,
+    name: Option<String>,
+    doc_id: Ulid,
+    body: BodyState,
+}
+
+fn project_doc(store: &Store, project: &str, name: Option<&str>) -> Result<ProjectDoc> {
+    let p = store
+        .project(project)?
+        .ok_or_else(|| CliError::not_found(format!("no project '{project}'")))?;
+    let doc_id = match name {
+        None => store.design_doc_id(project)?.ok_or_else(|| {
+            CliError::error(format!(
+                "project '{project}' has no design doc bound yet (its binding has not synced here)"
+            ))
+        })?,
+        Some(name) => {
+            if !p.documents.contains_key(name) {
+                return Err(CliError::not_found(format!(
+                    "project '{project}' has no document '{name}'"
+                )));
+            }
+            store.named_doc_id(project, name)?.ok_or_else(|| {
+                CliError::error(format!(
+                    "project '{project}' document '{name}' has no id bound yet (its binding has not synced here)"
+                ))
+            })?
+        }
+    };
+    let body = store
+        .doc_view(doc_id)?
+        .map(|view| view.body)
+        .unwrap_or_default();
+    Ok(ProjectDoc {
+        project: project.to_string(),
+        name: name.map(str::to_string),
+        doc_id,
+        body,
+    })
+}
+
+/// `{"schema", "project", "doc", "doc_id"}`: which document a body answer
+/// is. `doc` is `null` for the design doc.
+fn doc_header(doc: &ProjectDoc) -> Value {
+    json!({
+        "schema": SCHEMA,
+        "project": doc.project,
+        "doc": doc.name,
+        "doc_id": doc.doc_id.to_string(),
+    })
+}
+
+async fn doc_body(
+    state: Arc<AppState>,
+    id: String,
+    name: Option<String>,
+    q: BodyQuery,
+) -> ApiResult {
+    let since = since_version(q)?;
+    with_store(&state, move |store, _ws| {
+        let doc = project_doc(store, &id, name.as_deref())?;
+        let mut out = doc_header(&doc);
+        body_answer(&mut out, &doc.body, since)?;
+        Ok(Json(out))
+    })
+    .await
+}
+
+/// `GET /projects/{id}/body[?since=]`: the design doc, as
+/// `GET /tickets/{id}/body` serves a description.
+async fn design_doc_body(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<BodyQuery>,
+) -> ApiResult {
+    doc_body(state, id, None, q).await
+}
+
+/// `GET /projects/{id}/docs/{name}/body[?since=]`: a named document.
+async fn named_doc_body(
+    State(state): State<Arc<AppState>>,
+    Path((id, name)): Path<(String, String)>,
+    Query(q): Query<BodyQuery>,
+) -> ApiResult {
+    doc_body(state, id, Some(name), q).await
+}
+
+async fn doc_edit(
+    state: Arc<AppState>,
+    id: String,
+    name: Option<String>,
+    body: Bytes,
+) -> ApiResult {
+    let edit = BodyEditRequest::parse(&body)?;
+    let actor = state.actor.clone();
+    let shared = state.clone();
+    with_store(&state, move |store, _ws| {
+        let doc = project_doc(store, &id, name.as_deref())?;
+        let update = edit.plan(&doc.body)?;
+        if !update.is_empty() {
+            let mut stamper = Stamper::new(store, actor)?;
+            let op = stamper.op(doc.doc_id, Payload::BodyEdit(BodyEdit { update }));
+            // The document analogue of `commit_batch`: the op joins the log
+            // (and the outbox) and the document is re-materialized, in one
+            // transaction — exactly `pm project edit`'s write.
+            store.commit_doc_edit(doc.doc_id, &op)?;
+            shared.nudge.notify_one();
+        }
+        let doc = project_doc(store, &id, name.as_deref())?;
+        let mut out = doc_header(&doc);
+        out["text"] = json!(doc.body.text());
+        Ok(Json(out))
+    })
+    .await
+}
+
+/// `POST /projects/{id}/body`: `{"update"}` or `{"text"}`, as
+/// `POST /tickets/{id}/body`; one `body.edit` on the design doc's `doc_id`.
+async fn design_doc_edit(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult {
+    doc_edit(state, id, None, body).await
+}
+
+/// `POST /projects/{id}/docs/{name}/body`: the same, on a named document.
+async fn named_doc_edit(
+    State(state): State<Arc<AppState>>,
+    Path((id, name)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult {
+    doc_edit(state, id, Some(name), body).await
 }
 
 /// `GET /ready?…`: `pm ready --json`'s flags.
@@ -473,70 +633,57 @@ async fn state_move(
     .await
 }
 
-/// `POST /tickets/{id}/body`: either `{"update": "<base64>"}` — a Loro
-/// update the editor's own document produced (its peer id must be fresh
-/// per session, as `crate::edit` explains) — or `{"text": "..."}`, the
-/// whole description, diffed here under a fresh session peer exactly as
-/// `pm edit` diffs a save. Either way one `body.edit` op, relative to the
-/// history the ticket has, so a concurrent edit merges instead of being
-/// reverted.
-async fn body_edit(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    body: Bytes,
-) -> ApiResult {
-    let object = json_object(&body)?;
-    enum Edit {
-        Update(Vec<u8>),
-        Text(String),
-    }
-    let edit = match (object.get("update"), object.get("text")) {
-        (Some(_), Some(_)) => {
-            return Err(CliError::usage("give either update or text, not both").into());
-        }
-        (Some(Value::String(b64)), None) => {
-            let bytes = pm_core::bytes::decode(b64)
-                .map_err(|e| CliError::usage(format!("update: not base64 Loro bytes: {e}")))?;
-            if bytes.is_empty() {
-                return Err(CliError::usage("update: empty").into());
+/// A body write's request: `{"update": "<base64>"}` — a Loro update the
+/// editor's own document produced (its peer id must be fresh per session,
+/// as `crate::edit` explains) — or `{"text": "..."}`, the whole body,
+/// diffed under a fresh session peer exactly as `pm edit` diffs a save.
+enum BodyEditRequest {
+    Update(Vec<u8>),
+    Text(String),
+}
+
+impl BodyEditRequest {
+    fn parse(body: &Bytes) -> Result<Self> {
+        let object = json_object(body)?;
+        match (object.get("update"), object.get("text")) {
+            (Some(_), Some(_)) => Err(CliError::usage("give either update or text, not both")),
+            (Some(Value::String(b64)), None) => {
+                let bytes = pm_core::bytes::decode(b64)
+                    .map_err(|e| CliError::usage(format!("update: not base64 Loro bytes: {e}")))?;
+                if bytes.is_empty() {
+                    return Err(CliError::usage("update: empty"));
+                }
+                Ok(BodyEditRequest::Update(bytes))
             }
-            Edit::Update(bytes)
-        }
-        (None, Some(Value::String(text))) => Edit::Text(text.clone()),
-        _ => {
-            return Err(CliError::usage(
+            (None, Some(Value::String(text))) => Ok(BodyEditRequest::Text(text.clone())),
+            _ => Err(CliError::usage(
                 "expected {\"update\": \"<base64>\"} or {\"text\": \"...\"}",
-            )
-            .into());
+            )),
         }
-    };
-    let actor = state.actor.clone();
-    let shared = state.clone();
-    with_store(&state, move |store, ws| {
-        let ticket = find(store, ws, &id)?;
-        let view = store.ticket_view(ticket.id)?.ok_or_else(|| {
-            CliError::not_found(format!("no ticket {}", display_id(ws, &ticket)))
-        })?;
-        let update = match edit {
-            Edit::Text(text) => {
-                if text == view.body.text() {
-                    Vec::new()
+    }
+
+    /// The `body.edit` update for `body`, relative to the history it has so
+    /// a concurrent edit merges instead of being reverted; empty when
+    /// nothing changes (text equal to the current body).
+    fn plan(self, body: &BodyState) -> Result<Vec<u8>> {
+        match self {
+            BodyEditRequest::Text(text) => {
+                if text == body.text() {
+                    Ok(Vec::new())
                 } else {
-                    crate::edit::body_update(&view, &text, crate::edit::session_peer(Ulid::new()))?
+                    crate::edit::body_update(body, &text, crate::edit::session_peer(Ulid::new()))
                 }
             }
-            Edit::Update(bytes) => {
-                // Prove the bytes apply on top of what the ticket has
-                // before logging them: a corrupt update, or one whose
-                // history this replica lacks, is refused here rather than
-                // left for the store (or every other replica) to trip on.
+            BodyEditRequest::Update(bytes) => {
+                // Prove the bytes apply on top of what the body has before
+                // logging them: a corrupt update, or one whose history this
+                // replica lacks, is refused here rather than left for the
+                // store (or every other replica) to trip on.
                 let err = |e: pm_core::BodyError| {
                     CliError::usage(format!("update: not a Loro update for this body: {e}"))
                 };
                 let mut probe = Body::new();
-                probe
-                    .apply(&view.body.snapshot().map_err(err)?)
-                    .map_err(err)?;
+                probe.apply(&body.snapshot().map_err(err)?).map_err(err)?;
                 let pending = probe
                     .apply_awaiting(&BodyUpdate::from_bytes(bytes.clone()))
                     .map_err(err)?;
@@ -545,9 +692,27 @@ async fn body_edit(
                         "update: depends on history this replica does not have; reload the body and retry",
                     ));
                 }
-                bytes
+                Ok(bytes)
             }
-        };
+        }
+    }
+}
+
+/// `POST /tickets/{id}/body`: a [`BodyEditRequest`]; one `body.edit` op.
+async fn body_edit(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult {
+    let edit = BodyEditRequest::parse(&body)?;
+    let actor = state.actor.clone();
+    let shared = state.clone();
+    with_store(&state, move |store, ws| {
+        let ticket = find(store, ws, &id)?;
+        let view = store
+            .ticket_view(ticket.id)?
+            .ok_or_else(|| CliError::not_found(format!("no ticket {}", display_id(ws, &ticket))))?;
+        let update = edit.plan(&view.body)?;
         let ops = if update.is_empty() {
             Vec::new()
         } else {
@@ -557,4 +722,97 @@ async fn body_edit(
         Ok(Json(commit(&shared, store, ws, &ticket, &ops)?))
     })
     .await
+}
+
+// ----------------------------------------------------------- new tickets
+
+/// An optional string field of a `POST /tickets` body: absent, `null` or
+/// blank is `None`.
+fn opt_string(object: &Map<String, Value>, key: &str) -> Result<Option<String>> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.trim().to_string())),
+        Some(_) => Err(CliError::usage(format!("{key}: expected a string"))),
+    }
+}
+
+/// A string-array field (`labels`, `blocked_by`): absent or `null` is
+/// empty; every item a non-empty string.
+fn string_list(object: &Map<String, Value>, key: &str) -> Result<Vec<String>> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| match item.as_str().map(str::trim) {
+                Some(s) if !s.is_empty() => Ok(s.to_string()),
+                _ => Err(CliError::usage(format!(
+                    "{key}: every item must be a non-empty string"
+                ))),
+            })
+            .collect(),
+        Some(_) => Err(CliError::usage(format!(
+            "{key}: expected an array of strings"
+        ))),
+    }
+}
+
+/// `POST /tickets` `{"title", "project"?, "priority"?, "repo"?, "labels"?,
+/// "description"?, "blocked_by"?}`: `pm new` with those flags — the same
+/// validation, op set and numbering (`verbs::file_ticket`): numbered
+/// locally, or pending (`AGT-?`, named by its ULID) while a configured hub
+/// has yet to number it. Answers `201` with the ticket as `pm new --json`
+/// prints it. Any other key is a `400`: the view files what `pm new`
+/// files, nothing more.
+async fn create(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<Response> {
+    let object = json_object(&body)?;
+    const KEYS: &[&str] = &[
+        "title",
+        "project",
+        "priority",
+        "repo",
+        "labels",
+        "description",
+        "blocked_by",
+    ];
+    if let Some(key) = object.keys().find(|k| !KEYS.contains(&k.as_str())) {
+        return Err(CliError::usage(format!(
+            "unknown key '{key}': expected one of {}",
+            KEYS.join(", ")
+        ))
+        .into());
+    }
+    let title = match object.get("title") {
+        Some(Value::String(t)) => non_empty("title", t)?,
+        _ => return Err(CliError::usage("title: a non-empty string is required").into()),
+    };
+    let priority = match opt_string(&object, "priority")? {
+        None => Priority::default(),
+        Some(p) => serde_json::from_value::<Priority>(Value::String(p.clone())).map_err(|_| {
+            CliError::usage(format!(
+                "unknown priority '{p}': expected one of low, medium, high, critical"
+            ))
+        })?,
+    };
+    let spec = NewTicket {
+        title,
+        project: opt_string(&object, "project")?,
+        repo: opt_string(&object, "repo")?,
+        priority,
+        labels: string_list(&object, "labels")?.into_iter().collect(),
+        description: opt_string(&object, "description")?,
+        blocked_by: string_list(&object, "blocked_by")?,
+        source: None,
+        linked_github: None,
+    };
+    let actor = state.actor.clone();
+    let env = state.env.clone();
+    let shared = state.clone();
+    let ticket = with_store(&state, move |store, ws| {
+        let ticket = file_ticket(store, ws, &env, &actor, spec)?;
+        shared.nudge.notify_one();
+        ticket_json(ws, store, &ticket)
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(ticket)).into_response())
 }
