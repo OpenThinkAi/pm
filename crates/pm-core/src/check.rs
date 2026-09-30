@@ -16,6 +16,11 @@
 //! - **blocker cycle** — tickets that (transitively) block each other.
 //! - **dangling relation** — a relation between a live ticket and one that
 //!   is tombstoned or absent.
+//! - **deleted project** (AGT-1464) — a live ticket filed in a project
+//!   that has since been deleted: a `project.delete` synced in while this
+//!   replica still had tickets in it. The store keeps the name in the
+//!   ticket's view and `NULL` on its row, so it is reported here (by
+//!   [`with_deleted_projects`]) instead of as R1.
 //!
 //! "Live" means neither tombstoned nor archived.
 
@@ -56,6 +61,8 @@ pub enum Finding {
     BlockerCycle { tickets: Vec<Ulid> },
     /// `relation` touches `missing`, which is tombstoned or absent.
     DanglingRelation { relation: Relation, missing: Ulid },
+    /// The ticket is filed in `project`, which was deleted (AGT-1464).
+    DeletedProject { ticket: Ulid, project: String },
 }
 
 impl Finding {
@@ -65,7 +72,8 @@ impl Finding {
             Finding::NoProject { ticket }
             | Finding::Stale { ticket, .. }
             | Finding::Held { ticket, .. }
-            | Finding::AssignedUnstarted { ticket, .. } => vec![*ticket],
+            | Finding::AssignedUnstarted { ticket, .. }
+            | Finding::DeletedProject { ticket, .. } => vec![*ticket],
             Finding::BlockerCycle { tickets } => tickets.clone(),
             Finding::DanglingRelation { relation, .. } => vec![relation.from, relation.to],
         }
@@ -80,6 +88,7 @@ impl Finding {
             Finding::AssignedUnstarted { .. } => "assigned-unstarted",
             Finding::BlockerCycle { .. } => "blocker-cycle",
             Finding::DanglingRelation { .. } => "dangling-relation",
+            Finding::DeletedProject { .. } => "deleted-project",
         }
     }
 }
@@ -185,6 +194,32 @@ pub fn check(
         });
     }
     findings
+}
+
+/// Folds the store's deleted-project references (`(ticket, project)`, for
+/// live tickets whose project was deleted — see the module docs) into
+/// `findings` from [`check`]: each such ticket's R1 finding (its row has
+/// no project) becomes a `deleted-project` finding, appended after the
+/// rest. With a `project` filter nothing is added — a deleted project
+/// cannot be the filter, and the ticket is no longer in any other.
+pub fn with_deleted_projects(
+    findings: &mut Vec<Finding>,
+    deleted: &[(Ulid, String)],
+    project: Option<&str>,
+) {
+    if project.is_some() || deleted.is_empty() {
+        return;
+    }
+    let tickets: BTreeSet<Ulid> = deleted.iter().map(|(t, _)| *t).collect();
+    findings.retain(|f| !matches!(f, Finding::NoProject { ticket } if tickets.contains(ticket)));
+    findings.extend(
+        deleted
+            .iter()
+            .map(|(ticket, project)| Finding::DeletedProject {
+                ticket: *ticket,
+                project: project.clone(),
+            }),
+    );
 }
 
 /// The cycles of a directed graph given as edges: each strongly connected
@@ -591,6 +626,36 @@ mod tests {
         let found = check(&ws(30), &[a.clone(), b, c], &rels, NOW, Some("pm"));
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(found.iter().all(|f| f.tickets().contains(&a.id)));
+    }
+
+    /// AGT-1464: a ticket whose project was deleted is reported as such,
+    /// not as R1; nothing is added under a project filter.
+    #[test]
+    fn deleted_project_references_replace_r1() {
+        let (gone, bare) = (ticket(1, None), ticket(2, None));
+        let mut found = check(&ws(30), &[gone.clone(), bare.clone()], &[], NOW, None);
+        assert_eq!(found.len(), 2);
+        let deleted = [(gone.id, "old".to_string())];
+        with_deleted_projects(&mut found, &deleted, None);
+        assert_eq!(
+            found,
+            [
+                Finding::NoProject { ticket: bare.id },
+                Finding::DeletedProject {
+                    ticket: gone.id,
+                    project: "old".into()
+                },
+            ]
+        );
+        assert_eq!(found[1].rule(), "deleted-project");
+        assert_eq!(
+            serde_json::to_value(&found[1]).unwrap()["rule"],
+            "deleted-project"
+        );
+        assert_eq!(found[1].tickets(), [gone.id]);
+        let mut filtered = Vec::new();
+        with_deleted_projects(&mut filtered, &deleted, Some("pm"));
+        assert!(filtered.is_empty());
     }
 
     #[test]

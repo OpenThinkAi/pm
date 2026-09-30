@@ -32,9 +32,30 @@ export interface DocTab {
 
 export const DESIGN_DOC: DocTab = { key: "", name: null, label: "Design doc" };
 
-/** The design doc first, then every named document by name. */
+/**
+ * Whether `name` is a safe document name — pm-core's `ids::is_safe_doc_name`
+ * (AGT-1464), which every ingest path enforces: at most 255 bytes of
+ * `/`-separated segments, each non-empty, not starting with `.` (so never
+ * a `.` or `..` dot-segment) and free of `\` and control characters.
+ * `encodeURIComponent` leaves `.` alone, so a tab named `..` would bind
+ * `/projects/{id}/docs/../body` — which `fetch` resolves to the design
+ * doc's endpoint.
+ */
+export function isSafeDocName(name: string): boolean {
+  return (
+    new TextEncoder().encode(name).length <= 255 &&
+    name
+      .split("/")
+      .every((seg) => seg !== "" && !seg.startsWith(".") && !/[\\\u0000-\u001f\u007f-\u009f]/.test(seg))
+  );
+}
+
+/** The design doc first, then every named document by name (a name that is
+ * not {@link isSafeDocName} gets no tab). */
 export function docTabs(project: Pick<Project, "documents">): DocTab[] {
-  const names = Object.keys(project.documents ?? {}).sort((a, b) => a.localeCompare(b));
+  const names = Object.keys(project.documents ?? {})
+    .filter(isSafeDocName)
+    .sort((a, b) => a.localeCompare(b));
   return [DESIGN_DOC, ...names.map((name) => ({ key: `doc:${name}`, name, label: name }))];
 }
 
@@ -53,7 +74,10 @@ export function pickTab(tabs: DocTab[], wanted: string): DocTab {
  */
 export function docBodyPath(project: string, tab: Pick<DocTab, "name">): string {
   const base = `/projects/${encodeURIComponent(project)}`;
-  return tab.name === null ? `${base}/body` : `${base}/docs/${encodeURIComponent(tab.name)}/body`;
+  if (tab.name === null) return `${base}/body`;
+  // Never let a name resolve to another document's endpoint.
+  if (!isSafeDocName(tab.name)) throw new Error(`unsafe document name ${JSON.stringify(tab.name)}`);
+  return `${base}/docs/${encodeURIComponent(tab.name)}/body`;
 }
 
 /** The `GET /events` op fields the view reads. */

@@ -15,7 +15,7 @@ use ulid::Ulid;
 
 use crate::Store;
 use crate::codec::{enum_name, json, wall_ms};
-use crate::config::{commit_config_in, project_exists, states};
+use crate::config::{Mode, commit_config_in, project_exists, project_tombstoned, states};
 use crate::error::{Result, StoreError, map_duplicate_number};
 
 impl Store {
@@ -205,14 +205,16 @@ fn commit_in(
         return Err(StoreError::DuplicateOp { op_id: op.op_id });
     }
     if op.payload.is_config() {
-        commit_config_in(tx, op, between)?;
+        commit_config_in(tx, op, Mode::Commit, between)?;
         return Ok(None);
     }
+    check_ingest(op)?;
+    check_ticket_entity(tx, op)?;
     ensure_actor(tx, &op.actor)?;
     let view = next_view(tx, op, Fold::Local)?;
     append_op(tx, op)?;
     between()?;
-    materialize(tx, &view, op).map(Some)
+    materialize(tx, &view, op, Fold::Local).map(Some)
 }
 
 /// Commits an op that came from the hub (AGT-1393, [`Store::apply_pulled`]):
@@ -230,13 +232,59 @@ fn commit_in(
 /// it — so the pull defers it until its history lands.
 pub(crate) fn commit_foreign_in(tx: &Transaction<'_>, op: &Op) -> Result<Option<Ticket>> {
     if op.payload.is_config() {
-        commit_config_in(tx, op, || Ok(()))?;
+        commit_config_in(tx, op, Mode::Foreign, || Ok(()))?;
         return Ok(None);
     }
+    check_ticket_entity(tx, op)?;
     ensure_actor(tx, &op.actor)?;
     let view = next_view(tx, op, Fold::Foreign)?;
     append_op(tx, op)?;
-    materialize(tx, &view, op).map(Some)
+    materialize(tx, &view, op, Fold::Foreign).map(Some)
+}
+
+/// The checks every op passes on its way into the log, whichever path
+/// brings it — a local verb ([`commit_in`], the config and document
+/// commits), a pull ([`Store::apply_pulled`]) or `pm backup --restore`
+/// ([`Store::commit_any`]) (oaudit 2026-09-30, AGT-1450; every ingest path
+/// since AGT-1464): the stamp is storable and not more than
+/// [`crate::PULL_MAX_FUTURE_SKEW_MS`] ahead of this machine's clock, and
+/// every identifier or name it carries that becomes a file path is safe
+/// ([`pm_core::ids::check_op_ids`]). A replay of the log (`pm doctor
+/// --rebuild`) does not re-check: what is in the log already passed.
+pub(crate) fn check_ingest(op: &Op) -> Result<()> {
+    check_ingest_at(op, now_ms())
+}
+
+pub(crate) fn check_ingest_at(op: &Op, now_ms: u64) -> Result<()> {
+    op.hlc.check_range()?;
+    op.hlc
+        .check_not_after(now_ms, crate::sync::PULL_MAX_FUTURE_SKEW_MS)?;
+    pm_core::ids::check_op_ids(op)?;
+    Ok(())
+}
+
+/// AGT-1464: a `ticket.create` may not take an entity that is already a
+/// project document (bound by any project, winner or not) or a project —
+/// tickets, documents and projects share the op log's entity namespace,
+/// and a `body.edit` is routed by it. The mirror check, a document
+/// binding whose `doc_id` is already a ticket, is
+/// [`crate::config::check_config_admission`]'s.
+pub(crate) fn check_ticket_entity(tx: &Transaction<'_>, op: &Op) -> Result<()> {
+    if !matches!(op.payload, Payload::TicketCreate(_)) {
+        return Ok(());
+    }
+    let entity = op.entity.to_string();
+    let holder = if crate::project::is_known_doc(tx, op.entity)? {
+        "a project document"
+    } else if exists(tx, "SELECT 1 FROM project_view WHERE project = ?1", &entity)? {
+        "a project"
+    } else {
+        return Ok(());
+    };
+    Err(StoreError::EntityInUse {
+        entity: op.entity,
+        holder,
+    })
 }
 
 /// Re-applies an op that is already in the log: the same load → apply →
@@ -246,7 +294,7 @@ pub(crate) fn commit_foreign_in(tx: &Transaction<'_>, op: &Op) -> Result<Option<
 /// the original.
 pub(crate) fn replay_in(tx: &Transaction<'_>, op: &Op) -> Result<Ticket> {
     let view = next_view(tx, op, Fold::Replay)?;
-    materialize(tx, &view, op)
+    materialize(tx, &view, op, Fold::Replay)
 }
 
 /// Which commit path is folding an op into a ticket's view.
@@ -339,8 +387,14 @@ pub(crate) fn append_op(conn: &Connection, op: &Op) -> Result<()> {
 /// Rewrites every derived row of the ticket from its view. Checks the
 /// hygiene rules first so a violation names its rule; the foreign keys
 /// stay as the backstop.
-fn materialize(tx: &Transaction<'_>, view: &TicketView, op: &Op) -> Result<Ticket> {
-    let t = view.snapshot();
+///
+/// A ticket whose project was deleted (a pulled `project.delete` for a
+/// project this replica still had tickets in, AGT-1464) keeps the name in
+/// its view and reads `NULL` on its row — and in the returned ticket —
+/// until a project of that slug exists again; only a local op that *sets*
+/// the project is refused for naming a deleted one.
+fn materialize(tx: &Transaction<'_>, view: &TicketView, op: &Op, fold: Fold) -> Result<Ticket> {
+    let mut t = view.snapshot();
     let id = t.id.to_string();
 
     if !exists(tx, "SELECT 1 FROM state WHERE name = ?1", &t.state)? {
@@ -351,9 +405,17 @@ fn materialize(tx: &Transaction<'_>, view: &TicketView, op: &Op) -> Result<Ticke
     if let Some(project) = &t.project
         && !project_exists(tx, project)?
     {
-        return Err(StoreError::UnknownProject {
-            project: project.clone(),
-        });
+        let sets_project = match &op.payload {
+            Payload::TicketCreate(c) => c.project.is_some(),
+            Payload::FieldSet(FieldSet::Project(p)) => p.is_some(),
+            _ => false,
+        };
+        if (fold == Fold::Local && sets_project) || !project_tombstoned(tx, project)? {
+            return Err(StoreError::UnknownProject {
+                project: project.clone(),
+            });
+        }
+        t.project = None;
     }
     if let Payload::RelationAdd(r) = &op.payload {
         let other = if r.relation.from == t.id {

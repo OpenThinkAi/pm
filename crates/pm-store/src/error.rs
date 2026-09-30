@@ -73,6 +73,25 @@ pub enum StoreError {
     /// reuses one: every writer mints a fresh id.
     #[error("document id {doc_id} is already bound to another document")]
     DocIdInUse { doc_id: Ulid },
+    /// AGT-1464: tickets and documents share one entity namespace, so a
+    /// document binding whose `doc_id` is already a ticket (a
+    /// `ticket.create` in the log), or a `ticket.create` whose entity is
+    /// already a bound document or a project, is refused — it would
+    /// reroute the other entity's `body.edit` ops. Only a foreign writer
+    /// reuses an id.
+    #[error("id {entity} is already {holder}")]
+    EntityInUse {
+        entity: Ulid,
+        /// `"a ticket"`, `"a project document"` or `"a project"`.
+        holder: &'static str,
+    },
+    /// AGT-1464: a second `project.create` for a project that already has
+    /// one. Every writer mints a fresh project Ulid, so only a foreign
+    /// writer sends this — and a backdated one would move the project's
+    /// creation stamp, which document identity is anchored to
+    /// ([`pm_core::DocClaims`]).
+    #[error("project {project} already has a project.create")]
+    DuplicateProjectCreate { project: Ulid },
     /// A document's text could not be turned into a `body.edit`.
     #[error(transparent)]
     Body(#[from] pm_core::BodyError),
@@ -83,13 +102,14 @@ pub enum StoreError {
     /// Same rule, for a child project's `parent` reference.
     #[error("project '{project}' has child projects; reparent or delete them first")]
     ProjectHasChildren { project: String },
-    /// A stamp that is not admissible: out of the storable range, or (on
-    /// a pull) too far ahead of this machine's clock (oaudit 2026-09-30,
-    /// see [`crate::Store::apply_pulled`]).
+    /// A stamp that is not admissible: out of the storable range, or too
+    /// far ahead of this machine's clock (oaudit 2026-09-30, see
+    /// [`crate::Store::apply_pulled`]; every ingest path since AGT-1464).
     #[error("invalid stamp: {0}")]
     InvalidStamp(#[from] pm_core::StampError),
-    /// A foreign op carrying a workspace prefix or project id that is not
-    /// safe in a file path (`pm_core::ids`, AGT-1450).
+    /// An op carrying a workspace prefix, project id, state name or
+    /// document name that is not safe in a file path (`pm_core::ids`,
+    /// AGT-1450, AGT-1464) — refused on every ingest path.
     #[error(transparent)]
     InvalidId(#[from] pm_core::ids::IdError),
     /// A stored column no longer decodes (a JSON blob or a ULID). Only a

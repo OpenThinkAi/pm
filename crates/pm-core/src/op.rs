@@ -359,10 +359,13 @@ pub struct ProjectCreate {
 
 /// Binds `doc_id` to one of the project's documents (`entity` = the
 /// project's Ulid): the design doc when `name` is absent, else the named
-/// document `name`. Each document slot keeps the *earliest* binding it has
-/// seen (by stamp, then `doc_id`) — a document's identity is fixed once
-/// made, and two replicas that add the same name offline converge on one
-/// of the two ids ([`crate::config::DocClaims`]).
+/// document `name`. Each document slot keeps the *earliest* eligible
+/// binding it has seen (by stamp, then `doc_id`; one stamped before the
+/// project's create counts only if its creator made it, AGT-1464) — a
+/// document's identity is fixed once made, and two replicas that add the
+/// same name offline converge on one of the two ids
+/// ([`crate::config::DocClaims`]). `name` must be
+/// [`crate::ids::is_safe_doc_name`] (checked at every ingest path).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectDocAdd {
     #[serde(default, skip_serializing_if = "Option::is_none")]

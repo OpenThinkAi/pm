@@ -16,6 +16,7 @@ import {
   createdRef,
   docBodyPath,
   docTabs,
+  isSafeDocName,
   newTicketRequest,
   opEffect,
   pickTab,
@@ -48,6 +49,21 @@ test("each tab binds its own body endpoint, names percent-encoded", () => {
   assert.equal(docBodyPath("pm", DESIGN_DOC), "/projects/pm/body");
   assert.equal(docBodyPath("pm", { name: "run notes" }), "/projects/pm/docs/run%20notes/body");
   assert.equal(docBodyPath("pm", { name: "a/b?c" }), "/projects/pm/docs/a%2Fb%3Fc/body");
+});
+
+test("dot-segment and other unsafe names get no tab and no endpoint (AGT-1464)", () => {
+  for (const ok of ["notes", "ideation/IDEA-1", "run notes", "a/b?c", "é"]) {
+    assert.ok(isSafeDocName(ok), ok);
+  }
+  for (const bad of ["", ".", "..", "../x", "x/..", "a/./b", "/abs", "x/", ".hidden", "a\\b", "a\u0000b", "a".repeat(256)]) {
+    assert.ok(!isSafeDocName(bad), JSON.stringify(bad));
+    assert.throws(() => docBodyPath("pm", { name: bad }), /unsafe document name/);
+  }
+  const tabs = docTabs({ documents: { "..": "", ".": "", notes: "" } });
+  assert.deepEqual(
+    tabs.map((t) => t.name),
+    [null, "notes"],
+  );
 });
 
 test("an op event pulls the open document, refetches the list or the project", () => {

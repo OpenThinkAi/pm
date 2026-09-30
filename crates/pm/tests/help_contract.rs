@@ -300,6 +300,10 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             },
             missing: id,
         },
+        Finding::DeletedProject {
+            ticket: id,
+            project: "p".into(),
+        },
     ];
     for f in &findings {
         match f {
@@ -308,7 +312,8 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             | Finding::Held { .. }
             | Finding::AssignedUnstarted { .. }
             | Finding::BlockerCycle { .. }
-            | Finding::DanglingRelation { .. } => {}
+            | Finding::DanglingRelation { .. }
+            | Finding::DeletedProject { .. } => {}
         }
     }
 

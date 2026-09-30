@@ -146,12 +146,38 @@ pub struct ProjectView {
 
 /// Every `doc_id` ever bound to one document slot (the design doc, or one
 /// document name), with the earliest stamp that bound it. The slot's
-/// document is the earliest binding — [`DocClaims::winner`], by stamp
-/// then `doc_id` — so a document's identity never moves once made, and two
-/// replicas that bind the same slot offline converge on one id whatever
-/// order the ops arrive in. The losers stay listed: their `body.edit` ops
-/// are still documents' edits (a replica must route them as such) even
-/// though no row shows them.
+/// document is the earliest *eligible* binding — [`DocClaims::winner`],
+/// by stamp then `doc_id` — so a document's identity never moves once
+/// made, and two replicas that bind the same slot offline converge on one
+/// id whatever order the ops arrive in. The losers stay listed: their
+/// `body.edit` ops are still documents' edits (a replica must route them
+/// as such) even though no row shows them.
+///
+/// **Eligibility (AGT-1464).** Earliest-wins is the one rule where a
+/// *backdated* op wins (under LWW it loses): a peer could send a
+/// `project.doc_add` stamped `hlc 0` and take any project's design doc or
+/// named document for good. So a binding stamped before the project's
+/// `project.create` ([`ProjectView::created`]) is eligible only when the
+/// project's creator made it (the create's actor). An honest binding is
+/// never earlier than the create unless the creator made it: binding a
+/// document needs the project, and every replica's clock has moved past
+/// the create's stamp by the time it has the project; the one exception,
+/// migration 0008's backfill, stamps its `project.doc_add`s a millisecond
+/// *below* the log's oldest op, under the same `migrate` actor that
+/// migration 0007 gave every backfilled `project.create`. When no binding
+/// of a slot is eligible, the earliest overall is used (a database whose
+/// projects were created by someone else before 0008 ran keeps its
+/// documents); before the create is seen every binding is eligible.
+///
+/// Why this converges: eligibility reads only the slot's claims and
+/// `created` — each a pure, order-independent fold of the op set (a
+/// minimum per id, a minimum over creates) — so every replica holding the
+/// same ops picks the same winner, whatever order they arrived in. What it
+/// cannot stop is a binding stamped *after* the create but before a later
+/// honest one; stamps alone cannot tell that apart from an honest offline
+/// binding, only arrival order at the hub can. A second `project.create`
+/// for a project (which could drag `created` back) is refused at every
+/// ingest path instead (`pm-store`, and the hub's push).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DocClaims(BTreeMap<Ulid, Stamp>);
@@ -172,12 +198,21 @@ impl DocClaims {
         }
     }
 
-    /// The slot's document: the earliest binding, `None` before any.
-    pub fn winner(&self) -> Option<Ulid> {
-        self.0
-            .iter()
-            .min_by(|(a_id, a), (b_id, b)| a.cmp(b).then_with(|| a_id.cmp(b_id)))
-            .map(|(id, _)| *id)
+    /// The slot's document for a project created at `created` (`None`:
+    /// no `project.create` seen yet): the earliest eligible binding (see
+    /// the type's docs), else the earliest; `None` before any binding.
+    pub fn winner(&self, created: Option<&Stamp>) -> Option<Ulid> {
+        let eligible = |stamp: &Stamp| {
+            created.is_none_or(|created| stamp >= created || stamp.actor == created.actor)
+        };
+        let earliest = |eligible_only: bool| {
+            self.0
+                .iter()
+                .filter(|(_, stamp)| !eligible_only || eligible(stamp))
+                .min_by(|(a_id, a), (b_id, b)| a.cmp(b).then_with(|| a_id.cmp(b_id)))
+                .map(|(id, _)| *id)
+        };
+        earliest(true).or_else(|| earliest(false))
     }
 
     /// Whether `doc_id` was ever bound to this slot.
@@ -216,12 +251,14 @@ impl ProjectView {
 
     /// The design doc's `doc_id`, once one is bound.
     pub fn design_doc_id(&self) -> Option<Ulid> {
-        self.design_doc.winner()
+        self.design_doc.winner(self.created.as_ref())
     }
 
     /// The named document `name`'s `doc_id`, once one is bound.
     pub fn doc_id(&self, name: &str) -> Option<Ulid> {
-        self.documents.get(name).and_then(DocClaims::winner)
+        self.documents
+            .get(name)
+            .and_then(|claims| claims.winner(self.created.as_ref()))
     }
 
     /// Every `doc_id` ever bound to one of this project's documents,
@@ -266,6 +303,19 @@ pub enum ConfigApplyError {
         op_id: Ulid,
         view: &'static str,
         kind: &'static str,
+    },
+    /// Admission, not folding (AGT-1464; the hub's push, pm-store's commit
+    /// paths): a second `project.create` for a project. It could move
+    /// [`ProjectView::created`], which document identity is anchored to.
+    #[error("op {op_id}: project {project} already has a project.create")]
+    DuplicateCreate { op_id: Ulid, project: Ulid },
+    /// Admission (AGT-1464): an id already taken in the op log's shared
+    /// entity namespace — a `ticket.create` for a bound document's id.
+    #[error("op {op_id}: id {entity} is already {holder}")]
+    EntityInUse {
+        op_id: Ulid,
+        entity: Ulid,
+        holder: &'static str,
     },
 }
 
@@ -849,6 +899,113 @@ mod tests {
         obj.remove("documents");
         let back: ProjectView = serde_json::from_value(json).unwrap();
         assert_eq!(back.design_doc_id(), None);
+    }
+
+    /// AGT-1464: a binding stamped before the project's create, by anyone
+    /// but its creator, cannot take a slot another binding holds — in any
+    /// arrival order — while the creator's own backdated binding (migration
+    /// 0008's shape) still counts.
+    #[test]
+    fn a_backdated_binding_cannot_hijack_a_document() {
+        let id = Ulid::new();
+        let add = |wall, actor: &str, name: Option<&str>, doc_id| {
+            op(
+                id,
+                wall,
+                actor,
+                Payload::ProjectDocAdd(ProjectDocAdd {
+                    name: name.map(str::to_string),
+                    doc_id,
+                }),
+            )
+        };
+        let (design, notes, evil) = (Ulid::new(), Ulid::new(), Ulid::new());
+        let with_doc = op(
+            id,
+            100,
+            "matt",
+            Payload::ProjectCreate(ProjectCreate {
+                id: "pm".into(),
+                title: "pm".into(),
+                status: ProjectStatus::InProgress,
+                parent: None,
+                doc_id: Some(design),
+            }),
+        );
+        let ops = [
+            with_doc,
+            add(200, "claude:pm-build", Some("notes"), notes),
+            // Hostile: stamped at the dawn of time, for both slots.
+            add(0, "mallory", None, evil),
+            add(0, "mallory", Some("notes"), evil),
+            // Just under the create, or tied with it by a smaller actor.
+            add(99, "aaa", None, evil),
+            add(100, "aaa", None, evil),
+        ];
+        for order in [[0, 1, 2, 3, 4, 5], [5, 4, 3, 2, 1, 0], [2, 3, 0, 5, 1, 4]] {
+            let mut view = ProjectView::new(id);
+            for i in order {
+                apply_project(&mut view, &ops[i]).unwrap();
+            }
+            assert_eq!(view.design_doc_id(), Some(design), "{order:?}");
+            assert_eq!(view.doc_id("notes"), Some(notes), "{order:?}");
+            assert!(view.doc_ids().any(|(_, d)| d == evil), "losers stay listed");
+        }
+
+        // Migration 0008's shape: the creator (`migrate`) binds a
+        // millisecond below its own create, and keeps the slot against a
+        // later-arriving backdated binding by anyone else.
+        let migrated = Ulid::new();
+        let mut create = create(id, 1_000);
+        create.actor = ActorId::new("migrate");
+        let mut view = ProjectView::new(id);
+        for o in [
+            add(999, "migrate", None, migrated),
+            add(999, "migrate", Some("notes"), notes),
+            create,
+            add(5, "mallory", None, evil),
+            add(5, "mallory", Some("notes"), evil),
+        ] {
+            apply_project(&mut view, &o).unwrap();
+        }
+        assert_eq!(view.design_doc_id(), Some(migrated));
+        assert_eq!(view.doc_id("notes"), Some(notes));
+    }
+
+    /// With no eligible binding the slot still has a document (the earliest
+    /// overall), and before the create is seen every binding counts.
+    #[test]
+    fn doc_eligibility_falls_back_and_waits_for_the_create() {
+        let id = Ulid::new();
+        let (early, late) = (Ulid::new(), Ulid::new());
+        let add = |wall, actor: &str, doc_id| {
+            op(
+                id,
+                wall,
+                actor,
+                Payload::ProjectDocAdd(ProjectDocAdd {
+                    name: Some("notes".into()),
+                    doc_id,
+                }),
+            )
+        };
+        let mut view = ProjectView::new(id);
+        apply_project(&mut view, &add(3, "zed", early)).unwrap();
+        apply_project(&mut view, &add(4, "amy", late)).unwrap();
+        assert_eq!(view.doc_id("notes"), Some(early), "no create yet");
+        apply_project(&mut view, &create(id, 10)).unwrap();
+        assert_eq!(
+            view.doc_id("notes"),
+            Some(early),
+            "both predate the create and neither is the creator's"
+        );
+        let later = Ulid::new();
+        apply_project(&mut view, &add(20, "amy", later)).unwrap();
+        assert_eq!(
+            view.doc_id("notes"),
+            Some(later),
+            "the one eligible binding"
+        );
     }
 
     #[test]

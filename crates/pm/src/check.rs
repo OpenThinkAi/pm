@@ -23,7 +23,9 @@ pub fn check(ctx: &Ctx<'_>, project: Option<&str>) -> Result<()> {
     // finding names tickets to act on (`pm set <id> …`), so a ticket still
     // awaiting its hub number is named by ULID (`ref_id`), not `AGT-?`.
     let tickets = store.all_tickets()?;
-    let findings = pm_core::check::check(&ws, &tickets, &store.all_relations()?, now_ms(), project);
+    let mut findings =
+        pm_core::check::check(&ws, &tickets, &store.all_relations()?, now_ms(), project);
+    pm_core::check::with_deleted_projects(&mut findings, &store.deleted_project_refs()?, project);
     let names: BTreeMap<Ulid, String> = tickets.iter().map(|t| (t.id, ref_id(&ws, t))).collect();
     let name = |id: &Ulid| names.get(id).cloned().unwrap_or_else(|| id.to_string());
 
@@ -82,6 +84,7 @@ fn finding_json(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) ->
             },
             "missing": name(missing),
         }),
+        Finding::DeletedProject { project, .. } => json!({ "project": project }),
         Finding::NoProject { .. } | Finding::BlockerCycle { .. } => json!({}),
     };
     if let (Value::Object(out), Value::Object(extra)) = (&mut out, extra) {
@@ -112,6 +115,10 @@ fn message(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) -> Stri
             let ids: Vec<String> = tickets.iter().map(name).collect();
             format!("blocker cycle: {} block each other", ids.join(", "))
         }
+        Finding::DeletedProject { project, .. } => format!(
+            "filed in project '{project}', which was deleted; \
+             move it (`pm set <id> project=…`)"
+        ),
         Finding::DanglingRelation { relation, missing } => {
             let kind = serde_json::to_value(relation.kind)
                 .ok()
