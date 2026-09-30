@@ -227,20 +227,6 @@ pub fn parse_preset(s: &str) -> std::result::Result<Preset, String> {
     }
 }
 
-fn validate_prefix(prefix: &str) -> Result<()> {
-    let mut chars = prefix.chars();
-    let ok = prefix.len() <= 16
-        && chars.next().is_some_and(|c| c.is_ascii_uppercase())
-        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
-    if ok {
-        Ok(())
-    } else {
-        Err(CliError::usage(format!(
-            "invalid prefix '{prefix}': use 1-16 uppercase letters or digits, starting with a letter (e.g. PM)"
-        )))
-    }
-}
-
 /// `pm init`. With `join` (AGT-1396, `--join <WORKSPACE-ULID>`) the new
 /// database is an empty replica of that workspace — its id, no ops —
 /// for a second machine: `pm hub login` and `pm sync` then pull the whole
@@ -248,7 +234,7 @@ fn validate_prefix(prefix: &str) -> Result<()> {
 /// starts with are placeholders the first pull overwrites.
 pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>, join: Option<Ulid>) -> Result<()> {
     let prefix = prefix.unwrap_or_else(|| preset.default_prefix());
-    validate_prefix(prefix)?;
+    crate::ids::validate_prefix(prefix)?;
     let dir = match ctx.workspace.or(ctx.env.pm_workspace.as_deref()) {
         Some(dir) => dir.to_path_buf(),
         None => ctx.env.default_workspace_dir(prefix)?,

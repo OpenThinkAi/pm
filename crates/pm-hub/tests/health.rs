@@ -22,6 +22,11 @@ fn migrates_on_start_and_serves_health() {
     assert_eq!(health["status"], "ok");
     assert_eq!(health["schema_version"], expected_schema_version());
     assert_eq!(health["op_version"], pm_core::OP_VERSION);
+    // "unknown" unless PM_HUB_BUILD_SHA was set when this test built the hub.
+    assert!(
+        health["build"].as_str().is_some_and(|b| !b.is_empty()),
+        "{health}"
+    );
     drop(hub);
 
     let tables = query_rows(

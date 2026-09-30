@@ -10,7 +10,10 @@
 FROM rust:1.94-slim-trixie@sha256:cf09adf8c3ebaba10779e5c23ff7fe4df4cccdab8a91f199b0c142c53fef3e1a AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --locked --release -p pm-hub
+# .build-sha is written by scripts/deploy-hub.sh (`railway up` uploads no
+# .git); it is absent for a plain `docker build`, which reports "unknown".
+RUN PM_HUB_BUILD_SHA="$(cat .build-sha 2>/dev/null || echo unknown)" \
+    cargo build --locked --release -p pm-hub
 
 # Debian 13 (trixie): Debian 12 leaves security support in 2026.
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a

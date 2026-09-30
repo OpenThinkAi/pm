@@ -422,3 +422,49 @@ fn doctor_survives_a_deleted_project_that_had_document_edits() {
     assert_eq!(v["healthy"], true, "{v}");
     assert_eq!(v["rebuilt"]["tables"], serde_json::json!([]));
 }
+
+#[test]
+fn project_new_rejects_path_shaped_ids_with_usage_exit_and_accepts_live_ones() {
+    let sb = Sandbox::initialized();
+    for bad in [
+        "../x",
+        "a/b",
+        "..",
+        "a\\b",
+        "a\u{1}b",
+        "Upper",
+        &"a".repeat(65),
+    ] {
+        let out = sb.pm(&[
+            "project",
+            "new",
+            bad,
+            "--title",
+            "T",
+            "--workspace",
+            sb.ws_str(),
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{bad:?}: {}", stderr(&out));
+    }
+    for ok in ["pm", "think-3", "ui-leaf-v1"] {
+        assert_ok(&sb.pm(&[
+            "project",
+            "new",
+            ok,
+            "--title",
+            "T",
+            "--workspace",
+            sb.ws_str(),
+        ]));
+    }
+}
+
+#[test]
+fn init_rejects_path_shaped_prefixes_with_usage_exit() {
+    for bad in ["../X", "A/B", "a", "A\u{1}B", "", &"A".repeat(17)] {
+        let sb = Sandbox::new();
+        let out = sb.pm(&["init", "--prefix", bad, "--workspace", sb.ws_str()]);
+        assert_eq!(out.status.code(), Some(2), "{bad:?}: {}", stderr(&out));
+        assert!(!sb.ws.exists(), "{bad:?} created a workspace");
+    }
+}

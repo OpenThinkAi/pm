@@ -127,6 +127,7 @@ impl Env {
     /// Where `pm init` puts a workspace nobody named:
     /// `$XDG_DATA_HOME/pm/<prefix>`, else `~/.local/share/pm/<prefix>`.
     pub fn default_workspace_dir(&self, prefix: &str) -> Result<PathBuf> {
+        crate::ids::safe_component(prefix, "prefix")?;
         let base = match (&self.xdg_data_home, &self.home) {
             (Some(xdg), _) => xdg.clone(),
             (None, Some(home)) => home.join(".local").join("share"),

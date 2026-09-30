@@ -130,6 +130,7 @@ fn write(root: &Path, r: &Rendered) -> Result<()> {
 /// Where a ticket's file goes, relative to the export root. The state
 /// folder is a workspace state name, checked as a path segment too.
 pub(crate) fn ticket_path(ws: &Workspace, t: &Ticket) -> Result<PathBuf> {
+    crate::ids::safe_component(&ws.prefix, "workspace prefix")?;
     let id = display_id(ws, t);
     let slug = slug(&t.title);
     let name = if slug.is_empty() {
@@ -503,7 +504,10 @@ fn yaml_flow_value(v: &Value) -> String {
 /// A project's folder: the README (its design doc), then each named
 /// document.
 pub(crate) fn render_project(p: &Project) -> Result<Vec<Rendered>> {
-    let id = segment(&p.id, "project id")?;
+    let id = segment(
+        crate::ids::safe_component(&p.id, "project id")?,
+        "project id",
+    )?;
     let base = if p.status == ProjectStatus::InProgress {
         Path::new("projects").join(id)
     } else {

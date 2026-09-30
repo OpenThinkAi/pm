@@ -120,27 +120,6 @@ fn parse_status(s: &str) -> std::result::Result<ProjectStatus, String> {
     })
 }
 
-/// A project id (README §Data model: "project — id (kebab)"): lowercase
-/// letters, digits and single hyphens, never leading, trailing or doubled.
-fn validate_project_id(id: &str) -> Result<()> {
-    let ok = !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !id.starts_with('-')
-        && !id.ends_with('-')
-        && !id.contains("--");
-    if ok {
-        Ok(())
-    } else {
-        Err(CliError::usage(format!(
-            "invalid project id '{id}': use lowercase letters, digits and single hyphens \
-             (e.g. pm-project-verbs)"
-        )))
-    }
-}
-
 fn not_found(id: &str) -> CliError {
     CliError::not_found(format!("no project '{id}'"))
 }
@@ -148,7 +127,7 @@ fn not_found(id: &str) -> CliError {
 // -------------------------------------------------------------------- new
 
 fn new(ctx: &Ctx<'_>, id: &str, title: &str, repos: &[String], parent: Option<&str>) -> Result<()> {
-    validate_project_id(id)?;
+    crate::ids::validate_project_id(id)?;
     let title = non_empty("--title", title)?;
     let repos: BTreeSet<String> = repos
         .iter()
@@ -263,7 +242,7 @@ fn edit_in_editor(ctx: &Ctx<'_>, id: &str) -> Result<()> {
     // prompts for itself — a non-interactive `vi` just fails fast rather
     // than hang, which is how README's "no command may prompt when stdin
     // is not a TTY" is satisfied here too.
-    let file = edit::TempFile::create(id, &project.doc)?;
+    let file = edit::TempFile::create(crate::ids::safe_component(id, "project id")?, &project.doc)?;
     if !edit::run_editor(file.path())? {
         return Err(CliError::error("edit aborted (the editor exited non-zero)"));
     }
