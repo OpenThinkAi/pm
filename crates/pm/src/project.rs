@@ -169,6 +169,8 @@ fn show(ctx: &Ctx<'_>, id: &str, doc: Option<&str>) -> Result<()> {
             if ctx.json {
                 print_json(&json!({"schema": SCHEMA, "project": id, "doc": name, "body": body}));
             } else {
+                // stderr, so the body on stdout stays pipeable.
+                eprintln!("{id}: named doc '{}'", crate::text::inline(name));
                 print!("{}", crate::text::printable(body));
                 if !body.ends_with('\n') {
                     println!();
@@ -349,14 +351,26 @@ fn edit_from_file(ctx: &Ctx<'_>, id: &str, doc: Option<&str>, src: &str) -> Resu
         }
     };
     let text = crate::fromfile::read_source(src)?;
+    let label = match doc {
+        None => "design doc".to_string(),
+        Some(name) => format!("named doc '{}'", crate::text::inline(name)),
+    };
     if text == *current {
-        return print_project(ctx, &project);
+        if ctx.json {
+            return print_project(ctx, &project);
+        }
+        println!("{}: {label} unchanged", crate::text::inline(id));
+        return Ok(());
     }
     commit_doc_text(&mut store, actor, doc_id, &text)?;
-    let project = store
-        .project(id)?
-        .ok_or_else(|| CliError::error(format!("project '{id}' vanished after edit")))?;
-    print_project(ctx, &project)
+    if ctx.json {
+        let project = store
+            .project(id)?
+            .ok_or_else(|| CliError::error(format!("project '{id}' vanished after edit")))?;
+        return print_project(ctx, &project);
+    }
+    println!("{}: {label} updated", crate::text::inline(id));
+    Ok(())
 }
 
 // ----------------------------------------------------------------- delete
@@ -376,8 +390,25 @@ fn delete(ctx: &Ctx<'_>, id: &str) -> Result<()> {
 
 // --------------------------------------------------------------- doc add
 
+/// Names a NEW named document may not take (AGT-1481): they read as the
+/// design doc, and a named doc called `design` once shadowed it in
+/// everyone's head. CLI-only on purpose: pm-core accepts any safe name,
+/// because existing replicas already hold such docs and a core rule would
+/// wedge their sync.
+fn is_reserved_doc_name(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "design" | "readme")
+}
+
 fn doc_add(ctx: &Ctx<'_>, id: &str, name: &str, from_file: &std::path::Path) -> Result<()> {
     let name = non_empty("doc name", name)?;
+    if is_reserved_doc_name(&name) {
+        return Err(CliError::usage(format!(
+            "'{name}' is reserved: it reads as the project's design doc, which every \
+             project already has. Write the design doc with \
+             `pm project edit {id} --from-file <path|->`, or pick a different name for \
+             a named doc"
+        )));
+    }
     let text = fs::read_to_string(from_file)
         .with_context(|| format!("reading {}", from_file.display()))?;
     let actor = ctx.actor()?;
@@ -465,9 +496,16 @@ fn print_project(ctx: &Ctx<'_>, project: &Project) -> Result<()> {
     );
     if !project.documents.is_empty() {
         let names: Vec<&str> = project.documents.keys().map(String::as_str).collect();
-        println!("docs:    {}", crate::text::inline(&names.join(", ")));
+        println!(
+            "named docs: {}  (pm project show {} --doc <name>)",
+            crate::text::inline(&names.join(", ")),
+            crate::text::inline(&project.id)
+        );
     }
-    if !project.doc.is_empty() {
+    if project.doc.is_empty() {
+        println!("design doc: (empty)");
+    } else {
+        println!("design doc:");
         println!();
         print!("{}", crate::text::printable(&project.doc));
         if !project.doc.ends_with('\n') {

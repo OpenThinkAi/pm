@@ -1091,6 +1091,15 @@ Flags: `--title <TITLE>` (required), `--repo <OWNER/NAME>`
 Flags: `--doc <NAME>` (print a named document's body instead of the
 project itself).
 
+A project has one **design doc** (written by `pm project edit <ID>
+--from-file`, always present, possibly empty) and any number of **named
+docs** (`pm project doc add`; written by `pm project edit <ID> --doc
+<NAME> --from-file`). They are different documents: a named doc called
+`design` is *not* the design doc. Text output keeps them apart: `pm
+project show <ID>` prints `named docs: a, b` and a `design doc:` heading
+above the body; `--doc <NAME>` writes `<ID>: named doc '<NAME>'` to
+stderr, leaving stdout the bare body. `--json` shapes are unchanged.
+
 - Exit `3`: unknown project; `--doc` names a document the project does not
   have.
 - `--json` (no `--doc`): **Project**.
@@ -1117,8 +1126,10 @@ the file's text (`-` = stdin), launching nothing. The file is the document
 stored. Diffed through the line-faithful `Body::diff_from_text` like the
 editor flow, so concurrent edits merge; unchanged text commits nothing.
 Agents use this, never a scripted `$EDITOR`. Exit `3`: unknown project or
-unknown `--doc` name (create it with `pm project doc add`). `--json`:
-**Project**. Without `--from-file` the paragraphs below apply.
+unknown `--doc` name (create it with `pm project doc add`). Text output
+is one line saying which document it touched: `<ID>: design doc updated`
+or `<ID>: named doc '<NAME>' updated` (`unchanged` when nothing
+changed). `--json`: **Project**. Without `--from-file` the paragraphs below apply.
 
 Chooses its view exactly as `pm edit` does (AGT-1405): `--view`, then
 `edit.view`, else ui-leaf only when stdin and stdout are both terminals —
@@ -1167,6 +1178,12 @@ Flags: `--from-file <PATH>` (required).
 
 Creates only: a name that already exists is exit `1`, and the error points
 at `pm project edit <ID> --doc <NAME> --from-file <PATH|->`.
+
+**Reserved names** (AGT-1481): `design` and `readme`, case-insensitive,
+are refused with exit `2` (the error points at `pm project edit <ID>
+--from-file`), because they read as the design doc. The rule is CLI-only:
+pm-core accepts any safe name and existing named docs with those names
+keep working, so replicas that already hold one still sync.
 
 - Exit `3`: unknown project.
 - `--json`: `{"schema": 1, "project": "id", "doc": "NAME"}`.
