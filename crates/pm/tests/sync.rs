@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use hub::{admin, free_port, postgres_for, spawn_hub, wait_for_health};
+use hub::{admin, free_port, postgres_for, request_body, spawn_hub, wait_for_health};
 
 /// One machine: its own HOME (config.toml), workspace directory and actor.
 struct Replica {
@@ -178,6 +178,28 @@ fn create_token(url: &str, name: &str, workspace: &str) -> String {
     stdout.trim().to_string()
 }
 
+/// `POST /w/{ws}/seeded {"number_floor": 0}` straight at the hub: ends
+/// seed mode, so the hub numbers every `ticket.create` it is pushed from
+/// here on (AGT-1391) — which, with a hub configured, `pm new` no longer
+/// does locally (AGT-1398). `409 already_seeded` is fine too: the seed
+/// already ended (the first sync does this itself once AGT-1396 lands).
+fn end_seed(port: u16, hub_ws: &str, token: &str) {
+    let auth = format!("Authorization: Bearer {token}");
+    let resp = request_body(
+        port,
+        "POST",
+        &format!("/w/{hub_ws}/seeded"),
+        &[auth.as_str(), "Content-Type: application/json"],
+        b"{\"number_floor\": 0}",
+    );
+    assert!(
+        resp.status == 200 || (resp.status == 409 && resp.body.contains("already_seeded")),
+        "POST /seeded: {} {}",
+        resp.status,
+        resp.body
+    );
+}
+
 fn counts(v: &Value) -> (u64, u64, u64, u64) {
     (
         v["pushed"].as_u64().unwrap(),
@@ -229,22 +251,38 @@ fn two_replicas_converge_through_a_hub() {
     let again = alice.sync();
     assert_eq!(counts(&again), (0, 0, 0, 0), "{again}");
     assert_eq!(again["cursor"].as_i64().unwrap(), head_after_seed);
+    // The seed is in; from here the hub numbers tickets (AGT-1398: with a
+    // hub configured, `pm new` files them as `T-?` and waits for it).
+    end_seed(port, &hub_ws, &alice_token);
 
     // Bob's machine: a copy of the workspace as of now, synced.
     let mut bob = Replica::clone_from(&alice, "bob");
     bob.configure(&hub_url, &bob_token);
     assert_eq!(counts(&bob.sync()), (0, 0, 0, 0));
 
-    // Alice files a ticket; Bob pulls it.
-    alice.ok(&["new", "--title", "shared", "--description", "line one"]);
+    // Alice files a ticket (`T-?` until the hub numbers it); the sync
+    // pushes it and pulls the hub's `field.set number` back — the one
+    // foreign op in an otherwise all-echo pull. Bob pulls all of it.
+    let out = alice.ok(&["new", "--title", "shared", "--description", "line one"]);
+    assert!(out_s(&out).starts_with("T-?  "), "{}", out_s(&out));
+    assert_eq!(alice.sync_state()["pending_numbers"], 1);
     let created = alice.sync();
-    let (pushed, _, applied, skipped) = counts(&created);
+    let (pushed, pulled, applied, skipped) = counts(&created);
     assert!(pushed >= 2, "{created}");
-    assert_eq!((applied, skipped), (0, pushed));
+    assert_eq!(
+        (pulled, applied, skipped),
+        (pushed + 1, 1, pushed),
+        "{created}"
+    );
+    assert_eq!(created["pending_numbers"], 0, "{created}");
     let got = bob.sync();
     let (pushed, pulled, applied, skipped) = counts(&got);
     assert_eq!((pushed, applied, skipped), (0, pulled, 0), "{got}");
-    assert_eq!(pulled, counts(&created).0);
+    assert_eq!(
+        pulled,
+        counts(&created).0 + 1,
+        "Alice's ops plus the hub's number"
+    );
     assert_eq!(bob.show("T-1"), alice.show("T-1"));
     assert_eq!(bob.show("T-1")["title"], "shared");
 

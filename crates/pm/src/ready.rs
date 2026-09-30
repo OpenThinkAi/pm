@@ -24,7 +24,8 @@ use crate::exit::{CliError, Result};
 use crate::markers::describe_hold;
 use crate::read::priority_str;
 use crate::verbs::{
-    Ctx, SCHEMA, display_id, find, non_empty, now_ms, print_json, require_project, ticket_json,
+    Ctx, SCHEMA, display_id, find, non_empty, now_ms, print_json, ref_id, require_project,
+    ticket_json,
 };
 
 pub struct ReadyArgs {
@@ -74,10 +75,13 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
 
     let (tickets, frontier) = store.frontier(&ws, &scope, &rules)?;
     let by_id: BTreeMap<Ulid, &Ticket> = tickets.iter().map(|t| (t.id, t)).collect();
+    // Waves, `ids` and the excluded list are references (`ref_id`): a
+    // ticket still awaiting its hub number is named by ULID, which
+    // `--ids` accepts back. The `ready` rows keep their display id.
     let name = |id: &Ulid| -> String {
         by_id
             .get(id)
-            .map(|t| display_id(&ws, t))
+            .map(|t| ref_id(&ws, t))
             .unwrap_or_else(|| id.to_string())
     };
 
@@ -143,7 +147,7 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
                     tickets
                         .iter()
                         .filter(|t| ids.contains(&t.id))
-                        .map(|t| display_id(&ws, t))
+                        .map(|t| ref_id(&ws, t))
                         .collect::<Vec<_>>(),
                 ),
                 _ => None,

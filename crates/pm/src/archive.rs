@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 use ulid::Ulid;
 
 use crate::exit::{CliError, Result};
-use crate::verbs::{Ctx, SCHEMA, Stamper, display_id, find, print_json, ticket_json};
+use crate::verbs::{Ctx, SCHEMA, Stamper, display_id, find, print_json, ref_id, ticket_json};
 
 /// `pm archive AGT-N` or `pm archive --auto [--dry-run]`; clap's
 /// `conflicts_with`/`requires` rule out the other two combinations
@@ -186,7 +186,7 @@ fn print_auto_result(
         let out = json!({
             "schema": SCHEMA,
             "dry_run": dry_run,
-            "archived_tickets": tickets.iter().map(|(t, _)| Value::String(display_id(ws, t))).collect::<Vec<_>>(),
+            "archived_tickets": tickets.iter().map(|(t, _)| Value::String(ref_id(ws, t))).collect::<Vec<_>>(),
             "completed_projects": projects.iter().map(|p| Value::String(p.id.clone())).collect::<Vec<_>>(),
         });
         print_json(&out);
@@ -196,7 +196,7 @@ fn print_auto_result(
     if tickets.is_empty() {
         println!("{ticket_verb}: none");
     } else {
-        let ids: Vec<String> = tickets.iter().map(|(t, _)| display_id(ws, t)).collect();
+        let ids: Vec<String> = tickets.iter().map(|(t, _)| ref_id(ws, t)).collect();
         println!("{ticket_verb}: {}", ids.join(", "));
     }
     let project_verb = if dry_run {

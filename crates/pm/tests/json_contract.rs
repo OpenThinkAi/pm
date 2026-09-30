@@ -985,6 +985,37 @@ fn every_verbs_json_output_matches_its_fixture() {
         std::fs::write(&config, original).unwrap();
     }
 
+    // ---- pm new with a hub configured (AGT-1398) ----
+    // The ticket is filed without a number (`AGT-?`, `number: null`) and
+    // waits for the hub's — no hub need be reachable for that. In its own
+    // sandbox: a pending ticket left in the main one would leak into the
+    // fixtures below (`unnumbered` in the export, a `T-?` row in lists).
+    {
+        let pending = Sandbox::new();
+        let out = pending.pm(&[
+            "init",
+            "--prefix",
+            "AGT",
+            "--preset",
+            "saltline",
+            "--workspace",
+            pending.ws_str(),
+        ]);
+        if !out.status.success() {
+            failures.push(format!("new_pending setup: init failed: {}", stderr(&out)));
+        }
+        let config = pending.home.path().join(".config/pm/config.toml");
+        let original = std::fs::read_to_string(&config).unwrap_or_default();
+        std::fs::write(&config, format!("hub = \"http://127.0.0.1:1\"\n{original}")).unwrap();
+        capture(
+            &pending,
+            "new_pending",
+            &["new", "--title", "Filed while the hub numbers", "--json"],
+            0,
+            &mut failures,
+        );
+    }
+
     // ---- pm project delete ----
     // The creation here is only scaffolding for the delete below (already
     // covered by the "project_new" fixture above), so it runs unfixtured.

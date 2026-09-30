@@ -133,6 +133,25 @@ inherits whatever stdio `pm` itself was given, so a non-interactive editor
 invocation (no TTY) fails fast rather than hanging, and `pm edit` reports
 that as an aborted edit (exit `1`), never a hang.
 
+### Ticket ids
+
+Every `<ID>` argument is a ticket's display id (`AGT-12`; the prefix is
+matched case-insensitively) or its ULID (`ulid` in every **Ticket**);
+`verbs::find` resolves both. A ticket whose number the hub has yet to
+assign (AGT-1398, below under `pm new`) has no display id: it prints as
+`AGT-?`, which is **not** an id — passing it is exit `2`, with a message
+that says to use the ULID until `pm sync` numbers it.
+
+Output therefore distinguishes a ticket's own **display id** from a
+**ref** to another ticket. A display id (`id` in **Ticket**, the first
+column of `pm list`/`pm ready`, the line `pm set`/`label`/`move`/… echo)
+is `AGT-12` or `AGT-?`. A ref — something to hand back to `pm` to name
+that ticket again: **Ticket**'s `blocked_by`, `pm new --batch`'s `refs`,
+`pm graph`'s and `pm ready`'s `ids`/`waves`, `pm ready`'s `excluded[].id`,
+`pm check`'s `tickets`, `pm archive --auto`'s `archived_tickets` — is
+`AGT-12` once numbered and the **ULID** while the number is pending,
+never `AGT-?`. Human output of those same verbs uses the same refs.
+
 ## Shared `--json` shapes
 
 Several verbs print exactly this ticket shape (`verbs::ticket_json`) —
@@ -152,7 +171,7 @@ referenced below as **Ticket** rather than repeated per verb:
   "assignee": "string" | null,     // actor id
   "description": "string",         // markdown body
   "labels": ["string", ...],
-  "blocked_by": ["AGT-3", ...],    // display ids of tickets that block this one
+  "blocked_by": ["AGT-3", ...],    // refs to the tickets that block this one (see "Ticket ids")
   "created": {"wall_ms": 0, "counter": 0},
   "updated": {"wall_ms": 0, "counter": 0},
   "archived_at": {"wall_ms": 0, "counter": 0} | null,
@@ -273,15 +292,42 @@ comma-separated), `--description <TEXT>`, `--description-file <PATH|->`
   nothing — AC2 all-or-nothing).
 - Exit `3`: `--project`/a frontmatter `project:` names a project that does
   not exist; a `--blocked-by`/frontmatter `blocked-by:` id does not exist.
+- Text output: one line per ticket made — its display id (`AGT-12`), or
+  `AGT-?  <ULID>` (two spaces) while the number is pending (below); the
+  `--batch` form appends `  <title>` to each and, when any entry has a
+  `ref:`, a `refs:` block of `  @name -> <ref>` lines.
 - `--json` (plain and `--from-file` forms): **Ticket**.
 - `--json` (`--batch` form):
   ```jsonc
   {
     "schema": 1,
-    "refs": {"@name": "AGT-3", ...},   // every entry's `ref:`, display id
+    "refs": {"@name": "AGT-3", ...},   // every entry's `ref:` -> a ref (display id, or the ULID while pending)
     "tickets": [/* Ticket, one per entry, in file order */]
   }
   ```
+
+**Numbering (AGT-1398).** Who numbers a new ticket is one predicate,
+`hub::numbers_are_hub_assigned`: with no `hub` in config.toml this
+machine's database is the authority and `pm new` allocates the next
+number in the same transaction as the create, exactly as before. With a
+`hub` configured (`pm hub login`) `pm new` — every form — **never
+allocates locally**: the ticket is committed without a number and flagged
+pending (`pm_store::Store::commit_batch_pending`; `pm doctor` and `pm
+sync` report the count under `pending_numbers`), reads `AGT-?` / `"id":
+"AGT-?"`, `"number": null`, and is named by its ULID until a `pm sync`
+brings the hub's `field.set number` (actor `hub`) — allocated when the
+create is pushed to a seeded workspace, or at the end of the seed for a
+create pushed during it (`docs/hub-api.md` §Ticket numbers). `pm new`
+never contacts the hub and needs no token, so filing works offline and
+`pm sync` failing to reach the hub leaves the tickets pending, not lost.
+Everything else works on a pending ticket meanwhile by ULID: `pm show`,
+`set`, `label`, `comment`, `move`, `hold`, `relate`, `edit`, `archive`,
+`--blocked-by`/`blocked-by:` (a ULID next to numbered ids), `--ids`. In
+`pm list`/`pm ready` pending tickets sort after every numbered one, in
+creation order. Removing the hub from config (`pm hub logout`) restores
+local numbering for *new* tickets; a ticket already pending stays
+pending — only the hub can number it, and its create is still in the
+outbox for the next sync.
 
 ### `pm show <ID>`
 
@@ -289,7 +335,7 @@ Flags: `--field <NAME>`, `--section <NAME>` (mutually exclusive with
 each other).
 
 - Exit `2`: both `--field` and `--section` given; `--field` names an
-  unknown field.
+  unknown field; `<ID>` is `AGT-?` (see **Ticket ids**).
 - Exit `3`: unknown ticket id; `--section` names a heading the ticket's
   description does not have.
 - `--json` (no flag): **Ticket**.
@@ -537,8 +583,8 @@ whole workspace or project).
   {
     "schema": 1,
     "project": "string" | null,
-    "ids": ["AGT-3", ...] | null,                    // display ids, only set when scoped by --ids
-    "waves": [["AGT-1", "AGT-2"], ["AGT-3"], ...],  // display ids, not-yet-done tickets only
+    "ids": ["AGT-3", ...] | null,                    // refs, only set when scoped by --ids
+    "waves": [["AGT-1", "AGT-2"], ["AGT-3"], ...],  // refs (ULID while pending), not-yet-done tickets only
     "done": false                                    // true once nothing in scope is pending
   }
   ```
@@ -566,14 +612,14 @@ its reason).
   {
     "schema": 1,
     "project": "string" | null,
-    "ids": ["AGT-3", ...] | null,     // display ids, only set when scoped by --ids
+    "ids": ["AGT-3", ...] | null,     // refs, only set when scoped by --ids
     "model": "string" | null,
     "today": "YYYY-MM-DD",
     "limit": 5 | null,
     "ready": [/* Ticket, ... */],
     "excluded": [
       {
-        "id": "AGT-4", "ulid": "<ULID>",
+        "id": "AGT-4", "ulid": "<ULID>",  // id is a ref: the ULID while the number is pending
         "reason": "state" | "assigned" | "held" | "label" | "parked" | "not-before"
                 | "cycle" | "blocked-by" | "transitively-blocked" | "model" | "done",
         "message": "string",
@@ -588,7 +634,7 @@ its reason).
       },
       ...
     ],
-    "waves": [["AGT-3"], ["AGT-4"], ...]  // ready set, then the waves it would unblock; never cut by --limit
+    "waves": [["AGT-3"], ["AGT-4"], ...]  // refs; ready set, then the waves it would unblock; never cut by --limit
   }
   ```
 
@@ -634,7 +680,7 @@ tickets).
       {
         "rule": "R1" | "stale" | "held" | "assigned-unstarted" | "blocker-cycle"
               | "dangling-relation",
-        "tickets": ["AGT-2", ...],
+        "tickets": ["AGT-2", ...],       // refs (ULID while the number is pending)
         "message": "string",
         /* plus rule-specific fields: stale -> {days, stale_days}; held -> {hold};
            assigned-unstarted -> {assignee, state} (an unstarted-or-backlog ticket
@@ -699,7 +745,7 @@ retire every idle project, instead of one ticket), `--dry-run` (requires
   {
     "schema": 1,
     "dry_run": false,
-    "archived_tickets": ["AGT-3", ...],     // display ids, this run's archives (or would-be, with --dry-run)
+    "archived_tickets": ["AGT-3", ...],     // refs, this run's archives (or would-be, with --dry-run)
     "completed_projects": ["project-id", ...]
   }
   ```
@@ -1055,6 +1101,8 @@ no connection.
   keychain file instead of the login keychain.
 - A configured `hub` still makes `pm claim` refuse until the hub-side
   claim lands (AGT-1397); `pm hub logout` restores local claiming.
+- A configured `hub` makes `pm new` file tickets without a number
+  (`AGT-?`) for the hub to assign on sync (AGT-1398; see `pm new`).
 
 `login` reads the token from `PM_HUB_TOKEN`, else stdin (macOS), stores it
 (updating any existing item), then writes `hub`. It does not contact the hub.
@@ -1129,7 +1177,10 @@ leaves the outbox and cursor consistent:
   replica's own, echoed back — is skipped and counts as pushed), and the
   cursor moves to the page's `next` only after that transaction commits.
   A hub-authored `field.set number` (AGT-1391) arrives like any other op
-  and clears the ticket's pending-number flag.
+  and clears the ticket's pending-number flag: a ticket `pm new` filed as
+  `AGT-?` (AGT-1398) reads `AGT-N` from this sync on. (The push response
+  carries the same op; it is not applied from there — the pull that
+  follows in the same round delivers it.)
 - Exit `1`, with the cause on stderr and nothing printed on stdout
   (no partial `--json`), when: no hub is configured or no token is held
   (the message names `pm hub login`); the hub cannot be reached or times

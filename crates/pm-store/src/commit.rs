@@ -95,6 +95,37 @@ impl Store {
         Ok(tickets)
     }
 
+    /// [`Store::commit_batch`] for a replica whose numbers the hub assigns
+    /// (AGT-1398): commits every op in `ops`, allocates nothing, and flags
+    /// each ticket in `pending` as awaiting a hub number
+    /// ([`Store::mark_pending_number`]) — all in **one** transaction, so
+    /// a batch that fails leaves no stray pending flag and a batch that
+    /// lands is never observed created-but-unflagged. The tickets read
+    /// `AGT-?` until a pulled `field.set number` clears the flag
+    /// ([`Store::apply_pulled`]).
+    ///
+    /// Returns the tickets, in the same order as `pending`.
+    pub fn commit_batch_pending(&mut self, ops: &[Op], pending: &[Ulid]) -> Result<Vec<Ticket>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for op in ops {
+            commit_in(&tx, op, || Ok(()))?;
+        }
+        let mut tickets = Vec::with_capacity(pending.len());
+        for ticket in pending {
+            let view =
+                load_view(&tx, *ticket)?.ok_or(StoreError::UnknownTicket { ticket: *ticket })?;
+            tx.execute(
+                "INSERT OR IGNORE INTO pending_number (ticket) VALUES (?1)",
+                params![ticket.to_string()],
+            )?;
+            tickets.push(view.snapshot());
+        }
+        tx.commit()?;
+        Ok(tickets)
+    }
+
     /// The greatest HLC in the log ([`Hlc::ZERO`] when empty): what a
     /// caller restores its [`Clock`] from so it never re-issues a stamp.
     pub fn latest_hlc(&self) -> Result<Hlc> {

@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use ulid::Ulid;
 
 use crate::exit::{CliError, Result};
-use crate::verbs::{Ctx, SCHEMA, display_id, find, print_json, ticket_json};
+use crate::verbs::{Ctx, SCHEMA, display_id, find, print_json, ref_id, ticket_json};
 
 // ---------------------------------------------------------------- pm list
 
@@ -486,8 +486,9 @@ pub fn graph(ctx: &Ctx<'_>, args: GraphArgs) -> Result<()> {
     if !stuck.is_empty() {
         waves.push(stuck);
     }
-    let names: BTreeMap<Ulid, String> =
-        tickets.iter().map(|t| (t.id, display_id(&ws, t))).collect();
+    // Waves and `ids` are references (`ref_id`): a ticket still awaiting
+    // its hub number is named by ULID, which `--ids` accepts back.
+    let names: BTreeMap<Ulid, String> = tickets.iter().map(|t| (t.id, ref_id(&ws, t))).collect();
     let wave_ids: Vec<Vec<String>> = waves
         .iter()
         .map(|wave| wave.iter().map(|id| names[id].clone()).collect())
@@ -501,7 +502,7 @@ pub fn graph(ctx: &Ctx<'_>, args: GraphArgs) -> Result<()> {
                 tickets
                     .iter()
                     .filter(|t| id_set.contains(&t.id))
-                    .map(|t| display_id(&ws, t))
+                    .map(|t| ref_id(&ws, t))
                     .collect::<Vec<_>>()
             }),
             "waves": wave_ids,
