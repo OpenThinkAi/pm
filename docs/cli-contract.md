@@ -830,7 +830,7 @@ tickets).
     "findings": [
       {
         "rule": "R1" | "stale" | "held" | "assigned-unstarted" | "blocker-cycle"
-              | "dangling-relation",
+              | "dangling-relation" | "deleted-project",
         "tickets": ["AGT-2", ...],       // refs (ULID while the number is pending)
         "message": "string",
         /* plus rule-specific fields: stale -> {days, stale_days}; held -> {hold};
@@ -838,7 +838,10 @@ tickets).
            that still carries an assignee: `pm claim` refuses it, `pm ready`
            excludes it — AGT-1379); dangling-relation ->
            {relation: {kind: "blocks" | "parent" | "superseded_by", from, to},
-           missing}. R1 is "no project and no R1/standalone waiver". */
+           missing}; deleted-project -> {project} (a live ticket filed in a project
+           whose `project.delete` synced in afterwards — AGT-1464: the ticket
+           keeps the name, reports no project, and gets this instead of R1).
+           R1 is "no project and no R1/standalone waiver". */
       },
       ...
     ]

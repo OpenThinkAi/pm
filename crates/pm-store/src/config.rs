@@ -42,9 +42,12 @@
 //! documents and their cached merge state while keeping the view itself —
 //! so a `project.set` that syncs in later folds without resurrecting a
 //! row, and a rebuild reproduces the deletion instead of needing to
-//! remember it. A *live* commit (not a rebuild) refuses the deletes
-//! `pm project delete` refuses: a ticket still in the project, or a child
-//! project naming it as `parent` (R2). A database that deleted a project
+//! remember it. A *live* commit (not a rebuild, not a pull) refuses the
+//! deletes `pm project delete` refuses: a ticket still in the project, or
+//! a child project naming it as `parent` (R2). A pulled delete applies
+//! regardless (AGT-1464, see [`Mode`]): what still names the project keeps
+//! the name in its view and reads `NULL` on its row, and `pm check`
+//! reports the tickets. A database that deleted a project
 //! before this kind existed has no tombstone for it; a rebuild re-creates
 //! that row (without documents) from its `project.create`.
 //! - `actor` rows are never deleted (`ops.actor` references them) and an
@@ -312,12 +315,22 @@ impl Store {
 // ------------------------------------------------------------ commit path
 
 /// Whether a materialization is a live commit (which enforces R2 on a
-/// `project.delete`) or a replay of ops already in the log (a rebuild
-/// empties the ticket tables first and must reproduce whatever the log
-/// says).
+/// `project.delete`), a pulled op, or a replay of ops already in the log
+/// (a rebuild empties the ticket tables first and must reproduce whatever
+/// the log says).
+///
+/// A pulled `project.delete` is not refused for R2 (AGT-1464): the
+/// tombstone is already a fact on the replica that sent it, and refusing
+/// it would fail every retry of the pulled batch for good. It folds as a
+/// replay's does, and whatever still points at the project — this
+/// replica's tickets filed in it, a child project naming it as `parent` —
+/// keeps the reference in its view while its row reads `NULL` (see
+/// [`remove_project_rows`]); `pm check` reports those tickets
+/// (`deleted-project`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     Commit,
+    Foreign,
     Rebuild,
 }
 
@@ -335,13 +348,69 @@ enum ConfigView {
 pub(crate) fn commit_config_in(
     tx: &Transaction<'_>,
     op: &Op,
+    mode: Mode,
     between: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    crate::commit::check_ingest(op)?;
+    check_config_admission(tx, op)?;
     ensure_actor(tx, &op.actor)?;
     let view = next_view(tx, op)?;
     append_op(tx, op)?;
     between()?;
-    materialize(tx, &view, Mode::Commit)
+    materialize(tx, &view, mode)
+}
+
+/// What a config op must satisfy against the log before it is admitted
+/// (AGT-1464), on every commit path — local, pulled or restored; a replay
+/// of the log does not re-check:
+/// - a `project.create` for a project that already has one is refused
+///   ([`StoreError::DuplicateProjectCreate`]): a second, backdated create
+///   would move the stamp document identity is anchored to
+///   ([`pm_core::DocClaims`]), and no writer ever sends one;
+/// - a document binding (`project.create`'s `doc_id`, `project.doc_add`)
+///   whose `doc_id` is already a ticket or a project is refused
+///   ([`StoreError::EntityInUse`]) — the mirror of
+///   [`crate::commit::check_ticket_entity`].
+///
+/// Both are admission rules, not merge rules: the hub refuses the same
+/// ops at its push (pm-hub `views`), so its log — what every replica
+/// pulls — never holds one, and no replica has to pick between two.
+pub(crate) fn check_config_admission(tx: &Transaction<'_>, op: &Op) -> Result<()> {
+    let doc_id = match &op.payload {
+        Payload::ProjectCreate(create) => {
+            if exists(
+                tx,
+                "SELECT 1 FROM ops WHERE entity = ?1 AND kind = 'project.create'",
+                &op.entity.to_string(),
+            )? {
+                return Err(StoreError::DuplicateProjectCreate { project: op.entity });
+            }
+            create.doc_id
+        }
+        Payload::ProjectDocAdd(add) => Some(add.doc_id),
+        _ => None,
+    };
+    let Some(doc_id) = doc_id else {
+        return Ok(());
+    };
+    let id = doc_id.to_string();
+    let holder = if exists(
+        tx,
+        "SELECT 1 FROM ops WHERE entity = ?1 AND kind = 'ticket.create'",
+        &id,
+    )? {
+        "a ticket"
+    } else if doc_id == op.entity
+        || exists(tx, "SELECT 1 FROM project_view WHERE project = ?1", &id)?
+    {
+        "a project"
+    } else {
+        return Ok(());
+    };
+    Err(StoreError::EntityInUse {
+        entity: doc_id,
+        holder,
+    })
 }
 
 /// Re-applies a config op already in the log — load → apply →
@@ -502,13 +571,19 @@ fn materialize_project(tx: &Transaction<'_>, view: &ProjectView, mode: Mode) -> 
         remove_project_rows(tx, view.id, mode)?;
         return save_project_view(tx, view);
     }
-    if let Some(parent) = &p.parent
-        && !project_exists(tx, parent)?
-    {
-        return Err(StoreError::UnknownProject {
-            project: parent.clone(),
-        });
-    }
+    // A parent that was deleted (its tombstone folded) reads NULL on the
+    // row; the view keeps the name (see `Mode`).
+    let parent = match &p.parent {
+        Some(parent) if !project_exists(tx, parent)? => {
+            if !project_tombstoned(tx, parent)? {
+                return Err(StoreError::UnknownProject {
+                    project: parent.clone(),
+                });
+            }
+            None
+        }
+        other => other.clone(),
+    };
     if project_row_exists(tx, view.id)? {
         tx.execute(
             "UPDATE project SET id = ?1, title = ?2, status = ?3, parent = ?4, repos = ?5
@@ -517,7 +592,7 @@ fn materialize_project(tx: &Transaction<'_>, view: &ProjectView, mode: Mode) -> 
                 p.id,
                 p.title,
                 enum_name(&p.status),
-                p.parent,
+                parent,
                 json(&p.repos),
                 ulid
             ],
@@ -543,10 +618,11 @@ fn materialize_project(tx: &Transaction<'_>, view: &ProjectView, mode: Mode) -> 
                 p.id,
                 p.title,
                 enum_name(&p.status),
-                p.parent,
+                parent,
                 json(&p.repos)
             ],
         )?;
+        relink(tx, &p.id)?;
     }
     materialize_doc_identity(tx, view, &p.id)?;
     save_project_view(tx, view)
@@ -664,12 +740,47 @@ fn save_project_view(tx: &Transaction<'_>, view: &ProjectView) -> Result<()> {
     Ok(())
 }
 
+/// Whether `slug` names a deleted project: some project view with that
+/// slug is tombstoned (and, as the caller has checked, no live row holds
+/// the slug). A reference to one is kept in its view and reads `NULL`
+/// on its row; an unknown slug is still [`StoreError::UnknownProject`].
+pub(crate) fn project_tombstoned(conn: &Connection, slug: &str) -> Result<bool> {
+    Ok(exists(
+        conn,
+        "SELECT 1 FROM project_view
+         WHERE json_extract(view, '$.slug.value') = ?1
+           AND json_extract(view, '$.deleted_at') IS NOT NULL",
+        slug,
+    )?)
+}
+
+/// A project row with `slug` has just been inserted: every ticket and
+/// child project whose view names `slug` but whose row reads `NULL` (it
+/// pointed at a deleted project of that slug) points at it again — what
+/// materializing those rows now would write, and what a rebuild writes.
+fn relink(tx: &Transaction<'_>, slug: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE ticket SET project = ?1
+         WHERE project IS NULL AND id IN
+           (SELECT ticket FROM ticket_view WHERE json_extract(view, '$.project.value') = ?1)",
+        params![slug],
+    )?;
+    tx.execute(
+        "UPDATE project SET parent = ?1
+         WHERE parent IS NULL AND id <> ?1 AND ulid IN
+           (SELECT project FROM project_view WHERE json_extract(view, '$.parent.value') = ?1)",
+        params![slug],
+    )?;
+    Ok(())
+}
+
 /// Removes a tombstoned project's row, its named documents and the cached
 /// merge state of every document it owned (the `project_view` row stays:
 /// it carries the tombstone). A live commit refuses while a ticket is in
-/// the project or a child project names it as `parent`; a replay does not
-/// (the ticket tables are empty then, and the log already passed this
-/// check when the op was first committed).
+/// the project or a child project names it as `parent`; a pulled op and a
+/// replay do not (AGT-1464, see [`Mode`]) — the tickets and children left
+/// pointing at it are detached (their rows read `NULL`; their views keep
+/// the name).
 fn remove_project_rows(tx: &Transaction<'_>, id: Ulid, mode: Mode) -> Result<()> {
     let ulid = id.to_string();
     let slug: Option<String> = tx
@@ -690,6 +801,14 @@ fn remove_project_rows(tx: &Transaction<'_>, id: Ulid, mode: Mode) -> Result<()>
             return Err(StoreError::ProjectHasChildren { project: slug });
         }
     }
+    tx.execute(
+        "UPDATE ticket SET project = NULL WHERE project = ?1",
+        params![slug],
+    )?;
+    tx.execute(
+        "UPDATE project SET parent = NULL WHERE parent = ?1",
+        params![slug],
+    )?;
     tx.execute(
         "DELETE FROM project_doc_view WHERE doc_id IN
             (SELECT doc_id FROM project_doc WHERE project = ?1 AND doc_id IS NOT NULL
@@ -720,7 +839,7 @@ pub(crate) fn commit_payloads(
             entity,
             payload,
         );
-        commit_config_in(tx, &op, || Ok(()))?;
+        commit_config_in(tx, &op, Mode::Commit, || Ok(()))?;
     }
     Ok(n)
 }

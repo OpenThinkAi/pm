@@ -691,3 +691,120 @@ fn actors_named_in_payloads_are_held_to_the_token_binding() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(stored(&body), [true; 3]);
 }
+
+/// AGT-1464: the push refuses a hostile document name, a second
+/// (backdated) `project.create` for a stored project and a `ticket.create`
+/// under a bound document's id — ops every replica would refuse on pull.
+#[test]
+fn pushed_project_identity_is_admission_checked() {
+    let Some((_container, url)) = postgres_for("pushed_project_identity_is_admission_checked")
+    else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    wait_for_health(&mut hub, port);
+    let (studio, _, _) = mint(&url, "studio", &["--any"]);
+    let (project, design, notes) = (Ulid::new(), Ulid::new(), Ulid::new());
+    let at = |wall_ms: u64, entity: Ulid, payload: Payload| {
+        Op::new(
+            Ulid::new(),
+            Hlc::new(wall_ms, 0),
+            ActorId::new("matt"),
+            entity,
+            payload,
+        )
+    };
+    let create = |wall_ms: u64| {
+        at(
+            wall_ms,
+            project,
+            Payload::ProjectCreate(pm_core::op::ProjectCreate {
+                id: "pm".into(),
+                title: "pm".into(),
+                status: pm_core::ProjectStatus::InProgress,
+                parent: None,
+                doc_id: Some(design),
+            }),
+        )
+    };
+    let doc_add = |name: &str, doc_id: Ulid| {
+        at(
+            2_000,
+            project,
+            Payload::ProjectDocAdd(pm_core::op::ProjectDocAdd {
+                name: Some(name.into()),
+                doc_id,
+            }),
+        )
+    };
+    let (status, body) = push(port, &studio, &[&create(1_000), &doc_add("notes", notes)]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(count_ops(&url), 2);
+
+    let (status, err) = push(port, &studio, &[&doc_add("../x", Ulid::new())]);
+    assert_eq!(
+        (status, err["error"].as_str()),
+        (400, Some("invalid_id")),
+        "{err}"
+    );
+
+    let (status, err) = push(port, &studio, &[&create(1)]);
+    assert_eq!(
+        (status, err["error"].as_str()),
+        (400, Some("invalid_op")),
+        "{err}"
+    );
+    assert!(
+        err["reason"]
+            .as_str()
+            .unwrap()
+            .contains("already has a project.create"),
+        "{err}"
+    );
+
+    for doc in [design, notes] {
+        let (status, err) = push(port, &studio, &[&create_as("matt", doc, 3_000)]);
+        assert_eq!(
+            (status, err["error"].as_str()),
+            (400, Some("invalid_op")),
+            "{err}"
+        );
+        assert!(
+            err["reason"]
+                .as_str()
+                .unwrap()
+                .contains("already a project document"),
+            "{err}"
+        );
+    }
+    // And the mirror: a document binding of a stored ticket's id.
+    let ticket = Ulid::new();
+    let (status, body) = push(port, &studio, &[&create_as("matt", ticket, 3_000)]);
+    assert_eq!(status, 200, "{body}");
+    let (status, err) = push(port, &studio, &[&doc_add("other", ticket)]);
+    assert_eq!(
+        (status, err["error"].as_str()),
+        (400, Some("invalid_op")),
+        "{err}"
+    );
+    assert!(
+        err["reason"].as_str().unwrap().contains("already a ticket"),
+        "{err}"
+    );
+    assert_eq!(count_ops(&url), 3, "nothing more stored");
+
+    // A re-push of the stored create (a lost ack) is still idempotent.
+    let (status, body) = push_values(
+        port,
+        &studio,
+        &[serde_json::from_str(
+            &query_rows(&url, "SELECT op::text FROM ops ORDER BY seq LIMIT 1").unwrap()[0][0]
+                .clone()
+                .unwrap(),
+        )
+        .unwrap()],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored(&body), [false]);
+}

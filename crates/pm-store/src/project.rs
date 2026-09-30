@@ -300,6 +300,7 @@ pub(crate) fn commit_doc_edit_in(tx: &Transaction<'_>, doc_id: Ulid, op: &Op) ->
     )? {
         return Err(StoreError::DuplicateOp { op_id: op.op_id });
     }
+    crate::commit::check_ingest(op)?;
     ensure_actor(tx, &op.actor)?;
     if !doc_has_row(tx, doc_id)? {
         if !is_known_doc(tx, doc_id)? {

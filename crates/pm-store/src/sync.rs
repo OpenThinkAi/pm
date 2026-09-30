@@ -451,17 +451,16 @@ fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
 /// dragging this replica's clock years ahead.
 pub const PULL_MAX_FUTURE_SKEW_MS: u64 = 365 * pm_core::MAX_FUTURE_SKEW_MS;
 
-/// The trust-boundary check on a foreign op's stamp (oaudit 2026-09-30):
-/// storable, its counter not spent, and not absurdly far in the future.
-/// Refused as [`StoreError::InvalidStamp`] before the op reaches the log,
-/// a view or a clock; the pull rolls back and names the op.
+/// The trust-boundary check on a foreign op (oaudit 2026-09-30): its
+/// stamp storable, its counter not spent, and not absurdly far in the
+/// future; and every identifier it carries safe in a file path (AGT-1450,
+/// AGT-1453, AGT-1464). Refused as [`StoreError::InvalidStamp`] /
+/// [`StoreError::InvalidId`] before the op reaches the log, a view or a
+/// clock; the pull rolls back and names the op. The same check every
+/// local commit and `pm backup --restore` runs
+/// ([`crate::commit::check_ingest`]).
 fn check_foreign_stamp(op: &Op, now_ms: u64) -> Result<()> {
-    op.hlc.check_range()?;
-    op.hlc.check_not_after(now_ms, PULL_MAX_FUTURE_SKEW_MS)?;
-    // A prefix or project id this replica would later put in a file path
-    // (AGT-1453) is refused here too (AGT-1450).
-    pm_core::ids::check_op_ids(op)?;
-    Ok(())
+    crate::commit::check_ingest_at(op, now_ms)
 }
 
 /// Failures another op in the same batch may yet resolve: a missing
