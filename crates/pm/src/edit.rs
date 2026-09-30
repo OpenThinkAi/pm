@@ -589,8 +589,9 @@ fn error_file(ws_id: &str, error: &str, saved: &str) -> String {
 /// The whole directory is removed on drop, which covers every exit path:
 /// a save, an abort, an editor failure, a propagated error and a panic
 /// (unwinding runs `Drop`). Signals are handled in [`run_editor`]. Nothing
-/// is ever kept: a rejected save's text is in the error message's hands,
-/// not in a file that outlives the command. `pub(crate)` alongside
+/// is ever kept: when a rejected save is given up on, [`recover`] prints the
+/// user's last text to stderr so it survives in scrollback instead of in a
+/// file that outlives the command. `pub(crate)` alongside
 /// [`run_editor`], for the same reason.
 pub(crate) struct TempFile {
     dir: PathBuf,
@@ -686,11 +687,11 @@ pub fn edit(ctx: &Ctx<'_>, reference: &str, view_flag: Option<View>) -> Result<(
     let mut reopens = 0;
     let after = loop {
         if !run_editor(&file.path)? {
-            return Err(abort("the editor exited non-zero"));
+            return Err(abort(&file, reopens, "the editor exited non-zero"));
         }
         let saved = file.read()?;
         if reopens > 0 && saved == written {
-            return Err(abort("the file was left unchanged"));
+            return Err(abort(&file, reopens, "the file was left unchanged"));
         }
         match parse(&saved).and_then(|p| validate(&store, &p).map(|()| p)) {
             Ok(parsed) => break parsed,
@@ -700,9 +701,10 @@ pub fn edit(ctx: &Ctx<'_>, reference: &str, view_flag: Option<View>) -> Result<(
                 file.write(&written)?;
             }
             Err(error) => {
+                recover(&saved);
                 return Err(CliError::error(format!(
                     "{shown}: gave up after {MAX_REOPENS} failed saves: {error}; \
-                     nothing was saved"
+                     nothing was saved (your last text is above)"
                 )));
             }
         }
@@ -746,9 +748,27 @@ fn validate(store: &Store, parsed: &Parsed) -> std::result::Result<(), String> {
 }
 
 /// Exit 1 with nothing saved; the temp file goes with the caller's
-/// `TempFile`.
-fn abort(why: &str) -> CliError {
-    CliError::error(format!("edit aborted ({why}); nothing was saved"))
+/// `TempFile`. After a failed parse the user's text is worth keeping, so it
+/// is printed to stderr first ([`recover`]).
+fn abort(file: &TempFile, reopens: usize, why: &str) -> CliError {
+    if reopens > 0 {
+        if let Ok(text) = file.read() {
+            recover(&text);
+        }
+        CliError::error(format!(
+            "edit aborted ({why}); nothing was saved (your last text is above)"
+        ))
+    } else {
+        CliError::error(format!("edit aborted ({why}); nothing was saved"))
+    }
+}
+
+/// No recovery file outlives the command (AGT-1468), so a save that could
+/// not be applied is echoed to stderr, scrubbed like any synced text, where
+/// it stays in scrollback.
+fn recover(text: &str) {
+    eprintln!("pm: the text you saved last:");
+    eprintln!("{}", crate::text::printable(text));
 }
 
 #[cfg(test)]
