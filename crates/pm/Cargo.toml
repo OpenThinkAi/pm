@@ -37,3 +37,9 @@ ulid = { version = "1.2", features = ["serde"] }
 # Tests corrupt a materialized row directly to prove `pm doctor` catches it.
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 tempfile = "3.27"
+# `tests/sync.rs` (AGT-1395) runs the real `pm-hub` against a throwaway
+# Postgres through pm-hub's own test harness (`crates/pm-hub/tests/common`,
+# included by path), which reaches Postgres with tokio-postgres. Both are
+# already in the workspace's lockfile for pm-hub.
+tokio = { version = "1", features = ["rt"] }
+tokio-postgres = "0.7"

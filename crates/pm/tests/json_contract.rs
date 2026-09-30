@@ -31,8 +31,11 @@
 //! the command always prints its fixed human text. `docs/cli-contract.md`
 //! calls this out explicitly rather than fixturing an absence of JSON.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::thread;
 
 use pm_core::{Project, ProjectStatus};
 use pm_store::Store;
@@ -206,6 +209,15 @@ fn normalize_value(v: &mut Value) {
                         *val = Value::String("<SERVICE>".into());
                         continue;
                     }
+                    // `pm sync`: the loopback fake hub's random port.
+                    "hub"
+                        if val
+                            .as_str()
+                            .is_some_and(|u| u.starts_with("http://127.0.0.1:")) =>
+                    {
+                        *val = Value::String("<HUB>".into());
+                        continue;
+                    }
                     // `pm ready`: today's date.
                     "today" if val.is_string() => {
                         *val = Value::String("<TODAY>".into());
@@ -269,6 +281,96 @@ fn normalize(raw: &str, sb: &Sandbox) -> String {
         .unwrap_or_else(|e| panic!("normalizing non-JSON output: {e}\n---\n{text}"));
     normalize_value(&mut value);
     serde_json::to_string_pretty(&value).unwrap()
+}
+
+// -------------------------------------------------------------- fake hub
+
+/// A loopback hub for the `sync` fixture: `POST …/ops` acknowledges every
+/// op in the batch (`stored: true`, seqs from 1) and `GET …/ops?since=N`
+/// answers an empty page at `N` (`next = head = N`). Serves until the
+/// test process exits; returns its base URL.
+fn fake_hub() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 8192];
+            // Read headers, then exactly Content-Length bytes of body.
+            let (head_len, body_len) = loop {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break (raw.len(), 0);
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&raw[..pos]).into_owned();
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            l.split_once(':')
+                                .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        })
+                        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    break (pos + 4, len);
+                }
+            };
+            while raw.len() < head_len + body_len {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let head = String::from_utf8_lossy(&raw[..head_len]).into_owned();
+            let mut request_line = head.lines().next().unwrap_or("").split_whitespace();
+            let (method, path) = (
+                request_line.next().unwrap_or(""),
+                request_line.next().unwrap_or(""),
+            );
+            let body = if method == "POST" && path.ends_with("/ops") {
+                let batch: Value = serde_json::from_slice(&raw[head_len..head_len + body_len])
+                    .unwrap_or(Value::Null);
+                let acks: Vec<Value> = batch["ops"]
+                    .as_array()
+                    .map(|ops| {
+                        ops.iter()
+                            .enumerate()
+                            .map(|(i, op)| {
+                                serde_json::json!({"op_id": op["op_id"], "seq": i + 1, "stored": true})
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                serde_json::json!({ "ops": acks }).to_string()
+            } else if method == "GET" && path.contains("/ops") {
+                let since: i64 = path
+                    .split_once('?')
+                    .map(|(_, q)| q)
+                    .unwrap_or("")
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("since="))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                serde_json::json!({ "ops": [], "next": since, "head": since }).to_string()
+            } else {
+                String::new()
+            };
+            let status = if body.is_empty() {
+                "404 Not Found"
+            } else {
+                "200 OK"
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    url
 }
 
 // -------------------------------------------------------------- fixtures
@@ -857,6 +959,30 @@ fn every_verbs_json_output_matches_its_fixture() {
                 .env("HOME", sb.home.path())
                 .output();
         }
+    }
+
+    // ---- pm sync ----
+    // Against a loopback stand-in for the hub that acknowledges every
+    // pushed op and serves an empty log (AGT-1395), so the whole outbox —
+    // every op the verbs above committed — goes up in one round and the
+    // pull finds nothing. The convergence shapes (`applied` > 0) are
+    // exercised in tests/sync.rs against the real hub. The hub URL is
+    // prepended to config.toml (a top-level key must precede any table)
+    // and the file is restored afterwards.
+    {
+        let hub_url = fake_hub();
+        let config = sb.home.path().join(".config/pm/config.toml");
+        let original = std::fs::read_to_string(&config).unwrap_or_default();
+        std::fs::write(&config, format!("hub = \"{hub_url}\"\n{original}")).unwrap();
+        capture_env(
+            &sb,
+            "sync",
+            &["sync", "--json"],
+            &[("PM_HUB_TOKEN", "pmh_fixture-token")],
+            0,
+            &mut failures,
+        );
+        std::fs::write(&config, original).unwrap();
     }
 
     // ---- pm project delete ----

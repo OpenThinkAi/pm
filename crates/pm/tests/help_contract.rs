@@ -61,6 +61,7 @@ const PATHS: &[&[&str]] = &[
     &["hub", "login"],
     &["hub", "status"],
     &["hub", "logout"],
+    &["sync"],
     &["ticket"],
     &["ticket", "list"],
     &["ticket", "show"],
