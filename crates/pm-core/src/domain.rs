@@ -151,10 +151,12 @@ pub enum Priority {
 /// Deliberately `kebab-case`, unlike every other enum here: these are the
 /// literal `status:` values in `projects/*/README.md` frontmatter
 /// (`in-progress|complete|abandoned`, README §Data model), and import must
-/// read them verbatim.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// read them verbatim. A new project is `in-progress` (the default the
+/// [`crate::config::ProjectView`] register starts from).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProjectStatus {
+    #[default]
     InProgress,
     Complete,
     Abandoned,

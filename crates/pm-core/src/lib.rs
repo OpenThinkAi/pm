@@ -12,6 +12,9 @@
 //! - [`archive`] — selection logic for `pm archive --auto` (AGT-1351)
 //! - [`body`] — ticket/project-doc text as a Loro CRDT (AGT-1338)
 //! - [`check`] — the `pm check` invariants, over a ticket snapshot (AGT-1342)
+//! - [`config`] — [`WorkspaceView`] and [`ProjectView`]: workspace config,
+//!   states, actors and project metadata folded from the config op kinds
+//!   (AGT-1384, decision A4)
 //! - [`doc`] — [`DocView`], the same text CRDT keyed for a project document
 //!   rather than a ticket (AGT-1344)
 //! - [`domain`] — entity types (`Ticket`, `Project`, markers, …)
@@ -27,6 +30,7 @@ pub mod archive;
 pub mod body;
 pub mod bytes;
 pub mod check;
+pub mod config;
 pub mod doc;
 pub mod domain;
 pub mod hlc;
@@ -39,6 +43,7 @@ pub mod view;
 pub use archive::{month_key, project_idle, ticket_archivable};
 pub use body::{Body, BodyError, BodyUpdate};
 pub use check::Finding;
+pub use config::{ConfigApplyError, ProjectView, WorkspaceView, apply_project, apply_workspace};
 pub use doc::{DocApplyError, DocView, apply_doc};
 pub use domain::{
     Actor, ActorId, ActorKind, Comment, Hold, NotBefore, Parked, Priority, Project, ProjectStatus,

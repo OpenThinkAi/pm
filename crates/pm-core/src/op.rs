@@ -13,11 +13,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ulid::Ulid;
 
-use crate::domain::{ActorId, Hold, NotBefore, Parked, Priority, Relation, Source, Waiver};
+use crate::domain::{
+    ActorId, ActorKind, Hold, NotBefore, Parked, Priority, ProjectStatus, Relation, Source,
+    StateCategory, Waiver,
+};
 use crate::hlc::{Hlc, Stamp};
 
 /// Schema version written into every op this build produces. Bump when a
 /// payload shape changes incompatibly; readers branch on `op.version`.
+///
+/// Adding a *kind* is not a bump: every op already in a log keeps its
+/// shape, and a reader dispatches on `kind`, not `version` (the config
+/// kinds of AGT-1384 landed this way).
 pub const OP_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +37,13 @@ pub struct Op {
     /// (AGT-1344), that document's `doc_id`, a Ulid pm-store stamps on the
     /// `project` or `project_doc` row it belongs to. Never a project's own
     /// kebab-case `id`.
+    ///
+    /// Config ops (AGT-1384) target the workspace's id for `workspace.set`,
+    /// `state.upsert` and `actor.upsert` — states and actors are name-keyed
+    /// children of the workspace, the way `ext` keys are of a ticket — and
+    /// a per-project Ulid for `project.create` / `project.set`, with the
+    /// kebab-case id carried in the create payload the way a ticket's human
+    /// number is separate from its Ulid.
     pub entity: Ulid,
     /// Serialized as the sibling keys `kind` and `payload`.
     #[serde(flatten)]
@@ -92,6 +106,18 @@ pub enum Payload {
     BodyEdit(BodyEdit),
     #[serde(rename = "tombstone")]
     Tombstone,
+    // Config kinds (AGT-1384, README §Sync & hub "Config must become ops",
+    // decision A4). Folded by `crate::config`, never by a ticket view.
+    #[serde(rename = "workspace.set")]
+    WorkspaceSet(WorkspaceSet),
+    #[serde(rename = "state.upsert")]
+    StateUpsert(StateUpsert),
+    #[serde(rename = "actor.upsert")]
+    ActorUpsert(ActorUpsert),
+    #[serde(rename = "project.create")]
+    ProjectCreate(ProjectCreate),
+    #[serde(rename = "project.set")]
+    ProjectSet(ProjectSet),
 }
 
 impl Payload {
@@ -110,7 +136,27 @@ impl Payload {
             Payload::HoldClear => "hold.clear",
             Payload::BodyEdit(_) => "body.edit",
             Payload::Tombstone => "tombstone",
+            Payload::WorkspaceSet(_) => "workspace.set",
+            Payload::StateUpsert(_) => "state.upsert",
+            Payload::ActorUpsert(_) => "actor.upsert",
+            Payload::ProjectCreate(_) => "project.create",
+            Payload::ProjectSet(_) => "project.set",
         }
+    }
+
+    /// Whether this kind mutates workspace config (the workspace, its
+    /// states, its actors) or a project — anything but a ticket or a
+    /// document. `entity` is then the workspace or project id, and only
+    /// [`crate::config`] folds it.
+    pub fn is_config(&self) -> bool {
+        matches!(
+            self,
+            Payload::WorkspaceSet(_)
+                | Payload::StateUpsert(_)
+                | Payload::ActorUpsert(_)
+                | Payload::ProjectCreate(_)
+                | Payload::ProjectSet(_)
+        )
     }
 }
 
@@ -224,6 +270,76 @@ pub struct BodyEdit {
     pub update: Vec<u8>,
 }
 
+/// One workspace-config write (`entity` = the workspace id). Scalars are
+/// LWW registers; the gate-label set is an OR-set, so its remove cites
+/// the add-tags it observed exactly like [`LabelRemove`]; `model_labels`
+/// is one register per label, like a ticket's `ext` keys. Serialized as
+/// `{"field": "<name>", "value": …}`, the [`FieldSet`] shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "field", content = "value", rename_all = "snake_case")]
+pub enum WorkspaceSet {
+    Prefix(String),
+    GateLabelAdd(String),
+    GateLabelRemove {
+        label: String,
+        observed: Vec<Ulid>,
+    },
+    /// `model_labels[label] = model`; `None` deletes the key.
+    ModelLabel {
+        label: String,
+        model: Option<String>,
+    },
+    /// The whole ordered list: sections are an ordered template, not a set.
+    TemplateSections(Vec<String>),
+    StaleDays(u32),
+}
+
+/// Insert or replace one workflow state, keyed by `name` (`entity` = the
+/// workspace id). The record is one LWW register: the later upsert wins
+/// whole, since `category` and `position` are never written separately.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateUpsert {
+    pub name: String,
+    pub category: StateCategory,
+    pub position: u32,
+}
+
+/// Insert or replace one actor, keyed by `id` (`entity` = the workspace
+/// id); `kind` is an LWW register.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorUpsert {
+    pub id: ActorId,
+    pub kind: ActorKind,
+}
+
+/// A project's initial scalars; `entity` is the project's own Ulid and
+/// `id` its kebab-case human id (`pm`). Repos follow as `project.set
+/// repo_add` ops, the way labels follow a `ticket.create`.
+///
+/// Two replicas creating the same `id` offline mint two Ulids; the
+/// authority (the hub, from P3) arbitrates that the way it does ticket
+/// numbers — this crate merges, it does not allocate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCreate {
+    pub id: String,
+    pub title: String,
+    pub status: ProjectStatus,
+    pub parent: Option<String>,
+}
+
+/// One project-metadata write; scalars are LWW registers and `repos` an
+/// OR-set (remove cites observed add-tags, as [`LabelRemove`]).
+/// Serialized as `{"field": "<name>", "value": …}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "field", content = "value", rename_all = "snake_case")]
+pub enum ProjectSet {
+    Title(String),
+    Status(ProjectStatus),
+    Parent(Option<String>),
+    RepoAdd(String),
+    RepoRemove { repo: String, observed: Vec<Ulid> },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +408,34 @@ mod tests {
                 update: vec![1, 2, 3],
             })),
             op(Payload::Tombstone),
+            op(Payload::WorkspaceSet(WorkspaceSet::Prefix("AGT".into()))),
+            op(Payload::WorkspaceSet(WorkspaceSet::GateLabelRemove {
+                label: "manual".into(),
+                observed: vec![Ulid::new()],
+            })),
+            op(Payload::WorkspaceSet(WorkspaceSet::ModelLabel {
+                label: "model:fable-5".into(),
+                model: None,
+            })),
+            op(Payload::StateUpsert(StateUpsert {
+                name: "triage".into(),
+                category: StateCategory::Unstarted,
+                position: 0,
+            })),
+            op(Payload::ActorUpsert(ActorUpsert {
+                id: ActorId::new("claude:pm-build"),
+                kind: ActorKind::Agent,
+            })),
+            op(Payload::ProjectCreate(ProjectCreate {
+                id: "pm".into(),
+                title: "pm".into(),
+                status: ProjectStatus::InProgress,
+                parent: None,
+            })),
+            op(Payload::ProjectSet(ProjectSet::RepoRemove {
+                repo: "OpenThinkAi/pm".into(),
+                observed: vec![],
+            })),
         ]
     }
 
@@ -312,8 +456,17 @@ mod tests {
             "hold.clear",
             "body.edit",
             "tombstone",
+            "workspace.set",
+            "workspace.set",
+            "workspace.set",
+            "state.upsert",
+            "actor.upsert",
+            "project.create",
+            "project.set",
         ];
-        for (op, kind) in all_kinds().into_iter().zip(expected) {
+        let ops = all_kinds();
+        assert_eq!(ops.len(), expected.len());
+        for (op, kind) in ops.into_iter().zip(expected) {
             assert_eq!(op.kind(), kind);
             let json = serde_json::to_value(&op).unwrap();
             assert_eq!(json["kind"], kind, "{json}");
@@ -321,6 +474,41 @@ mod tests {
             let back: Op = serde_json::from_value(json).unwrap();
             assert_eq!(back, op);
         }
+    }
+
+    /// AGT-1384: the config kinds share `field.set`'s `{field, value}`
+    /// payload shape, and only they answer `is_config`.
+    #[test]
+    fn config_kinds_use_the_field_value_shape() {
+        let ops = all_kinds();
+        let (tickets, config): (Vec<_>, Vec<_>) = ops.iter().partition(|o| !o.payload.is_config());
+        assert_eq!(tickets.len(), 14);
+        assert_eq!(config.len(), 7);
+
+        let json =
+            serde_json::to_value(op(Payload::WorkspaceSet(WorkspaceSet::StaleDays(30)))).unwrap();
+        assert_eq!(
+            json["payload"],
+            serde_json::json!({"field": "stale_days", "value": 30})
+        );
+        let json = serde_json::to_value(op(Payload::ProjectSet(ProjectSet::RepoRemove {
+            repo: "OpenThinkAi/pm".into(),
+            observed: vec![],
+        })))
+        .unwrap();
+        assert_eq!(
+            json["payload"],
+            serde_json::json!({"field": "repo_remove", "value": {"repo": "OpenThinkAi/pm", "observed": []}})
+        );
+        let json = serde_json::to_value(op(Payload::ProjectSet(ProjectSet::Status(
+            ProjectStatus::Complete,
+        ))))
+        .unwrap();
+        assert_eq!(
+            json["payload"],
+            serde_json::json!({"field": "status", "value": "complete"}),
+            "project status keeps its kebab-case frontmatter spelling"
+        );
     }
 
     #[test]

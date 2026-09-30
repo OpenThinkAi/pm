@@ -158,6 +158,37 @@ fn op_summary(op: &Op) -> String {
         Payload::HoldClear => "cleared hold".to_string(),
         Payload::BodyEdit(_) => "edited description".to_string(),
         Payload::Tombstone => "deleted".to_string(),
+        // Config kinds (AGT-1384) target a workspace or project, so `pm log
+        // <ticket>` never lists one; the summaries exist so the match stays
+        // exhaustive and a misrouted op still reads.
+        Payload::WorkspaceSet(w) => format!("set workspace {}", workspace_field(w)),
+        Payload::StateUpsert(s) => format!("upserted state '{}'", s.name),
+        Payload::ActorUpsert(a) => format!("upserted actor '{}'", a.id),
+        Payload::ProjectCreate(p) => format!("created project '{}'", p.id),
+        Payload::ProjectSet(p) => format!("set project {}", project_field(p)),
+    }
+}
+
+fn workspace_field(w: &pm_core::op::WorkspaceSet) -> &'static str {
+    use pm_core::op::WorkspaceSet;
+    match w {
+        WorkspaceSet::Prefix(_) => "prefix",
+        WorkspaceSet::GateLabelAdd(_) => "gate label (add)",
+        WorkspaceSet::GateLabelRemove { .. } => "gate label (remove)",
+        WorkspaceSet::ModelLabel { .. } => "model label",
+        WorkspaceSet::TemplateSections(_) => "template sections",
+        WorkspaceSet::StaleDays(_) => "stale days",
+    }
+}
+
+fn project_field(p: &pm_core::op::ProjectSet) -> &'static str {
+    use pm_core::op::ProjectSet;
+    match p {
+        ProjectSet::Title(_) => "title",
+        ProjectSet::Status(_) => "status",
+        ProjectSet::Parent(_) => "parent",
+        ProjectSet::RepoAdd(_) => "repo (add)",
+        ProjectSet::RepoRemove { .. } => "repo (remove)",
     }
 }
 
