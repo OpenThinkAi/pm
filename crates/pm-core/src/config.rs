@@ -50,6 +50,10 @@ pub struct WorkspaceView {
     pub model_labels: BTreeMap<String, Lww<Option<String>>>,
     pub template_sections: Lww<Vec<String>>,
     pub stale_days: Lww<u32>,
+    /// `#[serde(default)]`: views stored before AGT-1406 (client
+    /// `workspace_view` rows, the hub's `workspace_views`) have no such key
+    /// and must still load — the hub panics on a view it can't decode.
+    #[serde(default)]
     pub docs_owned_by: Lww<DocsOwner>,
     /// Keyed by state name; the register holds the whole record, since
     /// `state.upsert` always writes `category` and `position` together.
@@ -705,6 +709,15 @@ mod tests {
             apply_project(&mut reverse, op).unwrap();
         }
         assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn a_view_stored_before_docs_owned_by_still_loads() {
+        let mut view = WorkspaceView::new(Ulid::new());
+        let mut json = serde_json::to_value(&view).unwrap();
+        json.as_object_mut().unwrap().remove("docs_owned_by");
+        view = serde_json::from_value(json).unwrap();
+        assert_eq!(view.snapshot().docs_owned_by, DocsOwner::Vault);
     }
 
     #[test]
