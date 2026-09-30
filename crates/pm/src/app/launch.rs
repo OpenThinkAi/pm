@@ -358,6 +358,12 @@ pub(crate) enum Target {
 /// page (`views/vendor/loro.js`), which a CSP without that source refuses.
 /// It allows WebAssembly compilation only — not `eval` or `new Function` —
 /// and every other directive is the preset's.
+///
+/// `'unsafe-inline'` stays in `script-src` (AGT-1452): ui-leaf serves a view
+/// as one HTML page whose bootstrap and compiled view are inline `<script>`
+/// elements (`packages/cli/src/compile.ts`), with no nonce or hash support
+/// in its CSP config, so dropping it would blank the page. Revisit if
+/// ui-leaf gains nonce/hash injection.
 fn csp(api: &str) -> String {
     [
         "default-src 'self'".to_string(),

@@ -17,6 +17,7 @@
 //   page's script-src (crates/pm/src/app/launch.rs).
 // - vendor/codemirror.js — codemirror.ts, bundled and minified, with every
 //   `loro-crdt` import rewritten to `./loro.js`.
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -63,4 +64,19 @@ writeFileSync(
     `// Bundles (all MIT): ${pins}.\n` +
     js,
 );
-console.log(`wrote ${out}/loro.js and ${out}/codemirror.js`);
+
+// vendor.sha256 pins the two committed bundles (AGT-1452), in `sha256sum`
+// format, sorted by name. `cargo test` (views::tests::vendored_bundles_match_manifest)
+// hashes crates/pm/views/vendor/*.js against it, so a hand-edited bundle
+// fails without network or a JS toolchain; regenerating the bundles
+// regenerates this file, and both are committed together.
+const manifest = ["codemirror.js", "loro.js"]
+  .map((name) => {
+    const digest = createHash("sha256")
+      .update(readFileSync(join(out, name)))
+      .digest("hex");
+    return `${digest}  ${name}\n`;
+  })
+  .join("");
+writeFileSync(join(import.meta.dir, "vendor.sha256"), manifest);
+console.log(`wrote ${out}/loro.js, ${out}/codemirror.js and vendor.sha256`);

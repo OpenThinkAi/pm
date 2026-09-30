@@ -348,6 +348,10 @@ loosening, and only for WebAssembly: the editors' `loro-crdt`
 compiles its wasm module from bytes inlined in the page (ui-leaf serves a
 view as a single HTML page, so there is no `.wasm` URL to load), which
 CSP otherwise refuses. It does not allow `eval` or `new Function`.
+`'unsafe-inline'` also stays in `script-src`: ui-leaf emits its bootstrap
+and the compiled view as inline `<script>` elements, with no nonce or
+hash mechanism, so the page does not run without it. The page loads no
+third-party script and `connect-src` is limited to this API's origin.
 
 **How the view gets the URL and token: the `session` mutation.** Never a
 URL: ui-leaf's `ready` URL carries no token, and its launch fragment
