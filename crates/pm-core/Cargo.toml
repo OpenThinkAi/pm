@@ -6,7 +6,6 @@ publish = false
 description.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 # pm-core is pure: no IO, no SQLite, no filesystem access. It holds domain
 # types, op types, merge rules and HLC logic shared by the `pm` CLI and

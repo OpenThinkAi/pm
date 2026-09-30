@@ -6,7 +6,6 @@ publish = false
 description.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 # The SQLite op log + materialized tables (projects/pm/README.md §Op log,
 # AGT-1335). SQLite is statically linked (`bundled`) so `pm` stays a single
