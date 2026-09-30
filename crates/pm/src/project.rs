@@ -156,7 +156,7 @@ fn show(ctx: &Ctx<'_>, id: &str, doc: Option<&str>) -> Result<()> {
             if ctx.json {
                 print_json(&json!({"schema": SCHEMA, "project": id, "doc": name, "body": body}));
             } else {
-                print!("{body}");
+                print!("{}", crate::text::printable(body));
                 if !body.ends_with('\n') {
                     println!();
                 }
@@ -182,7 +182,12 @@ fn list(ctx: &Ctx<'_>, status: Option<ProjectStatus>) -> Result<()> {
         eprintln!("no projects found");
     } else {
         for p in &projects {
-            println!("{:<24} {:<12} {}", p.id, status_str(p.status), p.title);
+            println!(
+                "{:<24} {:<12} {}",
+                p.id,
+                status_str(p.status),
+                crate::text::inline(&p.title)
+            );
         }
     }
     Ok(())
@@ -217,7 +222,10 @@ fn edit_in_ui_leaf(ctx: &Ctx<'_>, id: &str, explicit: bool) -> Result<bool> {
     match crate::app::edit_project(ctx, runtime, id)? {
         crate::app::launch::Ended::Closed => {}
         crate::app::launch::Ended::Failed(why) => {
-            eprintln!("pm project edit: ui-leaf could not open {id} ({why}); using $EDITOR");
+            eprintln!(
+                "pm project edit: ui-leaf could not open {id} ({}); using $EDITOR",
+                crate::text::inline(&why.to_string())
+            );
             return Ok(false);
         }
     }
@@ -366,7 +374,7 @@ fn print_project(ctx: &Ctx<'_>, project: &Project) -> Result<()> {
         print_json(&project_json(project));
         return Ok(());
     }
-    println!("{}  {}", project.id, project.title);
+    println!("{}  {}", project.id, crate::text::inline(&project.title));
     println!("status:  {}", status_str(project.status));
     println!("parent:  {}", project.parent.as_deref().unwrap_or("-"));
     let repos: Vec<&str> = project.repos.iter().map(String::as_str).collect();
@@ -384,7 +392,7 @@ fn print_project(ctx: &Ctx<'_>, project: &Project) -> Result<()> {
     }
     if !project.doc.is_empty() {
         println!();
-        print!("{}", project.doc);
+        print!("{}", crate::text::printable(&project.doc));
         if !project.doc.ends_with('\n') {
             println!();
         }

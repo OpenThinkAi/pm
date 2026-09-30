@@ -14,16 +14,13 @@ pm-store = { path = "../pm-store" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # `pm new --from-file` / `--batch` (AGT-1346): vault ticket files and batch
-# specs are YAML. `serde_yaml` is deprecated (archived by dtolnay, Nov
-# 2024) with no further releases. Of the forks that stepped in:
-# `serde_yml` (sebastienrousseau) now ships its own crate-level notice
-# calling itself unmaintained and redirecting elsewhere — the exact
-# provenance risk this ticket asked to check for, so it is ruled out.
-# `serde_yaml_ng` is a straight fork by an identifiable, existing Rust
-# maintainer (acatton), keeps `serde_yaml`'s exact API (so this crate's
-# usage is a drop-in), stayed on the MIT license, and is the fork most
-# commonly pointed to as the migration target since the deprecation.
-serde_yaml_ng = "0.10"
+# specs are YAML. `serde_yaml` is archived (dtolnay, 2024) and its forks
+# either sit on `unsafe-libyaml` (`serde_yaml_ng`, `serde_norway`; AGT-1465
+# drops it: archived, unsafe C-port) or are unmaintained (`serde_yml`).
+# `serde-saphyr` is actively maintained, pure Rust with no unsafe code, and
+# panic-free by design. It has no dynamic `Value`, so callers deserialize
+# into `serde_json::Value` (same scalar/sequence/map shapes).
+serde-saphyr = "1.3"
 # `~/.config/pm/config.toml` (README §Surfaces). Later config keys
 # (`edit.view`, hub settings) land in the same file.
 toml = "1.1"
@@ -44,13 +41,14 @@ futures-util = { version = "0.3", default-features = false }
 getrandom = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 
+# The view-cache fingerprint (AGT-1465) and the vendored-bundle manifest
+# test (AGT-1452); the release pm-hub and postgres-protocol already lock.
+sha2 = "0.11"
+
 [dev-dependencies]
 # Tests corrupt a materialized row directly to prove `pm doctor` catches it.
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 tempfile = "3.27"
-# `views::tests::vendored_bundles_match_manifest` (AGT-1452); the release
-# pm-hub and postgres-protocol already lock.
-sha2 = "0.11"
 # `tests/sync.rs` (AGT-1395) runs the real `pm-hub` against a throwaway
 # Postgres through pm-hub's own test harness (`crates/pm-hub/tests/common`,
 # included by path), which reaches Postgres with tokio-postgres (already in

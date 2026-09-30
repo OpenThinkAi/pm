@@ -162,7 +162,11 @@ impl fmt::Display for Ticket {
         write!(
             f,
             "{:<8} {:<11} {:<6} {:<24} {}",
-            self.id, self.state, self.priority, project, self.title
+            self.id,
+            self.state,
+            self.priority,
+            crate::text::inline(project),
+            crate::text::inline(&self.title)
         )
     }
 }

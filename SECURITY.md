@@ -56,6 +56,26 @@ committed bundles against it offline, so a hand-edited bundle fails. At
 runtime the unpacked view cache is re-verified against the embedded views
 before each reuse and re-unpacked if anything differs.
 
+The cache fingerprint (the cache directory's name, and the re-verification
+above) is SHA-256 over every file's length-prefixed path and bytes (AGT-1465;
+it was FNV-1a).
+
+### Terminal output
+
+Ticket text, comments, hold reasons and hub error bodies arrive from other
+actors through `pm sync`. Every human-readable (non-`--json`) output strips
+terminal controls — C0/C1 (ESC/CSI/OSC introducers, CR, DEL), bidi
+overrides and isolates, line/paragraph separators — via `crates/pm/src/text.rs`
+(newlines and tabs kept only in multi-line sinks: descriptions, comments).
+`--json` output is exactly what is stored.
+
+### ui-leaf runtime
+
+pm hands the ui-leaf runtime its API token. `ui_leaf.path` is used as given;
+a `ui-leaf` found on `PATH` is launched only when it is the npm-installed
+`@openthink/ui-leaf` package (see `docs/app-api.md`). This is provenance, not
+a content hash.
+
 ### View CSP
 
 The `pm app` view page keeps `'wasm-unsafe-eval'` (for loro's wasm) and

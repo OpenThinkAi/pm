@@ -57,7 +57,7 @@ use pm_core::op::{BodyEdit, FieldSet, LabelAdd, LabelRemove};
 use pm_core::{ActorId, Body, BodyState, Payload, Priority, Source, TicketView, Workspace};
 use pm_store::Store;
 use serde_json::Value;
-use serde_yaml_ng::{Mapping, Value as Yaml};
+use serde_json::Value as Yaml;
 use ulid::Ulid;
 
 use crate::app::{
@@ -236,6 +236,23 @@ pub(crate) struct Parsed {
     body: String,
 }
 
+/// Frontmatter keys in render order. `serde_json::Map` sorts its keys, so
+/// the editor file's field order lives in this vector and serializes as a
+/// map in that order.
+#[derive(Default)]
+struct Fields(Vec<(String, Yaml)>);
+
+impl serde::Serialize for Fields {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(self.0.len()))?;
+        for (k, v) in &self.0 {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
 fn yaml_opt(value: &Option<String>) -> Yaml {
     value.clone().map_or(Yaml::Null, Yaml::String)
 }
@@ -244,14 +261,12 @@ fn yaml_opt(value: &Option<String>) -> Yaml {
 /// instructions), then frontmatter, then the description.
 pub(crate) fn render(ws: &Workspace, view: &TicketView) -> Result<String> {
     let t = view.snapshot();
-    let mut fm = Mapping::new();
-    let mut put = |k: &str, v: Yaml| {
-        fm.insert(Yaml::String(k.to_string()), v);
-    };
+    let mut fm = Fields::default();
+    let mut put = |k: &str, v: Yaml| fm.0.push((k.to_string(), v));
     put("title", Yaml::String(t.title.clone()));
     put(
         "priority",
-        serde_yaml_ng::to_value(t.priority).context("rendering priority")?,
+        serde_json::to_value(t.priority).context("rendering priority")?,
     );
     put("project", yaml_opt(&t.project));
     put("repo", yaml_opt(&t.repo));
@@ -261,33 +276,30 @@ pub(crate) fn render(ws: &Workspace, view: &TicketView) -> Result<String> {
     );
     put(
         "labels",
-        Yaml::Sequence(t.labels.iter().cloned().map(Yaml::String).collect()),
+        Yaml::Array(t.labels.iter().cloned().map(Yaml::String).collect()),
     );
     put("linked-github", yaml_opt(&t.linked_github));
     put("linked-pr", yaml_opt(&t.linked_pr));
     put("linear", yaml_opt(&t.linear));
     if let Some(source) = &t.source {
-        let mut m = Mapping::new();
+        let mut m = serde_json::Map::new();
         for (k, v) in [
             ("type", &source.kind),
             ("url", &source.url),
             ("id", &source.id),
             ("fetched-at", &source.fetched_at),
         ] {
-            m.insert(Yaml::String(k.into()), Yaml::String(v.clone()));
+            m.insert(k.into(), Yaml::String(v.clone()));
         }
-        put("source", Yaml::Mapping(m));
+        put("source", Yaml::Object(m));
     }
     for (key, value) in &t.ext {
         if KNOWN_KEYS.contains(&key.as_str()) {
             continue;
         }
-        put(
-            key,
-            serde_yaml_ng::to_value(value).with_context(|| format!("rendering ext.{key}"))?,
-        );
+        put(key, value.clone());
     }
-    let yaml = serde_yaml_ng::to_string(&fm).context("rendering frontmatter")?;
+    let yaml = serde_saphyr::to_string(&fm).context("rendering frontmatter")?;
     // `key: null` reads as noise in an editor; a bare `key:` parses the
     // same. Only top-level lines (no indent) are touched.
     let yaml: String = yaml
@@ -809,6 +821,65 @@ mod tests {
         assert_eq!(p.ext.get("team"), Some(&Value::String("eng".into())));
         assert_eq!(p.body, "alpha\nbeta\ngamma");
         assert_eq!(p.project, None);
+    }
+
+    /// AGT-1465: the serde-saphyr emitter quotes whatever its own parser
+    /// would misread, so tricky strings survive render -> parse untouched
+    /// and the field order is the editor file's documented order.
+    #[test]
+    fn tricky_strings_round_trip_through_render() {
+        let tricky = [
+            "yes",
+            "a: b",
+            "# hash",
+            "\"quoted\"",
+            "1",
+            "null",
+            "x: y: z",
+            "it's",
+            "trailing:",
+            "- dash",
+            "@at",
+            "é ünï ✓",
+            "{brace}",
+            "[1, 2]",
+            "010",
+            "true",
+            "~",
+            " padded ",
+        ];
+        for title in tricky {
+            let id = Ulid::new();
+            let mut ops = base_ops(id);
+            let Payload::TicketCreate(c) = &mut ops[0].payload else {
+                unreachable!()
+            };
+            c.title = title.to_string();
+            c.ext.insert("note".into(), Value::String(title.into()));
+            let text = render(&ws(), &view_of(id, &ops)).unwrap();
+            let p = parse(&text).unwrap_or_else(|e| panic!("{title:?}: {e}\n{text}"));
+            assert_eq!(p.title, title.trim(), "{text}");
+            assert_eq!(
+                p.ext.get("note"),
+                Some(&Value::String(title.into())),
+                "{text}"
+            );
+        }
+        let id = Ulid::new();
+        let text = render(&ws(), &view_of(id, &base_ops(id))).unwrap();
+        let keys: Vec<&str> = text
+            .lines()
+            .skip_while(|l| *l != "---")
+            .skip(1)
+            .take_while(|l| *l != "---")
+            .filter(|l| !l.starts_with([' ', '-']))
+            .filter_map(|l| l.split(':').next())
+            .collect();
+        assert_eq!(
+            &keys[..4],
+            ["title", "priority", "project", "repo"],
+            "{text}"
+        );
     }
 
     #[test]

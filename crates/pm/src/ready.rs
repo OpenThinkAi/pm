@@ -78,8 +78,8 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
             } else {
                 models.join(",")
             },
-            t.project.as_deref().unwrap_or("-"),
-            t.title,
+            crate::text::inline(t.project.as_deref().unwrap_or("-")),
+            crate::text::inline(&t.title),
         );
     }
     if args.explain && !frontier.excluded.is_empty() {
@@ -91,7 +91,7 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
             .max()
             .unwrap_or(2);
         for (name, message) in &frontier.excluded {
-            println!("  {name:<ex_w$}  {message}");
+            println!("  {name:<ex_w$}  {}", crate::text::inline(message));
         }
     }
     Ok(())

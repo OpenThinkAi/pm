@@ -329,7 +329,15 @@ terminals) and `pm app` without `--json` (the board) start this server in-proces
 (`ui-leaf mount`, line-delimited JSON; `crates/pm/src/app/launch.rs`).
 
 **Runtime.** `ui_leaf.path` in config.toml, else the first `ui-leaf` on
-`PATH`. When that is the npm package's Node shim, pm runs the native
+`PATH`. `ui_leaf.path` is an explicit choice and is used as given. A `PATH`
+hit is launched only when it is the npm-installed `@openthink/ui-leaf`
+package (AGT-1465): pm resolves the shim's symlink and requires the
+`package.json` one directory above it (`<pkg>/bin/ui-leaf` → `<pkg>`) to be
+named `@openthink/ui-leaf`; anything else — a stray executable, another
+package's shim — is not launched, pm says so on stderr, and the editor flow
+runs until the binary is named in `ui_leaf.path`. (Provenance, not
+integrity: pm hands the runtime its API token, so install ui-leaf from a
+trusted source.) When that is the npm package's Node shim, pm runs the native
 `ui-leaf-bin` beside it. It must report (`--version`) a version in
 `>=1.6.0, <2.0.0` — 1.6.0 is the release the views were built against, and
 ui-leaf's wire protocol `"1"` may only break at a new major. Otherwise pm

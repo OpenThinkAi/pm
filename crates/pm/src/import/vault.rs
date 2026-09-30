@@ -6,7 +6,7 @@
 //! The vault's frontmatter is YAML in spirit but hand-written in
 //! practice — 682 bare titles, some with `: ` or ` #` in them, which a
 //! strict parser reads as a mapping or a comment. [`quote_bare_scalars`]
-//! quotes every top-level bare value before `serde_yaml_ng` sees it, so
+//! quotes every top-level bare value before the YAML parser sees it, so
 //! the text of every value survives exactly (AC6: "non-template values
 //! import without loss") and the same `FileFrontmatter` that `pm new
 //! --from-file` uses (`crate::batch`) does the rest. Every failure names
@@ -318,20 +318,17 @@ pub(super) fn parse_ticket(
     let (fm_text, body) = batch::split_frontmatter(text)
         .map_err(|e| CliError::usage(format!("{shown}:1: {:#}", e.error)))?;
     let normalized = quote_bare_scalars(fm_text, &shown, findings);
-    let fm: FileFrontmatter = serde_yaml_ng::from_str(&normalized).map_err(|e| {
-        let at = e
-            .location()
-            .map(|l| format!("{shown}:{}", l.line() + 1))
+    let fm: FileFrontmatter = crate::yaml::from_str(&normalized).map_err(|e| {
+        let at = crate::yaml::line_of(&e)
+            .map(|l| format!("{shown}:{}", l + 1))
             .unwrap_or_else(|| shown.clone());
         CliError::usage(format!("{at}: parsing frontmatter: {e}"))
     })?;
 
     let at = |key: &str| format!("{shown}:{}", fm_line(fm_text, key));
-    let scalar = |key: &str, v: &Option<serde_yaml_ng::Value>| -> Result<String> {
+    let scalar = |key: &str, v: &Option<serde_json::Value>| -> Result<String> {
         match v {
-            Some(serde_yaml_ng::Value::String(s)) if !s.trim().is_empty() => {
-                Ok(s.trim().to_string())
-            }
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_string()),
             _ => Err(CliError::usage(format!("{}: missing {key}", at(key)))),
         }
     };
@@ -417,11 +414,11 @@ pub(super) fn parse_ticket(
         ("parked", prose::MarkerKind::Parked),
     ] {
         let values: Vec<String> = match ext_yaml.remove(key) {
-            Some(serde_yaml_ng::Value::String(s)) => vec![s],
-            Some(serde_yaml_ng::Value::Sequence(items)) => items
+            Some(serde_json::Value::String(s)) => vec![s],
+            Some(serde_json::Value::Array(items)) => items
                 .into_iter()
                 .filter_map(|v| match v {
-                    serde_yaml_ng::Value::String(s) => Some(s),
+                    serde_json::Value::String(s) => Some(s),
                     _ => None,
                 })
                 .collect(),
@@ -666,10 +663,9 @@ fn read_project(root: &Path, rel: &Path, findings: &mut Findings) -> Result<Vaul
         let (fm_text, _) = batch::split_frontmatter(&doc)
             .map_err(|e| CliError::usage(format!("{shown}:1: {:#}", e.error)))?;
         let normalized = quote_bare_scalars(fm_text, &shown, findings);
-        let fm: ProjectFm = serde_yaml_ng::from_str(&normalized).map_err(|e| {
-            let at = e
-                .location()
-                .map(|l| format!("{shown}:{}", l.line() + 1))
+        let fm: ProjectFm = crate::yaml::from_str(&normalized).map_err(|e| {
+            let at = crate::yaml::line_of(&e)
+                .map(|l| format!("{shown}:{}", l + 1))
                 .unwrap_or_else(|| shown.clone());
             CliError::usage(format!("{at}: parsing frontmatter: {e}"))
         })?;
@@ -901,11 +897,11 @@ mod tests {
             q,
             "id: \"AGT-7\"\ntitle: \"deps: pass (#62, #92)\"\nstate: \"done\"\nrepo: \nlabels: [a, b]\nsource: { type: manual, url: \"\" }\nlinked-pr: \"https://x\"\nnote: \"say \\\"hi\\\" \\\\ there\"\nbad: \"\\\"open\"\n"
         );
-        let fm: FileFrontmatter = serde_yaml_ng::from_str(&q).unwrap();
+        let fm: FileFrontmatter = crate::yaml::from_str(&q).unwrap();
         assert_eq!(fm.title.as_deref(), Some("deps: pass (#62, #92)"));
         assert_eq!(
             fm.ext["note"],
-            serde_yaml_ng::Value::String("say \"hi\" \\ there".into())
+            serde_json::Value::String("say \"hi\" \\ there".into())
         );
         assert_eq!(
             f.non_template["frontmatter: bare value containing ': '"],

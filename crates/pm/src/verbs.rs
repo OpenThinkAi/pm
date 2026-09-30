@@ -993,7 +993,7 @@ fn print_batch_result(
         }));
     } else {
         for t in tickets {
-            println!("{}  {}", created_line(ws, t), t.title);
+            println!("{}  {}", created_line(ws, t), crate::text::inline(&t.title));
         }
         if !refs.is_empty() {
             println!("refs:");
@@ -1142,9 +1142,9 @@ fn print_comments(store: &Store, t: &Ticket) -> Result<()> {
         println!(
             "{} — {}",
             pm_core::markers::date_from_ms(c.hlc.wall_ms),
-            c.author
+            crate::text::inline(c.author.as_str())
         );
-        for line in c.body.trim_end().lines() {
+        for line in crate::text::printable(c.body.trim_end()).lines() {
             if line.is_empty() {
                 println!();
             } else {
@@ -1157,8 +1157,8 @@ fn print_comments(store: &Store, t: &Ticket) -> Result<()> {
 
 fn print_human(ws: &Workspace, t: &Ticket) {
     let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
-    println!("{}  {}", display_id(ws, t), t.title);
-    println!("state:     {}", t.state);
+    println!("{}  {}", display_id(ws, t), crate::text::inline(&t.title));
+    println!("state:     {}", crate::text::inline(&t.state));
     println!(
         "priority:  {}",
         serde_json::to_value(t.priority)
@@ -1166,13 +1166,13 @@ fn print_human(ws: &Workspace, t: &Ticket) {
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default()
     );
-    println!("project:   {}", dash(&t.project));
-    println!("repo:      {}", dash(&t.repo));
+    println!("project:   {}", crate::text::inline(&dash(&t.project)));
+    println!("repo:      {}", crate::text::inline(&dash(&t.repo)));
     println!(
         "assignee:  {}",
         t.assignee
             .as_ref()
-            .map_or_else(|| "-".into(), ActorId::to_string)
+            .map_or_else(|| "-".into(), |a| crate::text::inline(a.as_str()))
     );
     let labels: Vec<&str> = t.labels.iter().map(String::as_str).collect();
     println!(
@@ -1180,7 +1180,7 @@ fn print_human(ws: &Workspace, t: &Ticket) {
         if labels.is_empty() {
             "-".into()
         } else {
-            labels.join(", ")
+            crate::text::inline(&labels.join(", "))
         }
     );
     for (name, value) in [
@@ -1189,7 +1189,7 @@ fn print_human(ws: &Workspace, t: &Ticket) {
         ("linear", &t.linear),
     ] {
         if let Some(value) = value {
-            println!("{name}: {value}");
+            println!("{name}: {}", crate::text::inline(value));
         }
     }
     if t.deleted {
@@ -1199,7 +1199,7 @@ fn print_human(ws: &Workspace, t: &Ticket) {
     crate::markers::print_block(t);
     if !t.description.is_empty() {
         println!();
-        print!("{}", t.description);
+        print!("{}", crate::text::printable(&t.description));
         if !t.description.ends_with('\n') {
             println!();
         }
@@ -1232,14 +1232,17 @@ fn print_field(ctx: &Ctx<'_>, ticket: &Value, field: &str) -> Result<()> {
         return Ok(());
     }
     match value {
-        Value::String(s) => println!("{s}"),
+        Value::String(s) => println!("{}", crate::text::printable(s)),
         Value::Null => println!(),
         Value::Array(items) if items.iter().all(Value::is_string) => {
             for item in items {
-                println!("{}", item.as_str().unwrap_or_default());
+                println!(
+                    "{}",
+                    crate::text::printable(item.as_str().unwrap_or_default())
+                );
             }
         }
-        other => println!("{other}"),
+        other => println!("{}", crate::text::printable(&other.to_string())),
     }
     Ok(())
 }

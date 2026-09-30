@@ -384,8 +384,8 @@ impl Claimer<'_> {
                 &mut round,
             ) {
                 eprintln!(
-                    "pm: the claim is admitted; its --branch write stays in the outbox until the next `pm sync`: {:#}",
-                    e.error
+                    "pm: the claim is admitted; its --branch write stays in the outbox until the next `pm sync`: {}",
+                    crate::text::printable(&format!("{:#}", e.error))
                 );
             }
         }

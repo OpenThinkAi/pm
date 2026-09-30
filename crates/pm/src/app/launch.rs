@@ -8,6 +8,17 @@
 //! the native binary (`ui-leaf-bin`), so when that sibling exists pm runs
 //! it directly — an explicit binary path, no Node in between.
 //!
+//! **Trust (AGT-1465).** pm hands the runtime its API bearer token, so a
+//! random executable named `ui-leaf` earlier on `PATH` must not get it.
+//! `ui_leaf.path` is the operator's explicit choice and is used as given.
+//! A `PATH` hit is launched only when it is the npm-installed
+//! `@openthink/ui-leaf` package: the shim's symlink is resolved and the
+//! `package.json` at the package root (`<pkg>/bin/ui-leaf` → `<pkg>`) must
+//! be named `@openthink/ui-leaf` ([`verify_npm_package`]). Anything else is
+//! [`Missing::Untrusted`] — pm says so and uses `$EDITOR` — until the
+//! operator names it in `ui_leaf.path`. This is provenance, not integrity:
+//! a compromised npm release still passes.
+//!
 //! **Pinned** means: `<runtime> --version` reports a version in
 //! [`PIN_MIN`]`..<`[`PIN_NEXT_MAJOR`]`.0.0`. The lower bound is the ui-leaf
 //! these views and this driver were built and tested against; the upper
@@ -87,6 +98,9 @@ pub(crate) enum Missing {
     NotFound,
     /// `ui_leaf.path` names something that is not an executable file.
     NotExecutable(PathBuf),
+    /// Found on `PATH`, but it is not the npm-installed
+    /// `@openthink/ui-leaf` package (AGT-1465).
+    Untrusted { path: PathBuf, why: String },
     /// `--version` failed or printed something that is not a version.
     Unrunnable { path: PathBuf, why: String },
     /// A version outside the pin.
@@ -104,6 +118,12 @@ impl fmt::Display for Missing {
                     path.display()
                 )
             }
+            Missing::Untrusted { path, why } => write!(
+                f,
+                "ui-leaf on PATH at {} is not the npm @openthink/ui-leaf package ({why}); \
+                 not launched. Set ui_leaf.path in config.toml to use it anyway",
+                path.display()
+            ),
             Missing::Unrunnable { path, why } => {
                 write!(
                     f,
@@ -195,6 +215,31 @@ fn native_binary(found: &Path) -> PathBuf {
     }
 }
 
+/// The npm package name the `PATH` shim must belong to.
+const NPM_PACKAGE: &str = "@openthink/ui-leaf";
+
+/// Whether `found` (a `PATH` hit) is the npm package's shim: its symlink
+/// resolved, `package.json` one directory up from the shim (`bin/`) — or
+/// beside it — names [`NPM_PACKAGE`]. `Err` says what is wrong.
+fn verify_npm_package(found: &Path) -> std::result::Result<(), String> {
+    let real = std::fs::canonicalize(found).map_err(|e| format!("cannot resolve it: {e}"))?;
+    let bin_dir = real.parent().ok_or("it has no parent directory")?;
+    for dir in [bin_dir.parent(), Some(bin_dir)].into_iter().flatten() {
+        let Ok(text) = std::fs::read_to_string(dir.join("package.json")) else {
+            continue;
+        };
+        let name = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_string));
+        return match name.as_deref() {
+            Some(NPM_PACKAGE) => Ok(()),
+            Some(other) => Err(format!("its package.json is named {other:?}")),
+            None => Err("its package.json has no name".into()),
+        };
+    }
+    Err("no package.json beside it".into())
+}
+
 /// Where the runtime should be: config first, then `PATH`.
 fn locate(
     configured: Option<PathBuf>,
@@ -207,10 +252,12 @@ fn locate(
             Err(Missing::NotExecutable(path))
         };
     }
-    path_var
-        .and_then(search_path)
-        .map(|p| native_binary(&p))
-        .ok_or(Missing::NotFound)
+    let found = path_var.and_then(search_path).ok_or(Missing::NotFound)?;
+    verify_npm_package(&found).map_err(|why| Missing::Untrusted {
+        path: found.clone(),
+        why,
+    })?;
+    Ok(native_binary(&found))
 }
 
 /// `<path> --version`'s stdout, bounded by [`VERSION_TIMEOUT`].
@@ -554,6 +601,42 @@ mod tests {
         assert!(!pinned((PIN_NEXT_MAJOR, 0, 0)));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_path_hit_must_be_the_npm_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        // A bare executable named ui-leaf: no package, no launch.
+        std::fs::create_dir_all(&bin).unwrap();
+        script(&bin, "ui-leaf", "echo 1.6.0");
+        let path_var = bin.as_os_str().to_owned();
+        assert!(matches!(
+            locate(None, Some(&path_var)),
+            Err(Missing::Untrusted { why, .. }) if why.contains("no package.json")
+        ));
+        // ...a symlink into somebody else's package...
+        std::fs::remove_file(bin.join("ui-leaf")).unwrap();
+        npm_install(tmp.path(), "evil", "not-ui-leaf", &bin);
+        let err = locate(None, Some(&path_var)).unwrap_err();
+        assert!(
+            matches!(&err, Missing::Untrusted { why, .. } if why.contains("not-ui-leaf")),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("ui_leaf.path"), "{err}");
+        // ...an unreadable/nameless package.json...
+        let pkg = tmp.path().join("evil/lib/node_modules/@openthink/ui-leaf");
+        std::fs::write(pkg.join("package.json"), "{}").unwrap();
+        assert!(matches!(
+            locate(None, Some(&path_var)),
+            Err(Missing::Untrusted { why, .. }) if why.contains("no name")
+        ));
+        // ...but the real package, and an explicit config path, launch.
+        std::fs::write(pkg.join("package.json"), r#"{"name":"@openthink/ui-leaf"}"#).unwrap();
+        assert!(locate(None, Some(&path_var)).is_ok());
+        let bare = script(tmp.path(), "mine", "echo 1.6.0");
+        assert_eq!(locate(Some(bare.clone()), None), Ok(bare));
+    }
+
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -565,6 +648,20 @@ mod tests {
         path
     }
 
+    /// An npm-global-style install under `root/<tag>` named `name`, and
+    /// its `ui-leaf` symlinked into `bin` (as `npm i -g` does).
+    #[cfg(unix)]
+    fn npm_install(root: &Path, tag: &str, name: &str, bin: &Path) -> PathBuf {
+        let pkg = root.join(tag).join("lib/node_modules/@openthink/ui-leaf");
+        std::fs::create_dir_all(pkg.join("bin")).unwrap();
+        std::fs::write(pkg.join("package.json"), format!("{{\"name\":\"{name}\"}}")).unwrap();
+        let shim = script(&pkg.join("bin"), "ui-leaf", "echo 1.6.0");
+        std::fs::create_dir_all(bin).unwrap();
+        let link = bin.join("ui-leaf");
+        std::os::unix::fs::symlink(&shim, &link).unwrap();
+        link
+    }
+
     #[cfg(unix)]
     #[test]
     fn config_wins_over_path_and_path_is_searched_in_order() {
@@ -572,10 +669,10 @@ mod tests {
         let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        let in_b = script(&b, "ui-leaf", "echo 1.6.0");
+        let in_b = npm_install(tmp.path(), "nb", NPM_PACKAGE, &b);
         let path_var = std::env::join_paths([a.clone(), b.clone()]).unwrap();
         assert_eq!(locate(None, Some(&path_var)), Ok(in_b.clone()));
-        let in_a = script(&a, "ui-leaf", "echo 1.6.0");
+        let in_a = npm_install(tmp.path(), "na", NPM_PACKAGE, &a);
         assert_eq!(locate(None, Some(&path_var)), Ok(in_a));
 
         let configured = script(tmp.path(), "custom-ui-leaf", "echo 1.6.0");
