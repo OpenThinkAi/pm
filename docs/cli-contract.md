@@ -221,12 +221,24 @@ where it applies). `pm --help` and `pm <verb> --help` are the flags'
 authoritative source; this section names every one but does not repeat
 clap's per-flag help text verbatim.
 
-### `pm init [--prefix <PREFIX>] [--preset <PRESET>]`
+### `pm init [--prefix <PREFIX>] [--preset <PRESET>] [--join <WORKSPACE-ULID>]`
 
 Creates a workspace database. Presets are data, not flavors of code path —
 `--preset` picks the seed, `--prefix` (still 1-16 uppercase letters/digits,
 starting with a letter — else exit `2`) always overrides that preset's
 default prefix when given.
+
+`--join <WORKSPACE-ULID>` (AGT-1396) is how a **second machine** starts
+on a workspace a hub already holds: the database gets the `workspace` row
+with that id and nothing else — no states, no ops — so `pm hub login`
+then `pm sync` pull the whole log, config included, from the hub (§`pm
+sync`). No config op is written locally on purpose: one would be a newer
+write of the prefix and states and win the merge over the seeded ones.
+Until that first pull the workspace opens (`pm doctor` is healthy, `pm hub
+status` shows the id) but has no states, so `pm new` fails with exit `1`;
+the prefix (`--prefix`, else `PM`) is a placeholder the pull overwrites.
+`--join` conflicts with `--preset` (exit `2`); a malformed ULID is exit
+`2`; a directory that is already a workspace is exit `1` as always.
 
 Every config write in the CLI is an op (AGT-1385/1386/1413): `pm init`
 commits `workspace.set` / `state.upsert` ops, `pm project new` a
@@ -266,11 +278,13 @@ config-table write left is the allocator floor (`workspace.number_floor`).
       {"name": "done", "category": "completed", "position": 3}
     ],
     "config": "/abs/path/config.toml",
-    "config_written": true            // false if config.toml already existed
+    "config_written": true,           // false if config.toml already existed
+    "joined": null                    // the ULID given to --join, else null
   }
   ```
   `--preset saltline --prefix AGT` prints the same shape with `"prefix":
-  "AGT"` and the three saltline states instead.
+  "AGT"` and the three saltline states instead; `--join` prints it with
+  `"states": []` and `"joined": "<ULID>"`.
 
 ### `pm new`
 
@@ -724,7 +738,7 @@ report what changed, then run the same report).
     "schema": 1,
     "healthy": true,
     "rebuilt": {"tables": [...]} | null,   // a Diff, only present with --rebuild
-    "schema_version": 6,                    // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state)
+    "schema_version": 9,                    // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state); 9 since AGT-1396 (seeded flag)
     "op_count": 30,
     "tables": {"ticket": 5, "comment": 2, ...},
     "integrity": [],                        // SQLite integrity_check messages, if any
@@ -735,13 +749,16 @@ report what changed, then run the same report).
       "outbox": 30,                         // local ops the hub has not acknowledged (the whole log until a first push)
       "pushed_through": 0,                  // every op with seq <= this is known to the hub
       "cursor": 0,                          // hub seq the last pull got through; 0 = never pulled
-      "pending_numbers": 0                  // tickets created with a hub configured, still awaiting a number
+      "pending_numbers": 0,                 // tickets created with a hub configured, still awaiting a number
+      "seeded": false                       // the hub is this workspace's authority: its seed ended (AGT-1396)
     }
   }
   ```
 - Text output adds a `sync` line: `outbox N op(s), pushed through seq S,
   cursor C, P ticket(s) awaiting a hub number`, where `S` is a local op-log
-  `seq` (not a ticket number) and a zero cursor reads `0 (never pulled)`.
+  `seq` (not a ticket number) and a zero cursor reads `0 (never pulled)`,
+  and a `seeded` line: `yes (the hub is this workspace's authority)` or
+  `no (…)`.
 
 ### `pm archive [ID]`
 
@@ -1177,10 +1194,52 @@ Both sides merge by the same `pm-core` rules; the hub only orders. Needs a
 moves. Flag: `--watch <SECS>` (an integer `>= 1`, else exit `2`): repeat
 the sync every `SECS` seconds until interrupted.
 
-One sync is **push, then pull**, in units the database commits on its own,
-so an interruption at any point (crash, Ctrl-C, a dropped connection)
-leaves the outbox and cursor consistent:
+One sync is **seed if needed, then push, then pull**, in units the
+database commits on its own, so an interruption at any point (crash,
+Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
 
+- **Seed** (AGT-1396; the hub's side is `docs/hub-api.md` §Ticket
+  numbers). Every sync first asks `GET …/whoami` whether the hub
+  workspace is still in seed mode. A workspace whose hub has never seen
+  its log — `seeded: false` on the hub, `sync.seeded: false` locally (`pm
+  doctor`) — uploads the **whole log** as the seed before anything else:
+  the outbox (which on a never-synced workspace is every op, the config
+  ops included) goes up in the same batches as a push — the config ops
+  (`workspace.set`, `state.upsert`, `actor.upsert`, `project.*`) first,
+  then the rest in log order, the order `pm doctor` replays in, so a
+  replica joining later can apply the hub's log page by page even though
+  migrations 0007/0008 backfilled a legacy log's config ops at its end —
+  with the workspace's own `field.set number` ops accepted as they are; then `POST
+  …/seeded {"number_floor": <workspace.number_floor>}` ends the hub's
+  seed mode, the hub adopts the greater of that floor and the largest
+  seeded number, numbers any create the seed left unnumbered and returns
+  those ops (applied at once; the local floor is raised to the hub's);
+  and only then is the workspace marked seeded locally — the hub is its
+  authority from here. Progress goes to stderr, one `seed: …` line per
+  batch (the Studio's seed is ~13k ops and ~36 MB), plus a start and an
+  end line. The round's pull then runs from cursor `0`, which brings the
+  seeded log back and skips it (this replica's own ops), once.
+  - **Interrupted seed.** Nothing special: the next `pm sync` finds the
+    hub still in seed mode with a non-empty log, checks that every op in
+    the hub's first page is in the local log (else it refuses, exit `1`:
+    that hub workspace was seeded from another log), marks those as
+    pushed and re-runs the push — idempotent on `op_id`, so ops the hub
+    already stored cost a `stored: false` and nothing more — then ends
+    the seed. A seed whose `POST …/seeded` landed but whose answer was
+    lost gets `409 already_seeded`, which counts as done (the hub's
+    number ops arrive on the pull).
+  - **Refused** (exit `1`, a message naming the hub workspace, nothing
+    changed locally): a workspace that has **never synced** and holds ops
+    against a hub workspace that is **already seeded** (that log would be
+    a second seed; a second machine joins with `pm init --join`); a
+    workspace with **no log** against a hub still in seed mode (nothing to
+    seed it with — sync the workspace that holds the log first); a hub
+    still seeding whose log holds ops this workspace's does not; and a
+    workspace that is seeded locally whose hub says it is not (a hub
+    restored from before the seed).
+  - **Joining.** An empty replica (`pm init --join`) against a seeded hub
+    is simply marked seeded and pulls everything; the same happens to a
+    replica whose seed ended on the hub but never got the answer.
 - **Push.** The outbox (local ops the hub has not acknowledged; the whole
   log until the first push) goes up in batches sized under both hub limits
   — 1000 ops and 64 MiB of request body per batch (`docs/hub-api.md`); a
@@ -1228,13 +1287,24 @@ leaves the outbox and cursor consistent:
   mode, one JSON object per line under `--json` — and a failed round is
   reported on stderr (`pm: sync failed: …`) and retried after the interval
   rather than ending the loop; Ctrl-C stops it.
+- Test hooks (never for real use): `PM_SYNC_TEST_BATCH_OPS=<n>` shrinks
+  the push batch to `n` ops (clamped to the hub's cap) so a small log
+  takes many batches; `PM_SYNC_TEST_CRASH_AFTER_BATCHES=<n>` exits the
+  process (code `1`, a line on stderr) after the hub has acknowledged `n`
+  batches and before the `n`th is marked pushed — the worst place a
+  crash can land, which the next sync must recover from.
 - `--json` (one round):
   ```jsonc
   {
     "schema": 1,
     "hub": "https://hub.example",
     "workspace": "01M3…",       // workspace ULID (canonical, uppercase)
-    "pushed": 3,                // outbox ops the hub acknowledged this round
+    "seed": null,               // the seed this round ran, if it was the first sync:
+                                //   {"resumed": false, "pushed": 12631, "number_floor": 1380, "numbered": 0}
+                                //   (resumed: the hub already held part of the log; numbered: creates
+                                //   the seed left unnumbered that the hub numbered at the end)
+    "seeded": true,             // the hub is this workspace's authority now (= pm doctor's sync.seeded)
+    "pushed": 3,                // outbox ops the hub acknowledged this round (the seed's included)
     "pulled": 5,                // ops received from the hub this round
     "applied": 4,               // of those, foreign ops committed into the log
     "skipped": 1,               // of those, already present (this replica's own, echoed back)
@@ -1257,7 +1327,10 @@ leaves the outbox and cursor consistent:
   ```
 - Text output is one line: `pushed 3 op(s); pulled 5 op(s): 4 applied,
   1 skipped; cursor 42 (hub head 42)`, with `; N op(s) still in the outbox`
-  and `; N ticket(s) still awaiting a hub number` appended when non-zero.
+  and `; N ticket(s) still awaiting a hub number` appended when non-zero,
+  and — on the round that seeded — prefixed with `seeded hub workspace
+  <id> ([resumed; ]N op(s), number floor F, K ticket(s) numbered by the
+  hub); `.
 
 ## Verbs with no `--json` output
 

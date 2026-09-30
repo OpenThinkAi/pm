@@ -2,6 +2,7 @@
   "config": "<HOME>/.config/pm/config.toml",
   "config_written": true,
   "db": "<HOME>/ws/pm.sqlite",
+  "joined": null,
   "prefix": "AGT",
   "schema": 1,
   "states": [

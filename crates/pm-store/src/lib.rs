@@ -32,7 +32,10 @@
 //!   JSON arrays to base64 (AGT-1378)
 //! - `sync` — client sync state (AGT-1393): the outbox of ops the hub has
 //!   not acknowledged, the pull cursor, [`Store::apply_pulled`] for foreign
-//!   ops, and the pending-number marker for tickets awaiting a hub number
+//!   ops, the pending-number marker for tickets awaiting a hub number, and
+//!   (AGT-1396) the seeded flag plus the seed's helpers — which of a set of
+//!   op ids the log lacks, and [`Store::join_workspace`], the empty replica
+//!   a second machine starts from
 //! - [`StoreError`] — typed failures (R2/R4/R5 violations, claim rejection, …)
 
 mod backfill;
@@ -78,10 +81,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (6, include_str!("../migrations/0006_sync_state.sql")),
     (7, include_str!("../migrations/0007_config_ops.sql")),
     (8, include_str!("../migrations/0008_doc_identity.sql")),
+    (9, include_str!("../migrations/0009_sync_seeded.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// The migration whose work is Rust, not SQL: after its (comment-only)
 /// SQL file runs, [`reencode::run`] rewrites every stored byte payload in
@@ -97,6 +101,12 @@ const CONFIG_OPS_VERSION: u32 = 7;
 /// [`backfill::doc_identity`] appends a `project.doc_add` for every
 /// existing project document (AGT-1413).
 const DOC_IDENTITY_VERSION: u32 = 8;
+
+/// And for the seeded flag (AGT-1396): its (comment-only) SQL file is
+/// followed by [`sync::add_seeded_column`], which adds
+/// `sync_state.seeded` only if it is not there yet, so the migration can
+/// run again against a database that already has it.
+const SYNC_SEEDED_VERSION: u32 = 9;
 
 /// How long a writer waits for the database lock before giving up. Sized
 /// for many concurrent CLI invocations (build loops fan out), not for a
@@ -161,6 +171,9 @@ impl Store {
             }
             if *version == DOC_IDENTITY_VERSION {
                 backfill::doc_identity(&tx)?;
+            }
+            if *version == SYNC_SEEDED_VERSION {
+                sync::add_seeded_column(&tx)?;
             }
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",

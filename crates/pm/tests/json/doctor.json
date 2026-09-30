@@ -9,12 +9,13 @@
   "rebuilt": null,
   "replay_error": null,
   "schema": 1,
-  "schema_version": 8,
+  "schema_version": 9,
   "sync": {
     "cursor": 0,
     "outbox": 48,
     "pending_numbers": 0,
-    "pushed_through": 0
+    "pushed_through": 0,
+    "seeded": false
   },
   "tables": {
     "actor": 1,
@@ -29,7 +30,7 @@
     "project_doc_view": 1,
     "project_view": 1,
     "relation": 2,
-    "schema_version": 8,
+    "schema_version": 9,
     "state": 3,
     "sync_pushed": 0,
     "sync_state": 1,

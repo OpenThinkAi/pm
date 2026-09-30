@@ -312,6 +312,97 @@ fn init_rejects_an_unknown_preset_as_usage() {
     assert!(!sb.config_path().exists());
 }
 
+/// AGT-1396: `pm init --join <ULID>` makes an empty replica — the
+/// workspace row with that id, no states, no ops — that only a pull can
+/// fill; it refuses a second join and a preset (the hub's config wins).
+#[test]
+fn init_join_makes_an_empty_replica_of_the_given_workspace() {
+    let sb = Sandbox::new();
+    let id = Ulid::new();
+    let out = sb.pm(&[
+        "init",
+        "--join",
+        &id.to_string(),
+        "--workspace",
+        sb.ws_str(),
+    ]);
+    assert_ok(&out);
+    assert!(stdout(&out).contains(&format!("joined workspace {id}")));
+
+    let store = sb.store();
+    let workspace = store.workspace().unwrap().unwrap();
+    assert_eq!(workspace.id, id);
+    assert_eq!(workspace.prefix, "PM");
+    assert!(workspace.states.is_empty());
+    assert_eq!(store.op_count().unwrap(), 0);
+    let status = store.sync_status().unwrap();
+    assert_eq!((status.outbox, status.cursor, status.seeded), (0, 0, false));
+    drop(store);
+
+    // Healthy (nothing derived is missing), but nothing can be filed
+    // until the states arrive from the hub.
+    assert_ok(&sb.pm(&["doctor", "--workspace", sb.ws_str()]));
+    assert_code(
+        &sb.pm(&["new", "--title", "too early", "--workspace", sb.ws_str()]),
+        1,
+    );
+    let v = json(&sb.pm(&["hub", "status", "--workspace", sb.ws_str(), "--json"]));
+    assert_eq!(v["workspace"]["id"], id.to_string());
+
+    // Already a workspace: init refuses, whichever way.
+    assert_code(
+        &sb.pm(&[
+            "init",
+            "--join",
+            &id.to_string(),
+            "--workspace",
+            sb.ws_str(),
+        ]),
+        1,
+    );
+    assert_code(&sb.pm(&["init", "--workspace", sb.ws_str()]), 1);
+
+    // `--join` takes its config from the hub, so a preset is a conflict;
+    // a bad ULID is a usage error too.
+    let other = sb.home.path().join("other");
+    let other = other.to_str().unwrap();
+    assert_code(
+        &sb.pm(&[
+            "init",
+            "--join",
+            &id.to_string(),
+            "--preset",
+            "saltline",
+            "--workspace",
+            other,
+        ]),
+        2,
+    );
+    assert_code(
+        &sb.pm(&["init", "--join", "not-a-ulid", "--workspace", other]),
+        2,
+    );
+    assert!(!Path::new(other).join("pm.sqlite").exists());
+
+    // The prefix is a placeholder until the pull; `--prefix` sets it.
+    let out = sb.pm(&[
+        "init",
+        "--join",
+        &id.to_string(),
+        "--prefix",
+        "AGT",
+        "--workspace",
+        other,
+        "--json",
+    ]);
+    assert_ok(&out);
+    let v = json(&out);
+    assert_eq!(v["prefix"], "AGT");
+    assert_eq!(v["joined"], id.to_string());
+    assert_eq!(v["states"], serde_json::json!([]));
+    assert_eq!(v["config_written"], false);
+}
+
 /// AC1: `pm init` with no flags at all — the neutral default for outside
 /// users, no `--prefix` required.
 #[test]

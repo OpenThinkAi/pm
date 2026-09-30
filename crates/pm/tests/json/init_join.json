@@ -1,0 +1,10 @@
+{
+  "config": "<HOME>/.config/pm/config.toml",
+  "config_written": false,
+  "db": "<HOME>/joined/pm.sqlite",
+  "joined": "<ULID>",
+  "prefix": "PM",
+  "schema": 1,
+  "states": [],
+  "workspace": "<HOME>/joined"
+}

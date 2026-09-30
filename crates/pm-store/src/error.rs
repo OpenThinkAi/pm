@@ -45,6 +45,14 @@ pub enum StoreError {
     /// this database's — one workspace per database (AGT-1385).
     #[error("op targets workspace {entity}, but this database is workspace {workspace}")]
     ForeignWorkspace { entity: Ulid, workspace: Ulid },
+    /// `join_workspace` (AGT-1396) on a database that already is that
+    /// workspace.
+    #[error("this database already is workspace {workspace}")]
+    AlreadyJoined { workspace: Ulid },
+    /// `join_workspace` on a database that already holds ops: a joined
+    /// replica starts empty and takes its whole log from the hub.
+    #[error("this database already holds {ops} op(s); a joined replica must start empty")]
+    NotEmpty { ops: u64 },
     /// A ticket op reached the config path. Only a routing bug in this
     /// crate can produce it.
     #[error("op {op_id}: '{kind}' is not a config op")]

@@ -285,10 +285,13 @@ fn normalize(raw: &str, sb: &Sandbox) -> String {
 
 // -------------------------------------------------------------- fake hub
 
-/// A loopback hub for the `sync` fixture: `POST …/ops` acknowledges every
-/// op in the batch (`stored: true`, seqs from 1) and `GET …/ops?since=N`
-/// answers an empty page at `N` (`next = head = N`). Serves until the
-/// test process exits; returns its base URL.
+/// A loopback hub for the `sync` fixture: `GET …/whoami` reports a
+/// workspace in seed mode (so the fixture's round is a first sync,
+/// AGT-1396), `POST …/ops` acknowledges every op in the batch
+/// (`stored: true`, seqs from 1), `GET …/ops?since=N` answers an empty
+/// page at `N` (`next = head = N`), and `POST …/seeded` ends the seed
+/// with the client's floor and no stragglers. Serves until the test
+/// process exits; returns its base URL.
 fn fake_hub() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -330,7 +333,15 @@ fn fake_hub() -> String {
                 request_line.next().unwrap_or(""),
                 request_line.next().unwrap_or(""),
             );
-            let body = if method == "POST" && path.ends_with("/ops") {
+            let body = if method == "GET" && path.ends_with("/whoami") {
+                r#"{"workspace":"fixture","token_id":1,"name":"fixture","seeded":false}"#
+                    .to_string()
+            } else if method == "POST" && path.ends_with("/seeded") {
+                let req: Value = serde_json::from_slice(&raw[head_len..head_len + body_len])
+                    .unwrap_or(Value::Null);
+                serde_json::json!({ "number_floor": req["number_floor"], "numbers": [] })
+                    .to_string()
+            } else if method == "POST" && path.ends_with("/ops") {
                 let batch: Value = serde_json::from_slice(&raw[head_len..head_len + body_len])
                     .unwrap_or(Value::Null);
                 let acks: Vec<Value> = batch["ops"]
@@ -516,6 +527,27 @@ fn every_verbs_json_output_matches_its_fixture() {
         0,
         &mut failures,
     );
+
+    // ---- pm init --join (AGT-1396) ----
+    // An empty replica of some other workspace, in its own directory so
+    // the sandbox's workspace (and config.toml, already written) are
+    // untouched.
+    {
+        let joined = sb.home.path().join("joined");
+        cap(
+            "init_join",
+            &[
+                "init",
+                "--join",
+                "01M3QJAX8VSQ83D3AP4R81VTDS",
+                "--workspace",
+                joined.to_str().unwrap(),
+                "--json",
+            ],
+            0,
+            &mut failures,
+        );
+    }
 
     // ---- pm workspace gate-label add/remove/list (AGT-1380) ----
     cap(
