@@ -1034,3 +1034,312 @@ fn a_missing_workspace_is_exit_1_before_anything_listens() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+// ---------------------------------------------------- project documents
+
+/// A **Ticket** minus what differs between two tickets filed the same way:
+/// identity, number and stamps.
+fn filed_shape(t: &Value) -> Value {
+    let mut t = t.clone();
+    for key in ["id", "ulid", "number", "created", "updated"] {
+        t.as_object_mut().unwrap().remove(key);
+    }
+    t
+}
+
+/// `GET <path>?since=…` for an encoded version vector, percent-encoded.
+fn since(path: &str, version: &[u8]) -> String {
+    let b64 = pm_core::bytes::encode(version)
+        .replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D");
+    format!("{path}?since={b64}")
+}
+
+/// An editor document bound to a body endpoint's snapshot.
+fn bind(answer: &Value) -> Body {
+    let mut doc = Body::new();
+    doc.apply(&BodyUpdate::from_bytes(
+        pm_core::bytes::decode(answer["snapshot"].as_str().unwrap()).unwrap(),
+    ))
+    .unwrap();
+    doc
+}
+
+/// Every op on `entity` in the log, by kind (a document's `body.edit`s
+/// are not in `pm log`, which lists tickets and config ops).
+fn entity_op_kinds(sb: &Sandbox, entity: &str) -> Vec<String> {
+    sb.store()
+        .ops(entity.parse().unwrap())
+        .unwrap()
+        .iter()
+        .map(|op| op.payload.kind().to_string())
+        .collect()
+}
+
+/// AGT-1405: the design doc and a named document are CRDT bodies served
+/// and written exactly like a ticket's description — snapshot, `since`,
+/// `{"update"}` and `{"text"}` — and every write is one `body.edit` on the
+/// document's own `doc_id`, visible to `pm project show` and rebuilt by
+/// `pm doctor --rebuild`.
+#[test]
+fn project_documents_are_crdt_bodies_on_their_doc_ids() {
+    let sb = Sandbox::new();
+    assert_ok(&sb.run(&["project", "new", "design", "--title", "Design"], &[]));
+    let notes = sb.path("notes.md");
+    std::fs::write(&notes, "first note\n").unwrap();
+    assert_ok(&sb.run(
+        &[
+            "project",
+            "doc",
+            "add",
+            "design",
+            "run notes",
+            "--from-file",
+            notes.to_str().unwrap(),
+        ],
+        &[],
+    ));
+    let app = App::start(&sb, &["--idle", "0"]);
+    let events = app.events();
+    events.next(Duration::from_secs(5)); // hello
+
+    // The design doc: empty so far, with its own doc_id.
+    let (status, design) = app.get("/projects/design/body");
+    assert_eq!(status, 200, "{design}");
+    assert_eq!(design["project"], "design");
+    assert!(design["doc"].is_null(), "{design}");
+    assert_eq!(design["text"], "");
+    let design_id = design["doc_id"].as_str().unwrap().to_string();
+    assert_ne!(design_id, "");
+
+    // An editor's own Loro update lands as one body.edit on that doc_id.
+    let mut doc = bind(&design);
+    let update = doc.diff_from_text("# Design\n\nThe plan.\n").unwrap();
+    let (status, written) = app.post(
+        "/projects/design/body",
+        json!({"update": pm_core::bytes::encode(update.as_bytes())}),
+    );
+    assert_eq!(status, 200, "{written}");
+    assert_eq!(written["text"], "# Design\n\nThe plan.\n");
+    assert_eq!(written["doc_id"], design_id);
+    assert_eq!(
+        sb.json(&["project", "show", "design"])["doc"],
+        "# Design\n\nThe plan.\n"
+    );
+    assert_eq!(entity_op_kinds(&sb, &design_id), ["body.edit"]);
+    let op = events.next(Duration::from_secs(2));
+    assert_eq!(op["kind"], "body.edit");
+    assert_eq!(op["entity"], design_id.as_str());
+    assert!(op["id"].is_null(), "a document op names no ticket: {op}");
+
+    // Another window's whole-text save merges with the editor's unsent
+    // edit; `since` ships only what the editor lacks.
+    doc.diff_from_text("# Design!\n\nThe plan.\n").unwrap();
+    let (status, _) = app.post(
+        "/projects/design/body",
+        json!({"text": "# Design\n\nThe plan.\n\nMore.\n"}),
+    );
+    assert_eq!(status, 200);
+    let (status, caught_up) = app.get(&since("/projects/design/body", &doc.version()));
+    assert_eq!(status, 200, "{caught_up}");
+    assert!(caught_up.get("snapshot").is_none(), "{caught_up}");
+    doc.apply(&BodyUpdate::from_bytes(
+        pm_core::bytes::decode(caught_up["update"].as_str().unwrap()).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(doc.text(), "# Design!\n\nThe plan.\n\nMore.\n");
+    let mine = doc.updates_since(&[]).unwrap();
+    let (status, merged) = app.post(
+        "/projects/design/body",
+        json!({"update": pm_core::bytes::encode(mine.as_bytes())}),
+    );
+    assert_eq!(status, 200, "{merged}");
+    assert_eq!(merged["text"], "# Design!\n\nThe plan.\n\nMore.\n");
+    // Same text again commits nothing.
+    let before = entity_op_kinds(&sb, &design_id).len();
+    let (status, _) = app.post(
+        "/projects/design/body",
+        json!({"text": "# Design!\n\nThe plan.\n\nMore.\n"}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(entity_op_kinds(&sb, &design_id).len(), before);
+
+    // A named document, by name (percent-encoded), the same way.
+    let (status, named) = app.get("/projects/design/docs/run%20notes/body");
+    assert_eq!(status, 200, "{named}");
+    assert_eq!(named["doc"], "run notes");
+    assert_eq!(named["text"], "first note\n");
+    let named_id = named["doc_id"].as_str().unwrap().to_string();
+    assert_ne!(named_id, design_id);
+    let mut notes_doc = bind(&named);
+    let update = notes_doc
+        .diff_from_text("first note\nsecond note\n")
+        .unwrap();
+    let (status, written) = app.post(
+        "/projects/design/docs/run%20notes/body",
+        json!({"update": pm_core::bytes::encode(update.as_bytes())}),
+    );
+    assert_eq!(status, 200, "{written}");
+    assert_eq!(
+        sb.json(&["project", "show", "design", "--doc", "run notes"])["body"],
+        "first note\nsecond note\n"
+    );
+    assert_eq!(entity_op_kinds(&sb, &named_id), ["body.edit", "body.edit"]);
+
+    // Refusals, with nothing written.
+    let kinds = entity_op_kinds(&sb, &design_id);
+    assert_eq!(app.get("/projects/nope/body").0, 404);
+    assert_eq!(app.get("/projects/design/docs/nope/body").0, 404);
+    assert_eq!(app.post("/projects/nope/body", json!({"text": "x"})).0, 404);
+    assert_eq!(app.get("/projects/design/body?since=%2F%2F%2F%2F").0, 400);
+    let mut stranger = Body::new();
+    stranger.diff_from_text("unrelated").unwrap();
+    let orphan = stranger.diff_from_text("unrelated, more").unwrap();
+    let (status, err) = app.post(
+        "/projects/design/body",
+        json!({"update": pm_core::bytes::encode(orphan.as_bytes())}),
+    );
+    assert_eq!(status, 400, "{err}");
+    assert_eq!(
+        app.post("/projects/design/body", json!({"update": "", "text": ""}))
+            .0,
+        400
+    );
+    assert_eq!(entity_op_kinds(&sb, &design_id), kinds);
+
+    // It is ordinary history: a rebuild from the log reproduces both
+    // documents, and the database is healthy.
+    drop(events);
+    drop(app);
+    let rebuilt = sb.json(&["doctor", "--rebuild"]);
+    assert_eq!(rebuilt["healthy"], true, "{rebuilt}");
+    let project = sb.json(&["project", "show", "design"]);
+    assert_eq!(project["doc"], "# Design!\n\nThe plan.\n\nMore.\n");
+    assert_eq!(
+        project["documents"]["run notes"],
+        "first note\nsecond note\n"
+    );
+    assert_ok(&sb.run(&["doctor"], &[]));
+}
+
+/// AGT-1405: "New ticket" is `POST /tickets`, which files exactly as
+/// `pm new` with the same flags — same ops, same Ticket — and answers 201
+/// with `pm new --json`'s shape.
+#[test]
+fn post_tickets_files_exactly_as_pm_new() {
+    let sb = Sandbox::new();
+    let app = App::start(&sb, &["--idle", "0"]);
+    let events = app.events();
+    events.next(Duration::from_secs(5)); // hello
+
+    let (status, made) = app.post(
+        "/tickets",
+        json!({
+            "title": "  Filed from the view ",
+            "project": "pm",
+            "priority": "high",
+            "labels": ["x", "y"],
+            "description": "why\n",
+            "blocked_by": ["AGT-1"],
+        }),
+    );
+    assert_eq!(status, 201, "{made}");
+    assert_eq!(made["id"], "AGT-3");
+    assert_eq!(made["title"], "Filed from the view");
+    assert!(made.get("comments").is_none(), "pm new --json has none");
+    assert_eq!(
+        made,
+        sb.json(&["show", "AGT-3"])
+            .as_object()
+            .map(|o| {
+                let mut o = o.clone();
+                o.remove("comments");
+                Value::Object(o)
+            })
+            .unwrap()
+    );
+    let op = events.next(Duration::from_secs(2));
+    assert_eq!(op["kind"], "ticket.create");
+    assert_eq!(op["id"], "AGT-3");
+
+    let cli = sb.json(&[
+        "new",
+        "--title",
+        "Filed from the view",
+        "--project",
+        "pm",
+        "--priority",
+        "high",
+        "--label",
+        "x,y",
+        "--description",
+        "why\n",
+        "--blocked-by",
+        "AGT-1",
+    ]);
+    assert_eq!(cli["id"], "AGT-4");
+    assert_eq!(filed_shape(&made), filed_shape(&cli));
+    assert_eq!(sb.op_kinds("AGT-3"), sb.op_kinds("AGT-4"));
+
+    // Just a title and a project, as the project view sends it.
+    let (status, bare) = app.post("/tickets", json!({"title": "Bare", "project": "pm"}));
+    assert_eq!(status, 201, "{bare}");
+    let cli = sb.json(&["new", "--title", "Bare", "--project", "pm"]);
+    assert_eq!(filed_shape(&bare), filed_shape(&cli));
+
+    // pm new's refusals, and nothing filed.
+    let count = sb.json(&["list"]).as_array().unwrap().len();
+    for (body, want) in [
+        (json!({"project": "pm"}), 400),
+        (json!({"title": "  "}), 400),
+        (json!({"title": "x", "project": "nope"}), 404),
+        (json!({"title": "x", "blocked_by": ["AGT-99"]}), 404),
+        (json!({"title": "x", "priority": "urgent"}), 400),
+        (json!({"title": "x", "state": "done"}), 400),
+        (json!({"title": "x", "labels": "a"}), 400),
+        (json!(["title"]), 400),
+    ] {
+        let (status, err) = app.post("/tickets", body.clone());
+        assert_eq!(status, want, "{body}: {err}");
+    }
+    assert_eq!(sb.json(&["list"]).as_array().unwrap().len(), count);
+}
+
+/// With a hub configured — even one that cannot be reached — `POST
+/// /tickets` numbers nothing locally, exactly as `pm new` does
+/// (AGT-1398): the ticket is `AGT-?`, pending, and named by its ULID,
+/// which is what the project view opens it by.
+#[test]
+fn post_tickets_leaves_the_number_to_a_configured_hub() {
+    let sb = Sandbox::new();
+    let config = sb.path(".config/pm/config.toml");
+    let base = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("hub = \"http://127.0.0.1:1\"\n{base}")).unwrap();
+    let app = App::start(&sb, &["--idle", "0"]);
+
+    let (status, made) = app.post("/tickets", json!({"title": "Pending", "project": "pm"}));
+    assert_eq!(status, 201, "{made}");
+    assert_eq!(made["id"], "AGT-?");
+    assert!(made["number"].is_null(), "{made}");
+    let ulid = made["ulid"].as_str().unwrap().to_string();
+    let cli = sb.json(&["new", "--title", "Pending", "--project", "pm"]);
+    assert_eq!(cli["id"], "AGT-?");
+    assert_eq!(filed_shape(&made), filed_shape(&cli));
+    let doctor = sb.json(&["doctor"]);
+    assert_eq!(doctor["sync"]["pending_numbers"], 2, "{doctor}");
+
+    // The editor opens it by ULID: reads and writes work, AGT-? does not.
+    let (status, t) = app.get(&format!("/tickets/{ulid}"));
+    assert_eq!(status, 200, "{t}");
+    assert_eq!(t["title"], "Pending");
+    let (status, _) = app.get(&format!("/tickets/{ulid}/body"));
+    assert_eq!(status, 200);
+    let (status, t) = app.post(
+        &format!("/tickets/{ulid}/body"),
+        json!({"text": "filled in"}),
+    );
+    assert_eq!(status, 200, "{t}");
+    assert_eq!(t["description"], "filled in");
+    assert_eq!(app.get("/tickets/AGT-?").0, 400);
+}

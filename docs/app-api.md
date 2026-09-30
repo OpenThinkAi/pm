@@ -138,6 +138,30 @@ on every `body.edit` op event for its ticket and after every (re)connect
 
 **Project**.
 
+### `GET /projects/{id}/body[?since=<base64>]`, `GET /projects/{id}/docs/{name}/body[?since=<base64>]`
+
+A project document as a CRDT document (AGT-1405): the design doc, or the
+named document `{name}` (percent-encoded; `pm project doc add` creates
+them). Exactly `GET /tickets/{id}/body` — the same `text`, the same
+`snapshot` without `since` and `update` with it, the same `400`s — with
+the document named instead of a ticket:
+
+```jsonc
+{
+  "schema": 1,
+  "project": "pm",
+  "doc": null,                    // the design doc; a named document's name otherwise
+  "doc_id": "<ULID>",             // the entity its body.edit ops (and their op events) carry
+  "text": "…",
+  "snapshot": "<base64>"          // or "update" with ?since=
+}
+```
+
+A document nobody has edited yet is an empty body (its snapshot imports
+as `""`). An unknown project or document is `404`; a document whose id
+binding has not synced to this replica yet (only a project pulled from
+another replica mid-sync) is `500`, as `pm project edit` exits `1` on it.
+
 ### `GET /ready[?…]`
 
 `pm ready --json`, with the same keys as its flags: `project`, `ids`
@@ -145,9 +169,33 @@ on every `body.edit` op event for its ticket and after every (re)connect
 
 ## Writes
 
-Every write is a JSON `POST` on a ticket, answers with the ticket as it
+Every write on a ticket is a JSON `POST`, answers with the ticket as it
 now reads in the `GET /tickets/{id}` shape (**Ticket** plus `comments`,
 as `pm show --json` prints it), and commits its ops in one batch. A write that changes nothing commits nothing.
+Filing a ticket (`POST /tickets`) and writing a project document
+(`POST /projects/{id}/body`) answer as described under each.
+
+### `POST /tickets`
+
+```json
+{"title": "Write the parser", "project": "pm", "priority": "high",
+ "labels": ["x"], "description": "…", "repo": "OpenThinkAi/pm", "blocked_by": ["AGT-12"]}
+```
+
+`pm new` with those flags (AGT-1405) — only `title` is required — through
+the very same path (`verbs::file_ticket`): the workspace's initial state,
+the project checked before anything is written (`404`), blockers resolved
+(`404` for an unknown one), the same op set, and the same **numbering**:
+this machine numbers the ticket when no hub is configured; with a `hub`
+in config.toml — reachable or not, the API never contacts it — the
+ticket is committed **pending**, reads `"id": "AGT-?"`, `"number": null`,
+and is named by its `ulid` until `pm sync` brings the hub's number
+(cli-contract §`pm new`, Numbering). Blank strings count as absent; an
+unknown key, a bad `priority` or a non-array `labels`/`blocked_by` is
+`400`, and nothing is written. Answers `201` with the ticket exactly as
+`pm new --json` prints it (**Ticket**, no `comments`). `pm new` puts no
+template sections in a description and neither does this. The ops reach
+`GET /events` like any other (`ticket.create` first).
 
 ### `POST /tickets/{id}/fields`
 
@@ -213,6 +261,18 @@ as `pm edit` diffs a save, so only the changed span travels and a
 concurrent edit merges rather than being reverted. Text equal to the
 current description commits nothing.
 
+### `POST /projects/{id}/body`, `POST /projects/{id}/docs/{name}/body`
+
+`{"update": "<base64>"}` or `{"text": "…"}`, exactly as
+`POST /tickets/{id}/body` (the same peer-id rules, the same refusal of an
+update whose history this replica lacks): one **`body.edit` op on the
+document's `doc_id`** (AGT-1344/1413), committed through the same
+`Store::commit_doc_edit` `pm project edit` and `pm project doc add` use —
+so it joins the outbox, syncs, and `pm doctor --rebuild` rebuilds the
+document from it. Text equal to the document commits nothing. Answers the
+document header with its text: `{"schema", "project", "doc", "doc_id",
+"text"}`.
+
 ## `GET /events`
 
 Server-sent events (`text/event-stream`), for as long as the client keeps
@@ -261,8 +321,10 @@ compiling the view); ui-leaf exiting ends the server too.
 
 ## Launching a view
 
-`pm edit <ID>` (the ticket view) and `pm app` without `--json` (the board)
-start this server in-process and mount a view in
+`pm edit <ID>` (the ticket view), `pm project edit <ID>` (the project
+view, AGT-1405 — under exactly `pm edit`'s rules: `--view`, then
+`edit.view`, and the default ui-leaf only when stdin and stdout are
+terminals) and `pm app` without `--json` (the board) start this server in-process and mount a view in
 [ui-leaf](https://github.com/OpenThinkAi/ui-leaf) over its stdio protocol
 (`ui-leaf mount`, line-delimited JSON; `crates/pm/src/app/launch.rs`).
 
@@ -275,12 +337,14 @@ does not launch it (and says why). No display — `UI_LEAF_NO_OPEN` truthy,
 an SSH session, or Linux/BSD without `DISPLAY`/`WAYLAND_DISPLAY` — means no
 launch either; `UI_LEAF_NO_OPEN=0` forces one.
 
-**The mount.** Config line: `view` (`ticket` or `board`), an absolute
-`viewsRoot` (below), `data` = `{"schema":1,"view":…,"ticket":"AGT-12"}`,
+**The mount.** Config line: `view` (`ticket`, `board` or `project`), an absolute
+`viewsRoot` (below), `data` = `{"schema":1,"view":…,"ticket":"AGT-12"}`
+(`"ticket"` is the ULID while the number is pending; the project view's is
+`{"schema":1,"view":"project","project":"pm"}`),
 `mutations: ["session"]`, `port: 0`, `shell: "app"`, and `csp` = ui-leaf's
 strict preset with this API's origin added to `connect-src` and
 `'wasm-unsafe-eval'` added to `script-src`. The latter is the one
-loosening, and only for WebAssembly: the ticket editor's `loro-crdt`
+loosening, and only for WebAssembly: the editors' `loro-crdt`
 compiles its wasm module from bytes inlined in the page (ui-leaf serves a
 view as a single HTML page, so there is no `.wasm` URL to load), which
 CSP otherwise refuses. It does not allow `eval` or `new Function`.
@@ -315,12 +379,15 @@ A view imports only relative files and `react`/`react-dom` (ui-leaf
 aliases those two; it resolves no other npm package), so the views carry
 no npm dependencies; third-party code a view needs is vendored as relative
 files (the ticket editor's, below). Logic worth testing lives in plain `.ts` beside them
-(`lib/board.ts`), written in erasable TypeScript so Node runs it
+(`lib/board.ts`, `lib/project.ts`), written in erasable TypeScript so Node runs it
 directly: `node --test crates/pm/views-test/*.test.ts` (Node ≥ 22.18; no
 install, no browser). Those tests sit outside `crates/pm/views/` so they
 are not shipped, and are not part of `cargo test`.
 
-The ticket editor also imports `views/vendor/`: `loro.js` (`loro-crdt`'s
+The editors (`lib/editor.tsx`: `BodyEditor`, CodeMirror bound to a
+`BodySync`, and `TicketEditor`, the whole ticket editor — `ticket.tsx` is
+one filling the window, and the project view hosts one inline) also
+import `views/vendor/`: `loro.js` (`loro-crdt`'s
 `base64` build — the wasm inlined, ~4.7 MB) and `codemirror.js`
 (CodeMirror 6 and `loro-codemirror`, minified, importing `./loro.js` so
 there is one Loro instance). ui-leaf bundles relative imports but
@@ -333,15 +400,18 @@ as the pin change, and the build is reproducible — rerunning it on a clean
 checkout leaves `git status` clean). Building or installing pm needs no
 JavaScript toolchain.
 
-The editor's description binding (`lib/body.ts`, `BodySync`) is
-DOM-free: a fresh `LoroDoc` (fresh random peer, never 0) imported from the
+The body binding (`lib/body.ts`, `BodySync`) is DOM-free and binds any
+body endpoint — `bodyTransport(api, path)` with `ticketBodyPath(ref)`
+(`apiTransport(api, ref)` is that) or a project document's
+`docBodyPath(project, tab)` (`lib/project.ts`): a fresh `LoroDoc` (fresh random peer, never 0) imported from the
 snapshot; local commits are exported as updates holding only this
 session's own ops and POSTed 250 ms after the last keystroke (at most
 750 ms after the first unsent one), one request at a time, retried until
 a `200`; on close (`pagehide`, or the window going hidden) whatever is
 unsent is flushed with `keepalive`. Its tests
-(`crates/pm/tests/views/*.test.ts`) run under node against a real
-`pm app` from `cargo test` (`crates/pm/tests/views_js.rs`); without node
+(`crates/pm/tests/views/*.test.ts`: `body.test.ts` on a ticket,
+`project.test.ts` on a project's documents and "New ticket") run under
+node against a real `pm app` from `cargo test` (`crates/pm/tests/views_js.rs`); without node
 >= 22 on `PATH` that test skips, and `PM_REQUIRE_NODE_TESTS=1` makes the
 skip a failure.
 
@@ -356,7 +426,7 @@ instead, for developing a view without rebuilding pm.
 |---|---|---|---|
 | `ticket` | `pm edit <ID>` | the editor: title, priority, project, labels, state, and the description bound to the text CRDT; live (AGT-1403) | — |
 | `board` | `pm app` | the board (AGT-1404, below) | — |
-| (project) | — | — | the project view (AGT-1405) |
+| `project` | `pm project edit <ID>` | the design doc and named documents in the CRDT editor, the project's tickets, "New ticket" (AGT-1405, below) | — |
 
 ### The board
 
@@ -393,3 +463,37 @@ instead, for developing a view without rebuilding pm.
   panel (`GET /tickets/{ref}`: description, comments, blockers, hold) that
   stays live. ui-leaf gives a view no way to open another view, so editing
   is `pm edit <ref>`, which the panel shows and copies.
+
+### The project view
+
+`pm project edit <ID>`'s view (`project.tsx`; its policy is
+`lib/project.ts`, covered by `crates/pm/views-test/project.test.ts`):
+
+- **Documents** — a tab for the design doc, then one per named document
+  by name; the open one is a `BodyEditor` bound through `BodySync` to its
+  body endpoint (`GET`/`POST /projects/{id}/body`, or
+  `…/docs/{name}/body`), the same CRDT editor as a ticket's description:
+  every edit is a `body.edit` op on the document's `doc_id` within a
+  second, and switching tabs flushes what is unsent first. New named
+  documents are `pm project doc add` (the view does not create them).
+- **Tickets** — `GET /tickets?project={id}`, one section per workflow
+  state in state order (empty ones dropped). Clicking a ticket opens it.
+- **Live** — one `GET /events` stream: a `body.edit` on the open
+  document's `doc_id` pulls it (`?since=`); a ticket op refetches the
+  list; any other op with no ticket id (project metadata, a new document,
+  a workspace change) refetches the project, and the list; each refetch
+  debounced 150 ms.
+- **New ticket** — a title, filed as `POST /tickets {"title", "project":
+  <id>}`: `pm new --title … --project <id>`, numbering included. The new
+  ticket then **opens in the editor**, by its ref — the display id, or the
+  ULID while a configured hub has yet to number it (the pane shows `AGT-?`
+  with a note until `pm sync`).
+- **Opening a ticket** — ui-leaf gives a view no way to open another view:
+  its host-side `view`/`patch` messages swap the *only* window's view and
+  take a self-contained source with no relative imports, which could
+  carry neither this view nor the vendored editor. So the ticket opens
+  **inline**: the ticket list gives way to a `TicketEditor` pane — the
+  component `pm edit` shows, fields, labels, state and the description
+  CRDT, live — with "← Back to tickets" to return. (The board, which
+  predates this, still points at `pm edit <ref>`.)
+

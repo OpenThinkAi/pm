@@ -343,7 +343,13 @@ pub(crate) fn choose(env: &Env, explicit: bool) -> Result<Choice> {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Target {
     Board,
-    Ticket { id: String },
+    Ticket {
+        id: String,
+    },
+    /// The project view (AGT-1405), by project id.
+    Project {
+        id: String,
+    },
 }
 
 /// ui-leaf's strict CSP preset with `api` added to `connect-src`, and
@@ -380,6 +386,12 @@ pub(crate) fn mount_config(target: &Target, views_root: &Path, api: &str) -> Val
             format!("pm — {id}"),
             json!({"schema": SCHEMA, "view": "ticket", "ticket": id}),
             (900, 900),
+        ),
+        Target::Project { id } => (
+            "project",
+            format!("pm — project {id}"),
+            json!({"schema": SCHEMA, "view": "project", "project": id}),
+            (1280, 900),
         ),
     };
     json!({
@@ -735,5 +747,15 @@ mod tests {
         let board = mount_config(&Target::Board, Path::new("/views"), "http://127.0.0.1:1");
         assert_eq!(board["view"], "board");
         assert!(board["data"].get("ticket").is_none());
+        let project = mount_config(
+            &Target::Project { id: "pm".into() },
+            Path::new("/views"),
+            "http://127.0.0.1:1",
+        );
+        assert_eq!(project["view"], "project");
+        assert_eq!(
+            project["data"],
+            json!({"schema": 1, "view": "project", "project": "pm"})
+        );
     }
 }

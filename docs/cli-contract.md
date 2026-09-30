@@ -131,8 +131,8 @@ apparent exception, `pm edit` / `pm project edit`, launches `$EDITOR` (or
 `$VISUAL`, or `vi`) as a **child process** through `sh -c`; that child
 inherits whatever stdio `pm` itself was given, so a non-interactive editor
 invocation (no TTY) fails fast rather than hanging, and `pm edit` reports
-that as an aborted edit (exit `1`), never a hang. `pm edit`'s default
-ui-leaf view is used only at a terminal (stdin and stdout both TTYs) or
+that as an aborted edit (exit `1`), never a hang. `pm edit`'s (and `pm project edit`'s)
+default ui-leaf view is used only at a terminal (stdin and stdout both TTYs) or
 when asked for explicitly, and then waits on a window until it closes;
 `pm app` without `--json` always opens (and waits on) the board.
 
@@ -526,8 +526,10 @@ external view's `http://127.0.0.1:5173`; repeatable; default none).
 
 Serves the localhost HTTP API the ui-leaf views use (AGT-1401; README
 §Surfaces, decision A6) — the shapes above (**Ticket**, **Project**,
-`pm list`, `pm ready`) as `GET`s, field/label/state/`body.edit` writes as
-`POST`s that commit ordinary ops, and an SSE stream of every op that
+`pm list`, `pm ready`) and ticket descriptions and project documents as
+CRDT bodies as `GET`s, field/label/state/`body.edit` writes (on tickets
+and on project documents) and ticket filing (`pm new`'s path and
+numbering, AGT-1405) as `POST`s that commit ordinary ops, and an SSE stream of every op that
 lands in the log. The HTTP contract is `docs/app-api.md`. Binds
 `127.0.0.1` on a random port; requires a bearer token minted per launch;
 refuses any other `Host` or a non-allow-listed `Origin`; exits when the
@@ -1037,14 +1039,35 @@ Flags: `--status <STATUS>` (`in-progress`, `complete`, `abandoned`).
 
 ### `pm project edit <ID>`
 
-No flags beyond the globals. Same `$EDITOR`/`$VISUAL`/`vi` launch and
-no-TTY-fails-fast behavior as `pm edit`; edits the design doc (`doc`), not
-a named document.
+Flags: `--view <VIEW>` (`ui-leaf` or `editor`; default: `edit.view` in
+config.toml, else `ui-leaf` — for an interactive invocation only).
+
+Chooses its view exactly as `pm edit` does (AGT-1405): `--view`, then
+`edit.view`, else ui-leaf only when stdin and stdout are both terminals —
+a scripted `pm project edit` (an agent with a scripted `$EDITOR`) is the
+`editor` flow, silently, and never opens a window it did not ask for. The
+same display, pin and fallback rules and notes apply (§`pm edit`); the
+project is resolved first, so an unknown id is exit `3` before any window.
+
+**`ui-leaf`** opens the **project view** (`docs/app-api.md` §The project
+view) and returns when its window closes: the design doc and every named
+document in the CRDT editor (each edit a `body.edit` op on that
+document's `doc_id`, within a second), the project's tickets, live, and
+**New ticket**, which files exactly as `pm new --title … --project <ID>`
+would (hub-pending numbering included) and opens the new ticket in an
+inline ticket editor — the same editor `pm edit` shows (ui-leaf cannot
+open a second view from inside one).
+
+**`editor`** is `$EDITOR`/`$VISUAL`/`vi` on the design doc (`doc`), not a
+named document, with `pm edit`'s no-TTY-fails-fast behavior.
 
 - Exit `1`: the project has no design doc bound yet (only a project
-  pulled from a replica whose binding has not synced); the editor aborts.
+  pulled from a replica whose binding has not synced; `editor` flow); the
+  editor aborts.
+- Exit `3`: unknown project.
 - `--json`: **Project** (as it reads after the save commits, or
-  unchanged).
+  unchanged — or, from the project view, as it reads when the window
+  closed).
 
 ### `pm project delete <ID>`
 

@@ -1,8 +1,9 @@
-//! The ticket editor's JavaScript (AGT-1403): `crates/pm/tests/views/*.test.ts`
+//! The editors' JavaScript (AGT-1403, AGT-1405): `crates/pm/tests/views/*.test.ts`
 //! run under node (`node --test`, no browser) against a real `pm app` in a
-//! temp workspace — two editor sessions converging through the API, a CLI
-//! `pm edit`/`pm set` reaching an open one — then `pm doctor` on what they
-//! left behind.
+//! temp workspace — two editor sessions converging through the API on a
+//! ticket's description and on a project's documents, a CLI
+//! `pm edit`/`pm project edit`/`pm set` reaching an open one, "New ticket"
+//! — then `pm doctor --rebuild` on what they left behind.
 //!
 //! node is not a required toolchain for pm: without a `node` (>= 22, for
 //! TypeScript type stripping) on `PATH` this test prints why and passes.
@@ -100,6 +101,38 @@ fn the_editor_binding_converges_against_a_real_server() {
         "--description",
         "line one\nline two",
     ]));
+    // tests/views/project.test.ts: project `design` with a design doc and
+    // a named document.
+    assert_ok(&run(&["project", "new", "design", "--title", "Design"]));
+    let seed = home.path().join("seed.md");
+    std::fs::write(&seed, "# Design\n").unwrap();
+    let editor = home.path().join("seed-editor.sh");
+    std::fs::write(
+        &editor,
+        format!("#!/bin/sh\ncat '{}' > \"$1\"\n", seed.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_ok(
+        &pm(home.path(), &ws, &["project", "edit", "design"])
+            .env("EDITOR", &editor)
+            .output()
+            .unwrap(),
+    );
+    std::fs::write(&seed, "first note\n").unwrap();
+    assert_ok(&run(&[
+        "project",
+        "doc",
+        "add",
+        "design",
+        "notes",
+        "--from-file",
+        seed.to_str().unwrap(),
+    ]));
 
     // A short idle grace: once the tests close their streams, the server
     // exits by itself — the window closing.
@@ -152,8 +185,23 @@ fn the_editor_binding_converges_against_a_real_server() {
     };
     assert_eq!(status.code(), Some(0));
 
-    // What the sessions wrote is ordinary history.
+    // What the sessions wrote is ordinary history, and a rebuild from the
+    // log reproduces it.
+    assert_ok(&run(&["doctor", "--rebuild"]));
     assert_ok(&run(&["doctor"]));
+    let show = run(&["project", "show", "design", "--json"]);
+    assert_ok(&show);
+    let project: Value = serde_json::from_slice(&show.stdout).unwrap();
+    let doc = project["doc"].as_str().unwrap();
+    for part in [
+        "[b] # Design",
+        "from window A",
+        "from the CLI",
+        "unsent in the window",
+    ] {
+        assert!(doc.contains(part), "{part:?} missing: {doc:?}");
+    }
+    assert_eq!(project["documents"]["notes"], "first note\nsecond note\n");
     let show = run(&["show", "AGT-1", "--json"]);
     assert_ok(&show);
     let ticket: Value = serde_json::from_slice(&show.stdout).unwrap();

@@ -64,8 +64,13 @@ pub enum ProjectCmd {
         #[arg(long, value_parser = parse_status)]
         status: Option<ProjectStatus>,
     },
-    /// Open the design doc in $EDITOR and record the result as body.edit ops
-    Edit { id: String },
+    /// Open the project view in ui-leaf (design doc + named docs in the CRDT editor, its tickets), or the design doc in $EDITOR; every change becomes body.edit ops
+    Edit {
+        id: String,
+        /// ui-leaf or editor ($EDITOR); default: config `edit.view`, else ui-leaf at a terminal (falling back to $EDITOR)
+        #[arg(long, value_parser = edit::parse_view)]
+        view: Option<edit::View>,
+    },
     /// Refuses while the project still has tickets or child projects (FK)
     Delete { id: String },
     /// Named documents beyond the design doc
@@ -96,7 +101,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: ProjectCmd) -> Result<()> {
         } => new(ctx, &id, &title, &repos, parent.as_deref()),
         ProjectCmd::Show { id, doc } => show(ctx, &id, doc.as_deref()),
         ProjectCmd::List { status } => list(ctx, status),
-        ProjectCmd::Edit { id } => edit(ctx, &id),
+        ProjectCmd::Edit { id, view } => edit(ctx, &id, view),
         ProjectCmd::Delete { id } => delete(ctx, &id),
         ProjectCmd::Doc { cmd } => match cmd {
             ProjectDocCmd::Add {
@@ -206,7 +211,44 @@ fn list(ctx: &Ctx<'_>, status: Option<ProjectStatus>) -> Result<()> {
 
 // ------------------------------------------------------------------- edit
 
-fn edit(ctx: &Ctx<'_>, id: &str) -> Result<()> {
+/// `pm project edit <id> [--view=editor|ui-leaf]` (AGT-1405): the view is
+/// chosen exactly as `pm edit` chooses (`crate::edit::resolve_view`, and
+/// the default ui-leaf only at a terminal); ui-leaf opens the project view,
+/// anything else — or a ui-leaf that cannot open — is the `$EDITOR` flow
+/// on the design doc below.
+fn edit(ctx: &Ctx<'_>, id: &str, view_flag: Option<edit::View>) -> Result<()> {
+    let (view, explicit) = edit::resolve_view(view_flag, ctx.env)?;
+    if view == edit::View::UiLeaf && edit_in_ui_leaf(ctx, id, explicit)? {
+        return Ok(());
+    }
+    edit_in_editor(ctx, id)
+}
+
+/// The ui-leaf path of `pm project edit`: `Ok(true)` when the project view
+/// opened and has closed, `Ok(false)` to continue with `$EDITOR`.
+fn edit_in_ui_leaf(ctx: &Ctx<'_>, id: &str, explicit: bool) -> Result<bool> {
+    let Some(runtime) = edit::ui_leaf_runtime(ctx, explicit, "pm project edit")? else {
+        return Ok(false);
+    };
+    // Resolve the project first: an unknown id is exit 3 before any window.
+    {
+        let (store, _ws) = ctx.open()?;
+        store.project(id)?.ok_or_else(|| not_found(id))?;
+    }
+    match crate::app::edit_project(ctx, runtime, id)? {
+        crate::app::launch::Ended::Closed => {}
+        crate::app::launch::Ended::Failed(why) => {
+            eprintln!("pm project edit: ui-leaf could not open {id} ({why}); using $EDITOR");
+            return Ok(false);
+        }
+    }
+    let (store, _ws) = ctx.open()?;
+    let project = store.project(id)?.ok_or_else(|| not_found(id))?;
+    print_project(ctx, &project)?;
+    Ok(true)
+}
+
+fn edit_in_editor(ctx: &Ctx<'_>, id: &str) -> Result<()> {
     let actor = ctx.actor()?;
     let (mut store, _ws) = ctx.open()?;
     let project = store.project(id)?.ok_or_else(|| not_found(id))?;

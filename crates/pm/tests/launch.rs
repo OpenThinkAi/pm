@@ -636,3 +636,165 @@ fn pm_app_json_is_headless_even_with_ui_leaf() {
     assert_eq!(line["idle_secs"], 1);
     assert!(!sb.was_mounted());
 }
+
+// ------------------------------------------------ the project view (AGT-1405)
+
+/// `pm project edit <id>` in ui-leaf: the project view, its API — the
+/// design doc body and "New ticket" — reachable from the view's origin,
+/// and pm returning (with the project as it now reads) once the window
+/// closes. `$EDITOR` never runs.
+#[test]
+fn pm_project_edit_opens_the_project_view_and_returns_when_it_closes() {
+    let sb = Sandbox::new();
+    assert_ok(&sb.run(&["project", "new", "design", "--title", "Design"], &[]));
+    let editor = sb.editor();
+    let mut child = sb.spawn(
+        &["project", "edit", "design", "--view=ui-leaf", "--json"],
+        &[("EDITOR", editor.to_str().unwrap())],
+    );
+    let session = Session::from_reply(&sb.wait_for_session(&mut child));
+    assert_passed_explicitly(&sb, &session);
+    assert_api_reachable(&session);
+
+    let config: Value = serde_json::from_str(sb.recorded("config.json").unwrap().trim()).unwrap();
+    assert_eq!(config["view"], "project");
+    assert_eq!(
+        config["data"],
+        json!({"schema": 1, "view": "project", "project": "design"})
+    );
+    let root = PathBuf::from(config["viewsRoot"].as_str().unwrap());
+    for file in [
+        "project.tsx",
+        "lib/project.ts",
+        "lib/editor.tsx",
+        "lib/body.ts",
+        "vendor/loro.js",
+    ] {
+        assert!(root.join(file).is_file(), "{file} not unpacked");
+    }
+    // The CSP carries the editor's WebAssembly allowance for this view too.
+    assert!(
+        config["csp"]
+            .as_str()
+            .unwrap()
+            .contains("'wasm-unsafe-eval'")
+    );
+
+    // The view edits the design doc and files a ticket through the API.
+    assert_eq!(
+        session.post(
+            "/projects/design/body",
+            json!({"text": "# From the view\n"})
+        ),
+        200
+    );
+    assert_eq!(
+        session.post("/tickets", json!({"title": "Filed", "project": "design"})),
+        201
+    );
+    let events = session.open_events();
+    std::thread::sleep(Duration::from_millis(300));
+    drop(events);
+    let (code, stdout, stderr) = wait(child, 30);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        sb.recorded("stdin.log")
+            .unwrap()
+            .contains(r#""type":"close""#),
+        "pm asked ui-leaf to close"
+    );
+    let project: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(project["id"], "design");
+    assert_eq!(project["doc"], "# From the view\n");
+    assert_eq!(sb.editor_runs(), 0, "$EDITOR never ran");
+    let listed = sb.run(&["list", "--project", "design", "--json"], &[]);
+    assert_ok(&listed);
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed[0]["title"], "Filed");
+}
+
+/// `pm project edit` follows `pm edit`'s rules: a non-interactive default
+/// is the `$EDITOR` flow even with ui-leaf present, `edit.view = "ui-leaf"`
+/// is a request, and an unknown project is exit 3 before any window.
+#[test]
+fn pm_project_edit_follows_pm_edits_launch_rules() {
+    let sb = Sandbox::new();
+    assert_ok(&sb.run(&["project", "new", "design", "--title", "Design"], &[]));
+    let editor = sb.editor();
+    let out = sb.run(
+        &["project", "edit", "design"],
+        &[("EDITOR", editor.to_str().unwrap())],
+    );
+    assert_ok(&out);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("ui-leaf"));
+    assert!(
+        !sb.was_mounted(),
+        "a scripted pm project edit opened a window"
+    );
+    assert_eq!(sb.editor_runs(), 1);
+
+    let out = sb.run(&["project", "edit", "nope", "--view=ui-leaf"], &[]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(!sb.was_mounted());
+
+    // Without ui-leaf, asking for it is the editor flow with one note.
+    let fake = sb.path("bin/ui-leaf");
+    std::fs::rename(&fake, sb.path("ui-leaf.away")).unwrap();
+    let out = sb.run(
+        &["project", "edit", "design", "--view=ui-leaf"],
+        &[("EDITOR", editor.to_str().unwrap())],
+    );
+    assert_ok(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.lines().filter(|l| l.contains("ui-leaf")).count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(sb.editor_runs(), 2);
+    std::fs::rename(sb.path("ui-leaf.away"), &fake).unwrap();
+
+    // edit.view = ui-leaf in config is a request: it launches.
+    let config = sb.path(".config/pm/config.toml");
+    let base = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::write(&config, format!("{base}\n[edit]\nview = \"ui-leaf\"\n")).unwrap();
+    let mut child = sb.spawn(
+        &["project", "edit", "design"],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("FAKE_UI_LEAF_MODE", "quit"),
+        ],
+    );
+    sb.wait_for_session(&mut child);
+    std::fs::write(sb.rec().join("quit"), "").unwrap();
+    let (code, _, stderr) = wait(child, 30);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(sb.editor_runs(), 2, "$EDITOR did not run again");
+}
+
+/// A ticket still awaiting its hub number opens in the ticket view by its
+/// ULID — `AGT-?` names nothing the view could load.
+#[test]
+fn pm_edit_mounts_a_pending_ticket_by_its_ulid() {
+    let sb = Sandbox::new();
+    let config = sb.path(".config/pm/config.toml");
+    let base = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("hub = \"http://127.0.0.1:1\"\n{base}")).unwrap();
+    let out = sb.run(&["new", "--title", "Pending", "--json"], &[]);
+    assert_ok(&out);
+    let made: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(made["id"], "AGT-?");
+    let ulid = made["ulid"].as_str().unwrap();
+    let mut child = sb.spawn(
+        &["edit", ulid, "--view=ui-leaf"],
+        &[("FAKE_UI_LEAF_MODE", "quit")],
+    );
+    let session = Session::from_reply(&sb.wait_for_session(&mut child));
+    let config: Value = serde_json::from_str(sb.recorded("config.json").unwrap().trim()).unwrap();
+    assert_eq!(config["data"]["ticket"], ulid);
+    let (status, _, body) = session.get(&format!("/tickets/{ulid}"), VIEW_ORIGIN);
+    assert_eq!(status, 200, "{body}");
+    std::fs::write(sb.rec().join("quit"), "").unwrap();
+    let (code, _, stderr) = wait(child, 30);
+    assert_eq!(code, Some(0), "{stderr}");
+}

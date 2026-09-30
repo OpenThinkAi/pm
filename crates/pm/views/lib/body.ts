@@ -1,7 +1,11 @@
-// The ticket editor's description binding (AGT-1403; docs/app-api.md
-// §`GET /tickets/{id}/body`, §`POST /tickets/{id}/body`).
+// The CRDT body binding every pm editor shares (AGT-1403, AGT-1405;
+// docs/app-api.md §`GET /tickets/{id}/body`, §`POST /tickets/{id}/body`,
+// §Project documents).
 //
-// A `BodySync` owns one `loro-crdt` document bound to a ticket's body:
+// A `BodySync` owns one `loro-crdt` document bound to one body endpoint —
+// a ticket's description (`ticketBodyPath`) or a project document, the
+// design doc or a named one (lib/project.ts's `docBodyPath`). The endpoints behave
+// identically, so everything below holds for both:
 //
 // - **Open.** The document is a fresh `LoroDoc` — a fresh random peer id,
 //   never a fixed one and never 0 (the server's materialized view is peer
@@ -18,9 +22,10 @@
 //   and nothing is lost, since what counts as sent only advances on a 200.
 // - **Remote edits** (another window, a `pm edit` in a terminal, a sync)
 //   arrive through `pull()`: it sends the document's version vector as
-//   `GET /tickets/{id}/body?since=…` and imports the ops it lacked, which
+//   `GET <endpoint>?since=…` and imports the ops it lacked, which
 //   loro-codemirror turns into editor changes. The view calls it on every
-//   `body.edit` op event for the ticket and after every (re)connect.
+//   `body.edit` op event for the body's entity (the ticket, or the
+//   document's `doc_id`) and after every (re)connect.
 //
 // Framework-free and DOM-free so it runs under node for the tests
 // (crates/pm/tests/views/): no parameter properties or other TypeScript
@@ -45,13 +50,21 @@ export interface ApiLike {
   post<T>(path: string, body: unknown, opts?: { keepalive?: boolean }): Promise<T>;
 }
 
-/** `GET /tickets/{id}/body` (without `since`). */
+/**
+ * A body endpoint's answer without `since`. A ticket's also names the
+ * ticket (`id`, `ulid`); a project document's names the project, the
+ * document (`doc`: null for the design doc) and its `doc_id` — the entity
+ * its `body.edit` op events carry.
+ */
 export interface BodySnapshot {
   schema: number;
-  id: string;
-  ulid: string;
   text: string;
   snapshot: string;
+  id?: string;
+  ulid?: string;
+  project?: string;
+  doc?: string | null;
+  doc_id?: string;
 }
 
 /** Where the local edits stand, for the view's indicator. */
@@ -91,9 +104,13 @@ export function fromBase64(text: string): Uint8Array {
 
 // ------------------------------------------------------------ transport
 
-/** The body endpoints of ticket `id` over a connected client. */
-export function apiTransport(api: ApiLike, id: string): BodyTransport {
-  const path = `/tickets/${encodeURIComponent(id)}/body`;
+/** A ticket's description endpoint: `/tickets/{ref}/body`. */
+export function ticketBodyPath(ref: string): string {
+  return `/tickets/${encodeURIComponent(ref)}/body`;
+}
+
+/** Any body endpoint (`ticketBodyPath`, lib/project.ts's `docBodyPath`) over a connected client. */
+export function bodyTransport(api: ApiLike, path: string): BodyTransport {
   return {
     async post(update, opts) {
       await api.post(path, { update: toBase64(update) }, opts);
@@ -105,6 +122,11 @@ export function apiTransport(api: ApiLike, id: string): BodyTransport {
       return fromBase64(res.update);
     },
   };
+}
+
+/** The description endpoint of ticket `id` (`bodyTransport(api, ticketBodyPath(id))`). */
+export function apiTransport(api: ApiLike, id: string): BodyTransport {
+  return bodyTransport(api, ticketBodyPath(id));
 }
 
 // ----------------------------------------------------------------- sync
