@@ -235,7 +235,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 /// `pm-hub healthcheck`: GET /health on this machine's `PORT` (IPv4
 /// loopback, then IPv6), exit 0 on a 200. The runtime image has no curl;
 /// this is what its `HEALTHCHECK` runs. Railway ignores `HEALTHCHECK` and
-/// probes `/health` itself (`railway.toml` `healthcheckPath`).
+/// probes `/health` itself (the service's Healthcheck Path setting).
 fn healthcheck() -> Result<(), Box<dyn Error>> {
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};

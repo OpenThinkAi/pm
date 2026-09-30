@@ -13,8 +13,10 @@
 # Success means /health reports this commit's sha as "build", so a deploy
 # that never switched traffic (old build still serving) fails the script.
 #
-# Railway builds the image remotely from crates/pm-hub/Dockerfile (see
-# railway.toml) and only switches traffic once /health passes.
+# Railway builds the image remotely from crates/pm-hub/Dockerfile (selected by
+# the service variable RAILWAY_DOCKERFILE_PATH; Railway ignores railway.toml)
+# and, when the service's Healthcheck Path is set to /health, only switches
+# traffic once it passes.
 
 set -euo pipefail
 set +x
