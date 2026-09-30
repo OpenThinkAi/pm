@@ -1691,3 +1691,91 @@ fn relate_refuses_self_block_cycles_and_empty_calls_with_exit_2() {
     assert_ok(&sb.pm(&["relate", "AGT-3", "--unblock", "AGT-2"]));
     assert_ok(&sb.pm(&["relate", "AGT-1", "--blocked-by", "AGT-3"]));
 }
+
+// ------------------------------------------- AGT-1430: pm show comments
+
+fn show_json(sb: &Sandbox, args: &[&str]) -> serde_json::Value {
+    let out = sb.pm(args);
+    assert_ok(&out);
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn show_without_comments_is_unchanged_and_json_has_empty_array() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T", "--description", "the body"]));
+    let out = sb.pm(&["show", "AGT-1"]);
+    assert_ok(&out);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("Comments"), "{text}");
+    assert!(text.trim_end().ends_with("the body"), "{text}");
+    let v = show_json(&sb, &["show", "AGT-1", "--json"]);
+    assert_eq!(v["comments"], serde_json::json!([]));
+}
+
+#[test]
+fn show_lists_one_comment_after_the_description() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T", "--description", "the body"]));
+    assert_ok(&sb.pm(&["comment", "AGT-1", "hello there", "--as", "bob"]));
+    let out = sb.pm(&["show", "AGT-1"]);
+    assert_ok(&out);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let body_at = text.find("the body").unwrap();
+    let head_at = text.find("Comments (1):").expect(&text);
+    assert!(body_at < head_at, "{text}");
+    assert!(text.contains(" — bob\n  hello there"), "{text}");
+    let v = show_json(&sb, &["show", "AGT-1", "--json"]);
+    let c = &v["comments"];
+    assert_eq!(c.as_array().unwrap().len(), 1);
+    assert_eq!(c[0]["author"], "bob");
+    assert_eq!(c[0]["body"], "hello there");
+    let at = c[0]["at"].as_str().unwrap();
+    assert!(at.len() == 10 && at.as_bytes()[4] == b'-', "{at}");
+}
+
+#[test]
+fn show_lists_several_comments_oldest_first_with_multiline_bodies() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_ok(&sb.pm(&["comment", "AGT-1", "first", "--as", "ann"]));
+    let out = sb.run_with_stdin(
+        &["comment", "AGT-1", "--file", "-", "--as", "bob"],
+        "line one\n\nline three\n",
+    );
+    assert_ok(&out);
+    assert_ok(&sb.pm(&["comment", "AGT-1", "third", "--as", "cy"]));
+
+    let out = sb.pm(&["show", "AGT-1"]);
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("Comments (3):"), "{text}");
+    assert!(
+        text.contains(" — bob\n  line one\n\n  line three\n"),
+        "{text}"
+    );
+    let (a, b, c) = (
+        text.find("ann").unwrap(),
+        text.find("bob").unwrap(),
+        text.find("cy\n").unwrap(),
+    );
+    assert!(a < b && b < c, "{text}");
+
+    let v = show_json(&sb, &["show", "AGT-1", "--json"]);
+    let authors: Vec<&str> = v["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["author"].as_str().unwrap())
+        .collect();
+    assert_eq!(authors, ["ann", "bob", "cy"]);
+    assert_eq!(v["comments"][1]["body"], "line one\n\nline three");
+}
+
+#[test]
+fn list_json_omits_comments() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T"]));
+    assert_ok(&sb.pm(&["comment", "AGT-1", "hi"]));
+    let v = show_json(&sb, &["list", "--json"]);
+    assert!(v[0].get("comments").is_none(), "{v}");
+}
