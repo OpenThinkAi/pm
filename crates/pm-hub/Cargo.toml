@@ -30,3 +30,7 @@ tokio-postgres = "0.7"
 ulid = "1.2"
 
 [dev-dependencies]
+# The claims tests build a client log with pm-store and compare the hub's
+# views with the client's own rebuild of it (AGT-1392).
+pm-store = { path = "../pm-store" }
+tempfile = "3.27"

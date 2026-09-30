@@ -33,7 +33,15 @@ fn migrates_on_start_and_serves_health() {
     let tables: Vec<&str> = tables.iter().filter_map(|r| r[0].as_deref()).collect();
     assert_eq!(
         tables,
-        ["numbers", "ops", "schema_version", "tokens", "workspaces"]
+        [
+            "numbers",
+            "ops",
+            "schema_version",
+            "ticket_views",
+            "tokens",
+            "workspace_views",
+            "workspaces"
+        ]
     );
     let seq = query_rows(
         &url,
