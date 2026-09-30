@@ -5,11 +5,13 @@
 //! - `GET /w/{workspace}/whoami` (bearer token): the token's workspace and
 //!   name, so a client can check a token before syncing with it;
 //! - `POST /w/{workspace}/ops` (bearer token): push a batch of ops and get
-//!   their seqs (see `ops`).
+//!   their seqs (see `ops`);
+//! - `GET /w/{workspace}/ops?since=&limit=` (bearer token): pull ops past
+//!   a seq, a page at a time (see `pull`).
 //!
-//! Pull and conditional ops land under `/w/{workspace}/` behind the same
-//! auth layer (AGT-1390 onward). `pm-hub token create|list|revoke` manage
-//! bearer tokens (see `admin`). The HTTP contract is `docs/hub-api.md`.
+//! Conditional ops land under `/w/{workspace}/` behind the same auth layer
+//! (AGT-1391 onward). `pm-hub token create|list|revoke` manage bearer
+//! tokens (see `admin`). The HTTP contract is `docs/hub-api.md`.
 //!
 //! Environment: `DATABASE_URL` (required; a Postgres URL) and `PORT`
 //! (default 8080; Railway sets it).
@@ -18,6 +20,7 @@ mod admin;
 mod auth;
 mod migrate;
 mod ops;
+mod pull;
 
 use std::env;
 use std::error::Error;
@@ -168,7 +171,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
 /// token for the `{workspace}` in their path; `/health` is added after it
 /// and stays open. Unknown paths, wrong methods and auth failures all get
 /// the same bare 404 (`auth::not_found`). Only the push route accepts a
-/// body larger than axum's 2 MB default (`ops::MAX_BODY_BYTES`).
+/// body larger than axum's 2 MB default (`ops::MAX_BODY_BYTES`); axum
+/// merges the two method routers registered for `/ops`, so the pull is
+/// on the same path without that limit (a GET carries no body).
 fn app(db: Db) -> Router {
     let routes = Router::new()
         .route("/w/{workspace}/whoami", get(whoami))
@@ -176,6 +181,7 @@ fn app(db: Db) -> Router {
             "/w/{workspace}/ops",
             post(ops::push).layer(DefaultBodyLimit::max(ops::MAX_BODY_BYTES)),
         )
+        .route("/w/{workspace}/ops", get(pull::pull))
         .route_layer(middleware::from_fn_with_state(
             db.clone(),
             auth::require_auth,
