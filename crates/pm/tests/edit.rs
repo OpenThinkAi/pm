@@ -388,3 +388,74 @@ fn a_body_edit_merges_with_a_concurrent_edit() {
     );
     assert_ok(&sb.run(&["doctor"], None));
 }
+
+impl Sandbox {
+    /// A second replica of this workspace: a byte copy of its database in
+    /// a fresh HOME, taken while no `pm` process has it open.
+    fn replica(&self) -> Sandbox {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        for name in ["pm.sqlite", "pm.sqlite-wal", "pm.sqlite-shm"] {
+            let from = self.ws.join(name);
+            if from.is_file() {
+                std::fs::copy(&from, ws.join(name)).unwrap();
+            }
+        }
+        // `pm init` pointed this HOME's config.toml at the workspace; point
+        // the copy's at its own.
+        let config = |home: &Path| home.join(".config/pm/config.toml");
+        let text = std::fs::read_to_string(config(self.home.path())).unwrap();
+        let text = text.replace(self.ws.to_str().unwrap(), ws.to_str().unwrap());
+        std::fs::create_dir_all(config(home.path()).parent().unwrap()).unwrap();
+        std::fs::write(config(home.path()), text).unwrap();
+        Sandbox { home, ws }
+    }
+
+    /// Every op on AGT-1 in this replica's log.
+    fn ticket_ops(&self) -> Vec<pm_core::Op> {
+        let store = self.store();
+        let t = store.ticket_by_number(1).unwrap().unwrap();
+        store.ops(t.id).unwrap()
+    }
+}
+
+/// P3 gate finding 1 (AGT-1429): two replicas `pm edit` the same
+/// description offline — one edits line A and appends C, the other edits
+/// line B and appends D — and exchange ops. Each edit must land on its own
+/// line; the character-level diff put ", x" on line C.
+#[test]
+fn offline_description_edits_merge_line_faithfully() {
+    let sb = Sandbox::new();
+    let seed = sb.editor(&["perl -pi -e 's/^line one$/A./; s/^line two$/B./' \"$1\""]);
+    assert_ok(&sb.run(&["edit", "AGT-1", "--view=editor"], Some(&seed)));
+    assert_eq!(sb.show()["description"], "A.\nB.");
+    std::fs::remove_file(sb.path("editor-count")).unwrap();
+
+    let other = sb.replica();
+    let left = sb.editor(&["perl -pi -e 's/^A\\.$/A, y./' \"$1\"; printf 'C.\\n' >> \"$1\""]);
+    let right = other.editor(&["perl -pi -e 's/^B\\.$/B, x./' \"$1\"; printf 'D.\\n' >> \"$1\""]);
+    assert_ok(&sb.run(&["edit", "AGT-1", "--view=editor"], Some(&left)));
+    assert_ok(&other.run(&["edit", "AGT-1", "--view=editor"], Some(&right)));
+    assert_eq!(sb.show()["description"], "A, y.\nB.\nC.");
+    assert_eq!(other.show()["description"], "A.\nB, x.\nD.");
+
+    // Reconnect: each replica pulls the other's log (already-known ops are
+    // skipped by op id).
+    let (from_sb, from_other) = (sb.ticket_ops(), other.ticket_ops());
+    sb.store().apply_pulled(&from_other).unwrap();
+    other.store().apply_pulled(&from_sb).unwrap();
+
+    let merged = sb.show()["description"].as_str().unwrap().to_string();
+    assert_eq!(
+        other.show()["description"],
+        merged.as_str(),
+        "replicas converge"
+    );
+    assert!(
+        merged == "A, y.\nB, x.\nC.\nD." || merged == "A, y.\nB, x.\nD.\nC.",
+        "{merged:?}"
+    );
+    assert_ok(&sb.run(&["doctor"], None));
+    assert_ok(&other.run(&["doctor"], None));
+}
