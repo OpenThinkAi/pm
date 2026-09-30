@@ -273,7 +273,9 @@ impl Store {
     /// the storable range, with a spent counter, or more than
     /// [`PULL_MAX_FUTURE_SKEW_MS`] ahead of this machine's clock fails the
     /// batch as [`StoreError::InvalidStamp`] (inside [`StoreError::Pull`])
-    /// rather than panicking or poisoning the local clock.
+    /// rather than panicking or poisoning the local clock. An op carrying
+    /// a workspace prefix or project id unsafe in a file path fails it as
+    /// [`StoreError::InvalidId`].
     pub fn apply_pulled(&mut self, ops: &[Op]) -> Result<Pulled> {
         let tx = self
             .conn
@@ -456,6 +458,9 @@ pub const PULL_MAX_FUTURE_SKEW_MS: u64 = 365 * pm_core::MAX_FUTURE_SKEW_MS;
 fn check_foreign_stamp(op: &Op, now_ms: u64) -> Result<()> {
     op.hlc.check_range()?;
     op.hlc.check_not_after(now_ms, PULL_MAX_FUTURE_SKEW_MS)?;
+    // A prefix or project id this replica would later put in a file path
+    // (AGT-1453) is refused here too (AGT-1450).
+    pm_core::ids::check_op_ids(op)?;
     Ok(())
 }
 

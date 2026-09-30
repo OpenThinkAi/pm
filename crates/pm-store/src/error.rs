@@ -88,6 +88,10 @@ pub enum StoreError {
     /// see [`crate::Store::apply_pulled`]).
     #[error("invalid stamp: {0}")]
     InvalidStamp(#[from] pm_core::StampError),
+    /// A foreign op carrying a workspace prefix or project id that is not
+    /// safe in a file path (`pm_core::ids`, AGT-1450).
+    #[error(transparent)]
+    InvalidId(#[from] pm_core::ids::IdError),
     /// A stored column no longer decodes (a JSON blob or a ULID). Only a
     /// foreign writer or a schema bug can produce this.
     #[error("stored {what} is corrupt: {detail}")]

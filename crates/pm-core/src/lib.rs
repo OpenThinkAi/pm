@@ -20,6 +20,7 @@
 //! - [`domain`] — entity types (`Ticket`, `Project`, markers, …)
 //! - [`markers`] — strict marker dates, waiver rules (AGT-1342)
 //! - [`hlc`] — hybrid logical clock and the `(hlc, actor)` [`Stamp`]
+//! - [`ids`] — path-safety of prefixes and project ids ops carry (AGT-1450)
 //! - [`op`] — the [`Op`] envelope and every payload
 //! - [`bytes`] — byte payloads as base64 on the wire, legacy arrays on read (AGT-1378)
 //! - [`merge`] — LWW register, OR-set, append-only comment log
@@ -34,6 +35,7 @@ pub mod config;
 pub mod doc;
 pub mod domain;
 pub mod hlc;
+pub mod ids;
 pub mod markers;
 pub mod merge;
 pub mod op;

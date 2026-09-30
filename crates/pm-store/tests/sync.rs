@@ -522,6 +522,45 @@ fn a_pulled_op_with_an_inadmissible_stamp_is_a_typed_error() {
     assert_eq!(pulled.applied, 2);
 }
 
+/// AGT-1450: a pulled prefix or project id that would escape a directory
+/// is refused before it is stored.
+#[test]
+fn a_pulled_op_with_a_path_unsafe_id_is_a_typed_error() {
+    let (_dir, mut store) = store();
+    let ws = store.workspace().unwrap().unwrap().id;
+    let bad_prefix = Op::new(
+        Ulid::new(),
+        Hlc::new(50, 0),
+        ActorId::new("laptop"),
+        ws,
+        Payload::WorkspaceSet(pm_core::op::WorkspaceSet::Prefix("../x".into())),
+    );
+    let bad_project = Op::new(
+        Ulid::new(),
+        Hlc::new(51, 0),
+        ActorId::new("laptop"),
+        Ulid::new(),
+        Payload::ProjectCreate(pm_core::op::ProjectCreate {
+            id: "a/b".into(),
+            title: "t".into(),
+            status: ProjectStatus::InProgress,
+            parent: None,
+            doc_id: None,
+        }),
+    );
+    for bad in [bad_prefix, bad_project] {
+        let before = store.ops_since(0).unwrap().len();
+        let err = store.apply_pulled(std::slice::from_ref(&bad)).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Pull { op_id, source, .. }
+                if *op_id == bad.op_id && matches!(**source, StoreError::InvalidId(_))),
+            "{err:?}"
+        );
+        assert_eq!(store.ops_since(0).unwrap().len(), before);
+    }
+    assert_eq!(store.workspace().unwrap().unwrap().prefix, "AGT");
+}
+
 /// The store's own codec: a stamp that does not fit an SQLite integer is
 /// refused with a typed error on any commit path, not a panic.
 #[test]

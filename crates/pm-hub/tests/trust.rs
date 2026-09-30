@@ -453,6 +453,25 @@ fn pushed_stamps_are_range_checked_and_bounded_in_the_future() {
         assert_eq!(count_ops(&url), 0, "{case}: batch refused whole");
     }
 
+    // A prefix or project id unsafe in a file path (AGT-1450).
+    let ws = Ulid::new();
+    let bad_prefix = Op::new(
+        Ulid::new(),
+        Hlc::new(1_000, 1),
+        ActorId::new("matt"),
+        ws,
+        Payload::WorkspaceSet(pm_core::op::WorkspaceSet::Prefix("../../etc".into())),
+    );
+    let (status, err) = push(port, &studio, &[&ok, &bad_prefix]);
+    assert_eq!(status, 400, "{err}");
+    assert_eq!(err["error"], "invalid_id");
+    assert_eq!(err["index"], 1);
+    assert!(
+        err["reason"].as_str().unwrap().contains("workspace prefix"),
+        "{err}"
+    );
+    assert_eq!(count_ops(&url), 0);
+
     // A few hours ahead (a fast clock) and ancient history are fine.
     let ahead = label_as("matt", Hlc::new(now + 3 * 60 * 60 * 1000, u32::MAX - 1));
     let (status, body) = push(port, &studio, &[&ok, &ahead]);

@@ -69,6 +69,11 @@
 //! forward. Stamps from the past are always accepted — a seed uploads
 //! historical ops.
 //!
+//! **Identifiers (AGT-1450).** A `workspace.set prefix`, `project.create`
+//! (id, parent) or `project.set parent` whose value is not a safe path
+//! component (`pm_core::ids::is_safe_component`) is `400 invalid_id`:
+//! clients use these in file paths.
+//!
 //! **Limits.** [`MAX_BATCH_OPS`] ops per batch, [`MAX_BODY_BYTES`] of body
 //! (the Studio's seed log holds one 23 MB `body.edit`, so the byte limit
 //! leaves room for a single large op plus a batch around it). A body over
@@ -190,8 +195,9 @@ enum PushError {
         reason: String,
     },
     /// An op whose HLC is out of range (`invalid_stamp`) or too far in
-    /// the future (`future_stamp`).
-    Stamp {
+    /// the future (`future_stamp`), or that carries a prefix or project id
+    /// unsafe in a file path (`invalid_id`).
+    OpCheck {
         error: &'static str,
         index: usize,
         op_id: Option<String>,
@@ -303,7 +309,7 @@ impl IntoResponse for PushError {
                     op_id: Some(op_id),
                 },
             ),
-            PushError::Stamp {
+            PushError::OpCheck {
                 error,
                 index,
                 op_id,
@@ -465,7 +471,7 @@ fn parse_op(index: usize, raw: &RawValue, now_ms: u64) -> Result<Parsed<'_>, Pus
     if op.actor.as_str().is_empty() {
         return Err(invalid("actor is empty".to_string()));
     }
-    let stamp = |error: &'static str, e: pm_core::StampError| PushError::Stamp {
+    let stamp = |error: &'static str, e: pm_core::StampError| PushError::OpCheck {
         error,
         index,
         op_id: Some(op.op_id.to_string()),
@@ -477,6 +483,14 @@ fn parse_op(index: usize, raw: &RawValue, now_ms: u64) -> Result<Parsed<'_>, Pus
     op.hlc
         .check_not_after(now_ms, MAX_FUTURE_SKEW_MS)
         .map_err(|e| stamp("future_stamp", e))?;
+    // Prefixes and project ids end up in client file paths (AGT-1453);
+    // refuse a hostile one before it is stored (AGT-1450).
+    pm_core::ids::check_op_ids(&op).map_err(|e| PushError::OpCheck {
+        error: "invalid_id",
+        index,
+        op_id: Some(op.op_id.to_string()),
+        reason: e.to_string(),
+    })?;
     let hlc_wall_ms = i64::try_from(op.hlc.wall_ms)
         .map_err(|_| invalid(format!("hlc.wall_ms {} is out of range", op.hlc.wall_ms)))?;
     let role = match (&op.payload, numbers::number_value(&op)) {
@@ -857,15 +871,19 @@ mod tests {
     }
 
     fn stamp_err(raw: &str) -> (&'static str, Option<String>, String) {
+        stamp_err_at(2, raw)
+    }
+
+    fn stamp_err_at(at: usize, raw: &str) -> (&'static str, Option<String>, String) {
         let raw: &RawValue = serde_json::from_str(raw).unwrap();
-        match parse_op(2, raw, NOW) {
-            Err(PushError::Stamp {
+        match parse_op(at, raw, NOW) {
+            Err(PushError::OpCheck {
                 error,
                 index,
                 op_id,
                 reason,
             }) => {
-                assert_eq!(index, 2);
+                assert_eq!(index, at);
                 (error, op_id, reason)
             }
             Err(e) => panic!("not a stamp error: {e:?}"),
@@ -900,6 +918,17 @@ mod tests {
             let raw: &RawValue = serde_json::from_str(&raw).unwrap();
             assert!(parse_op(0, raw, NOW).is_ok(), "{wall_ms}.{counter}");
         }
+    }
+
+    #[test]
+    fn refuses_path_unsafe_prefixes_and_project_ids() {
+        let raw = r#"{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{"wall_ms":1,"counter":0},
+            "actor":"a","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"workspace.set",
+            "payload":{"field":"prefix","value":"../../etc"},"version":1}"#;
+        let (error, op_id, reason) = stamp_err_at(0, raw);
+        assert_eq!(error, "invalid_id");
+        assert_eq!(op_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(reason.contains("workspace prefix"), "{reason}");
     }
 
     #[test]
