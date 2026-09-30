@@ -28,6 +28,14 @@ pub struct Env {
     pub pm_workspace: Option<PathBuf>,
     pub pm_actor: Option<String>,
     pub user: Option<String>,
+    /// `PM_HUB_TOKEN` (AGT-1394): the hub bearer token; wins over the keychain.
+    pub hub_token: Option<String>,
+    /// `PM_HUB_KEYCHAIN_SERVICE_PREFIX`: replaces `pm-hub` in the keychain
+    /// service name so tests only touch throwaway items.
+    pub hub_keychain_prefix: Option<String>,
+    /// `PM_HUB_KEYCHAIN`: a keychain file for every keychain call instead of
+    /// the default (login) keychain. Tests point it at a throwaway one.
+    pub hub_keychain: Option<PathBuf>,
 }
 
 impl Env {
@@ -55,6 +63,9 @@ impl Env {
             pm_workspace: path("PM_WORKSPACE"),
             pm_actor: text("PM_ACTOR"),
             user: text("USER"),
+            hub_token: text("PM_HUB_TOKEN"),
+            hub_keychain_prefix: text("PM_HUB_KEYCHAIN_SERVICE_PREFIX"),
+            hub_keychain: path("PM_HUB_KEYCHAIN"),
         }
     }
 
@@ -105,7 +116,7 @@ pub struct Config {
     pub edit: Option<EditConfig>,
     /// The pm-hub that arbitrates claims and numbers (README §Authority),
     /// e.g. `https://pm-hub.example`. Unset means this machine's database
-    /// is the authority (phases 1–2). Until the hub protocol lands (P3),
+    /// is the authority (phases 1–2). Written by `pm hub login` (AGT-1394). Until the hub protocol lands (P3),
     /// setting it makes `pm claim` refuse rather than claim unconfirmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub: Option<String>,

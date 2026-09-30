@@ -1,0 +1,19 @@
+{
+  "configured": false,
+  "error": null,
+  "health": null,
+  "hub": null,
+  "keychain_service": "<SERVICE>",
+  "reachable": null,
+  "schema": 1,
+  "token": {
+    "present": true,
+    "source": "env"
+  },
+  "token_accepted": null,
+  "token_name": null,
+  "workspace": {
+    "id": "<ULID>",
+    "prefix": "AGT"
+  }
+}

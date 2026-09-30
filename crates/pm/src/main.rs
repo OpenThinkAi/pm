@@ -12,6 +12,7 @@ mod doctor;
 mod edit;
 mod exit;
 mod export;
+mod hub;
 mod import;
 mod markers;
 mod mutate;
@@ -351,6 +352,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: workspace::WorkspaceCmd,
     },
+    /// The pm-hub connection: login (URL + token), status, logout
+    Hub {
+        #[command(subcommand)]
+        cmd: hub::HubCmd,
+    },
     /// Markdown vault tickets (legacy, reads ticket files directly)
     Ticket {
         #[command(subcommand)]
@@ -609,6 +615,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         } => export::md(ctx, &dir, legacy_markers),
         Cmd::Project { cmd } => project::run(ctx, cmd),
         Cmd::Workspace { cmd } => workspace::run(ctx, cmd),
+        Cmd::Hub { cmd } => hub::run(ctx, cmd),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {
             Some(BackupCmd::InstallTimer { dir, no_load }) => {

@@ -1024,6 +1024,78 @@ regardless of `--no-load`), `--no-load` (write without loading).
   }
   ```
 
+### `pm hub login <URL>` / `status` / `logout`
+
+Where this machine keeps the hub URL and bearer token for the resolved
+workspace (AGT-1394). None of these write an op; only `status` touches the
+network. **Reads (`pm list`, `show`, `ready`, `status`, `graph`, `log`, …)
+never contact the hub** — `tests/hub.rs` runs them against a loopback
+listener and asserts it sees no connection.
+
+- **URL**: `hub = "<URL>"` in config.toml. `login` edits only that key
+  (other keys survive; comments do not). The URL must be `http(s)://host[:port][/path]`
+  with no credentials, query or fragment (exit `2`); a trailing `/` is dropped.
+- **Token**: never in config.toml.
+  - macOS: login keychain, service `pm-hub.<workspace-id>`, account `pm`.
+    `<workspace-id>` is the workspace's ULID (`workspace.id`, the id the hub
+    keys a workspace by in `/w/{workspace}/…`). It is stable if the prefix is
+    renamed and distinct per workspace. The token is handed to
+    `security -i` on its stdin, so it is never on argv.
+  - Elsewhere: no keychain. The token is read only from `PM_HUB_TOKEN`;
+    `login` writes the URL, stores nothing, and says so on stderr.
+  - `PM_HUB_TOKEN`, when set, wins over the keychain on every platform.
+  - Tokens are `[A-Za-z0-9_-]+` (the hub's alphabet), else exit `2`.
+- Test hooks: `PM_HUB_KEYCHAIN_SERVICE_PREFIX` replaces `pm-hub` in the
+  service name; `PM_HUB_KEYCHAIN=<file>` points every keychain call at that
+  keychain file instead of the login keychain.
+- A configured `hub` still makes `pm claim` refuse until the sync protocol
+  lands (P3); `pm hub logout` restores local claiming.
+
+`login` reads the token from `PM_HUB_TOKEN`, else stdin (macOS), stores it
+(updating any existing item), then writes `hub`. It does not contact the hub.
+`--json`:
+
+```jsonc
+{
+  "schema": 1,
+  "hub": "https://hub.example",
+  "workspace": "01M3…",              // workspace ULID
+  "config": "/abs/path/config.toml",
+  "token_stored": true,             // false when there is no keychain
+  "keychain_service": "pm-hub.01M3…" | null
+}
+```
+
+`status` reports the URL, workspace, token presence (never its value) and,
+when a hub is configured, `GET <hub>/health` (5 s timeout) and — if a token
+is present and the hub is reachable — `GET <hub>/w/<workspace-id>/whoami`
+(a bare `404` means the token is not accepted). Exit `1` if the hub is
+unreachable or rejects the token; exit `0` when no hub is configured.
+`--json`:
+
+```jsonc
+{
+  "schema": 1,
+  "configured": true,
+  "hub": "https://hub.example" | null,
+  "workspace": {"id": "01M3…", "prefix": "AGT"},
+  "token": {"present": true, "source": "env" | "keychain" | null},
+  "keychain_service": "pm-hub.01M3…" | null,   // null off macOS
+  "reachable": true | false | null,             // null: no hub configured
+  "health": {"schema_version": 1, "op_version": 5} | null,
+  "token_accepted": true | false | null,        // null: not asked (no token, or hub unreachable)
+  "token_name": "laptop" | null,                // whoami's `name`
+  "error": "string" | null                      // transport / unexpected-status message
+}
+```
+
+`logout` deletes the keychain item (a missing one is fine) and removes `hub`
+from config.toml; running it twice is not an error. `--json`:
+
+```jsonc
+{ "schema": 1, "hub_removed": true, "token_removed": true, "workspace": "01M3…" }
+```
+
 ## Verbs with no `--json` output
 
 `pm ticket list`/`pm ticket show` (above) are the only verbs `--json`
