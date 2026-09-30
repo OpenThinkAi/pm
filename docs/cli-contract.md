@@ -536,6 +536,13 @@ the board's window has been closed for `--idle` seconds, or when ui-leaf
 exits. With no display or no pinned ui-leaf it says why on stderr and
 serves headless instead, printing `url:` and `token:` lines.
 
+The board (AGT-1404; `docs/app-api.md` §The board) is a column per
+workflow state in state order, a card per unarchived ticket with its
+held/parked/gate markers, filters by project, label and assignee, and a
+live refetch as ops land. Dragging a card (or its **Move…** menu) is
+`pm move` without `--keep-assignee`; dropping into a `started` state is
+refused with a pointer to `pm claim` — claims stay CLI-only.
+
 It opens the board whether or not stdin/stdout are terminals: `pm app`
 is itself the request to open it (unlike `pm edit`'s default). Scripts and
 agents that want only the API use `--json`.

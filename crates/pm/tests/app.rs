@@ -828,6 +828,51 @@ fn a_loro_update_from_an_editor_merges_like_pm_edit() {
     assert_eq!(sb.op_kinds("AGT-1"), before);
 }
 
+/// The board's drop (AGT-1404, `planMove` in crates/pm/views/lib/board.ts)
+/// sends exactly `{"state", "keep_assignee": false}` addressed by the
+/// ticket's ref — the ULID when it has no number yet — and that is one
+/// `state.transition` (plus `pm move`'s assignee clear into an unstarted
+/// state), streamed to every open board.
+#[test]
+fn a_board_move_is_a_state_transition_by_ref() {
+    let sb = Sandbox::new();
+    assert_ok(&sb.run(&["set", "AGT-1", "assignee=matt"], &[]));
+    let ulid = sb.json(&["show", "AGT-1"])["ulid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let app = App::start(&sb, &["--idle", "0"]);
+    let events = app.events();
+    events.next(Duration::from_secs(5)); // hello
+
+    let before = sb.op_kinds("AGT-1").len();
+    let (status, t) = app.post(
+        &format!("/tickets/{ulid}/state"),
+        json!({"state": "done", "keep_assignee": false}),
+    );
+    assert_eq!(status, 200, "{t}");
+    assert_eq!(t["state"], "done");
+    assert_eq!(t["assignee"], "matt", "a completed move keeps the assignee");
+    assert_eq!(sb.op_kinds("AGT-1")[before..], ["state.transition"]);
+    let op = events.next(Duration::from_secs(1));
+    assert_eq!(op["kind"], "state.transition");
+    assert_eq!(op["id"], "AGT-1");
+
+    let (status, t) = app.post(
+        &format!("/tickets/{ulid}/state"),
+        json!({"state": "triage", "keep_assignee": false}),
+    );
+    assert_eq!(status, 200, "{t}");
+    assert_eq!(t["state"], "triage");
+    assert!(t["assignee"].is_null(), "back to unstarted un-assigns: {t}");
+    assert_eq!(sb.op_kinds("AGT-1")[before + 1], "state.transition");
+    assert_eq!(
+        t,
+        sb.json(&["show", "AGT-1"]),
+        "the answer is `pm show --json`"
+    );
+}
+
 #[test]
 fn a_cli_write_in_another_process_reaches_the_stream_within_a_second() {
     let sb = Sandbox::new();

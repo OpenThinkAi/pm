@@ -27,6 +27,7 @@ use crate::workspace::Env;
 pub(crate) const FILES: &[(&str, &str)] = &[
     ("board.tsx", include_str!("../../views/board.tsx")),
     ("ticket.tsx", include_str!("../../views/ticket.tsx")),
+    ("lib/board.ts", include_str!("../../views/lib/board.ts")),
     ("lib/pm.ts", include_str!("../../views/lib/pm.ts")),
 ];
 
