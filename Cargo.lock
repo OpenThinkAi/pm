@@ -1525,9 +1525,13 @@ name = "pm-hub"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
+ "clap",
+ "getrandom 0.3.4",
  "pm-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "tokio",
  "tokio-postgres",
