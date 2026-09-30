@@ -70,6 +70,11 @@ see the `pm label` note below):
 | `-h`, `--help` | Print help for the command or subcommand and exit `0`. |
 | `-V`, `--version` | Print `pm`'s version and exit `0` (top-level only). |
 
+Human-readable output (AGT-1465) strips terminal control characters (C0/C1,
+ESC sequences, bidi overrides) from ticket and project text, comments, hold
+reasons and hub error bodies, since they arrive from other actors; `--json` is
+exactly the stored text.
+
 **`pm label`'s flag-ordering gotcha.** `pm label <id> +x -y` takes
 `-y`-shaped tokens as its own positional arguments (`allow_hyphen_values`),
 so a global flag placed *after* `label` can be swallowed by that same
@@ -513,7 +518,9 @@ when:
   `ui-leaf` was asked for by flag or config, then one stderr line;
 - there is **no pinned ui-leaf** — `ui_leaf.path` in config.toml (else the
   first `ui-leaf` on `PATH`) is missing, does not run, or reports a version
-  outside `>=1.6.0, <2.0.0`. Always one stderr line saying which;
+  outside `>=1.6.0, <2.0.0`; or the `PATH` hit is not the npm-installed
+  `@openthink/ui-leaf` package (AGT-1465; name it in `ui_leaf.path` to use it
+  anyway). Always one stderr line saying which;
 - ui-leaf **exits before its view is ready**. One stderr line.
 
 **`editor`** opens the ticket as frontmatter + markdown in `$EDITOR`

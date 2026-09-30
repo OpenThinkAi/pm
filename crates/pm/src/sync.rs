@@ -153,7 +153,10 @@ pub fn sync(ctx: &Ctx<'_>, args: SyncArgs) -> Result<()> {
         Some(secs) => loop {
             match run_once(ctx, &mut store, &hub, &limits) {
                 Ok(round) => report(ctx, &store, &ws, &hub, &round, true)?,
-                Err(e) => eprintln!("pm: sync failed: {:#}", e.error),
+                Err(e) => eprintln!(
+                    "pm: sync failed: {}",
+                    crate::text::printable(&format!("{:#}", e.error))
+                ),
             }
             sleep(Duration::from_secs(secs));
         },
@@ -441,7 +444,7 @@ impl std::fmt::Display for RejectedClaim {
             self.op_id,
             self.ticket,
             crate::verbs::when(&self.rejected.at),
-            self.rejected.reason
+            crate::text::inline(&self.rejected.reason)
         )
     }
 }
@@ -604,13 +607,13 @@ pub(crate) fn unauthorized(hub: &HubClient) -> CliError {
 pub(crate) fn refused(status: u16, body: &str) -> CliError {
     let detail: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let field = |k: &str| detail.get(k).and_then(Value::as_str).map(str::to_string);
-    let error = field("error").unwrap_or_else(|| format!("HTTP {status}"));
-    let reason = field("reason").unwrap_or_else(|| body.trim().to_string());
+    let error = crate::text::inline(&field("error").unwrap_or_else(|| format!("HTTP {status}")));
+    let reason = crate::text::inline(&field("reason").unwrap_or_else(|| body.trim().to_string()));
     let mut msg = format!("the hub refused the request ({error}): {reason}");
     if let Some(index) = detail.get("index").and_then(Value::as_u64) {
         msg.push_str(&format!(" (op #{index} of the batch"));
         if let Some(op_id) = field("op_id") {
-            msg.push_str(&format!(", {op_id}"));
+            msg.push_str(&format!(", {}", crate::text::inline(&op_id)));
         }
         msg.push(')');
     }
@@ -702,6 +705,22 @@ mod tests {
     use super::*;
     use pm_core::op::CommentAdd;
     use pm_core::{ActorId, Hlc, Payload};
+
+    #[test]
+    fn hub_error_bodies_are_stripped_of_terminal_controls() {
+        let body =
+            r#"{"error":"bad\u001b[2J","reason":"why\u001b]0;x\u0007\u202e!","op_id":"o\u009b"}"#;
+        let msg = refused(400, &body.replace("\"op_id\"", "\"index\":1,\"op_id\""))
+            .error
+            .to_string();
+        assert!(
+            !msg.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{msg:?}"
+        );
+        assert!(msg.contains("why]0;x!"), "{msg}");
+        let plain = refused(502, "\x1b[31mgateway\x1b[0m\n").error.to_string();
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+    }
 
     fn comment(body: &str) -> (i64, Op) {
         (

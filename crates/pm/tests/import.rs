@@ -729,7 +729,7 @@ fn a_parse_error_names_the_file_and_line_and_writes_nothing() {
     let out = sb.pm(&["import", "vault", vault.to_str().unwrap()]);
     assert_code(&out, 2);
     assert!(
-        stderr(&out).contains("tickets/triage/AGT-99-bad.md:8: parsing frontmatter"),
+        stderr(&out).contains("tickets/triage/AGT-99-bad.md:7: parsing frontmatter"),
         "{}",
         stderr(&out)
     );

@@ -658,13 +658,15 @@ fn status(ctx: &Ctx<'_>) -> Result<()> {
             println!("op version: {}", field("op_version").unwrap_or(Value::Null));
         }
         match (token_accepted, &token_name) {
-            (Some(true), Some(n)) => println!("token ok:   accepted (named {n})"),
+            (Some(true), Some(n)) => {
+                println!("token ok:   accepted (named {})", crate::text::inline(n))
+            }
             (Some(true), None) => println!("token ok:   accepted"),
             (Some(false), _) => println!("token ok:   REJECTED"),
             (None, _) => {}
         }
         if let Some(e) = &error {
-            println!("error:      {e}");
+            println!("error:      {}", crate::text::inline(&e.to_string()));
         }
     }
 

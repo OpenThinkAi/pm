@@ -23,9 +23,11 @@ mod read;
 mod ready;
 mod seed;
 mod sync;
+mod text;
 mod ticket;
 mod verbs;
 mod workspace;
+mod yaml;
 
 use ticket::{Filter, State, Ticket};
 
@@ -479,7 +481,7 @@ fn main() -> ExitCode {
     match run(&ctx, cli.cmd) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("pm: {:#}", e.error);
+            eprintln!("pm: {}", text::printable(&format!("{:#}", e.error)));
             ExitCode::from(e.code)
         }
     }

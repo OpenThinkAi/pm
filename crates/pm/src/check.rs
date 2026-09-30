@@ -45,7 +45,7 @@ pub fn check(ctx: &Ctx<'_>, project: Option<&str>) -> Result<()> {
                 "{:<18} {:<14} {}",
                 f.rule(),
                 ids.join(","),
-                message(f, &ws, &name)
+                crate::text::inline(&message(f, &ws, &name))
             );
         }
         if findings.is_empty() {

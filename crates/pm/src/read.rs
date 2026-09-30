@@ -79,8 +79,8 @@ pub fn list(ctx: &Ctx<'_>, args: ListArgs) -> Result<()> {
             display_id(&ws, t),
             t.state,
             priority_str(&t.priority),
-            project,
-            t.title,
+            crate::text::inline(project),
+            crate::text::inline(&t.title),
             id_w = widths.0,
             state_w = widths.1,
         );
@@ -126,7 +126,7 @@ pub fn log(ctx: &Ctx<'_>, reference: Option<&str>) -> Result<()> {
             crate::verbs::when_secs(&op.hlc),
             op.actor.as_str(),
             op.kind(),
-            op_summary_in(op, &slugs)
+            crate::text::inline(&op_summary_in(op, &slugs))
         );
     }
     Ok(())
@@ -528,7 +528,7 @@ pub fn print_section(ctx: &Ctx<'_>, ticket: &Ticket, section: &str) -> Result<()
             if ctx.json {
                 print_json(&json!({ "schema": SCHEMA, "section": section, "body": body }));
             } else {
-                print!("{body}");
+                print!("{}", crate::text::printable(&body));
                 if !body.ends_with('\n') {
                     println!();
                 }

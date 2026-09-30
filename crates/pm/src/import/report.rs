@@ -168,6 +168,6 @@ fn section(title: &str, lines: &[String]) {
     println!();
     println!("{title} ({}):", lines.len());
     for line in lines {
-        println!("  {line}");
+        println!("  {}", crate::text::inline(line));
     }
 }

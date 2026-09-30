@@ -47,26 +47,29 @@ pub(crate) const FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// FNV-1a over every file's path and bytes, in `FILES` order.
-fn fingerprint_of<'a>(files: impl Iterator<Item = (&'a str, &'a [u8])>) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+/// SHA-256 over every file's path and bytes, in `FILES` order, each
+/// length-prefixed so no two file sets share a framing. (AGT-1465: this
+/// was FNV-1a, which is not collision-resistant, and [`verified`] leans on
+/// it to decide whether a cache directory may be mounted.) Lowercase hex.
+fn fingerprint_of<'a>(files: impl Iterator<Item = (&'a str, &'a [u8])>) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut hasher = Sha256::new();
     for (name, bytes) in files {
-        for byte in name
-            .bytes()
-            .chain([0])
-            .chain(bytes.iter().copied())
-            .chain([0])
-        {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
     }
-    hash
+    hasher.finalize().iter().fold(String::new(), |mut hex, b| {
+        let _ = write!(hex, "{b:02x}");
+        hex
+    })
 }
 
 /// The embedded views' fingerprint: the unpacked directory's name, so a
 /// `pm` with different views never mounts a stale copy.
-fn fingerprint() -> u64 {
+fn fingerprint() -> String {
     fingerprint_of(FILES.iter().map(|(n, t)| (*n, t.as_bytes())))
 }
 
@@ -121,7 +124,7 @@ pub(crate) fn root(env: &Env) -> Result<PathBuf> {
 
 /// `base/<fingerprint>`, written if it is not there yet.
 fn unpack(base: &Path) -> Result<PathBuf> {
-    let dir = base.join(format!("{:016x}", fingerprint()));
+    let dir = base.join(fingerprint());
     if dir.is_dir() {
         if verified(&dir) {
             return Ok(dir);
@@ -211,6 +214,20 @@ mod tests {
         }
         // Only the fingerprinted directory: no temp directory left behind.
         assert_eq!(fs::read_dir(&base).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn the_fingerprint_is_sha256_hex_with_unambiguous_framing() {
+        let a = fingerprint_of([("ab", b"c".as_slice())].into_iter());
+        let b = fingerprint_of([("a", b"bc".as_slice())].into_iter());
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        // SHA-256 of the empty file set is the empty-input digest.
+        assert_eq!(
+            fingerprint_of(std::iter::empty()),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]

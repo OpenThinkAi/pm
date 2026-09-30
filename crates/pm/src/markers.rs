@@ -127,8 +127,8 @@ pub fn holds(ctx: &Ctx<'_>, args: HoldsArgs) -> Result<()> {
             println!(
                 "{}  {}  [{}]",
                 display_id(&ws, t),
-                t.title,
-                describe_hold(hold)
+                crate::text::inline(&t.title),
+                crate::text::inline(&describe_hold(hold))
             );
         }
     }
@@ -161,7 +161,7 @@ pub fn print_block(t: &Ticket) {
     }
     println!("markers:");
     for line in lines {
-        println!("  {line}");
+        println!("  {}", crate::text::inline(&line));
     }
 }
 

@@ -68,7 +68,7 @@ impl Sandbox {
         let sb = Sandbox { home, ws };
         std::fs::create_dir_all(sb.rec()).unwrap();
         std::fs::create_dir_all(sb.path("bin")).unwrap();
-        sb.install_fake(&sb.path("bin/ui-leaf"));
+        sb.install_npm_fake("@openthink/ui-leaf");
         assert_ok(&sb.run(&["init", "--prefix", "AGT", "--preset", "saltline"], &[]));
         assert_ok(&sb.run(&["new", "--title", "Original title"], &[]));
         sb
@@ -86,6 +86,23 @@ impl Sandbox {
     fn install_fake(&self, at: &Path) {
         let script = FAKE.replace("__REC__", self.rec().to_str().unwrap());
         write_executable(at, &script);
+    }
+
+    /// The fake as an npm global install: `bin/ui-leaf` is a symlink to
+    /// `<lib>/@openthink/ui-leaf/bin/ui-leaf` beside a `package.json`
+    /// named `package` — the layout pm verifies a `PATH` hit against.
+    fn install_npm_fake(&self, package: &str) {
+        let pkg = self.path("lib/node_modules/@openthink/ui-leaf");
+        std::fs::create_dir_all(pkg.join("bin")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!("{{\"name\":\"{package}\"}}"),
+        )
+        .unwrap();
+        self.install_fake(&pkg.join("bin/ui-leaf"));
+        let link = self.path("bin/ui-leaf");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(pkg.join("bin/ui-leaf"), link).unwrap();
     }
 
     fn recorded(&self, name: &str) -> Option<String> {
@@ -449,6 +466,52 @@ fn ui_leaf_from_config_wins_over_path() {
     std::fs::write(sb.rec().join("quit"), "").unwrap();
     let (code, _, stderr) = wait(child, 30);
     assert_eq!(code, Some(0), "{stderr}");
+}
+
+#[test]
+fn a_path_ui_leaf_that_is_not_the_npm_package_is_not_launched() {
+    // AGT-1465: pm gives the runtime its API token, so a stray executable
+    // named ui-leaf on PATH (or a shim of another package) never gets it.
+    let sb = Sandbox::new();
+    let editor = sb.editor();
+    for bare in [true, false] {
+        if bare {
+            let _ = std::fs::remove_file(sb.path("bin/ui-leaf"));
+            sb.install_fake(&sb.path("bin/ui-leaf"));
+        } else {
+            sb.install_npm_fake("someone-elses-package");
+        }
+        let out = sb.run(
+            &["edit", "AGT-1", "--view=ui-leaf"],
+            &[("EDITOR", editor.to_str().unwrap())],
+        );
+        assert_ok(&out);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not the npm @openthink/ui-leaf package")
+                && stderr.contains("ui_leaf.path"),
+            "{stderr}"
+        );
+        assert!(!sb.was_mounted());
+    }
+    assert_eq!(sb.editor_runs(), 2);
+    // Naming the same binary in config is the explicit opt-in.
+    let custom = sb.path("tools/ui-leaf");
+    std::fs::create_dir_all(custom.parent().unwrap()).unwrap();
+    sb.install_fake(&custom);
+    let config = sb.path(".config/pm/config.toml");
+    let base = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::write(
+        &config,
+        format!("{base}\n[ui_leaf]\npath = \"{}\"\n", custom.display()),
+    )
+    .unwrap();
+    let out = sb.run(
+        &["edit", "AGT-1", "--view=ui-leaf"],
+        &[("EDITOR", editor.to_str().unwrap())],
+    );
+    assert_ok(&out);
+    assert!(sb.was_mounted(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 #[test]
