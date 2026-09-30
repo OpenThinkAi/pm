@@ -82,3 +82,38 @@ The `pm app` view page keeps `'wasm-unsafe-eval'` (for loro's wasm) and
 `'unsafe-inline'` in `script-src`. The latter stays because ui-leaf serves
 views as a single page with inline scripts and supports no nonce or hash;
 see `docs/app-api.md`.
+
+## Sync
+
+Ops arrive from other machines through the hub, so both ends check them
+(`docs/hub-api.md` §push lists the hub's refusals; a replica applies the
+same checks on pull, local commit and `pm backup --restore`).
+
+- **Bounded input (AGT-1467).** A `body.edit` update is at most 32 MiB
+  decoded (`pm_core::MAX_BODY_EDIT_BYTES`), refused at the hub's push and
+  on every client ingest path. A pull page is at most 16 MiB of ops
+  (always at least one op), cut in the database, so neither the hub nor a
+  client buffers an unbounded page. A replica's pull loop tries each op
+  at most 33 times however adversarially the page is ordered.
+- **No wedged replicas (AGT-1467).** A pulled op a replica cannot apply
+  is parked or refused into a local quarantine (`pm doctor` lists it)
+  instead of failing every later `pm sync`; the decision depends only on
+  the hub's log, so every replica quarantines the same ops and they still
+  converge (`pm_store::Store::apply_pulled_page` has the argument).
+- **Paths (AGT-1450, AGT-1464, AGT-1467).** Workspace prefixes, project
+  ids, state names and document names become file paths (`pm export md`,
+  backups, editor files). Besides separators, dot-segments and control
+  characters, they may not contain `:` or be a Windows device name
+  (`CON`, `NUL`, `COM1`, …, any case, any extension): on Windows `C:x`
+  joined onto a directory is drive-relative and replaces it. The
+  workspace prefix `pm init --join` stores is held to the same rule.
+- **Who an op says it is (AGT-1450, AGT-1467).** `op.actor` is written by
+  the op's author; the hub stores a fresh op only if the pushing token's
+  actor binding permits it. Document identity trusts it (a binding
+  stamped before its project's create counts only under the creator's
+  actor), so an unrestricted token (legacy or `--any`) is as trusted as
+  any actor; bind every other token to its machine's actors.
+- **Hub to Postgres.** No `sslmode` means plaintext and prints a notice at
+  start-up; `prefer` tries TLS then falls back as libpq does (a passive
+  listener only); `require`/`verify-*` always verify. Use TLS whenever
+  the database is not on a private network.

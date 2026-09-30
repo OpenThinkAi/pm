@@ -4,9 +4,15 @@
   "head": 0,
   "hub": "<HUB>",
   "outbox": 0,
+  "parked": 0,
   "pending_numbers": 0,
   "pulled": 0,
   "pushed": 48,
+  "quarantine": {
+    "parked": 0,
+    "refused": 0
+  },
+  "refused": [],
   "rejected": [],
   "schema": 1,
   "seed": {
@@ -17,5 +23,6 @@
   },
   "seeded": true,
   "skipped": 0,
+  "unparked": 0,
   "workspace": "<ULID>"
 }

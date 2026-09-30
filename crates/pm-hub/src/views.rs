@@ -59,7 +59,8 @@
 //! namespace, and a `body.edit` is routed by it). pm-store refuses
 //! the same ops on every commit path, a pull included, so a log the hub
 //! admitted is one every replica folds; refusing them at the push keeps
-//! them out of that log, where they would fail every replica's pull.
+//! them out of that log, where every replica would have to quarantine
+//! them (AGT-1467; before that, they failed every replica's pull).
 //! [`Views::load`] reads what the rules need for the batch's entities and
 //! the document ids it binds ([`batch_entities`]);
 //! a rebuild ([`rebuild`]) does not re-judge the stored log.

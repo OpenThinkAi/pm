@@ -6,17 +6,20 @@
   "healthy": true,
   "integrity": [],
   "op_count": 48,
+  "quarantine": [],
   "rebuilt": {
     "tables": []
   },
   "replay_error": null,
   "schema": 1,
-  "schema_version": 11,
+  "schema_version": 12,
   "sync": {
     "cursor": 0,
     "outbox": 48,
+    "parked": 0,
     "pending_numbers": 0,
     "pushed_through": 0,
+    "refused": 0,
     "seeded": false
   },
   "tables": {
@@ -32,9 +35,10 @@
     "project_doc_view": 1,
     "project_view": 1,
     "relation": 2,
-    "schema_version": 11,
+    "schema_version": 12,
     "state": 3,
     "sync_pushed": 0,
+    "sync_quarantine": 0,
     "sync_state": 1,
     "ticket": 4,
     "ticket_label": 3,

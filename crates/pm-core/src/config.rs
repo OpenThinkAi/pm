@@ -178,6 +178,20 @@ pub struct ProjectView {
 /// binding, only arrival order at the hub can. A second `project.create`
 /// for a project (which could drag `created` back) is refused at every
 /// ingest path instead (`pm-store`, and the hub's push).
+///
+/// **Who may speak as the creator (AGT-1467).** The exception trusts the
+/// binding's `actor`, a field whoever writes the op fills in; pm-core
+/// authenticates nothing. It is sound because no untrusted writer can
+/// choose it: the hub stores a fresh op only when the pushing token's
+/// actor binding permits the op's `actor` (AGT-1450, pm-hub
+/// `ops::check_actor`), so a backdated `project.doc_add` under the
+/// creator's actor — or `migrate`, migration 0007's creator — is accepted
+/// only from a token bound to that actor or an unrestricted one (`--any`,
+/// or a legacy token minted before bindings), i.e. from someone who could
+/// already author as the creator. A replica ingests foreign ops only
+/// from the hub (a pull) or from its own operator (`pm backup --restore`).
+/// Anything that ingests ops from another source must enforce the same
+/// binding before this rule is safe.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DocClaims(BTreeMap<Ulid, Stamp>);

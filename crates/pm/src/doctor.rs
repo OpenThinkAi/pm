@@ -3,7 +3,9 @@
 //! constraint holds and replaying the op log reproduces the derived
 //! tables (config, ticket and project-document; AGT-1385 added config)
 //! exactly — else 1. `--rebuild` regenerates them from the log first,
-//! prints what changed, then reports on the result.
+//! prints what changed, then reports on the result. Pulled ops `pm sync`
+//! parked or refused (AGT-1467) are listed under `quarantine`; they are
+//! informational and never affect health.
 
 use pm_store::{Diff, Report};
 use serde_json::{Value, json};
@@ -121,6 +123,29 @@ fn print_report(report: &Report) {
         println!(
             "seeded          no (the first `pm sync` seeds the hub, or joins one already seeded)"
         );
+    }
+
+    if report.quarantine.is_empty() {
+        println!("quarantine      none");
+    } else {
+        println!(
+            "quarantine      {} parked, {} refused (pulled ops kept out of the log)",
+            sync.parked, sync.refused
+        );
+        for q in &report.quarantine {
+            let status = match q.status {
+                pm_store::QuarantineStatus::Parked => "parked",
+                pm_store::QuarantineStatus::Refused => "refused",
+            };
+            println!(
+                "  {status:<7} {} {} (hub seq {}, entity {}): {}",
+                q.op_id,
+                q.kind,
+                q.hub_seq,
+                q.entity,
+                crate::text::inline(&q.reason)
+            );
+        }
     }
 
     match &report.replay_error {

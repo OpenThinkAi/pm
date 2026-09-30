@@ -19,6 +19,16 @@
 //! (`ideation/IDEA-1`) — so they get their own, looser rules
 //! ([`is_safe_segment`], [`is_safe_doc_name`], AGT-1464) that refuse only
 //! dot-segments, hidden names, separators and control characters.
+//!
+//! **Windows (AGT-1467).** Both rules also refuse what only Windows reads
+//! as more than a name: a `:` (`C:x` joined onto a directory is a
+//! drive-relative path that replaces it, and `name:stream` is an NTFS
+//! alternate data stream) and the reserved device names (`CON`, `PRN`,
+//! `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9` and their superscript-digit
+//! forms, `CONIN$`, `CONOUT$`) in any case and with any extension —
+//! Windows maps `nul.txt` to the device too ([`is_windows_reserved`]).
+//! On Unix these names are harmless, but a hub op reaches every platform.
+//! Every id and name in the live workspace passed on 2026-09-30.
 
 use crate::op::{FieldSet, Op, Payload, ProjectSet, WorkspaceSet};
 
@@ -35,6 +45,34 @@ pub fn is_safe_component(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !is_windows_reserved(value)
+}
+
+/// Whether Windows reads `value` as a device rather than a file: its stem
+/// (the part before the first `.`, trailing spaces dropped — Windows
+/// strips them) is `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
+/// `LPT1`–`LPT9` (or `COM`/`LPT` with a superscript `¹²³`), `CONIN$` or
+/// `CONOUT$`, in any case. `nul`, `Com1.txt` and `aux.tar.gz` are
+/// reserved; `console`, `nullable` and `com10` are not.
+pub fn is_windows_reserved(value: &str) -> bool {
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .trim_end_matches(' ');
+    let upper = stem.to_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        _ => {
+            let port = upper
+                .strip_prefix("COM")
+                .or_else(|| upper.strip_prefix("LPT"));
+            matches!(
+                port,
+                Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+            )
+        }
+    }
 }
 
 /// Longest document name, and the longest state name or name segment.
@@ -43,15 +81,17 @@ pub const NAME_MAX: usize = 255;
 /// Whether `value` is safe as one path segment of a free-form name (a
 /// workflow state, one `/`-separated part of a document name): 1 to
 /// [`NAME_MAX`] bytes, not starting with `.` (so never `.` or `..`, and
-/// never a hidden file), and no `/`, `\` or control character (NUL
-/// included). Spaces and non-ASCII letters are fine.
+/// never a hidden file), no `/`, `\`, `:` or control character (NUL
+/// included), and not a Windows device name ([`is_windows_reserved`],
+/// AGT-1467). Spaces and non-ASCII letters are fine.
 pub fn is_safe_segment(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= NAME_MAX
         && !value.starts_with('.')
         && !value
             .chars()
-            .any(|c| c == '/' || c == '\\' || c.is_control())
+            .any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
+        && !is_windows_reserved(value)
 }
 
 /// Whether `name` is a safe project document name: at most [`NAME_MAX`]
@@ -72,11 +112,23 @@ pub struct IdError {
     pub rule: &'static str,
 }
 
-const ID_RULE: &str =
-    "letters, digits, '-', '_', '.'; at most 64 characters; not starting with '.'";
-const SEGMENT_RULE: &str =
-    "at most 255 bytes; not starting with '.'; no '/', '\\' or control characters";
-const DOC_NAME_RULE: &str = "'/'-separated names, each non-empty, not starting with '.' (no '.' or '..'), no '\\' or control characters; at most 255 bytes";
+const ID_RULE: &str = "letters, digits, '-', '_', '.'; at most 64 characters; not starting with '.'; not a Windows device name (CON, NUL, COM1, ...)";
+const SEGMENT_RULE: &str = "at most 255 bytes; not starting with '.'; no '/', '\\', ':' or control characters; not a Windows device name (CON, NUL, COM1, ...)";
+const DOC_NAME_RULE: &str = "'/'-separated names, each non-empty, not starting with '.' (no '.' or '..'), no '\\', ':' or control characters, not a Windows device name (CON, NUL, COM1, ...); at most 255 bytes";
+
+/// [`is_safe_component`] as a typed check: `what` names the field in the
+/// error (`"workspace prefix"`, `"project id"`).
+pub fn check_component(what: &'static str, value: &str) -> Result<(), IdError> {
+    if is_safe_component(value) {
+        Ok(())
+    } else {
+        Err(IdError {
+            what,
+            value: value.to_string(),
+            rule: ID_RULE,
+        })
+    }
+}
 
 /// Checks every identifier and name `op` carries that becomes part of a
 /// path: a `workspace.set prefix`; a `project.create`'s id and parent and
@@ -247,6 +299,81 @@ mod tests {
         for bad in ["", ".", "..", "a/b", "a\\b", ".x", "a\tb"] {
             assert!(!is_safe_segment(bad), "{bad:?}");
         }
+    }
+
+    /// AGT-1467: `:` and the Windows device names are refused by both
+    /// rules, in any case, with or without an extension; names that only
+    /// start like one are fine.
+    #[test]
+    fn windows_drive_prefixes_and_device_names() {
+        for reserved in [
+            "CON",
+            "con",
+            "Con.txt",
+            "nul",
+            "NUL.tar.gz",
+            "aux",
+            "PRN",
+            "com1",
+            "COM9",
+            "lpt1",
+            "LPT9.md",
+            "COM\u{b9}",
+            "lpt\u{b3}",
+            "CONIN$",
+            "conout$",
+            "NUL ",
+            "nul .txt",
+        ] {
+            assert!(is_windows_reserved(reserved), "{reserved:?}");
+            assert!(!is_safe_segment(reserved), "{reserved:?}");
+            assert!(
+                !is_safe_doc_name(&format!("ideation/{reserved}")),
+                "{reserved:?}"
+            );
+        }
+        for fine in [
+            "console",
+            "nullable",
+            "com10",
+            "com0",
+            "lpt",
+            "auxiliary",
+            "CONTRIBUTING",
+            "prn-x",
+            "a.con",
+            "notes",
+        ] {
+            assert!(!is_windows_reserved(fine), "{fine:?}");
+            assert!(is_safe_segment(fine), "{fine:?}");
+        }
+        // Components: device names are refused; ':' never was allowed.
+        for bad in ["con", "NUL", "com1", "Lpt2.x", "C:x", "a:b"] {
+            assert!(!is_safe_component(bad), "{bad:?}");
+            assert_eq!(
+                check_component("project id", bad).unwrap_err().what,
+                "project id"
+            );
+        }
+        assert_eq!(check_component("workspace prefix", "AGT"), Ok(()));
+        // ':' in a free-form name: a drive prefix or an NTFS stream.
+        for bad in ["C:x", "C:", "notes:stream", "a:b"] {
+            assert!(!is_safe_segment(bad), "{bad:?}");
+            assert!(!is_safe_doc_name(bad), "{bad:?}");
+            assert!(!is_safe_doc_name(&format!("ideation/{bad}")), "{bad:?}");
+        }
+        let e = check_op_ids(&doc_add(Some("C:evil"))).unwrap_err();
+        assert!(e.to_string().contains("':'"), "{e}");
+        let upsert = op(Payload::StateUpsert(StateUpsert {
+            name: "NUL".into(),
+            category: StateCategory::Started,
+            position: 0,
+        }));
+        assert_eq!(check_op_ids(&upsert).unwrap_err().what, "state name");
+        assert_eq!(
+            check_op_ids(&create("con", None)).unwrap_err().what,
+            "project id"
+        );
     }
 
     fn doc_add(name: Option<&str>) -> Op {

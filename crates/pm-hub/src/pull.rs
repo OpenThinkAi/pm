@@ -14,7 +14,9 @@
 //! page holds the workspace's ops with `seq > since`, ascending, at most
 //! `limit` of them. `next` is the seq to pass as `since` on the next
 //! request: the last seq in the page, or `since` itself when the page is
-//! empty. `head` is the workspace's largest seq (0 for an empty log). Page
+//! empty. A page also stops before [`MAX_PAGE_BYTES`] of op text (always
+//! serving at least one op), so `next < head` can mean the byte cap cut it
+//! short (AGT-1467). `head` is the workspace's largest seq (0 for an empty log). Page
 //! and `head` come from one statement, so they are one snapshot: `next <
 //! head` means more ops were already waiting when this page was read;
 //! `next >= head` means the client had everything as of that snapshot.
@@ -49,6 +51,15 @@ pub const DEFAULT_PAGE_OPS: i64 = 500;
 /// `ops::MAX_BATCH_OPS`, so a client can pull no more per request than it
 /// can push.
 pub const MAX_PAGE_OPS: i64 = 1000;
+/// Most bytes of op text in one page (16 MiB, AGT-1467), whatever
+/// `limit` says: a page stops before the op that would take it over, so
+/// the hub never buffers (and a client never receives) a thousand
+/// document edits at once. A page always holds at least one op when any
+/// is past `since`, so a single op larger than this (up to a push's
+/// 64 MiB) is served on its own and the cursor still advances. `next` is
+/// the last seq served, as for a count-capped page: a client that pages
+/// until `next >= head` — every client, old or new — needs nothing else.
+pub const MAX_PAGE_BYTES: i64 = 16 * 1024 * 1024;
 
 /// The structured error body of a 400 from this route.
 #[derive(Serialize)]
@@ -150,17 +161,29 @@ async fn pull_page(db: &Db, workspace: &str, uri: &Uri) -> Result<String, PullEr
     let cursor = parse_query(uri)?;
     // One statement, so the page and `head` are read from one snapshot.
     // With nothing past `since` the join yields one row of `(head, NULL,
-    // NULL)`, which still carries `head`.
+    // NULL)`, which still carries `head`. The byte cap ([`MAX_PAGE_BYTES`])
+    // is applied in the database, over the running total of the first
+    // `limit` ops' sizes, so only the ops served ever reach the hub: the
+    // page is the longest prefix within the cap, and never empty
+    // (`n = 1`). `octet_length` of a `json` value reads its stored size.
     let rows = db
         .reader
         .query(
             "SELECT h.head, p.seq, p.op
              FROM (SELECT coalesce(max(seq), 0) AS head FROM ops WHERE workspace_id = $1) AS h
-             LEFT JOIN (SELECT seq, op::text AS op FROM ops
-                        WHERE workspace_id = $1 AND seq > $2
-                        ORDER BY seq LIMIT $3) AS p ON true
+             LEFT JOIN (
+                 SELECT seq, op FROM (
+                     SELECT seq, op::text AS op,
+                            row_number() OVER (ORDER BY seq) AS n,
+                            sum(octet_length(op::text)) OVER (ORDER BY seq) AS through
+                     FROM (SELECT seq, op FROM ops
+                           WHERE workspace_id = $1 AND seq > $2
+                           ORDER BY seq LIMIT $3) AS l
+                 ) AS w
+                 WHERE n = 1 OR through <= $4
+             ) AS p ON true
              ORDER BY p.seq",
-            &[&workspace, &cursor.since, &cursor.limit],
+            &[&workspace, &cursor.since, &cursor.limit, &MAX_PAGE_BYTES],
         )
         .await?;
     let head: i64 = rows.first().map_or(0, |row| row.get(0));

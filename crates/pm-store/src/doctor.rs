@@ -24,8 +24,8 @@
 //!    same way `ticket.description` is — scoped to rows with a `doc_id`.
 //!
 //! What a rebuild never touches: `workspace.number_floor`,
-//! `backup_target`, `sync_*`, `pending_number` — bookkeeping, not derived
-//! state.
+//! `backup_target`, `sync_*` (the quarantine included), `pending_number`
+//! — bookkeeping, not derived state.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,7 +40,7 @@ use crate::codec::ulid;
 use crate::commit::replay_in;
 use crate::error::{Result, StoreError};
 use crate::query::read_ops;
-use crate::sync::{SyncStatus, sync_status};
+use crate::sync::{Quarantined, SyncStatus, quarantine, sync_status};
 
 /// The tables derived from `ops`, parents before children — the reverse
 /// is the order they are emptied in.
@@ -113,6 +113,10 @@ pub struct Report {
     /// Client sync state (AGT-1393): outbox size, pull cursor, tickets
     /// awaiting a hub number. Informational — never affects health.
     pub sync: SyncStatus,
+    /// Pulled ops kept out of the log, parked or refused (AGT-1467), in
+    /// hub seq order. Informational like `sync`: the log and tables are
+    /// consistent without them.
+    pub quarantine: Vec<Quarantined>,
 }
 
 impl Report {
@@ -198,6 +202,7 @@ impl Store {
         let integrity = integrity_check(&self.conn)?;
         let foreign_keys = foreign_key_check(&self.conn)?;
         let sync = sync_status(&self.conn)?;
+        let quarantine = quarantine(&self.conn)?;
 
         let tx = self
             .conn
@@ -217,6 +222,7 @@ impl Store {
             replay_error,
             drift,
             sync,
+            quarantine,
         })
     }
 

@@ -91,7 +91,9 @@
 //! (the Studio's seed log holds one 23 MB `body.edit`, so the byte limit
 //! leaves room for a single large op plus a batch around it). A body over
 //! the limit is a 413 whether announced by `Content-Length` or discovered
-//! while reading.
+//! while reading. A `body.edit` whose decoded update is over
+//! `pm_core::MAX_BODY_EDIT_BYTES` (32 MiB) is `400 op_too_large`
+//! (AGT-1467); replicas refuse one on pull too.
 
 use std::collections::HashMap;
 
@@ -501,6 +503,14 @@ fn parse_op(index: usize, raw: &RawValue, now_ms: u64) -> Result<Parsed<'_>, Pus
     // refuse a hostile one before it is stored (AGT-1450).
     pm_core::ids::check_op_ids(&op).map_err(|e| PushError::OpCheck {
         error: "invalid_id",
+        index,
+        op_id: Some(op.op_id.to_string()),
+        reason: e.to_string(),
+    })?;
+    // AGT-1467: one oversized document update would be re-served to, and
+    // folded by, every replica.
+    op.check_size().map_err(|e| PushError::OpCheck {
+        error: "op_too_large",
         index,
         op_id: Some(op.op_id.to_string()),
         reason: e.to_string(),
@@ -1003,6 +1013,41 @@ mod tests {
         assert_eq!(error, "invalid_id");
         assert_eq!(op_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
         assert!(reason.contains("workspace prefix"), "{reason}");
+    }
+
+    /// AGT-1467: a `body.edit` over the size bound is refused before it
+    /// is stored; one at the bound, and ':'/device names, are judged by
+    /// pm-core's rules.
+    #[test]
+    fn refuses_oversized_body_edits_and_windows_unsafe_names() {
+        use base64::Engine as _;
+        let edit = |len: usize| {
+            let update = base64::engine::general_purpose::STANDARD.encode(vec![0u8; len]);
+            format!(
+                r#"{{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{{"wall_ms":1,"counter":0}},
+                    "actor":"a","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"body.edit",
+                    "payload":{{"update":"{update}"}},"version":1}}"#
+            )
+        };
+        let (error, op_id, reason) = stamp_err_at(1, &edit(pm_core::MAX_BODY_EDIT_BYTES + 1));
+        assert_eq!(error, "op_too_large");
+        assert_eq!(op_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(reason.contains("body.edit update"), "{reason}");
+        let ok = edit(pm_core::MAX_BODY_EDIT_BYTES);
+        let raw: &RawValue = serde_json::from_str(&ok).unwrap();
+        assert!(parse_op(0, raw, NOW).is_ok());
+
+        let state = |name: &str| {
+            format!(
+                r#"{{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{{"wall_ms":1,"counter":0}},
+                    "actor":"a","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"state.upsert",
+                    "payload":{{"name":"{name}","category":"started","position":0}},"version":1}}"#
+            )
+        };
+        for bad in ["C:evil", "NUL", "com1.txt"] {
+            let (error, _, _) = stamp_err_at(0, &state(bad));
+            assert_eq!(error, "invalid_id", "{bad}");
+        }
     }
 
     #[test]

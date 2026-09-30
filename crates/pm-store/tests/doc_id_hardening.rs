@@ -494,3 +494,102 @@ fn a_local_delete_still_refuses_a_project_with_tickets() {
         StoreError::ProjectHasTickets { .. }
     ));
 }
+
+/// AGT-1467: the document commit path takes only a `body.edit` of the
+/// document it is folding into — not an op logged under another entity,
+/// not another kind (what a tampered backup restored through `commit_any`
+/// would hand it) — and a `body.edit` for a bound-but-hidden document (a
+/// losing binding) must still decode before it joins the log.
+#[test]
+fn the_document_path_takes_only_that_documents_body_edits() {
+    let (_dir, mut store) = fresh();
+    let pm = project_entity(&store, "pm");
+    let design = store
+        .project_view("pm")
+        .unwrap()
+        .unwrap()
+        .design_doc_id()
+        .unwrap();
+    let before = all_ops(&store).len();
+    let mut body = pm_core::Body::new();
+    let update = body.diff_from_text("hello\n").unwrap().into_bytes();
+    let edit = |store: &Store, entity: Ulid| {
+        next(
+            store,
+            "matt",
+            entity,
+            Payload::BodyEdit(pm_core::op::BodyEdit {
+                update: update.clone(),
+            }),
+        )
+    };
+
+    // Logged under another entity than the one it would fold into.
+    let elsewhere = edit(&store, Ulid::new());
+    let err = store.commit_doc_edit(design, &elsewhere).unwrap_err();
+    assert!(
+        matches!(err, StoreError::NotADocumentEdit { doc_id, entity, kind: "body.edit", .. }
+            if doc_id == design && entity == elsewhere.entity),
+        "{err:?}"
+    );
+    // Another kind under the document's id: the restore path routes any op
+    // whose entity is a bound document here.
+    let label = next(
+        &store,
+        "matt",
+        design,
+        Payload::LabelAdd(pm_core::op::LabelAdd { label: "x".into() }),
+    );
+    let err = store.commit_any(&label).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::NotADocumentEdit {
+                kind: "label.add",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(all_ops(&store).len(), before, "nothing was written");
+
+    // A losing binding: bound (so routed as a document) but shown by no
+    // row. Garbage bytes are refused; a real update joins the log.
+    let loser = Ulid::new();
+    let bind = next(&store, "matt", pm, doc_add(None, loser));
+    store.commit(&bind).unwrap();
+    assert!(store.is_known_doc_id(loser).unwrap());
+    let garbage = next(
+        &store,
+        "matt",
+        loser,
+        Payload::BodyEdit(pm_core::op::BodyEdit {
+            update: vec![0xde, 0xad, 0xbe, 0xef],
+        }),
+    );
+    let err = store.commit_any(&garbage).unwrap_err();
+    assert!(matches!(err, StoreError::DocApply(_)), "{err:?}");
+    let good = edit(&store, loser);
+    store.commit_any(&good).unwrap();
+    assert!(all_ops(&store).iter().any(|o| o.op_id == good.op_id));
+    assert!(!all_ops(&store).iter().any(|o| o.op_id == garbage.op_id));
+    assert_healthy(&mut store);
+}
+
+/// AGT-1467: `join_workspace` holds the prefix to the same path rule as a
+/// `workspace.set prefix` op, before writing anything.
+#[test]
+fn join_refuses_a_path_unsafe_prefix() {
+    for bad in ["../x", "a/b", "", ".hidden", "CON", "nul", "C:x"] {
+        let (_dir, mut store) = empty();
+        let err = store.join_workspace(Ulid::new(), bad).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::InvalidId(e) if e.what == "workspace prefix"),
+            "{bad:?}: {err:?}"
+        );
+        assert!(store.workspace().unwrap().is_none(), "{bad:?}");
+    }
+    let (_dir, mut store) = empty();
+    store.join_workspace(Ulid::new(), "AGT").unwrap();
+    assert_eq!(store.workspace().unwrap().unwrap().prefix, "AGT");
+}

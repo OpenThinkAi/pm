@@ -206,8 +206,11 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     assert_eq!(v["rebuilt"], Value::Null);
     assert_eq!(
         v["sync"],
-        serde_json::json!({"outbox": 17, "pushed_through": 0, "cursor": 0, "pending_numbers": 0, "seeded": false})
+        serde_json::json!({"outbox": 17, "pushed_through": 0, "cursor": 0, "pending_numbers": 0, "seeded": false, "parked": 0, "refused": 0})
     );
+    // AGT-1467: nothing pulled, nothing quarantined.
+    assert_eq!(v["quarantine"], serde_json::json!([]));
+    assert!(text.contains("quarantine      none\n"), "{text}");
 }
 
 // ---------------------------------------------------------------- AC2
