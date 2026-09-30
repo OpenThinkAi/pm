@@ -214,7 +214,12 @@ fn validate_prefix(prefix: &str) -> Result<()> {
     }
 }
 
-pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>) -> Result<()> {
+/// `pm init`. With `join` (AGT-1396, `--join <WORKSPACE-ULID>`) the new
+/// database is an empty replica of that workspace — its id, no ops —
+/// for a second machine: `pm hub login` and `pm sync` then pull the whole
+/// log, config included, from the hub. The prefix and states the row
+/// starts with are placeholders the first pull overwrites.
+pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>, join: Option<Ulid>) -> Result<()> {
     let prefix = prefix.unwrap_or_else(|| preset.default_prefix());
     validate_prefix(prefix)?;
     let dir = match ctx.workspace.or(ctx.env.pm_workspace.as_deref()) {
@@ -234,19 +239,39 @@ pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>) -> Result<()> {
             existing.prefix
         )));
     }
-    let ws = Workspace {
-        id: Ulid::new(),
-        prefix: prefix.to_string(),
-        states: preset.states(),
-        gate_labels: preset.gate_labels(),
-        model_labels: Default::default(),
-        template_sections: vec!["Problem Statement".into(), "Acceptance Criteria".into()],
-        stale_days: 30,
+    let ws = match join {
+        Some(id) => {
+            // No ops: the workspace's config arrives from the hub. A
+            // config op of our own here would be a *newer* write of the
+            // prefix and states and win the merge over the seeded ones.
+            store.join_workspace(id, prefix)?;
+            Workspace {
+                id,
+                prefix: prefix.to_string(),
+                states: Vec::new(),
+                gate_labels: Default::default(),
+                model_labels: Default::default(),
+                template_sections: Vec::new(),
+                stale_days: 30,
+            }
+        }
+        None => {
+            let ws = Workspace {
+                id: Ulid::new(),
+                prefix: prefix.to_string(),
+                states: preset.states(),
+                gate_labels: preset.gate_labels(),
+                model_labels: Default::default(),
+                template_sections: vec!["Problem Statement".into(), "Acceptance Criteria".into()],
+                stale_days: 30,
+            };
+            // The workspace's first ops (AGT-1385): one `workspace.set` per
+            // field and gate label, one `state.upsert` per state, under this
+            // command's actor.
+            store.init_workspace(&ws, &actor)?;
+            ws
+        }
     };
-    // The workspace's first ops (AGT-1385): one `workspace.set` per
-    // field and gate label, one `state.upsert` per state, under this
-    // command's actor.
-    store.init_workspace(&ws, &actor)?;
 
     // config.toml records the default workspace the first time; an
     // existing file is never rewritten, so initializing a second (e.g.
@@ -273,7 +298,22 @@ pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>) -> Result<()> {
             "states": ws.states,
             "config": config_path,
             "config_written": config_written,
+            "joined": join.map(|id| id.to_string()),
         }));
+    } else if join.is_some() {
+        println!(
+            "joined workspace {} at {} (empty until `pm hub login` and `pm sync` pull its log)",
+            ws.id,
+            dir.display()
+        );
+        if config_written {
+            println!("config: wrote {}", config_path.display());
+        } else {
+            println!(
+                "config: {} already exists; left unchanged",
+                config_path.display()
+            );
+        }
     } else {
         println!("initialized {} workspace at {}", ws.prefix, dir.display());
         let states: Vec<String> = ws

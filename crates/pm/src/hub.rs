@@ -253,8 +253,12 @@ pub(crate) fn configured_hub(env: &Env) -> Result<Option<String>> {
 /// `duplicate_number`. Never contacts the hub and needs no token, so `pm
 /// new` stays offline-safe.
 ///
-/// AGT-1396: if a hub-authoritative bit lands in pm-store's sync state,
-/// wire it *here* (e.g. add a `&Store` parameter and AND it in) rather
+/// The hub-authoritative bit does exist (`sync_state.seeded`, AGT-1396:
+/// set once the first sync has seeded the hub, or joined one already
+/// seeded) and is deliberately **not** ANDed in here, for the reason
+/// above: a hub that is configured but not yet seeded must still get
+/// pending creates, which the seed's `POST /seeded` numbers. Should that
+/// ever change, change it *here* (e.g. add a `&Store` parameter) rather
 /// than at the call sites, so `pm new` and its tests keep one answer.
 pub(crate) fn numbers_are_hub_assigned(env: &Env) -> Result<bool> {
     Ok(configured_hub(env)?.is_some())

@@ -113,6 +113,13 @@ fn print_report(report: &Report) {
         "sync            outbox {} op(s), pushed through seq {}, cursor {cursor}, {} ticket(s) awaiting a hub number",
         sync.outbox, sync.pushed_through, sync.pending_numbers
     );
+    if sync.seeded {
+        println!("seeded          yes (the hub is this workspace's authority)");
+    } else {
+        println!(
+            "seeded          no (the first `pm sync` seeds the hub, or joins one already seeded)"
+        );
+    }
 
     match &report.replay_error {
         Some(error) => println!("replay          FAILED: {error}"),

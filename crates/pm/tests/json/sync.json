@@ -9,6 +9,13 @@
   "pushed": 48,
   "rejected": [],
   "schema": 1,
+  "seed": {
+    "number_floor": 0,
+    "numbered": 0,
+    "pushed": 48,
+    "resumed": false
+  },
+  "seeded": true,
   "skipped": 0,
   "workspace": "<ULID>"
 }

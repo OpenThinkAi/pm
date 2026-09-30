@@ -766,3 +766,177 @@ fn config_ops(store: &Store) -> usize {
         .filter(|(_, o)| o.actor == ActorId::new("matt") && o.payload.is_config())
         .count()
 }
+
+// ------------------------------------------------------ seeding (AGT-1396)
+
+/// The seed's first pass: `outbox_config` is the outbox's config ops
+/// alone, in `seq` order, however late in the log they sit — a ticket
+/// committed before a later `put_project` does not precede its ops.
+#[test]
+fn outbox_config_is_the_outbox_s_config_ops_in_seq_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
+    store
+        .init_workspace(&workspace(), &ActorId::new("matt"))
+        .unwrap();
+    let ticket = Ulid::new();
+    store
+        .commit(&op(
+            ticket,
+            1,
+            "matt",
+            Payload::TicketCreate(TicketCreate {
+                title: "t".into(),
+                state: "triage".into(),
+                priority: Priority::Medium,
+                project: None,
+                repo: None,
+                source: None,
+                ext: Default::default(),
+            }),
+        ))
+        .unwrap();
+    store
+        .put_project(
+            &Project {
+                id: "late".into(),
+                title: "late".into(),
+                status: ProjectStatus::InProgress,
+                parent: None,
+                repos: Default::default(),
+                doc: "doc".into(),
+                documents: Default::default(),
+            },
+            &ActorId::new("matt"),
+        )
+        .unwrap();
+    let all = store.outbox(100).unwrap();
+    let config = store.outbox_config(100).unwrap();
+    let config_kinds = [
+        "workspace.set",
+        "state.upsert",
+        "actor.upsert",
+        "project.create",
+        "project.set",
+        "project.delete",
+        "project.doc_add",
+    ];
+    let expected: Vec<Ulid> = all
+        .iter()
+        .filter(|(_, o)| config_kinds.contains(&o.kind()))
+        .map(|(_, o)| o.op_id)
+        .collect();
+    assert_eq!(ids(&config), expected);
+    assert!(
+        config.len() < all.len(),
+        "the ticket and the doc edit are not config"
+    );
+    assert!(config.windows(2).all(|w| w[0].0 < w[1].0));
+    assert!(
+        config.iter().any(|(_, o)| o.kind() == "project.create")
+            && all.iter().any(|(_, o)| o.kind() == "body.edit"),
+        "the late project is in the config pass"
+    );
+    assert_eq!(ids(&store.outbox_config(2).unwrap()), expected[..2]);
+    // Marking them pushed empties the config pass and leaves the rest.
+    store.mark_pushed(&expected).unwrap();
+    assert!(store.outbox_config(100).unwrap().is_empty());
+    assert_eq!(
+        store.outbox_len().unwrap() as usize,
+        all.len() - expected.len()
+    );
+    assert_eq!(store.op_count().unwrap() as usize, all.len());
+}
+
+/// The seeded flag, `ever_pushed`, and which op ids the log lacks.
+#[test]
+fn seeded_flag_ever_pushed_and_unknown_ops() {
+    let (_dir, mut store) = store();
+    assert!(!store.seeded().unwrap());
+    assert!(!store.sync_status().unwrap().seeded);
+    // `store()` marked the config ops pushed.
+    assert!(store.ever_pushed().unwrap());
+    let ticket = Ulid::new();
+    let c = create(ticket, 1);
+    store.commit(&c).unwrap();
+    let stranger = Ulid::new();
+    assert_eq!(
+        store.unknown_ops(&[c.op_id, stranger, c.op_id]).unwrap(),
+        [stranger]
+    );
+    assert!(store.unknown_ops(&[]).unwrap().is_empty());
+    store.mark_seeded().unwrap();
+    store.mark_seeded().unwrap();
+    assert!(store.seeded().unwrap());
+    assert!(store.sync_status().unwrap().seeded);
+
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = Store::open(fresh_dir.path().join("pm.sqlite")).unwrap();
+    assert!(!fresh.ever_pushed().unwrap());
+    assert_eq!(fresh.op_count().unwrap(), 0);
+}
+
+/// `join_workspace`: the row with the given id and nothing else; refused
+/// on a database that is already a workspace or already holds ops.
+#[test]
+fn join_workspace_makes_an_empty_replica_and_refuses_a_used_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
+    let id = Ulid::new();
+    store.join_workspace(id, "AGT").unwrap();
+    let ws = store.workspace().unwrap().unwrap();
+    assert_eq!((ws.id, ws.prefix.as_str()), (id, "AGT"));
+    assert!(ws.states.is_empty() && ws.gate_labels.is_empty());
+    assert_eq!(store.op_count().unwrap(), 0);
+    assert!(store.workspace_view().unwrap().is_none());
+    assert!(matches!(
+        store.join_workspace(id, "AGT").unwrap_err(),
+        StoreError::AlreadyJoined { workspace } if workspace == id
+    ));
+    assert!(matches!(
+        store.join_workspace(Ulid::new(), "AGT").unwrap_err(),
+        StoreError::ForeignWorkspace { workspace, .. } if workspace == id
+    ));
+    // The joined workspace's config arrives as foreign ops and overwrites
+    // the placeholder — the same id, so the row is rewritten in place.
+    let mut wanted = workspace();
+    wanted.id = id;
+    let other_dir = tempfile::tempdir().unwrap();
+    let mut other = Store::open(other_dir.path().join("pm.sqlite")).unwrap();
+    other
+        .init_workspace(&wanted, &ActorId::new("matt"))
+        .unwrap();
+    let ops: Vec<Op> = other
+        .ops_since(0)
+        .unwrap()
+        .into_iter()
+        .map(|(_, o)| o)
+        .collect();
+    let pulled = store.apply_pulled(&ops).unwrap();
+    assert_eq!(pulled.applied, ops.len());
+    let ws = store.workspace().unwrap().unwrap();
+    assert_eq!(ws, wanted);
+    assert!(
+        store.outbox(10).unwrap().is_empty(),
+        "pulled ops are not outbox"
+    );
+    assert!(store.ever_pushed().unwrap());
+    assert!(store.doctor().unwrap().is_healthy());
+
+    // A database with ops cannot become a joined replica: a `state.upsert`
+    // alone lands (the workspace row waits for a prefix), so the log is
+    // non-empty while no workspace exists yet.
+    let used_dir = tempfile::tempdir().unwrap();
+    let mut used = Store::open(used_dir.path().join("pm.sqlite")).unwrap();
+    let state_op = ops
+        .iter()
+        .find(|o| o.kind() == "state.upsert")
+        .expect("init_workspace emits a state.upsert")
+        .clone();
+    assert_eq!(used.apply_pulled(&[state_op]).unwrap().applied, 1);
+    assert!(used.workspace().unwrap().is_none());
+    assert!(matches!(
+        used.join_workspace(id, "AGT").unwrap_err(),
+        StoreError::NotEmpty { ops: 1 }
+    ));
+}

@@ -16,9 +16,19 @@
 //! - **Pending numbers.** `pending_number` flags tickets created while a hub
 //!   is configured: they read `AGT-?` until the hub's `field.set number`
 //!   arrives, and [`Store::apply_pulled`] clears the flag once it has.
+//! - **Seeded** (AGT-1396). `sync_state.seeded`: the hub is this
+//!   workspace's authority — its seed ended (this replica ended it, or it
+//!   joined a hub whose seed had ended). Until then `pm sync` runs the
+//!   seed path; after, only push/pull ([`Store::mark_seeded`]).
+//! - **Joining** (AGT-1396). [`Store::join_workspace`] makes the empty
+//!   replica a second machine starts from: the `workspace` row with the
+//!   hub's workspace id and no ops at all, so the first pull rebuilds
+//!   everything — config included — from the hub's log.
 //!
 //! All of it is bookkeeping written directly, like `backup_target`: not
 //! derived from the op log, untouched by `pm doctor --rebuild`.
+
+use std::collections::BTreeSet;
 
 use pm_core::{ApplyError, DocApplyError, Op, Payload};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -28,6 +38,7 @@ use ulid::Ulid;
 use crate::Store;
 use crate::codec::ulid;
 use crate::commit::commit_foreign_in;
+use crate::config::CONFIG_KINDS;
 use crate::error::{Result, StoreError};
 use crate::project::{commit_doc_edit_in, is_known_doc};
 use crate::query::read_ops;
@@ -53,9 +64,115 @@ pub struct SyncStatus {
     pub cursor: i64,
     /// Tickets still awaiting a hub-issued number.
     pub pending_numbers: u64,
+    /// The hub is this workspace's authority: its seed has ended
+    /// (AGT-1396). `false` until the first `pm sync` seeds it, or joins
+    /// a hub whose seed already ended.
+    pub seeded: bool,
 }
 
 impl Store {
+    /// How many ops the log holds.
+    pub fn op_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM ops", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
+    /// Whether this replica has ever had an op acknowledged by the hub:
+    /// the pushed-through marker has moved, or some op above it is known
+    /// to the hub. `false` on a workspace that has never synced (and on a
+    /// joined replica before its first pull).
+    pub fn ever_pushed(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT (SELECT pushed_through FROM sync_state) > 0
+                 OR EXISTS (SELECT 1 FROM sync_pushed)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Which of `op_ids` the log does not hold, in `op_ids` order. The
+    /// seed's probe (AGT-1396): a hub workspace whose ops are all in this
+    /// log was seeded from it; one holding ops this log lacks was not.
+    pub fn unknown_ops(&self, op_ids: &[Ulid]) -> Result<Vec<Ulid>> {
+        if op_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One query: the ids as a JSON array, joined against the log.
+        let wanted =
+            serde_json::to_string(&op_ids.iter().map(Ulid::to_string).collect::<Vec<String>>())
+                .expect("strings serialize");
+        let mut stmt = self.conn.prepare(
+            "SELECT value FROM json_each(?1)
+             WHERE value NOT IN (SELECT op_id FROM ops)",
+        )?;
+        let rows = stmt.query_map(params![wanted], |r| r.get::<_, String>(0))?;
+        let unknown: BTreeSet<Ulid> = rows
+            .map(|row| ulid("op_id", &row?))
+            .collect::<Result<_>>()?;
+        Ok(op_ids
+            .iter()
+            .filter(|id| unknown.contains(id))
+            .copied()
+            .collect())
+    }
+
+    /// Whether the hub is this workspace's authority (its seed has ended).
+    pub fn seeded(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT seeded FROM sync_state", [], |r| r.get(0))?)
+    }
+
+    /// Records that the workspace's seed has ended on the hub: from now on
+    /// `pm sync` pushes and pulls without seeding. Idempotent.
+    pub fn mark_seeded(&mut self) -> Result<()> {
+        self.conn.execute("UPDATE sync_state SET seeded = 1", [])?;
+        Ok(())
+    }
+
+    /// Makes this empty database a replica of workspace `id` that has yet
+    /// to pull anything (`pm init --join`, AGT-1396): the `workspace` row
+    /// with that id and `prefix`, no states, no ops. The row is a
+    /// placeholder the first pull overwrites — the hub's log carries the
+    /// workspace's `workspace.set` and `state.upsert` ops, and
+    /// materializing them rewrites the row in place — so until that pull
+    /// the workspace opens but has no states to file a ticket into.
+    /// Refuses a database that already has a workspace
+    /// ([`StoreError::ForeignWorkspace`] when the ids differ,
+    /// [`StoreError::AlreadyJoined`] when they match) or any op.
+    pub fn join_workspace(&mut self, id: Ulid, prefix: &str) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx
+            .query_row("SELECT id FROM workspace", [], |r| r.get(0))
+            .optional()?;
+        if let Some(existing) = existing {
+            let workspace = ulid("workspace.id", &existing)?;
+            return Err(if workspace == id {
+                StoreError::AlreadyJoined { workspace }
+            } else {
+                StoreError::ForeignWorkspace {
+                    entity: id,
+                    workspace,
+                }
+            });
+        }
+        let ops: i64 = tx.query_row("SELECT COUNT(*) FROM ops", [], |r| r.get(0))?;
+        if ops > 0 {
+            return Err(StoreError::NotEmpty { ops: ops as u64 });
+        }
+        tx.execute(
+            "INSERT INTO workspace (singleton, id, prefix, gate_labels, model_labels, template_sections, stale_days)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id.to_string(), prefix, "[]", "{}", "[]", 30u32],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Up to `limit` ops the hub has not acknowledged, oldest (`seq`)
     /// first — the next batch to push.
     pub fn outbox(&self, limit: usize) -> Result<Vec<(i64, Op)>> {
@@ -65,6 +182,27 @@ impl Store {
                            WHERE seq > (SELECT pushed_through FROM sync_state)
                              AND seq NOT IN (SELECT seq FROM sync_pushed)
                            ORDER BY seq LIMIT ?1)",
+            params![i64::try_from(limit).unwrap_or(i64::MAX)],
+        )
+    }
+
+    /// [`Store::outbox`] restricted to the config kinds (`workspace.set`,
+    /// `state.upsert`, `actor.upsert`, `project.*`): what a seed pushes
+    /// first (AGT-1396). Migrations 0007 and 0008 backfilled config ops
+    /// for rows that predate them at the *end* of the log, after the
+    /// ticket and document ops that depend on them; a replica applying
+    /// the hub's log page by page needs every state, project and document
+    /// binding before those, which is the order `pm doctor` replays in.
+    pub fn outbox_config(&self, limit: usize) -> Result<Vec<(i64, Op)>> {
+        read_ops(
+            &self.conn,
+            &format!(
+                "WHERE seq IN (SELECT seq FROM ops
+                               WHERE seq > (SELECT pushed_through FROM sync_state)
+                                 AND seq NOT IN (SELECT seq FROM sync_pushed)
+                                 AND kind IN ({CONFIG_KINDS})
+                               ORDER BY seq LIMIT ?1)"
+            ),
             params![i64::try_from(limit).unwrap_or(i64::MAX)],
         )
     }
@@ -205,11 +343,28 @@ impl Store {
     }
 }
 
-pub(crate) fn sync_status(conn: &Connection) -> Result<SyncStatus> {
-    let (pushed_through, cursor) = conn.query_row(
-        "SELECT pushed_through, pulled_seq FROM sync_state",
+/// Migration 0009's one step (AGT-1396): adds `sync_state.seeded` unless
+/// the table already has it — SQLite has no `ADD COLUMN IF NOT EXISTS`,
+/// and migrations from 0005 on must be re-runnable (`compact_bytes` test).
+pub(crate) fn add_seeded_column(conn: &Connection) -> Result<()> {
+    let has_seeded: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('sync_state') WHERE name = 'seeded'",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| r.get(0),
+    )?;
+    if !has_seeded {
+        conn.execute_batch(
+            "ALTER TABLE sync_state ADD COLUMN seeded INTEGER NOT NULL DEFAULT 0 CHECK (seeded IN (0, 1))",
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn sync_status(conn: &Connection) -> Result<SyncStatus> {
+    let (pushed_through, cursor, seeded) = conn.query_row(
+        "SELECT pushed_through, pulled_seq, seeded FROM sync_state",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let pending: i64 = conn.query_row("SELECT COUNT(*) FROM pending_number", [], |r| r.get(0))?;
     Ok(SyncStatus {
@@ -217,6 +372,7 @@ pub(crate) fn sync_status(conn: &Connection) -> Result<SyncStatus> {
         outbox: outbox_len(conn)?,
         cursor,
         pending_numbers: pending as u64,
+        seeded,
     })
 }
 

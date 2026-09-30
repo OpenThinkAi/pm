@@ -19,6 +19,7 @@ mod mutate;
 mod project;
 mod read;
 mod ready;
+mod seed;
 mod sync;
 mod ticket;
 mod verbs;
@@ -60,6 +61,9 @@ enum Cmd {
         /// Which seed to use: `default` (no saltline assumptions) or `saltline` (today's workflow)
         #[arg(long, value_parser = verbs::parse_preset, default_value = "default")]
         preset: verbs::Preset,
+        /// Join an existing workspace by its ULID as an empty replica: no states, no ops; `pm hub login` then `pm sync` pull its log from the hub
+        #[arg(long, value_name = "WORKSPACE-ULID", conflicts_with = "preset")]
+        join: Option<ulid::Ulid>,
     },
     /// File a ticket (or several) and print their id(s)
     New {
@@ -472,7 +476,11 @@ fn main() -> ExitCode {
 
 fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
     match cmd {
-        Cmd::Init { prefix, preset } => verbs::init(ctx, preset, prefix.as_deref()),
+        Cmd::Init {
+            prefix,
+            preset,
+            join,
+        } => verbs::init(ctx, preset, prefix.as_deref(), join),
         Cmd::New {
             title,
             project,

@@ -96,7 +96,8 @@ pub fn claim(ctx: &Ctx<'_>, args: ClaimArgs) -> Result<()> {
         // claim the hub has admitted, and the clock is past every pulled
         // op — a claim stamped before the unclaim it follows would be
         // admitted and then lose the LWW register (docs/hub-api.md).
-        sync::run_once(ctx, &mut store, hub).map_err(hub_required)?;
+        sync::run_once(ctx, &mut store, hub, &sync::Limits::from_env(ctx.env))
+            .map_err(hub_required)?;
     }
     let started = started_state(&ws)?;
     let mut claimer = Claimer {
@@ -369,7 +370,15 @@ impl Claimer<'_> {
             // Best effort: the claim is admitted either way, and the write
             // stays in the outbox for the next sync if this push fails.
             let mut round = Default::default();
-            if let Err(e) = sync::push_all(self.ctx, self.store, hub, &mut round) {
+            if let Err(e) = sync::push_all(
+                self.ctx,
+                self.store,
+                hub,
+                &sync::Limits::from_env(self.ctx.env),
+                sync::Outbox::All,
+                &mut sync::Progress::quiet(),
+                &mut round,
+            ) {
                 eprintln!(
                     "pm: the claim is admitted; its --branch write stays in the outbox until the next `pm sync`: {:#}",
                     e.error

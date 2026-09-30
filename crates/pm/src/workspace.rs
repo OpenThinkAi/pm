@@ -36,6 +36,15 @@ pub struct Env {
     /// `PM_HUB_KEYCHAIN`: a keychain file for every keychain call instead of
     /// the default (login) keychain. Tests point it at a throwaway one.
     pub hub_keychain: Option<PathBuf>,
+    /// `PM_SYNC_TEST_BATCH_OPS` (AGT-1396, a test hook): ops per push
+    /// batch, below the hub's own cap, so a test can make a small log take
+    /// many batches. Unset or unparsable means the real cap.
+    pub sync_test_batch_ops: Option<usize>,
+    /// `PM_SYNC_TEST_CRASH_AFTER_BATCHES` (AGT-1396, a test hook): exit
+    /// the process after the hub has acknowledged this many push batches
+    /// and *before* the last of them is marked pushed — the worst place a
+    /// crash can land, which the next sync must recover from.
+    pub sync_test_crash_after_batches: Option<usize>,
 }
 
 impl Env {
@@ -66,6 +75,9 @@ impl Env {
             hub_token: text("PM_HUB_TOKEN"),
             hub_keychain_prefix: text("PM_HUB_KEYCHAIN_SERVICE_PREFIX"),
             hub_keychain: path("PM_HUB_KEYCHAIN"),
+            sync_test_batch_ops: text("PM_SYNC_TEST_BATCH_OPS").and_then(|v| v.parse().ok()),
+            sync_test_crash_after_batches: text("PM_SYNC_TEST_CRASH_AFTER_BATCHES")
+                .and_then(|v| v.parse().ok()),
         }
     }
 

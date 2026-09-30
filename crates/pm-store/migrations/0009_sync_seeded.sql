@@ -1,0 +1,19 @@
+-- AGT-1396: whether the hub is this workspace's authority. `seeded` flips
+-- to 1 once the workspace's seed has ended on the hub — this replica ended
+-- it (`POST /w/{ws}/seeded` answered, or 409 already_seeded), or the hub
+-- reported `seeded: true` on a replica that had nothing to seed (a joined
+-- copy, or one whose seed-end response was lost). From then on `pm sync`
+-- takes the plain push/pull path and never the seed path again, and a
+-- hub that later reports `seeded: false` (restored from an older backup)
+-- is an error rather than a second seed. Bookkeeping like the rest of
+-- sync_state: written directly, untouched by `pm doctor --rebuild`.
+--
+-- The column itself is added in Rust (`src/sync.rs::add_seeded_column`,
+-- run by `Store::open` in this migration's transaction): SQLite has no
+-- `ADD COLUMN IF NOT EXISTS`, and every migration from 0005 on must be
+-- re-runnable against a database that already has its shape (the
+-- compact_bytes test rolls the recorded version back and reopens). The
+-- effect is:
+--
+--   ALTER TABLE sync_state ADD COLUMN seeded INTEGER NOT NULL DEFAULT 0
+--       CHECK (seeded IN (0, 1));

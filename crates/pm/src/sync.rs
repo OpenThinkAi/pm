@@ -2,9 +2,16 @@
 //! §Sync & hub. Local ops go up, everyone else's come down, and both sides
 //! converge by the same `pm-core` merge rules — the hub only orders.
 //!
-//! One sync is **push, then pull**, each in units the database commits on
-//! its own:
+//! One sync is **seed if needed, then push, then pull**, each in units the
+//! database commits on its own:
 //!
+//! - **Seed** ([`crate::seed`], AGT-1396). A workspace whose hub does not
+//!   yet hold its log — `GET whoami` says `seeded: false` — uploads the
+//!   whole log first and ends the hub's seed mode, so the hub becomes the
+//!   number authority only once it has everything. The seed module decides
+//!   between seeding, resuming an interrupted seed, joining an already
+//!   seeded hub from an empty replica, and refusing; after it has run once
+//!   (`sync_state.seeded`) every later sync is push and pull alone.
 //! - **Push.** The outbox ([`Store::outbox`]: local ops the hub has not
 //!   acknowledged) goes up in batches sized under both of the hub's limits
 //!   — [`MAX_BATCH_OPS`] ops and [`MAX_BATCH_BYTES`] of request body
@@ -49,6 +56,13 @@
 //!
 //! Numbers: a `field.set number` the hub authored (AGT-1391) arrives on
 //! pull like any other op; `apply_pulled` clears the ticket's pending flag.
+//!
+//! Two environment hooks exist for the seed tests and nothing else
+//! (`crate::workspace::Env`): `PM_SYNC_TEST_BATCH_OPS` shrinks the push
+//! batch so a small log takes many batches, and
+//! `PM_SYNC_TEST_CRASH_AFTER_BATCHES=n` exits the process after the hub
+//! has acknowledged `n` batches and before the `n`th is marked pushed —
+//! the worst place a crash can land.
 
 use std::thread::sleep;
 use std::time::Duration;
@@ -63,7 +77,9 @@ use ulid::Ulid;
 
 use crate::exit::{CliError, Result};
 use crate::hub::{HubClient, Transport};
+use crate::seed::{self, Seed};
 use crate::verbs::{Ctx, SCHEMA, Stamper, print_json};
+use crate::workspace::Env;
 
 /// The hub's per-batch op cap (`pm_hub::ops::MAX_BATCH_OPS`, mirrored
 /// here: the hub is a binary crate).
@@ -71,7 +87,7 @@ pub const MAX_BATCH_OPS: usize = 1000;
 /// The hub's per-request body cap (`pm_hub::ops::MAX_BODY_BYTES`).
 pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// Ops asked for per pull page (the hub clamps at 1000).
-const PAGE_LIMIT: usize = 1000;
+pub(crate) const PAGE_LIMIT: usize = 1000;
 /// Per request. A batch can be 64 MiB, and the Studio's uplink is not a
 /// data centre's. `pub(crate)`: `pm claim` (`crate::claim`) syncs and
 /// pushes through the same client.
@@ -82,12 +98,35 @@ pub struct SyncArgs {
     pub watch: Option<u64>,
 }
 
+/// How pushes are cut, and where a test wants the process to die.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    /// Ops per push batch: [`MAX_BATCH_OPS`] unless a test shrinks it.
+    pub batch_ops: usize,
+    /// `PM_SYNC_TEST_CRASH_AFTER_BATCHES` (module docs).
+    pub crash_after_batches: Option<usize>,
+}
+
+impl Limits {
+    pub(crate) fn from_env(env: &Env) -> Limits {
+        Limits {
+            batch_ops: env
+                .sync_test_batch_ops
+                .map_or(MAX_BATCH_OPS, |n| n.clamp(1, MAX_BATCH_OPS)),
+            crash_after_batches: env.sync_test_crash_after_batches,
+        }
+    }
+}
+
 /// What one round moved.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Round {
+    /// The seed this round ran, if it was the workspace's first sync.
+    seed: Option<Seed>,
     /// Outbox ops the hub acknowledged this round (rejected claims
-    /// included: they are acknowledged too).
-    pushed: usize,
+    /// included: they are acknowledged too; the seed's push too).
+    /// `pub(crate)`: the seed reads how much its two passes moved.
+    pub(crate) pushed: usize,
     /// Ops received from the hub this round.
     pulled: usize,
     /// Of those, foreign ops committed into the log.
@@ -105,13 +144,14 @@ pub(crate) struct Round {
 pub fn sync(ctx: &Ctx<'_>, args: SyncArgs) -> Result<()> {
     let (mut store, ws) = ctx.open()?;
     let hub = HubClient::resolve(ctx.env, &ws, TIMEOUT)?;
+    let limits = Limits::from_env(ctx.env);
     match args.watch {
         None => {
-            let round = run_once(ctx, &mut store, &hub)?;
+            let round = run_once(ctx, &mut store, &hub, &limits)?;
             report(ctx, &store, &ws, &hub, &round, false)
         }
         Some(secs) => loop {
-            match run_once(ctx, &mut store, &hub) {
+            match run_once(ctx, &mut store, &hub, &limits) {
                 Ok(round) => report(ctx, &store, &ws, &hub, &round, true)?,
                 Err(e) => eprintln!("pm: sync failed: {:#}", e.error),
             }
@@ -120,41 +160,127 @@ pub fn sync(ctx: &Ctx<'_>, args: SyncArgs) -> Result<()> {
     }
 }
 
-/// One push-then-pull round. `pub(crate)`: `pm claim` runs one before it
-/// asks the hub for a claim, so its candidates and stamps are current.
-pub(crate) fn run_once(ctx: &Ctx<'_>, store: &mut Store, hub: &HubClient) -> Result<Round> {
+/// One seed-if-needed, push, pull round. `pub(crate)`: `pm claim` runs
+/// one before it asks the hub for a claim, so its candidates and stamps
+/// are current.
+pub(crate) fn run_once(
+    ctx: &Ctx<'_>,
+    store: &mut Store,
+    hub: &HubClient,
+    limits: &Limits,
+) -> Result<Round> {
     let mut round = Round::default();
-    push_all(ctx, store, hub, &mut round)?;
+    round.seed = seed::ensure_seeded(ctx, store, hub, limits, &mut round)?;
+    push_all(
+        ctx,
+        store,
+        hub,
+        limits,
+        Outbox::All,
+        &mut Progress::quiet(),
+        &mut round,
+    )?;
     pull_all(store, hub, &mut round)?;
     Ok(round)
 }
 
 // ------------------------------------------------------------------- push
 
-/// Pushes the whole outbox, batch by batch, marking each batch as the hub
-/// acknowledges it and reconciling any claim it refuses (module docs); the
-/// compensating ops a rejection logs join the outbox and go up in a later
-/// batch of the same call. `pub(crate)`: `pm claim --branch` pushes its
-/// companion write this way once the hub has admitted the claim.
+/// Where a long push reports to. A plain sync says nothing per batch; a
+/// seed ([`Progress::seed`]) prints a line per batch on stderr, since the
+/// Studio's seed is thousands of ops and tens of megabytes.
+pub(crate) struct Progress {
+    total: usize,
+    pushed: usize,
+    bytes: usize,
+    loud: bool,
+}
+
+impl Progress {
+    pub(crate) fn quiet() -> Progress {
+        Progress {
+            total: 0,
+            pushed: 0,
+            bytes: 0,
+            loud: false,
+        }
+    }
+
+    /// Reports every batch of a push of `total` ops.
+    pub(crate) fn seed(total: usize) -> Progress {
+        Progress {
+            total,
+            pushed: 0,
+            bytes: 0,
+            loud: true,
+        }
+    }
+
+    fn batch(&mut self, ops: usize, bytes: usize) {
+        self.pushed += ops;
+        self.bytes += bytes;
+        if self.loud {
+            eprintln!(
+                "seed: {}/{} op(s) pushed ({:.1} MiB)",
+                self.pushed,
+                self.total,
+                self.bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
+}
+
+/// Which part of the outbox a push drains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outbox {
+    /// Everything, in local `seq` order: a plain sync.
+    All,
+    /// Only the config ops ([`Store::outbox_config`]): the seed's first
+    /// pass, so the hub's log has every state, project and document
+    /// binding ahead of the ops that need them.
+    Config,
+}
+
+/// Pushes the outbox (`which` part of it), batch by batch, marking each
+/// batch as the hub acknowledges it and reconciling any claim it refuses
+/// (module docs); the compensating ops a rejection logs join the outbox
+/// and go up in a later batch of the same call. `pub(crate)`: `pm claim
+/// --branch` pushes its companion write this way once the hub has
+/// admitted the claim, and the seed pushes through it twice.
 pub(crate) fn push_all(
     ctx: &Ctx<'_>,
     store: &mut Store,
     hub: &HubClient,
+    limits: &Limits,
+    which: Outbox,
+    progress: &mut Progress,
     round: &mut Round,
 ) -> Result<()> {
+    let mut batches = 0;
     loop {
-        let outbox = store.outbox(MAX_BATCH_OPS)?;
+        let outbox = match which {
+            Outbox::All => store.outbox(limits.batch_ops)?,
+            Outbox::Config => store.outbox_config(limits.batch_ops)?,
+        };
         if outbox.is_empty() {
             return Ok(());
         }
         let batch = Batch::take(&outbox, MAX_BATCH_BYTES)?;
         let acks = post_batch(hub, &batch)?;
+        batches += 1;
+        if limits.crash_after_batches == Some(batches) {
+            // Test hook (module docs): the hub has this batch, the outbox
+            // still does — exactly what a crash here would leave behind.
+            eprintln!("pm: PM_SYNC_TEST_CRASH_AFTER_BATCHES: exiting after batch {batches}");
+            std::process::exit(1);
+        }
         // Only what the hub acknowledged leaves the outbox — a refused
         // claim included: the hub decided it. Anything it did not name
         // stays and goes up again next round.
         let acked: Vec<Ulid> = acks.iter().map(|a| a.op_id).collect();
         store.mark_pushed(&acked)?;
         round.pushed += acked.len();
+        progress.batch(acked.len(), batch.body.len());
         // Reconcile after the mark: a crash between the two leaves the
         // claim out of the outbox rather than re-pushing it, since a re-push
         // is a fresh claim the hub may then admit — which would make the
@@ -382,16 +508,40 @@ impl Batch {
 
 /// One page of `GET /ops`, as `docs/hub-api.md` describes it.
 #[derive(Deserialize)]
-struct Page {
-    ops: Vec<Item>,
-    next: i64,
-    head: i64,
+pub(crate) struct Page {
+    pub(crate) ops: Vec<Item>,
+    pub(crate) next: i64,
+    pub(crate) head: i64,
 }
 
 #[derive(Deserialize)]
-struct Item {
-    seq: i64,
-    op: Value,
+pub(crate) struct Item {
+    pub(crate) seq: i64,
+    pub(crate) op: Value,
+}
+
+/// `GET /ops?since=<since>&limit=` — one page, or the sync's error for
+/// whatever the hub answered instead. `pub(crate)`: the seed's probe.
+pub(crate) fn pull_page(hub: &HubClient, since: i64) -> Result<Page> {
+    let (status, body) = hub
+        .get(&format!("ops?since={since}&limit={PAGE_LIMIT}"))
+        .map_err(|e| transport(hub, e))?;
+    match status {
+        200 => {}
+        404 => return Err(unauthorized(hub)),
+        400 => return Err(refused(status, &body)),
+        503 => return Err(unavailable()),
+        other => return Err(unexpected(other, "the pull")),
+    }
+    let page: Page =
+        serde_json::from_str(&body).context("the hub's pull response is not a page")?;
+    if page.next < since {
+        return Err(CliError::error(format!(
+            "the hub answered a pull since {since} with next = {}; refusing to move the cursor backwards",
+            page.next
+        )));
+    }
+    Ok(page)
 }
 
 /// Pulls from the cursor to the hub's head, a page per transaction, and
@@ -399,24 +549,7 @@ struct Item {
 fn pull_all(store: &mut Store, hub: &HubClient, round: &mut Round) -> Result<()> {
     let mut since = store.cursor()?;
     loop {
-        let (status, body) = hub
-            .get(&format!("ops?since={since}&limit={PAGE_LIMIT}"))
-            .map_err(|e| transport(hub, e))?;
-        match status {
-            200 => {}
-            404 => return Err(unauthorized(hub)),
-            400 => return Err(refused(status, &body)),
-            503 => return Err(unavailable()),
-            other => return Err(unexpected(other, "the pull")),
-        }
-        let page: Page =
-            serde_json::from_str(&body).context("the hub's pull response is not a page")?;
-        if page.next < since {
-            return Err(CliError::error(format!(
-                "the hub answered a pull since {since} with next = {}; refusing to move the cursor backwards",
-                page.next
-            )));
-        }
+        let page = pull_page(hub, since)?;
         let ops = page
             .ops
             .into_iter()
@@ -464,7 +597,8 @@ pub(crate) fn unauthorized(hub: &HubClient) -> CliError {
 }
 
 /// A structured `4xx`: `{"error", "reason", …}` (`docs/hub-api.md`).
-fn refused(status: u16, body: &str) -> CliError {
+/// `pub(crate)`: the seed's end reports the same way.
+pub(crate) fn refused(status: u16, body: &str) -> CliError {
     let detail: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     let field = |k: &str| detail.get(k).and_then(Value::as_str).map(str::to_string);
     let error = field("error").unwrap_or_else(|| format!("HTTP {status}"));
@@ -507,6 +641,8 @@ fn report(
             "schema": SCHEMA,
             "hub": hub.url,
             "workspace": ws.id.to_string(),
+            "seed": round.seed,
+            "seeded": state.seeded,
             "pushed": round.pushed,
             "pulled": round.pulled,
             "applied": round.applied,
@@ -523,10 +659,21 @@ fn report(
             print_json(&value);
         }
     } else {
-        let mut line = format!(
+        let mut line = String::new();
+        if let Some(seed) = &round.seed {
+            line.push_str(&format!(
+                "seeded hub workspace {} ({}{} op(s), number floor {}, {} ticket(s) numbered by the hub); ",
+                hub.workspace,
+                if seed.resumed { "resumed; " } else { "" },
+                seed.pushed,
+                seed.number_floor,
+                seed.numbered
+            ));
+        }
+        line.push_str(&format!(
             "pushed {} op(s); pulled {} op(s): {} applied, {} skipped; cursor {} (hub head {})",
             round.pushed, round.pulled, round.applied, round.skipped, round.cursor, round.head
-        );
+        ));
         if state.outbox > 0 {
             line.push_str(&format!("; {} op(s) still in the outbox", state.outbox));
         }
@@ -665,6 +812,19 @@ mod tests {
         assert_eq!(report["taken_by"], "claude:pm-build");
         assert_eq!(report["code"], "not_unstarted");
         assert_eq!(report["at"]["counter"], 3);
+    }
+
+    #[test]
+    fn limits_clamp_the_test_batch_size_to_the_hub_cap() {
+        let mut env = Env::default();
+        assert_eq!(Limits::from_env(&env).batch_ops, MAX_BATCH_OPS);
+        env.sync_test_batch_ops = Some(0);
+        assert_eq!(Limits::from_env(&env).batch_ops, 1);
+        env.sync_test_batch_ops = Some(7);
+        assert_eq!(Limits::from_env(&env).batch_ops, 7);
+        env.sync_test_batch_ops = Some(MAX_BATCH_OPS * 2);
+        assert_eq!(Limits::from_env(&env).batch_ops, MAX_BATCH_OPS);
+        assert_eq!(Limits::from_env(&env).crash_after_batches, None);
     }
 
     #[test]

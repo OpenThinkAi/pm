@@ -366,3 +366,35 @@ Errors: `400 invalid_body` (not `{"number_floor": <n>}`), `409
 already_seeded` (the seed already ended; the hub is the authority — a
 client retrying a lost response treats this as done). Auth failures are
 the usual bare `404`.
+
+### How `pm sync` seeds (AGT-1396)
+
+The client's first sync (`crates/pm/src/seed.rs`; `docs/cli-contract.md`
+§`pm sync`) drives the seed with the routes above and nothing else:
+
+1. `GET /whoami` — `seeded: false` means seed (or finish seeding);
+   `true` means the hub is the authority and the client only pushes and
+   pulls. A client that has never pushed yet holds a log refuses to sync
+   into a seeded workspace (that log would be a second seed).
+2. `GET /ops?since=0&limit=1000` — the probe. `head == 0`: a fresh seed.
+   `head > 0`: an interrupted seed being resumed, **only if every op in
+   that page is in the client's log**; a page holding an op the client
+   lacks means the workspace was seeded from another log, and the client
+   refuses. Ops the probe finds count as pushed.
+3. `POST /ops` for the whole outbox in batches, exactly as a push — the
+   **config ops first** (`workspace.set`, `state.upsert`, `actor.upsert`,
+   `project.*`), then the rest in the client's own log order, so the
+   hub's seq order has every state, project and document binding ahead
+   of the ops that need them (a legacy log's config ops were backfilled
+   at its end by pm-store's migrations 0007/0008) and a replica joining
+   later can apply the log page by page. The client's own `field.set
+   number` ops go up as they are. Re-pushing after an interruption
+   relies on `stored: false` being a no-op.
+4. `POST /seeded {"number_floor": <client floor>}` — the client applies
+   the returned `numbers[].op` at once and raises its floor to the
+   answer's `number_floor`; `409 already_seeded` is treated as done.
+   Only now does the client mark itself seeded; its first pull then runs
+   from `since=0` and skips its own ops.
+
+An empty replica joining a seeded workspace (`pm init --join`) runs step
+1, is marked seeded, and pulls from `since=0`.
