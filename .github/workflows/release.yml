@@ -169,7 +169,10 @@ jobs:
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+      # HAND-EDIT (AGT-1372 audit r4): only upload when the plan step ran;
+      # on a non-release push (version already on npm) there is no manifest.
       - name: "Upload dist-manifest.json"
+        if: steps.check_npm.outputs.published == 'false'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: artifacts-plan-dist-manifest
@@ -246,10 +249,15 @@ jobs:
       # release binaries are always built from the committed lockfile.
       - name: Verify Cargo.lock is up to date
         run: cargo fetch --locked
+      # HAND-EDIT (AGT-1372 audit r4): plan-derived `dist_args` is passed via
+      # env, like `packages_install`, instead of interpolated into the script.
+      # Left unquoted on purpose: it holds several flags that must word-split.
       - name: Build artifacts
+        env:
+          DIST_ARGS: ${{ matrix.dist_args }}
         run: |
           # Actually do builds and make zips and whatnot
-          dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json $DIST_ARGS > dist-manifest.json
           echo "dist ran successfully"
       - id: cargo-dist
         name: Post-build

@@ -201,6 +201,10 @@ marked with a `HAND-EDIT` or `PATCHED` comment in the file:
 - `build-global-artifacts` / `build-local-artifacts`: `matrix.packages_install`
   is passed via `env:` and run as a quoted variable, not interpolated into
   the `run:` script;
+- `build-local-artifacts`: `matrix.dist_args` is passed via `env:`
+  (`DIST_ARGS`, unquoted so its flags word-split), not interpolated;
+- `plan`: the "Upload dist-manifest.json" step carries the same
+  `published == 'false'` guard as the plan step;
 - `host`: `environment: release`, so the job holding `contents: write`,
   `id-token` and attestations is gated by environment rules.
 
