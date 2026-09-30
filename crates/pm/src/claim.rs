@@ -273,7 +273,11 @@ impl Taken {
         };
         CliError {
             code: exit::TAKEN,
-            error: anyhow::anyhow!("{id} is {holder} (since {}): {}", verbs::when(&self.at), self.reason),
+            error: anyhow::anyhow!(
+                "{id} is {holder} (since {}): {}",
+                verbs::when(&self.at),
+                self.reason
+            ),
         }
     }
 }

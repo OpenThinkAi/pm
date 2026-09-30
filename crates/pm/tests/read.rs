@@ -341,7 +341,10 @@ fn log_lists_ops_oldest_first_with_hlc_actor_kind_and_summary() {
     // AGT-1449: the time column is a UTC date-time, not `<wall_ms>.<n>`.
     let first = human.lines().next().unwrap();
     assert!(first.contains(" UTC"), "{first}");
-    assert!(!first.split_whitespace().next().unwrap().contains('.'), "{first}");
+    assert!(
+        !first.split_whitespace().next().unwrap().contains('.'),
+        "{first}"
+    );
     let wall = ops[0]["hlc"]["wall_ms"].as_u64().unwrap();
     assert!(!human.contains(&wall.to_string()), "{human}");
 }

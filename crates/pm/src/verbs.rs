@@ -1383,6 +1383,9 @@ mod when_tests {
         assert_eq!(when(&hlc), "2026-09-30 12:04 UTC");
         assert_eq!(when_secs(&hlc), "2026-09-30 12:04:10 UTC");
         assert_eq!(when(&Hlc::new(0, 0)), "1970-01-01 00:00 UTC");
-        assert_eq!(when_secs(&Hlc::new(86_399_999, 0)), "1970-01-01 23:59:59 UTC");
+        assert_eq!(
+            when_secs(&Hlc::new(86_399_999, 0)),
+            "1970-01-01 23:59:59 UTC"
+        );
     }
 }
