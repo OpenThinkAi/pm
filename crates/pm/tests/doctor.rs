@@ -345,3 +345,61 @@ fn doctor_exit_codes_outside_a_workspace() {
     );
     assert_code(&sb.pm(&["doctor", "--bogus"]), 2);
 }
+
+/// AGT-1482: `--prune-quarantine` drops a refused op's content now and
+/// says so; the entry stays, marked `pruned`, and the database is healthy.
+#[test]
+fn prune_quarantine_drops_refused_content_and_keeps_the_entry() {
+    let sb = Sandbox::new();
+    let ticket = exercise(&sb);
+    let bad = Op::new(
+        Ulid::new(),
+        pm_core::Hlc::new(1_700_000_000_000, 0),
+        ActorId::new("peer"),
+        ticket,
+        Payload::Claim(pm_core::op::Claim {
+            state: "../../x".into(),
+            assignee: ActorId::new("peer"),
+        }),
+    );
+    let pulled = sb
+        .store()
+        .apply_pulled_page(&[(7, bad.clone())], 7)
+        .unwrap();
+    assert_eq!(pulled.refused.len(), 1);
+
+    let before = json(&sb.pm(&["doctor", "--json", "--workspace", sb.ws_str()]));
+    assert!(before.get("pruned_quarantine").is_none(), "{before}");
+    assert_eq!(before["quarantine"][0]["pruned"], false);
+
+    let out = sb.pm(&[
+        "doctor",
+        "--json",
+        "--prune-quarantine",
+        "--workspace",
+        sb.ws_str(),
+    ]);
+    assert_code(&out, 0);
+    let after = json(&out);
+    assert_eq!(after["pruned_quarantine"], 1);
+    assert_eq!(after["healthy"], true);
+    let entry = &after["quarantine"][0];
+    assert_eq!(entry["op_id"], bad.op_id.to_string());
+    assert_eq!(entry["status"], "refused");
+    assert_eq!(entry["pruned"], true);
+    assert!(entry["reason"].as_str().unwrap().contains("state name"));
+    let content: String = sb
+        .raw()
+        .query_row("SELECT op FROM sync_quarantine", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(content, "");
+
+    let out = sb.pm(&["doctor", "--prune-quarantine", "--workspace", sb.ws_str()]);
+    assert_code(&out, 0);
+    let text = stdout(&out);
+    assert!(
+        text.contains("pruned the content of 0 refused op(s)"),
+        "{text}"
+    );
+    assert!(text.contains("[content pruned]"), "{text}");
+}

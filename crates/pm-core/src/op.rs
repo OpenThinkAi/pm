@@ -17,7 +17,7 @@ use crate::domain::{
     ActorId, ActorKind, Hold, NotBefore, Parked, Priority, ProjectStatus, Relation, Source,
     StateCategory, Waiver,
 };
-use crate::hlc::{Hlc, Stamp};
+use crate::hlc::{Hlc, Stamp, StampError};
 
 /// Schema version written into every op this build produces. Bump when a
 /// payload shape changes incompatibly; readers branch on `op.version`.
@@ -37,13 +37,42 @@ pub const OP_VERSION: u16 = 1;
 /// client ingest path ([`Op::check_size`]).
 pub const MAX_BODY_EDIT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Largest payload of any other kind, in bytes of its JSON (1 MiB;
+/// AGT-1482). Every pulled op is folded into a view that is re-serialized
+/// on each later op of its ticket, and re-served to every replica, so no
+/// kind may be unbounded. The largest honest non-`body.edit` payload on
+/// record is a 14 KB comment (the Studio workspace, 2026-09-30); a
+/// megabyte leaves room for a pasted log while keeping a hostile peer from
+/// making each later op on a ticket slow. Checked, like
+/// [`MAX_BODY_EDIT_BYTES`], at the hub's push and on every client ingest
+/// path ([`Op::check_size`]).
+pub const MAX_OP_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 /// An op whose payload is over its size bound ([`Op::check_size`]).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{kind} update is {bytes} bytes, over the {max}-byte limit")]
+#[error("{kind} {what} is {bytes} bytes, over the {max}-byte limit")]
 pub struct OpTooLarge {
     pub kind: &'static str,
+    /// What was measured: a `body.edit`'s decoded `update`, or any other
+    /// kind's `payload` JSON.
+    pub what: &'static str,
     pub bytes: usize,
     pub max: usize,
+}
+
+/// Counts the bytes serialized into it, so a payload can be measured
+/// without being buffered.
+struct Counter(usize);
+
+impl std::io::Write for Counter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,17 +123,69 @@ impl Op {
         Stamp::new(self.hlc, self.actor.clone())
     }
 
-    /// Refuses a `body.edit` whose update is over [`MAX_BODY_EDIT_BYTES`].
-    /// Every other kind is bounded only by the hub's request limit.
+    /// Refuses a `body.edit` whose update is over [`MAX_BODY_EDIT_BYTES`]
+    /// (decoded), and an op of any other kind whose payload serializes to
+    /// more than [`MAX_OP_PAYLOAD_BYTES`] of JSON (AGT-1482). A pure
+    /// function of the op, so every replica decides alike.
     pub fn check_size(&self) -> Result<(), OpTooLarge> {
-        match &self.payload {
-            Payload::BodyEdit(edit) if edit.update.len() > MAX_BODY_EDIT_BYTES => Err(OpTooLarge {
+        let (what, bytes, max) = match &self.payload {
+            Payload::BodyEdit(edit) => ("update", edit.update.len(), MAX_BODY_EDIT_BYTES),
+            payload => {
+                let mut counter = Counter(0);
+                serde_json::to_writer(&mut counter, payload).expect("a payload serializes");
+                ("payload", counter.0, MAX_OP_PAYLOAD_BYTES)
+            }
+        };
+        if bytes > max {
+            return Err(OpTooLarge {
                 kind: self.kind(),
-                bytes: edit.update.len(),
-                max: MAX_BODY_EDIT_BYTES,
-            }),
-            _ => Ok(()),
+                what,
+                bytes,
+                max,
+            });
         }
+        Ok(())
+    }
+
+    /// The stamps this op carries as data in its payload, by field:
+    /// a `field.set archived_at` value and a `hold.set`'s `hold.at`
+    /// (AGT-1482). The fold copies them into the ticket, where they are
+    /// stored as integers like the op's own stamp.
+    pub fn payload_stamps(&self) -> Vec<(&'static str, Hlc)> {
+        match &self.payload {
+            Payload::FieldSet(FieldSet::ArchivedAt(Some(at))) => vec![("archived_at", *at)],
+            Payload::HoldSet(set) => vec![("hold.at", set.hold.at)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Checks every [payload stamp](Op::payload_stamps) the way a trust
+    /// boundary checks the op's own stamp: storable ([`Hlc::check_range`],
+    /// else [`StampError::PayloadOutOfRange`] — a property of the op) and
+    /// at most `max_skew_ms` ahead of the receiver's clock `now_ms`
+    /// ([`Hlc::check_not_after`], else [`StampError::PayloadFarFuture`] —
+    /// a property of the clock, handled like [`StampError::FarFuture`]).
+    /// Not bounded by the op's own stamp: importing the vault writes a
+    /// ticket's archive month, which can postdate the op it rides on.
+    pub fn check_payload_stamps(&self, now_ms: u64, max_skew_ms: u64) -> Result<(), StampError> {
+        for (field, at) in self.payload_stamps() {
+            if at.check_range().is_err() {
+                return Err(StampError::PayloadOutOfRange {
+                    field,
+                    wall_ms: at.wall_ms,
+                    counter: at.counter,
+                });
+            }
+            if at.check_not_after(now_ms, max_skew_ms).is_err() {
+                return Err(StampError::PayloadFarFuture {
+                    field,
+                    wall_ms: at.wall_ms,
+                    now_ms,
+                    max_skew_ms,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -449,14 +530,149 @@ mod tests {
             e,
             OpTooLarge {
                 kind: "body.edit",
+                what: "update",
                 bytes: MAX_BODY_EDIT_BYTES + 1,
                 max: MAX_BODY_EDIT_BYTES
             }
         );
+        assert!(e.to_string().contains("body.edit update"), "{e}");
         for other in all_kinds() {
             if !matches!(other.payload, Payload::BodyEdit(_)) {
                 assert_eq!(other.check_size(), Ok(()), "{}", other.kind());
             }
+        }
+    }
+
+    /// AGT-1482: every other kind is bounded by its payload's JSON size,
+    /// measured exactly as `serde_json` writes it.
+    #[test]
+    fn every_other_payload_is_size_bounded() {
+        let comment = |len: usize| {
+            op(Payload::CommentAdd(CommentAdd {
+                body: "x".repeat(len),
+            }))
+        };
+        let json_len = |o: &Op| serde_json::to_vec(&o.payload).unwrap().len();
+        // `{"kind":"comment.add","payload":{"body":"…"}}` around the body.
+        let overhead = json_len(&comment(0));
+        let at_bound = comment(MAX_OP_PAYLOAD_BYTES - overhead);
+        assert_eq!(json_len(&at_bound), MAX_OP_PAYLOAD_BYTES);
+        assert_eq!(at_bound.check_size(), Ok(()));
+        let e = comment(MAX_OP_PAYLOAD_BYTES - overhead + 1)
+            .check_size()
+            .unwrap_err();
+        assert_eq!(
+            e,
+            OpTooLarge {
+                kind: "comment.add",
+                what: "payload",
+                bytes: MAX_OP_PAYLOAD_BYTES + 1,
+                max: MAX_OP_PAYLOAD_BYTES
+            }
+        );
+        assert!(e.to_string().contains("comment.add payload"), "{e}");
+        // Other shapes too: a title, an ext value, a hold reason, a label.
+        let big = "y".repeat(MAX_OP_PAYLOAD_BYTES);
+        for o in [
+            op(Payload::FieldSet(FieldSet::Title(big.clone()))),
+            op(Payload::FieldSet(FieldSet::Ext {
+                key: "k".into(),
+                value: Some(Value::String(big.clone())),
+            })),
+            op(Payload::HoldSet(HoldSet {
+                hold: Hold {
+                    reason: big.clone(),
+                    by: ActorId::new("m"),
+                    at: Hlc::new(5, 1),
+                },
+            })),
+            op(Payload::LabelAdd(LabelAdd { label: big.clone() })),
+        ] {
+            assert_eq!(o.check_size().unwrap_err().what, "payload", "{}", o.kind());
+        }
+    }
+
+    /// AGT-1482: stamps carried in payloads are range-checked, and
+    /// skew-checked against the receiver's clock like the op's own stamp
+    /// — not against the op (a vault import's archive month may postdate
+    /// its op).
+    #[test]
+    fn payload_stamps_are_range_and_skew_checked() {
+        use crate::hlc::MAX_FUTURE_SKEW_MS as DAY;
+        let at = |op_wall: u64, payload: Payload| {
+            Op::new(
+                Ulid::new(),
+                Hlc::new(op_wall, 0),
+                ActorId::new("matt"),
+                Ulid::new(),
+                payload,
+            )
+        };
+        let archived = |h: Hlc| Payload::FieldSet(FieldSet::ArchivedAt(Some(h)));
+        let hold = |h: Hlc| {
+            Payload::HoldSet(HoldSet {
+                hold: Hold {
+                    reason: "r".into(),
+                    by: ActorId::new("m"),
+                    at: h,
+                },
+            })
+        };
+        const NOW: u64 = 1_790_000_000_000;
+        for (field, make) in [
+            ("archived_at", &archived as &dyn Fn(Hlc) -> Payload),
+            ("hold.at", &hold),
+        ] {
+            // The op's own stamp, an older one, one later than its op (an
+            // imported archive month), one at the bound: fine.
+            for ok in [
+                Hlc::new(NOW - 90 * DAY, 0),
+                Hlc::new(0, 0),
+                Hlc::new(NOW - DAY, 3),
+                Hlc::new(NOW + DAY, 7),
+            ] {
+                assert_eq!(
+                    at(NOW - 90 * DAY, make(ok)).check_payload_stamps(NOW, DAY),
+                    Ok(()),
+                    "{ok}"
+                );
+            }
+            let o = at(NOW, make(Hlc::new(NOW + DAY + 1, 0)));
+            assert_eq!(
+                o.check_payload_stamps(NOW, DAY),
+                Err(StampError::PayloadFarFuture {
+                    field,
+                    wall_ms: NOW + DAY + 1,
+                    now_ms: NOW,
+                    max_skew_ms: DAY
+                })
+            );
+            // A wider window (a pull's) admits it.
+            assert_eq!(o.check_payload_stamps(NOW, 2 * DAY), Ok(()));
+            for bad in [
+                Hlc::new(u64::MAX, 0),
+                Hlc::new(crate::MAX_WALL_MS + 1, 0),
+                Hlc::new(5, u32::MAX),
+            ] {
+                let e = at(NOW, make(bad))
+                    .check_payload_stamps(u64::MAX, DAY)
+                    .unwrap_err();
+                assert!(
+                    matches!(e, StampError::PayloadOutOfRange { field: f, .. } if f == field),
+                    "{bad}: {e}"
+                );
+                assert!(e.to_string().contains(field), "{e}");
+            }
+        }
+        // `archived_at: null` and every stamp-free kind carry none.
+        assert_eq!(
+            at(NOW, Payload::FieldSet(FieldSet::ArchivedAt(None))).payload_stamps(),
+            []
+        );
+        for o in all_kinds() {
+            let expected = usize::from(matches!(o.payload, Payload::HoldSet(_)));
+            assert_eq!(o.payload_stamps().len(), expected, "{}", o.kind());
+            assert_eq!(o.check_payload_stamps(NOW, DAY), Ok(()), "{}", o.kind());
         }
     }
 

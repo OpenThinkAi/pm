@@ -5,7 +5,10 @@
 //! exactly — else 1. `--rebuild` regenerates them from the log first,
 //! prints what changed, then reports on the result. Pulled ops `pm sync`
 //! parked or refused (AGT-1467) are listed under `quarantine`; they are
-//! informational and never affect health.
+//! informational and never affect health. A refused op's content is
+//! dropped 30 days after its refusal (AGT-1482); `--prune-quarantine`
+//! drops every refused op's content now, before the report, keeping its
+//! id, hub seq, kind, entity and reason.
 
 use pm_store::{Diff, Report};
 use serde_json::{Value, json};
@@ -14,10 +17,15 @@ use crate::exit::{CliError, Result};
 use crate::verbs::{Ctx, SCHEMA};
 use crate::workspace;
 
-pub fn doctor(ctx: &Ctx<'_>, rebuild: bool) -> Result<()> {
+pub fn doctor(ctx: &Ctx<'_>, rebuild: bool, prune_quarantine: bool) -> Result<()> {
     let (mut store, _) = workspace::open(&workspace::resolve(ctx.workspace, ctx.env)?)?;
     let rebuilt = if rebuild {
         Some(store.rebuild()?)
+    } else {
+        None
+    };
+    let pruned = if prune_quarantine {
+        Some(store.prune_quarantine()?)
     } else {
         None
     };
@@ -29,6 +37,9 @@ pub fn doctor(ctx: &Ctx<'_>, rebuild: bool) -> Result<()> {
             "healthy": report.is_healthy(),
             "rebuilt": rebuilt,
         });
+        if let Some(pruned) = pruned {
+            out["pruned_quarantine"] = json!(pruned);
+        }
         let Value::Object(fields) = serde_json::to_value(&report).expect("a report serializes")
         else {
             unreachable!("a report serializes to an object");
@@ -43,6 +54,10 @@ pub fn doctor(ctx: &Ctx<'_>, rebuild: bool) -> Result<()> {
     } else {
         if let Some(diff) = &rebuilt {
             print_rebuilt(diff, report.op_count);
+        }
+        if let Some(pruned) = pruned {
+            println!("pruned the content of {pruned} refused op(s) in the sync quarantine");
+            println!();
         }
         print_report(&report);
     }
@@ -137,8 +152,9 @@ fn print_report(report: &Report) {
                 pm_store::QuarantineStatus::Parked => "parked",
                 pm_store::QuarantineStatus::Refused => "refused",
             };
+            let pruned = if q.pruned { " [content pruned]" } else { "" };
             println!(
-                "  {status:<7} {} {} (hub seq {}, entity {}): {}",
+                "  {status:<7} {} {} (hub seq {}, entity {}){pruned}: {}",
                 q.op_id,
                 q.kind,
                 q.hub_seq,

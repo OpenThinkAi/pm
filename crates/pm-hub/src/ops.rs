@@ -73,6 +73,18 @@
 //! hub refused its claim (`rejected.taken_by`). Unassigning
 //! (`field.set assignee null`) names nobody and is always accepted.
 //!
+//! **Assignments are arbitrated (AGT-1482).** Once seeded, a fresh
+//! `field.set assignee` naming an actor, from an actor-bound token, is
+//! judged like a `claim` (`views::Views::fold_judging`): admitted only on
+//! an unstarted, unassigned ticket, else answered with a claim's
+//! `rejected` ack and not stored. The restating write above is exempt;
+//! so are unrestricted tokens (the operator reassigns deliberately).
+//!
+//! **Seeded numbers (AGT-1482).** While seeding, only an unrestricted
+//! token may push `field.set number` ops (`400 number_not_allowed`
+//! otherwise): the largest seeded number becomes the floor, and a number
+//! taken now is refused to the real seed.
+//!
 //! **Stamps (oaudit 2026-09-30).** Every op's HLC must be storable and
 //! leave its counter room to advance (`pm_core::Hlc::check_range`:
 //! `wall_ms <= i64::MAX`, `counter < u32::MAX`; else `400
@@ -80,12 +92,14 @@
 //! ahead of the hub's wall clock (else `400 future_stamp`): a far-future
 //! stamp would win every LWW register and drag every clock that sees it
 //! forward. Stamps from the past are always accepted — a seed uploads
-//! historical ops.
+//! historical ops. Stamps carried in payloads (`archived_at`, `hold.at`;
+//! AGT-1482) get the same range and one-day checks.
 //!
 //! **Identifiers (AGT-1450).** A `workspace.set prefix`, `project.create`
 //! (id, parent) or `project.set parent` whose value is not a safe path
 //! component (`pm_core::ids::is_safe_component`) is `400 invalid_id`:
-//! clients use these in file paths.
+//! clients use these in file paths; so is every state name, a `claim`'s
+//! included (AGT-1482), and document name (`pm_core::ids::check_op_ids`).
 //!
 //! **Limits.** [`MAX_BATCH_OPS`] ops per batch, [`MAX_BODY_BYTES`] of body
 //! (the Studio's seed log holds one 23 MB `body.edit`, so the byte limit
@@ -93,7 +107,9 @@
 //! the limit is a 413 whether announced by `Content-Length` or discovered
 //! while reading. A `body.edit` whose decoded update is over
 //! `pm_core::MAX_BODY_EDIT_BYTES` (32 MiB) is `400 op_too_large`
-//! (AGT-1467); replicas refuse one on pull too.
+//! (AGT-1467), and so is any other op whose payload JSON is over
+//! `pm_core::MAX_OP_PAYLOAD_BYTES` (1 MiB, AGT-1482); replicas refuse
+//! them on pull too.
 
 use std::collections::HashMap;
 
@@ -196,6 +212,13 @@ enum PushError {
         index: usize,
         op_id: String,
     },
+    /// A `field.set number` pushed while seeding by an actor-bound token
+    /// (AGT-1482).
+    SeedNumberNotAllowed {
+        index: usize,
+        op_id: String,
+        reason: String,
+    },
     /// A seeded `field.set number` that collides with a number already
     /// issued, or re-numbers a ticket.
     DuplicateNumber {
@@ -295,6 +318,19 @@ impl IntoResponse for PushError {
                              (push the ticket.create without one and read the number \
                              from the response or a pull)"
                         .to_string(),
+                    index: Some(index),
+                    op_id: Some(op_id),
+                },
+            ),
+            PushError::SeedNumberNotAllowed {
+                index,
+                op_id,
+                reason,
+            } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "number_not_allowed",
+                    reason,
                     index: Some(index),
                     op_id: Some(op_id),
                 },
@@ -499,6 +535,13 @@ fn parse_op(index: usize, raw: &RawValue, now_ms: u64) -> Result<Parsed<'_>, Pus
     op.hlc
         .check_not_after(now_ms, MAX_FUTURE_SKEW_MS)
         .map_err(|e| stamp("future_stamp", e))?;
+    // AGT-1482: stamps carried as data (`archived_at`, `hold.at`) are
+    // held to the same range and the same one-day bound.
+    op.check_payload_stamps(now_ms, MAX_FUTURE_SKEW_MS)
+        .map_err(|e| match e {
+            pm_core::StampError::PayloadFarFuture { .. } => stamp("future_stamp", e),
+            e => stamp("invalid_stamp", e),
+        })?;
     // Prefixes and project ids end up in client file paths (AGT-1453);
     // refuse a hostile one before it is stored (AGT-1450).
     pm_core::ids::check_op_ids(&op).map_err(|e| PushError::OpCheck {
@@ -507,8 +550,8 @@ fn parse_op(index: usize, raw: &RawValue, now_ms: u64) -> Result<Parsed<'_>, Pus
         op_id: Some(op.op_id.to_string()),
         reason: e.to_string(),
     })?;
-    // AGT-1467: one oversized document update would be re-served to, and
-    // folded by, every replica.
+    // AGT-1467, AGT-1482: one oversized document update — or payload of
+    // any kind — would be re-served to, and folded by, every replica.
     op.check_size().map_err(|e| PushError::OpCheck {
         error: "op_too_large",
         index,
@@ -641,6 +684,23 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
             }
             Vec::new()
         } else {
+            // AGT-1482: seeded numbers set the floor the seed's end adopts,
+            // and a number taken now is refused to the real seed, so only a
+            // token that may end the seed may push them.
+            if !caller.actors.unrestricted()
+                && let Some(p) = fresh.iter().find(|p| matches!(p.role, Role::Number(_)))
+            {
+                return Err(PushError::SeedNumberNotAllowed {
+                    index: first_at[&p.op_id],
+                    op_id: p.op_id.clone(),
+                    reason: format!(
+                        "token {} ({}) is bound to actors; only an unrestricted token \
+                         (legacy, or minted with --any / bound to '*') may push a seed's \
+                         ticket numbers",
+                        caller.token_id, caller.token_label
+                    ),
+                });
+            }
             check_seeded_numbers(&tx, workspace, &fresh, &first_at).await?
         };
         // Only fresh ops are stored, so only they must be the caller's
@@ -664,7 +724,11 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
                 first_at[&p.op_id],
                 views.assignee(p.op.entity),
             )?;
-            match views.fold(&p.op, allocator.seeded) {
+            // AGT-1482: once seeded, an actor-bound token's assignee
+            // write is held to the claim rule; an unrestricted token
+            // (the operator, who may author as anyone) reassigns freely.
+            let judge_assignee = allocator.seeded && !caller.actors.unrestricted();
+            match views.fold_judging(&p.op, allocator.seeded, judge_assignee) {
                 Ok(Verdict::Folded) => admitted.push(p),
                 Ok(Verdict::Rejected(rejection)) => {
                     outcome.insert(p.op_id.clone(), Outcome::Rejected(rejection));

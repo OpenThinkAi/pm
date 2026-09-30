@@ -56,7 +56,7 @@ pub struct Rendered {
 /// `pm export md <dir> [--legacy-markers]`.
 pub fn md(ctx: &Ctx<'_>, dir: &Path, legacy_markers: bool) -> Result<()> {
     let (store, ws) = ctx.open()?;
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    create_private_dirs(dir)?;
     let mut tickets = 0usize;
     let mut archived = 0usize;
     let mut unnumbered = 0usize;
@@ -116,12 +116,46 @@ pub fn md(ctx: &Ctx<'_>, dir: &Path, legacy_markers: bool) -> Result<()> {
     Ok(())
 }
 
+/// Writes one rendered file under `root`, owner-only (AGT-1482): the export
+/// is every ticket, comment and author name in the workspace, so it gets
+/// the same 0700/0600 treatment as the editor's temp files (AGT-1468)
+/// rather than the umask's usual world-readable 0644.
 fn write(root: &Path, r: &Rendered) -> Result<()> {
     let path = root.join(&r.path);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        create_private_dirs(parent)?;
     }
-    fs::write(&path, &r.text).with_context(|| format!("writing {}", path.display()))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    // `mode` applies only to a file this call creates; a file an earlier
+    // export (or anyone) left behind is narrowed too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {}", path.display()))?;
+    }
+    std::io::Write::write_all(&mut file, r.text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// `create_dir_all`, with every directory it creates 0700 (AGT-1482). A
+/// directory that already exists — the export root the operator named,
+/// say, or their home — is left as it is.
+fn create_private_dirs(dir: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
     Ok(())
 }
 

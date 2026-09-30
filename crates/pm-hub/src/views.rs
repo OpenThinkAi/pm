@@ -22,7 +22,10 @@
 //! op by op, so of two claims on one ticket in one batch the first is
 //! admitted and the second rejected; across batches the push path's
 //! per-workspace lock serialises every decision, so of any number of
-//! concurrent claims exactly one lands.
+//! concurrent claims exactly one lands. An actor-bound token's `field.set
+//! assignee` is judged the same way once seeded (AGT-1482,
+//! [`Views::fold_judging`]), so a claim cannot be bypassed by writing the
+//! assignee directly.
 //!
 //! **Seed mode admits every claim.** While a workspace is seeding
 //! (`seeded_at IS NULL`, see `numbers`) the log being uploaded is
@@ -73,6 +76,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use pm_core::op::FieldSet;
 use pm_core::{
     ActorId, ApplyError, ClaimRejected, ConfigApplyError, Hlc, Op, Payload, State, TicketView,
     WorkspaceView, apply, apply_workspace,
@@ -230,8 +234,24 @@ impl Views {
     /// [`TicketView::claim_admissible`] against the workspace's states
     /// and, when refused, left out ([`Verdict::Rejected`]); without it
     /// (seed mode, rebuild) every claim folds as a plain write. Pure:
-    /// no IO.
+    /// no IO. [`Views::fold_judging`] also arbitrates assignee writes.
     pub fn fold(&mut self, op: &Op, arbitrate: bool) -> Result<Verdict, FoldError> {
+        self.fold_judging(op, arbitrate, false)
+    }
+
+    /// [`Views::fold`], and with `arbitrate_assignee` (a push from an
+    /// actor-bound token, once seeded; AGT-1482) a `field.set assignee`
+    /// naming an actor is judged exactly like a `claim` — unless it
+    /// restates the ticket's current assignee, which changes nothing (and
+    /// is how a client reconciles after a refusal, AGT-1463). Without
+    /// this, a bound token could skip the `claim` and write itself in as
+    /// the assignee of a ticket someone else had won.
+    pub fn fold_judging(
+        &mut self,
+        op: &Op,
+        arbitrate: bool,
+        arbitrate_assignee: bool,
+    ) -> Result<Verdict, FoldError> {
         if let Some(admission) = &mut self.admission {
             admission.admit(op)?;
         }
@@ -261,10 +281,14 @@ impl Views {
                     .tickets
                     .entry(op.entity)
                     .or_insert_with(|| TicketView::new(op.entity));
-                if arbitrate
-                    && matches!(op.payload, Payload::Claim(_))
-                    && let Err(reason) = view.claim_admissible(&states)
-                {
+                let judged = match &op.payload {
+                    Payload::Claim(_) => arbitrate,
+                    Payload::FieldSet(FieldSet::Assignee(Some(to))) => {
+                        arbitrate_assignee && view.assignee.value.as_ref() != Some(to)
+                    }
+                    _ => false,
+                };
+                if judged && let Err(reason) = view.claim_admissible(&states) {
                     return Ok(Verdict::Rejected(rejection(view, reason)));
                 }
                 apply(view, op)?;

@@ -625,3 +625,295 @@ fn an_oversized_body_edit_is_refused_on_pull() {
     );
     assert!(store.ticket(t).unwrap().is_some());
 }
+
+// ------------------------------------------------------------ AGT-1482
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn claim(ticket: Ulid, wall_ms: u64, state: &str) -> Op {
+    op(
+        ticket,
+        wall_ms,
+        "laptop",
+        Payload::Claim(pm_core::op::Claim {
+            state: state.into(),
+            assignee: ActorId::new("laptop"),
+        }),
+    )
+}
+
+fn hold(ticket: Ulid, wall_ms: u64, at: Hlc) -> Op {
+    op(
+        ticket,
+        wall_ms,
+        "laptop",
+        Payload::HoldSet(pm_core::op::HoldSet {
+            hold: pm_core::Hold {
+                reason: "r".into(),
+                by: ActorId::new("laptop"),
+                at,
+            },
+        }),
+    )
+}
+
+fn archived(ticket: Ulid, wall_ms: u64, at: Hlc) -> Op {
+    op(
+        ticket,
+        wall_ms,
+        "laptop",
+        Payload::FieldSet(FieldSet::ArchivedAt(Some(at))),
+    )
+}
+
+/// The ops AGT-1482 makes inadmissible, each a pure function of the op:
+/// a claim whose state is not path-safe, payload stamps out of range or
+/// more than a day ahead of their op, and an oversized non-`body.edit`
+/// payload. All are refused on pull — never fail the page — and the rest
+/// lands; the same ops are refused locally.
+#[test]
+fn claim_states_payload_stamps_and_payload_sizes_are_refused_on_pull() {
+    let log = log_head();
+    let (_d, mut store) = replica(&log);
+    let n = log.config.len() as i64;
+    store.apply_pulled_page(&seqd(1, &log.config), n).unwrap();
+    let t = Ulid::new();
+    let day = pm_core::MAX_FUTURE_SKEW_MS;
+    let bad = vec![
+        claim(t, 11, "../../x"),
+        claim(t, 12, "NUL"),
+        hold(t, 13, Hlc::new(13, u32::MAX)),
+        hold(t, 14, Hlc::new(u64::MAX, 0)),
+        archived(t, 15, Hlc::new(i64::MAX as u64 + 1, 0)),
+        archived(t, 16, Hlc::new(u64::MAX, 1)),
+        comment(t, 17, &"x".repeat(pm_core::MAX_OP_PAYLOAD_BYTES)),
+    ];
+    let mut page = vec![create(t, 10, "pm")];
+    page.extend(bad.iter().cloned());
+    // Honest neighbours: a hold stamped with its op, and an archive month
+    // that postdates its op (as a vault import writes).
+    page.push(hold(t, 20, Hlc::new(20, 0)));
+    page.push(archived(t, 21, Hlc::new(21 + 30 * day, 0)));
+    page.push(comment(t, 22, "fine"));
+    let pulled = store
+        .apply_pulled_page(&seqd(n + 1, &page), n + page.len() as i64)
+        .unwrap();
+    assert_eq!(pulled.applied, 4, "{pulled:?}");
+    assert_eq!(
+        refused_ids(&store),
+        bad.iter().map(|o| o.op_id).collect::<Vec<_>>()
+    );
+    let reasons: Vec<String> = pulled.refused.iter().map(|q| q.reason.clone()).collect();
+    assert!(reasons[0].contains("state name"), "{reasons:?}");
+    assert!(reasons[1].contains("state name"), "{reasons:?}");
+    assert!(reasons[2].contains("payload hold.at"), "{reasons:?}");
+    assert!(reasons[3].contains("payload hold.at"), "{reasons:?}");
+    assert!(reasons[4].contains("payload archived_at"), "{reasons:?}");
+    assert!(reasons[5].contains("out of range"), "{reasons:?}");
+    assert!(reasons[6].contains("comment.add payload"), "{reasons:?}");
+    let ticket = store.ticket(t).unwrap().unwrap();
+    assert_eq!(ticket.state, "triage");
+    assert_eq!(ticket.archived_at, Some(Hlc::new(21 + 30 * day, 0)));
+    assert_eq!(ticket.hold.unwrap().at, Hlc::new(20, 0));
+
+    // Local commits refuse them the same way.
+    for o in &bad {
+        let mut local = o.clone();
+        local.op_id = Ulid::new();
+        let err = store.commit(&local).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::InvalidId(_) | StoreError::InvalidStamp(_) | StoreError::OpTooLarge(_)
+            ),
+            "{}: {err:?}",
+            o.kind()
+        );
+    }
+}
+
+/// A payload stamp far ahead of this machine's clock is judged like the
+/// op's own stamp: it fails the page (the verdict depends on the clock, so
+/// quarantining it would split replicas), and is refused locally past the
+/// week.
+#[test]
+fn a_far_future_payload_stamp_fails_the_page_like_a_far_future_op() {
+    let log = log_head();
+    let (_d, mut store) = replica(&log);
+    let n = log.config.len() as i64;
+    let t = Ulid::new();
+    let mut ops = log.config.clone();
+    ops.push(create(t, 10, "pm"));
+    store.apply_pulled_page(&seqd(1, &ops), n + 1).unwrap();
+    let far = now_ms() + pm_store::PULL_MAX_FUTURE_SKEW_MS + 60_000;
+    for bad in [
+        hold(t, 11, Hlc::new(far, 0)),
+        archived(t, 12, Hlc::new(far, 0)),
+    ] {
+        let err = store
+            .apply_pulled_page(&seqd(n + 2, std::slice::from_ref(&bad)), n + 2)
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Pull { source, .. }
+                if matches!(**source, StoreError::InvalidStamp(pm_core::StampError::PayloadFarFuture { .. }))),
+            "{err:?}"
+        );
+        assert_eq!(store.cursor().unwrap(), n + 1);
+        assert!(store.quarantine().unwrap().is_empty());
+    }
+    let week_on = now_ms() + pm_store::LOCAL_MAX_FUTURE_SKEW_MS + 60_000;
+    let err = store
+        .commit(&archived(t, 13, Hlc::new(week_on, 0)))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::InvalidStamp(pm_core::StampError::PayloadFarFuture { .. })
+        ),
+        "{err:?}"
+    );
+    // Within the pull's year, the same payload applies on pull.
+    let pulled = store
+        .apply_pulled_page(
+            &seqd(n + 2, &[archived(t, 14, Hlc::new(week_on, 0))]),
+            n + 2,
+        )
+        .unwrap();
+    assert_eq!(pulled.applied, 1);
+}
+
+/// Local commits and restores allow a stamp at most a week ahead of this
+/// machine's clock; a pull keeps its year, for a replica whose clock runs
+/// behind.
+#[test]
+fn local_and_restore_stamps_have_a_tighter_future_window_than_pulls() {
+    let log = log_head();
+    let (_d, mut store) = replica(&log);
+    let n = log.config.len() as i64;
+    store.apply_pulled_page(&seqd(1, &log.config), n).unwrap();
+    assert_eq!(
+        pm_store::LOCAL_MAX_FUTURE_SKEW_MS,
+        7 * pm_core::MAX_FUTURE_SKEW_MS
+    );
+    let now = now_ms();
+    let ahead = |ms: u64| create(Ulid::new(), now + ms, "pm");
+
+    // Two days ahead (a slow clock): fine locally and on restore.
+    store
+        .commit(&ahead(2 * pm_core::MAX_FUTURE_SKEW_MS))
+        .unwrap();
+    store
+        .commit_any(&ahead(2 * pm_core::MAX_FUTURE_SKEW_MS))
+        .unwrap();
+    // Past the week: refused on both.
+    let far = pm_store::LOCAL_MAX_FUTURE_SKEW_MS + 60_000;
+    for err in [
+        store.commit(&ahead(far)).unwrap_err(),
+        store.commit_any(&ahead(far)).unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                err,
+                StoreError::InvalidStamp(pm_core::StampError::FarFuture { max_skew_ms, .. })
+                    if max_skew_ms == pm_store::LOCAL_MAX_FUTURE_SKEW_MS
+            ),
+            "{err:?}"
+        );
+    }
+    // A config op and a document edit take the local window too.
+    let mut upsert = actor_upsert(log.ws, now + far, "someone");
+    upsert.op_id = Ulid::new();
+    assert!(matches!(
+        store.commit(&upsert).unwrap_err(),
+        StoreError::InvalidStamp(_)
+    ));
+    // The same op, pulled, applies: the pull's window is a year.
+    let pulled_op = ahead(far);
+    let pulled = store
+        .apply_pulled_page(&seqd(n + 1, &[pulled_op.clone(), upsert]), n + 2)
+        .unwrap();
+    assert_eq!(pulled.applied, 2, "{pulled:?}");
+    assert!(store.ticket(pulled_op.entity).unwrap().is_some());
+}
+
+/// A refused op's content is dropped 30 days after its refusal (on the
+/// next pull) or at once by `prune_quarantine`; its row — op id, seq,
+/// kind, reason — stays, so the op stays refused. Parked ops keep theirs.
+#[test]
+fn refused_content_is_pruned_after_the_retention_window() {
+    let log = log_head();
+    let (dir, mut store) = replica(&log);
+    let n = log.config.len() as i64;
+    store.apply_pulled_page(&seqd(1, &log.config), n).unwrap();
+    let t = Ulid::new();
+    let (old, recent) = (claim(t, 11, "../x"), claim(t, 12, "a/b"));
+    let early = comment(Ulid::new(), 13, "waits for its ticket");
+    let page = seqd(
+        n + 1,
+        &[create(t, 10, "pm"), old.clone(), recent.clone(), early],
+    );
+    store.apply_pulled_page(&page, n + 4).unwrap();
+    let content = |op_id: Ulid| -> String {
+        let conn = rusqlite::Connection::open(dir.path().join("pm.sqlite")).unwrap();
+        conn.query_row(
+            "SELECT op FROM sync_quarantine WHERE op_id = ?1",
+            [op_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(content(old.op_id).contains("../x"));
+    assert!(store.quarantine().unwrap().iter().all(|q| !q.pruned));
+
+    // Age one refusal past the window; the next pull prunes it alone.
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("pm.sqlite")).unwrap();
+        let aged = now_ms() - pm_store::QUARANTINE_RETENTION_MS - 1;
+        conn.execute(
+            "UPDATE sync_quarantine SET recorded_ms = ?2 WHERE op_id = ?1",
+            rusqlite::params![old.op_id.to_string(), aged as i64],
+        )
+        .unwrap();
+    }
+    store
+        .apply_pulled_page(&seqd(n + 5, &[create(Ulid::new(), 20, "pm")]), n + 5)
+        .unwrap();
+    assert_eq!(content(old.op_id), "");
+    assert!(content(recent.op_id).contains("a/b"));
+    let q = store.quarantine().unwrap();
+    let pruned: Vec<(Ulid, bool)> = q.iter().map(|q| (q.op_id, q.pruned)).collect();
+    assert!(pruned.contains(&(old.op_id, true)), "{pruned:?}");
+    assert!(pruned.contains(&(recent.op_id, false)), "{pruned:?}");
+    let kept = q.iter().find(|q| q.op_id == old.op_id).unwrap();
+    assert_eq!(kept.hub_seq, n + 2);
+    assert_eq!(kept.kind, "claim");
+    assert!(kept.reason.contains("state name"), "{kept:?}");
+
+    // `pm doctor --prune-quarantine`: every refused op now, parked ones
+    // untouched (they are still retried).
+    assert_eq!(store.prune_quarantine().unwrap(), 1);
+    assert_eq!(store.prune_quarantine().unwrap(), 0);
+    assert_eq!(content(recent.op_id), "");
+    let q = store.quarantine().unwrap();
+    for entry in &q {
+        assert_eq!(
+            entry.pruned,
+            entry.status == QuarantineStatus::Refused,
+            "{entry:?}"
+        );
+    }
+    assert!(q.iter().any(|e| e.status == QuarantineStatus::Parked));
+
+    // A pruned op served again is still recognised, and still refused.
+    let again = store
+        .apply_pulled_page(&seqd(n + 6, std::slice::from_ref(&old)), n + 6)
+        .unwrap();
+    assert_eq!((again.applied, again.skipped), (0, 1));
+    assert_eq!(store.ticket(t).unwrap().unwrap().state, "triage");
+    assert!(store.doctor().unwrap().is_healthy());
+}

@@ -83,9 +83,23 @@ impl Sandbox {
         self.path("rec")
     }
 
+    fn fake_script(&self) -> String {
+        FAKE.replace("__REC__", self.rec().to_str().unwrap())
+    }
+
     fn install_fake(&self, at: &Path) {
-        let script = FAKE.replace("__REC__", self.rec().to_str().unwrap());
-        write_executable(at, &script);
+        write_executable(at, &self.fake_script());
+    }
+
+    /// The fake's SHA-256: what `PM_UI_LEAF_TEST_SHA256` (a debug-build
+    /// hook, AGT-1482) tells pm to trust in place of a pinned ui-leaf
+    /// build, so the npm-installed fake launches from `PATH`.
+    fn fake_digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(self.fake_script().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     /// The fake as an npm global install: `bin/ui-leaf` is a symlink to
@@ -126,6 +140,7 @@ impl Sandbox {
             .env("USER", "tester")
             .env("TMPDIR", self.home.path())
             .env("DISPLAY", ":0")
+            .env("PM_UI_LEAF_TEST_SHA256", self.fake_digest())
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", self.path("bin").display()),
@@ -509,6 +524,52 @@ fn a_path_ui_leaf_that_is_not_the_npm_package_is_not_launched() {
     let out = sb.run(
         &["edit", "AGT-1", "--view=ui-leaf"],
         &[("EDITOR", editor.to_str().unwrap())],
+    );
+    assert_ok(&out);
+    assert!(sb.was_mounted(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// AGT-1482: the npm package's binary must also hash to a pinned build;
+/// one that does not — a tampered release, a write to the npm prefix — is
+/// not launched, and naming it in `ui_leaf.path` is the explicit opt-in.
+#[test]
+fn a_path_ui_leaf_that_is_not_a_pinned_build_is_not_launched() {
+    let sb = Sandbox::new();
+    let editor = sb.editor();
+    let untrusted = "0".repeat(64);
+    let out = sb.run(
+        &["edit", "AGT-1", "--view=ui-leaf"],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("PM_UI_LEAF_TEST_SHA256", &untrusted),
+        ],
+    );
+    assert_ok(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not a build pm has pinned")
+            && stderr.contains(&sb.fake_digest())
+            && stderr.contains("ui_leaf.path"),
+        "{stderr}"
+    );
+    assert!(!sb.was_mounted());
+    assert_eq!(sb.editor_runs(), 1);
+
+    // The same binary, named in config: trusted as given.
+    let pkg_shim = sb.path("lib/node_modules/@openthink/ui-leaf/bin/ui-leaf");
+    let config = sb.path(".config/pm/config.toml");
+    let base = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::write(
+        &config,
+        format!("{base}\n[ui_leaf]\npath = \"{}\"\n", pkg_shim.display()),
+    )
+    .unwrap();
+    let out = sb.run(
+        &["edit", "AGT-1", "--view=ui-leaf"],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("PM_UI_LEAF_TEST_SHA256", &untrusted),
+        ],
     );
     assert_ok(&out);
     assert!(sb.was_mounted(), "{}", String::from_utf8_lossy(&out.stderr));

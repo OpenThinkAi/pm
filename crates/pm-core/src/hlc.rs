@@ -167,6 +167,29 @@ pub enum StampError {
         now_ms: u64,
         max_skew_ms: u64,
     },
+    /// A stamp carried as data in the payload (`archived_at`, `hold.at`;
+    /// AGT-1482) is not storable ([`Hlc::check_range`]).
+    #[error(
+        "payload {field} {wall_ms}.{counter} is out of range (wall_ms at most {MAX_WALL_MS}, counter at most {MAX_COUNTER})"
+    )]
+    PayloadOutOfRange {
+        field: &'static str,
+        wall_ms: u64,
+        counter: u32,
+    },
+    /// A stamp carried as data in the payload is more than `max_skew_ms`
+    /// ahead of the receiver's clock (AGT-1482): the payload twin of
+    /// [`StampError::FarFuture`], and like it a property of the clock,
+    /// not of the op.
+    #[error(
+        "payload {field} wall_ms {wall_ms} is more than {max_skew_ms} ms ahead of the receiver's clock ({now_ms})"
+    )]
+    PayloadFarFuture {
+        field: &'static str,
+        wall_ms: u64,
+        now_ms: u64,
+        max_skew_ms: u64,
+    },
 }
 
 /// A clock that cannot issue another storable stamp.
