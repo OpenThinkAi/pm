@@ -11,7 +11,7 @@
     }
   ],
   "healthy": true,
-  "last_seq": 45,
+  "last_seq": 47,
   "last_success": "<TIMESTAMP>",
   "schema": 1,
   "target": "<HOME>/backup-target",

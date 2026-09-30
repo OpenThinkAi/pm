@@ -327,19 +327,27 @@ No flags beyond the globals (see the `pm label` flag-ordering note under
 ### `pm relate <ID>`
 
 Flags: `--blocked-by <ID>[,…]` (each named ticket blocks `<ID>`: one
-`relation.add` per new blocker; repeatable or comma-separated) and
-`--unblock <ID>[,…]` (one `relation.remove` per current blocker, citing
-the add-tags this replica observes). At least one flag is required. Every
-id is resolved before anything is written and the whole call lands in one
-batch. Adding a blocker that is already present, or removing one that is
-not, is a no-op.
+`relation.add` per new edge; repeatable or comma-separated) and
+`--unblock <ID>[,…]` (remove those incoming edges), plus the outgoing
+mirrors `--blocks <ID>[,…]` (`<ID>` blocks each named ticket) and
+`--unblocks <ID>[,…]` (`<ID>` stops blocking each). A removal is one
+`relation.remove` citing the add-tags this replica observes for the
+edge. At least one flag is required, and all four compose in one call.
+Every id is resolved before anything is written and the whole call lands
+in one batch. Adding an edge that is already present, or removing one
+that is not, is a no-op.
 
-- Exit `2`: neither flag given, `<ID>` blocking itself, an id named by
-  both flags, or an add that would create a blocker cycle (detected with
-  `pm_core::check::blocker_cycles` over the graph as it would stand after
-  the call; nothing is written).
-- Exit `3`: `<ID>` or any id in either flag does not exist.
-- `--json`: **Ticket** (with `blocked_by` reflecting the result).
+- Exit `2`: no flag given, `<ID>` blocking itself (via `--blocked-by` or
+  `--blocks`), the same edge named by both an add flag and a remove flag
+  (e.g. `--blocks X --unblocks X`, or `--blocked-by X --unblock X`), or an add that would create a
+  blocker cycle (detected with `pm_core::check::blocker_cycles` over the
+  graph as it would stand after the call; refused only when the cycle
+  contains a newly added edge; nothing is written).
+- Exit `3`: `<ID>` or any id in any flag does not exist.
+- `--json`: **Ticket** for `<ID>` — always the ticket named on the
+  command line, so with `--blocks`/`--unblocks` its own `blocked_by` is
+  unchanged (the affected tickets are the flags' targets; `pm show` them
+  to see their `blocked_by`).
 
 ### `pm comment <ID> [TEXT]`
 
