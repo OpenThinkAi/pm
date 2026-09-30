@@ -328,7 +328,10 @@ resolves no npm package except React, so pm vendors them: they are
 generated from the exact versions pinned in
 `crates/pm/views-vendor/package.json` by
 `cd crates/pm/views-vendor && bun install --frozen-lockfile && bun build.ts`,
-and committed. Building or installing pm needs no JavaScript toolchain.
+and committed (`.gitattributes` marks them `-diff`: a vendor bump reviews
+as the pin change, and the build is reproducible — rerunning it on a clean
+checkout leaves `git status` clean). Building or installing pm needs no
+JavaScript toolchain.
 
 The editor's description binding (`lib/body.ts`, `BodySync`) is
 DOM-free: a fresh `LoroDoc` (fresh random peer, never 0) imported from the

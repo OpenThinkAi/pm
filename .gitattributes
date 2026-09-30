@@ -1,0 +1,5 @@
+# Generated, vendored third-party JavaScript for the ticket editor (AGT-1403):
+# rebuilt reproducibly from the pins in crates/pm/views-vendor/ by its
+# build.ts. Diffs show "binary files differ" so a vendor bump reviews as the
+# pin change in package.json/bun.lock, not ~5 MB of minified code and base64.
+crates/pm/views/vendor/*.js -diff linguist-generated=true
