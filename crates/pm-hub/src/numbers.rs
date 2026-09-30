@@ -457,11 +457,7 @@ async fn finish(db: &Db, workspace: &str, body: &str) -> Result<Seeded, SeedErro
     creates.sort_by_key(|(seq, _)| *seq);
     let creates: Vec<Create> = creates.into_iter().map(|(_, c)| c).collect();
     let numbers = allocator.allocate_all(&tx, workspace, &creates).await?;
-    let hub_ops: Vec<Op> = numbers
-        .iter()
-        .map(|n| serde_json::from_str(n.op.get()).expect("the hub wrote this op"))
-        .collect();
-    crate::views::fold_stored(&tx, workspace, &hub_ops).await?;
+    crate::views::fold_hub_ops(&tx, workspace, &numbers).await?;
 
     allocator.save(&tx, workspace).await?;
     tx.execute(

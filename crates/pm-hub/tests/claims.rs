@@ -507,12 +507,12 @@ fn once_seeded_the_hub_arbitrates_claims_first_come() {
     assert_eq!(hub.labels, BTreeSet::from(["x".to_string()]));
     assert_eq!(hub.assignee, Some(winner.actor.clone()));
     // The refused op is unknown to the log: a pull never serves it.
-    let rows = query_rows(
-        &url,
-        &format!("SELECT 1 FROM ops WHERE op_id = '{}'", loser.op_id),
-    )
-    .unwrap();
-    assert!(rows.is_empty());
+    let logged: Vec<String> = query_rows(&url, "SELECT op_id FROM ops")
+        .unwrap()
+        .into_iter()
+        .map(|r| r[0].clone().unwrap())
+        .collect();
+    assert!(!logged.contains(&loser.op_id.to_string()));
 
     // Unclaim (back to triage, unassigned): claimable again. The claim
     // is stamped after the unclaim, as a client's clock would stamp it:

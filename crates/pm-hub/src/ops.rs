@@ -541,8 +541,7 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
             allocator.save(&tx, workspace).await?;
             // The hub's own ops are part of the view too.
             for n in &allocated {
-                let op: Op = serde_json::from_str(n.op.get()).expect("the hub wrote this op");
-                views.fold(&op, false).expect("a number op folds");
+                views.fold_hub_op(n);
             }
             allocated
         } else {
@@ -580,16 +579,17 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
 
 /// The 400 for an op the views cannot fold.
 fn fold_error(index: usize, op_id: &str, e: FoldError) -> PushError {
+    let reason = e.to_string();
     match e {
         FoldError::ForeignWorkspace { .. } => PushError::ForeignWorkspace {
             index,
             op_id: op_id.to_string(),
-            reason: e.to_string(),
+            reason,
         },
-        e => PushError::Op {
+        FoldError::Ticket(_) | FoldError::Config(_) => PushError::Op {
             index,
             op_id: Some(op_id.to_string()),
-            reason: e.to_string(),
+            reason,
         },
     }
 }

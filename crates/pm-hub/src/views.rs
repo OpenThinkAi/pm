@@ -65,6 +65,8 @@ use serde::Serialize;
 use tokio_postgres::Transaction;
 use ulid::Ulid;
 
+use crate::numbers::Numbered;
+
 /// What a push answers for a claim the hub refused: who holds the ticket
 /// and since when, mirroring `pm claim --json`'s `{taken_by, at, …}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -171,6 +173,16 @@ impl Views {
         }
     }
 
+    /// Folds one of the hub's own `field.set number` ops (`numbers`)
+    /// into its ticket's view. The hub built the op a moment ago, so a
+    /// fold failure is a bug in this binary, not a request error: it
+    /// panics, and the push's transaction rolls back rather than commit
+    /// a view that disagrees with the log.
+    pub fn fold_hub_op(&mut self, numbered: &Numbered) {
+        let op: Op = serde_json::from_str(numbered.op.get()).expect("the hub wrote this op");
+        self.fold(&op, false).expect("a number op folds");
+    }
+
     /// The workspace's config view and the views of `entities` (a
     /// missing one is simply not there yet), under the caller's
     /// workspace lock.
@@ -267,24 +279,20 @@ fn decode<T: serde::de::DeserializeOwned>(text: String) -> T {
     serde_json::from_str(&text).expect("a stored view is pm-core JSON")
 }
 
-/// Folds hub-authored ops (`numbers`) into the views: loads their tickets,
-/// folds, saves. The ops are the log's own, so nothing is arbitrated.
-pub async fn fold_stored(
+/// [`Views::fold_hub_op`] for a caller holding no views yet (the seed
+/// end): loads the tickets, folds, saves.
+pub async fn fold_hub_ops(
     tx: &Transaction<'_>,
     workspace: &str,
-    ops: &[Op],
+    numbered: &[Numbered],
 ) -> Result<(), tokio_postgres::Error> {
-    if ops.is_empty() {
+    if numbered.is_empty() {
         return Ok(());
     }
-    let entities: Vec<String> = ops.iter().map(|op| op.entity.to_string()).collect();
+    let entities: Vec<String> = numbered.iter().map(|n| n.entity.clone()).collect();
     let mut views = Views::load(tx, workspace, &entities).await?;
-    for op in ops {
-        if let Err(e) = views.fold(op, false) {
-            // The hub built these ops itself; a fold failure is a bug,
-            // but never a reason to lose the push.
-            eprintln!("pm-hub: views: hub op {} does not fold: {e}", op.op_id);
-        }
+    for n in numbered {
+        views.fold_hub_op(n);
     }
     views.save(tx, workspace).await
 }
