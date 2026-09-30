@@ -14,6 +14,9 @@ use tokio_postgres::Client;
 use crate::auth;
 use crate::migrate;
 
+/// Token names are labels like `studio` or `claude:pm-build`.
+const MAX_TOKEN_NAME: usize = 128;
+
 /// Workspace ids are short slugs (today: `saltline`).
 fn valid_workspace_id(id: &str) -> bool {
     !id.is_empty()
@@ -59,8 +62,8 @@ pub async fn token_create(
         .into());
     }
     let name = name.trim();
-    if name.is_empty() {
-        return Err("token name must not be empty".into());
+    if name.is_empty() || name.chars().count() > MAX_TOKEN_NAME {
+        return Err(format!("token name must be 1-{MAX_TOKEN_NAME} characters").into());
     }
     check_schema(db).await?;
     let token = auth::generate_token()?;

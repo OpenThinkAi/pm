@@ -162,7 +162,8 @@ fn app(db: Arc<Client>) -> Router {
 struct Whoami {
     workspace: String,
     token_id: i64,
-    token: String,
+    /// The token's name from `token create <name>`, never its secret.
+    name: String,
 }
 
 /// The authenticated caller. A tiny probe for clients (`pm hub login`,
@@ -171,7 +172,7 @@ async fn whoami(caller: auth::Authed) -> Json<Whoami> {
     Json(Whoami {
         workspace: caller.workspace,
         token_id: caller.token_id,
-        token: caller.token_label,
+        name: caller.token_label,
     })
 }
 

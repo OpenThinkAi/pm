@@ -95,7 +95,9 @@ impl FromRequestParts<Arc<Client>> for Authed {
         parts: &mut Parts,
         db: &Arc<Client>,
     ) -> Result<Self, Self::Rejection> {
-        // Already authenticated by `require_auth` on this request.
+        // Already authenticated by `require_auth` on this request (every
+        // routed handler). The lookup below runs for the layer itself, and
+        // would also guard a handler wired outside the layer by mistake.
         if let Some(authed) = parts.extensions.get::<Authed>() {
             return Ok(authed.clone());
         }

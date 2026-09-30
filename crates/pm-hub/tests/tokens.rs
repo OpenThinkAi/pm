@@ -86,13 +86,18 @@ fn tokens_create_use_revoke_and_every_failure_is_a_plain_404() {
     let (ok, _, stderr) = admin(&url, &["token", "create", "x", "--workspace", "Bad Id"]);
     assert!(!ok);
     assert!(stderr.contains("workspace id"), "{stderr}");
+    let long = "n".repeat(129);
+    let (ok, _, stderr) = admin(&url, &["token", "create", &long, "--workspace", "saltline"]);
+    assert!(!ok);
+    assert!(stderr.contains("token name must be"), "{stderr}");
 
     // Use.
     let ok_resp = whoami(port, "saltline", Some(&studio));
     assert_eq!(ok_resp.status, 200, "{ok_resp:?}");
     let json: serde_json::Value = serde_json::from_str(&ok_resp.body).unwrap();
     assert_eq!(json["workspace"], "saltline");
-    assert_eq!(json["token"], "studio");
+    assert_eq!(json["name"], "studio");
+    assert!(json.get("token").is_none(), "{json}");
     assert_eq!(json["token_id"].to_string(), studio_id);
     let json: serde_json::Value =
         serde_json::from_str(&whoami(port, "other", Some(&other)).body).unwrap();
