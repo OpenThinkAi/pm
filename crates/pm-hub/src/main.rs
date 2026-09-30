@@ -12,9 +12,9 @@
 //! - `POST /w/{workspace}/seeded` (bearer token): end the workspace's
 //!   seed and make the hub its number authority (see `numbers`).
 //!
-//! Claim arbitration lands under `/w/{workspace}/` behind the same auth
-//! layer (AGT-1392). `pm-hub token create|list|revoke` manage bearer
-//! tokens (see `admin`). The HTTP contract is `docs/hub-api.md`.
+//! Claims are arbitrated inside the push, against the hub's materialized
+//! views (see `views`, AGT-1392). `pm-hub token create|list|revoke` manage
+//! bearer tokens (see `admin`). The HTTP contract is `docs/hub-api.md`.
 //!
 //! Environment: `DATABASE_URL` (required; a Postgres URL) and `PORT`
 //! (default 8080; Railway sets it).
@@ -25,6 +25,7 @@ mod migrate;
 mod numbers;
 mod ops;
 mod pull;
+mod views;
 
 use std::env;
 use std::error::Error;

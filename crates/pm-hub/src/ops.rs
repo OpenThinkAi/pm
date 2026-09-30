@@ -28,6 +28,18 @@
 //! and never overwritten. A batch is all-or-nothing: one bad op and nothing
 //! in it is stored.
 //!
+//! **Views and claims (AGT-1392, see `views`).** Every fresh op is folded
+//! into the hub's materialized views in batch order, in the same
+//! transaction, with pm-core's `apply`. Once the workspace is seeded a
+//! `claim` is admitted only if `TicketView::claim_admissible` holds
+//! against the view at that point; a refused claim is the one exception
+//! to all-or-nothing: the batch still lands, but nothing is stored for
+//! that op and its ack carries `rejected: {taken_by, at, state, code,
+//! reason}` and `seq: null` (a 200, not a 4xx — the op was understood
+//! and decided). An op the views cannot fold at all (a relation that does
+//! not touch its ticket, config for a foreign workspace) is a 400 like a
+//! malformed one, and the batch is refused whole.
+//!
 //! **Numbers (AGT-1391, see `numbers`).** Once the workspace is seeded,
 //! every fresh `ticket.create` in a batch is numbered here, in the same
 //! transaction: the hub's `field.set number` ops go into the log right
@@ -60,6 +72,7 @@ use tokio_postgres::Transaction;
 use crate::Db;
 use crate::auth::Authed;
 use crate::numbers::{self, Allocator, Create, Numbered};
+use crate::views::{FoldError, Rejection, Verdict, Views};
 
 /// Most ops in one batch.
 pub const MAX_BATCH_OPS: usize = 1000;
@@ -86,10 +99,22 @@ struct Pushed {
 #[derive(Serialize)]
 struct Ack {
     op_id: String,
-    seq: i64,
+    /// The op's seq; `null` for a rejected claim (nothing was stored).
+    seq: Option<i64>,
     /// `true` if this push stored the op; `false` if the workspace
-    /// already had it (its seq is the existing one).
+    /// already had it (its seq is the existing one) or rejected it.
     stored: bool,
+    /// Present only for a `claim` the hub refused (see `views`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rejected: Option<Rejection>,
+}
+
+/// What the push decided for one unique op of the batch.
+#[derive(Clone)]
+enum Outcome {
+    Stored(i64),
+    Existing(i64),
+    Rejected(Rejection),
 }
 
 /// The structured error body of every 4xx the write routes return.
@@ -133,6 +158,13 @@ enum PushError {
     /// A seeded `field.set number` that collides with a number already
     /// issued, or re-numbers a ticket.
     DuplicateNumber {
+        index: usize,
+        op_id: String,
+        reason: String,
+    },
+    /// A config op for a workspace Ulid other than the one this hub
+    /// workspace's config already belongs to.
+    ForeignWorkspace {
         index: usize,
         op_id: String,
         reason: String,
@@ -206,6 +238,19 @@ impl IntoResponse for PushError {
                     op_id: Some(op_id),
                 },
             ),
+            PushError::ForeignWorkspace {
+                index,
+                op_id,
+                reason,
+            } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "foreign_workspace",
+                    reason,
+                    index: Some(index),
+                    op_id: Some(op_id),
+                },
+            ),
             // The token authenticated, so the workspace row was there a
             // moment ago; answer as auth does when there is nothing there.
             PushError::NoWorkspace => return StatusCode::NOT_FOUND.into_response(),
@@ -227,8 +272,8 @@ enum Role {
     Other,
 }
 
-/// One op of a batch, parsed for its indexed columns; `raw` is what gets
-/// stored.
+/// One op of a batch, parsed for its indexed columns and for folding
+/// into the views; `raw` is what gets stored.
 struct Parsed<'a> {
     op_id: String,
     hlc: Hlc,
@@ -238,6 +283,7 @@ struct Parsed<'a> {
     entity: String,
     kind: &'static str,
     role: Role,
+    op: Op,
     raw: &'a str,
 }
 
@@ -337,6 +383,7 @@ fn parse_op(index: usize, raw: &RawValue) -> Result<Parsed<'_>, PushError> {
         entity: op.entity.to_string(),
         kind: op.kind(),
         role,
+        op,
         raw: raw.get(),
     })
 }
@@ -396,7 +443,7 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
         position.push(at);
     }
 
-    let mut seq_of: HashMap<String, (i64, bool)> = HashMap::with_capacity(unique.len());
+    let mut outcome: HashMap<String, Outcome> = HashMap::with_capacity(unique.len());
     let numbers;
     {
         let mut writer = db.writer.lock().await;
@@ -415,12 +462,12 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
             )
             .await?;
         for row in existing {
-            seq_of.insert(row.get(0), (row.get(1), false));
+            outcome.insert(row.get(0), Outcome::Existing(row.get(1)));
         }
 
         let fresh: Vec<&Parsed> = unique
             .iter()
-            .filter(|p| !seq_of.contains_key(&p.op_id))
+            .filter(|p| !outcome.contains_key(&p.op_id))
             .collect();
         // Seeded client numbers are checked before anything is written;
         // the whole batch is refused on the first problem.
@@ -436,7 +483,23 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
             check_seeded_numbers(&tx, workspace, &fresh, &first_at).await?
         };
 
-        let rows: Vec<OpRow<'_>> = fresh
+        // Fold the batch into the views in order; once seeded, that is
+        // where a claim is decided. A refused claim is answered, not
+        // stored (`views`).
+        let entities: Vec<String> = fresh.iter().map(|p| p.entity.clone()).collect();
+        let mut views = Views::load(&tx, workspace, &entities).await?;
+        let mut admitted: Vec<&Parsed> = Vec::with_capacity(fresh.len());
+        for p in &fresh {
+            match views.fold(&p.op, allocator.seeded) {
+                Ok(Verdict::Folded) => admitted.push(p),
+                Ok(Verdict::Rejected(rejection)) => {
+                    outcome.insert(p.op_id.clone(), Outcome::Rejected(rejection));
+                }
+                Err(e) => return Err(fold_error(first_at[&p.op_id], &p.op_id, e)),
+            }
+        }
+
+        let rows: Vec<OpRow<'_>> = admitted
             .iter()
             .map(|p| OpRow {
                 op_id: p.op_id.clone(),
@@ -449,10 +512,13 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
             })
             .collect();
         for (op_id, seq) in insert_ops(&tx, workspace, &rows).await? {
-            seq_of.insert(op_id, (seq, true));
+            outcome.insert(op_id, Outcome::Stored(seq));
         }
         for (entity, number, op_id) in seeded_numbers {
-            numbers::record(&tx, workspace, &entity, number, seq_of[&op_id].0).await?;
+            let Some(Outcome::Stored(seq)) = outcome.get(&op_id) else {
+                unreachable!("a number op is never a claim, so it was stored")
+            };
+            numbers::record(&tx, workspace, &entity, number, *seq).await?;
         }
 
         // Number the batch's creates. Every fresh op moves the hub's
@@ -473,10 +539,16 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
             }
             let allocated = allocator.allocate_all(&tx, workspace, &creates).await?;
             allocator.save(&tx, workspace).await?;
+            // The hub's own ops are part of the view too.
+            for n in &allocated {
+                let op: Op = serde_json::from_str(n.op.get()).expect("the hub wrote this op");
+                views.fold(&op, false).expect("a number op folds");
+            }
             allocated
         } else {
             Vec::new()
         };
+        views.save(&tx, workspace).await?;
         let entities: Vec<String> = creates.iter().map(|c| c.entity.to_string()).collect();
         numbers = numbers::report(&tx, workspace, &entities, allocated).await?;
         tx.commit().await?;
@@ -489,16 +561,37 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
         .into_iter()
         .map(|at| {
             let op_id = &unique[at].op_id;
-            let (seq, stored) = seq_of[op_id];
             let first = !std::mem::replace(&mut acked[at], true);
+            let (seq, stored, rejected) = match &outcome[op_id] {
+                Outcome::Stored(seq) => (Some(*seq), first, None),
+                Outcome::Existing(seq) => (Some(*seq), false, None),
+                Outcome::Rejected(r) => (None, false, Some(r.clone())),
+            };
             Ack {
                 op_id: op_id.clone(),
                 seq,
-                stored: stored && first,
+                stored,
+                rejected,
             }
         })
         .collect();
     Ok(Pushed { ops, numbers })
+}
+
+/// The 400 for an op the views cannot fold.
+fn fold_error(index: usize, op_id: &str, e: FoldError) -> PushError {
+    match e {
+        FoldError::ForeignWorkspace { .. } => PushError::ForeignWorkspace {
+            index,
+            op_id: op_id.to_string(),
+            reason: e.to_string(),
+        },
+        e => PushError::Op {
+            index,
+            op_id: Some(op_id.to_string()),
+            reason: e.to_string(),
+        },
+    }
 }
 
 /// Seed mode: the fresh `field.set number` ops of a batch, as `(entity,

@@ -21,7 +21,7 @@ nothing (think-hub precedent). A wrong method on a real route is that
 ## `GET /health` (open)
 
 ```json
-{"status": "ok", "schema_version": 1, "op_version": 1}
+{"status": "ok", "schema_version": 3, "op_version": 1}
 ```
 
 `schema_version` is read live from the database; `op_version` is the
@@ -39,7 +39,7 @@ workspace's sync mode.
 `seeded: false` means the workspace is still in **seed mode** (see
 [Ticket numbers](#ticket-numbers-agt-1391)): the first sync (AGT-1396)
 has yet to upload the client's log and end the seed. `true` means the
-hub is the workspace's number authority. `seeded` is read from the
+hub is the workspace's authority for numbers and claims. `seeded` is read from the
 database, so this route can answer `503` after the token authenticated
 (a transient database error; retry).
 
@@ -88,6 +88,11 @@ numbers](#ticket-numbers-agt-1391)):
   acknowledged batch is therefore a no-op, which is what makes an
   interrupted push safe to retry.
 - A batch is all-or-nothing: on any `4xx` nothing in it was stored.
+  The one per-op outcome inside a `200` is a refused `claim` (see
+  [Claims](#claims-agt-1392)): its entry is `{"op_id": …, "seq": null,
+  "stored": false, "rejected": {…}}`, nothing is stored for it, and the
+  rest of the batch lands as usual. `rejected` is present only on such
+  an entry.
 - `numbers` has one entry per ticket created by a `ticket.create` in the
   batch that has a number, in the order the numbers were issued:
   `allocated: true` when this push allocated it, `false` when the ticket
@@ -102,7 +107,8 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 
 | Status | `error` | Extra fields | When |
 |---|---|---|---|
-| `400` | `invalid_op` | `index` (position in the batch), `op_id` (if the JSON had one) | an op does not parse as `pm_core::Op`, its `actor` is empty, or its `version` is newer than the hub's |
+| `400` | `invalid_op` | `index` (position in the batch), `op_id` (if the JSON had one) | an op does not parse as `pm_core::Op`, its `actor` is empty, its `version` is newer than the hub's, or it does not fold into its ticket with `pm_core::apply` (a relation that does not touch the ticket) |
+| `400` | `foreign_workspace` | `index`, `op_id` | a config op (`workspace.set`, `state.upsert`, `actor.upsert`) for a workspace Ulid other than the one this hub workspace's config already belongs to |
 | `400` | `invalid_batch` | — | the body is not UTF-8 / not JSON / not `{"ops": [...]}`, or the batch has more than 1000 ops |
 | `400` | `number_not_allowed` | `index`, `op_id` | a `field.set number` pushed to a seeded workspace (only the hub numbers tickets then, whatever the op's `actor`) |
 | `400` | `duplicate_number` | `index`, `op_id` | in seed mode, a `field.set number` whose number another ticket already holds, or whose ticket is already numbered |
@@ -223,6 +229,117 @@ hub ops like any other, so a client that missed a push response learns
 its numbers on the next pull (pm-store clears `pending_number` when the
 op arrives).
 
+## Claims (AGT-1392)
+
+A `claim` is the one op that is not a CRDT (README §Conflict semantics):
+`claim if state is unstarted and unassigned`, decided by the authority
+first-come. Once a workspace is seeded, the hub is that authority.
+
+### The hub's view
+
+The hub keeps, per workspace, a materialized `pm_core::TicketView` per
+ticket and a `pm_core::WorkspaceView` (the states) — tables
+`ticket_views` / `workspace_views` (schema version 3) — and folds every
+op it stores into them **inside the push transaction, in batch order**,
+with pm-core's own `apply` / `apply_workspace`: the functions pm-store's
+commit path runs. The hub applies no merge logic of its own; its view of
+a ticket is what a client's `pm doctor --rebuild` of the same ops
+produces (state, assignee, deleted, number, title, labels, …), and
+`crates/pm-hub/tests/claims.rs` checks exactly that. Hub-authored ops
+(numbers) and the ops a seed carries fold like any other. Two kinds are
+stored but not folded: `body.edit` (the description is a Loro document
+nothing conditional reads, and the Studio's log holds a 23 MB one) and
+the `project.*` kinds. Ops fold in any order (a `field.set` ahead of its
+`ticket.create` starts a fresh view, as on a client). A hub upgraded over
+an existing log rebuilds the views from it in the migration to version 3.
+
+The states come only from the workspace's own `state.upsert` ops: a
+workspace that has pushed no config admits no claim (nothing is
+`unstarted`), as a client with no states cannot claim either. The first
+config op fixes the workspace's Ulid; config for another Ulid is a `400
+foreign_workspace` (pm-store's `ForeignWorkspace`).
+
+### Arbitration
+
+**Seeded workspace.** A pushed `claim` is admitted only if
+`TicketView::claim_admissible` holds against the hub's view at that point
+in the batch — the check pm-store runs locally, unchanged. An admitted
+claim is stored and folded. A refused one is **not stored** (no seq, no
+`ops` row, never served by a pull) and its ack is:
+
+```json
+{"op_id": "01K6…", "seq": null, "stored": false,
+ "rejected": {"taken_by": "claude:pm-build",
+              "at": {"wall_ms": 1790000000200, "counter": 0},
+              "state": "in-progress",
+              "code": "not_unstarted",
+              "reason": "ticket is in state 'in-progress', which is not unstarted"}}
+```
+
+- `taken_by`: the ticket's assignee, or `null` when it left `unstarted`
+  without one (done, canceled) or is deleted.
+- `at`: when the ticket entered the refusing condition — the stamp of the
+  write that set its assignee (`already_assigned`), its state
+  (`not_unstarted`) or its tombstone (`deleted`). For a claimed ticket
+  that is the admitted claim's HLC, which is what `pm claim --json`
+  reports locally.
+- `state`: the ticket's state at the hub.
+- `code`: `not_unstarted` | `already_assigned` | `deleted`, in
+  `claim_admissible`'s order of precedence (a deleted ticket is
+  `deleted` whatever else holds; a claimed ticket is `not_unstarted`,
+  since the claim moved it to a started state).
+- `reason`: `pm_core::ClaimRejected`'s message, the string `pm claim
+  --json` puts in `reason`.
+
+Everything else in the batch is stored (a `200`; a rejected claim is not
+an error — the op was understood and decided). Within a batch, views
+advance op by op: of two claims on one ticket the first is admitted and
+the second refused. Across pushes, the per-workspace lock serialises
+every decision: of any number of concurrent claims on one ticket exactly
+one is admitted. A re-push of an admitted claim is idempotent (`stored:
+false`, the existing seq; not re-arbitrated). A re-push of a refused one
+is a fresh claim — arbitrated again, and admitted if the ticket has since
+been freed. The hub admits; pm-core's rules then decide what the admitted
+claim's write does, so a client stamps a claim with its current clock: a
+claim stamped before the unclaim it follows would be admitted, stored,
+and lose the LWW register everywhere.
+
+**Seeding workspace.** Every claim in a seeding push is stored and folded
+as a plain write, never arbitrated. The seed is history: each claim in it
+was admitted by the then-authority (the client's own database, README
+§Authority) when it happened, and the hub "becomes the authority only
+after the seed is fully acknowledged". Re-judging would also be wrong on
+its face — the seed's `state.upsert` ops may arrive after the claims that
+depend on them, and a claim admitted months ago is not void because the
+ticket has since been done and re-claimed. This is pm-store's own
+replay/pull behaviour (`Fold::Replay` / `Fold::Foreign`).
+
+### What a client does with `rejected` (AGT-1395 `pm sync`, AGT-1397 `pm claim`)
+
+- **`pm claim` against the hub (AGT-1397)** pushes the `claim` op *alone*,
+  before logging anything locally. `stored: true` → commit the op locally
+  as a pulled (foreign) op — it is already admitted — together with any
+  companion write (`--branch`'s `field.set ext`), which then goes out
+  through the normal outbox; `rejected` → log nothing, print
+  `{taken_by, at, state, reason}` and exit 75 (`code: deleted` → exit 3,
+  as the local path does). Do not batch the companion write with the
+  claim: it would be stored even when the claim is refused.
+- **`pm sync` (AGT-1395)** treats a `rejected` entry as *acknowledged and
+  dropped*: call `mark_pushed` for its `op_id` like any other ack, so it
+  leaves the outbox and is never re-pushed. Nothing else is required for
+  a well-behaved client, because a claim only reaches the outbox when the
+  local database was the authority — `pm claim` refuses to claim locally
+  while a hub is configured — so a rejected claim in the outbox means a
+  claim made before the workspace switched to the hub, i.e. a seed, and
+  seeds are never arbitrated. Should one still occur (a log joined after
+  another machine's seed), the op stays in the local log — the log is
+  append-only and `pm doctor --rebuild` replays it as admitted — so the
+  client reconciles by logging a compensating `state.transition` to
+  `rejected.state` and `field.set assignee` to `rejected.taken_by`,
+  stamped now: both replicas then converge on the hub's answer, and the
+  compensation pushes as an ordinary op. `pm sync` should report the
+  rejection either way.
+
 ### `POST /w/{workspace}/seeded` — end the seed
 
 Request: `{"number_floor": <n>}` — the client's allocator floor
@@ -240,8 +357,9 @@ In one transaction under the workspace lock the hub: adopts as the floor
 the greater of the request's `number_floor` and the largest number the
 seed recorded; sets `next_number` to `floor + 1`; numbers, in log order,
 every `ticket.create` the seed left unnumbered (these are `numbers`, the
-same shape as a push's); and marks the workspace seeded (`whoami` now
-says `seeded: true`). An empty seed — a workspace with no log to bring —
+same shape as a push's, and fold into the hub's views like any other
+op); and marks the workspace seeded (`whoami` now says `seeded: true`
+and the hub arbitrates claims — see [Claims](#claims-agt-1392)). An empty seed — a workspace with no log to bring —
 ends the same way with `{"number_floor": 0}`: allocation then starts at 1.
 
 Errors: `400 invalid_body` (not `{"number_floor": <n>}`), `409
