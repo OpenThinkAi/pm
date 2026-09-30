@@ -488,6 +488,38 @@ fn build_create_ops(
     Ok(ops)
 }
 
+/// Commits one `pm new` invocation's ops — every ticket's create set in
+/// `ops`, the tickets themselves in `ids` — and numbers them the way this
+/// machine numbers tickets ([`crate::hub::numbers_are_hub_assigned`]):
+/// locally, as the numbering authority (README §Conflict semantics, phase
+/// 1), or not at all, flagged pending until the hub's `field.set number`
+/// arrives on `pm sync` (AGT-1398). One transaction either way. Returns
+/// the tickets in `ids` order.
+fn commit_new(
+    store: &mut Store,
+    env: &Env,
+    ops: &[Op],
+    ids: &[Ulid],
+    actor: &ActorId,
+) -> Result<Vec<Ticket>> {
+    if crate::hub::numbers_are_hub_assigned(env)? {
+        Ok(store.commit_batch_pending(ops, ids)?)
+    } else {
+        let to_number: Vec<(Ulid, ActorId)> = ids.iter().map(|id| (*id, actor.clone())).collect();
+        Ok(store.commit_batch(ops, &to_number)?)
+    }
+}
+
+/// The line `pm new` prints for a ticket it made: `AGT-12`, or — while the
+/// number is the hub's to give — `AGT-?  <ULID>`, so the id to refer to it
+/// by until then is right there.
+fn created_line(ws: &Workspace, t: &Ticket) -> String {
+    match t.number {
+        Some(_) => display_id(ws, t),
+        None => format!("{}  {}", display_id(ws, t), t.id),
+    }
+}
+
 fn print_created_ticket(
     ctx: &Ctx<'_>,
     store: &Store,
@@ -497,7 +529,7 @@ fn print_created_ticket(
     if ctx.json {
         print_json(&ticket_json(ws, store, ticket)?);
     } else {
-        println!("{}", display_id(ws, ticket));
+        println!("{}", created_line(ws, ticket));
     }
     Ok(())
 }
@@ -599,9 +631,7 @@ fn new_single(ctx: &Ctx<'_>, args: NewArgs) -> Result<()> {
         linked_github,
         None,
     )?;
-    // Phase 1: this database is the numbering authority (README §Conflict
-    // semantics).
-    let tickets = store.commit_batch(&ops, &[(id, actor)])?;
+    let tickets = commit_new(&mut store, ctx.env, &ops, &[id], &actor)?;
     let ticket = tickets
         .into_iter()
         .next()
@@ -667,7 +697,7 @@ fn new_from_file(ctx: &Ctx<'_>, path: &Path) -> Result<()> {
         linked_github,
         linked_pr,
     )?;
-    let tickets = store.commit_batch(&ops, &[(id, actor)])?;
+    let tickets = commit_new(&mut store, ctx.env, &ops, &[id], &actor)?;
     let ticket = tickets
         .into_iter()
         .next()
@@ -803,9 +833,9 @@ fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<()> {
 
     let mut stamper = Stamper::new(&store, actor.clone())?;
     let mut ops = Vec::new();
-    let mut to_number = Vec::with_capacity(validated.len());
+    let mut created = Vec::with_capacity(validated.len());
     for v in validated {
-        to_number.push((v.id, actor.clone()));
+        created.push(v.id);
         ops.extend(build_create_ops(
             &mut stamper,
             v.id,
@@ -824,9 +854,9 @@ fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<()> {
         )?);
     }
 
-    // One transaction across every ticket's ops and number allocation
-    // (AC2): a failure here creates nothing.
-    let tickets = store.commit_batch(&ops, &to_number)?;
+    // One transaction across every ticket's ops and number allocation (or
+    // pending flag) (AC2): a failure here creates nothing.
+    let tickets = commit_new(&mut store, ctx.env, &ops, &created, &actor)?;
     print_batch_result(ctx, &store, &ws, &refs, &tickets)
 }
 
@@ -837,11 +867,13 @@ fn print_batch_result(
     refs: &BTreeMap<String, Ulid>,
     tickets: &[Ticket],
 ) -> Result<()> {
+    // A ref resolves to something `find` accepts: the display id, or the
+    // ULID while the number is still the hub's to give (AC2).
     let shown = |id: Ulid| -> String {
         tickets
             .iter()
             .find(|t| t.id == id)
-            .map(|t| display_id(ws, t))
+            .map(|t| ref_id(ws, t))
             .unwrap_or_else(|| id.to_string())
     };
     if ctx.json {
@@ -860,7 +892,7 @@ fn print_batch_result(
         }));
     } else {
         for t in tickets {
-            println!("{}  {}", display_id(ws, t), t.title);
+            println!("{}  {}", created_line(ws, t), t.title);
         }
         if !refs.is_empty() {
             println!("refs:");
@@ -883,9 +915,30 @@ pub(crate) fn display_id(ws: &Workspace, t: &Ticket) -> String {
     }
 }
 
+/// A *reference* to `t`: the string to hand back to `pm` to name it
+/// again. `AGT-12` once numbered; the ULID while the number is pending
+/// (AGT-1398), since `AGT-?` names nothing. Every place output points at
+/// another ticket by id alone — `blocked_by`, `pm new --batch`'s `refs`,
+/// `pm graph`/`pm ready` waves, `pm check` findings — uses this;
+/// [`display_id`] stays the label on a ticket's own row.
+pub(crate) fn ref_id(ws: &Workspace, t: &Ticket) -> String {
+    match t.number {
+        Some(_) => display_id(ws, t),
+        None => t.id.to_string(),
+    }
+}
+
 /// A ticket named on the command line: `<PREFIX>-<n>` or its ULID.
 pub(crate) fn find(store: &Store, ws: &Workspace, reference: &str) -> Result<Ticket> {
     let r = reference.trim();
+    if let Some(prefix) = r.strip_suffix("-?")
+        && prefix.eq_ignore_ascii_case(&ws.prefix)
+    {
+        return Err(CliError::usage(format!(
+            "'{r}' is a ticket still awaiting its number from the hub: name it by its ULID \
+             (`pm list --json` shows `ulid`) until `pm sync` numbers it"
+        )));
+    }
     if let Some((prefix, digits)) = r.rsplit_once('-')
         && !digits.is_empty()
         && digits.bytes().all(|b| b.is_ascii_digit())
@@ -915,11 +968,12 @@ pub(crate) fn find(store: &Store, ws: &Workspace, reference: &str) -> Result<Tic
 }
 
 /// The `--json` shape of a ticket: every `pm_core::Ticket` field, with
-/// `id` the human id (`AGT-12`) and the ULID under `ulid`, plus `schema`
-/// and `blocked_by` (the tickets that block this one, by display id —
-/// AC5: "`pm show --json` reflects all" the flags `pm new` accepts,
-/// including `--blocked-by`). `pub(crate)`: `crate::read` reuses this for
-/// `pm list --json`.
+/// `id` the human id (`AGT-12`, or `AGT-?` while the hub's number is
+/// pending) and the ULID under `ulid`, plus `schema` and `blocked_by`
+/// (the tickets that block this one, by [`ref_id`] — AC5: "`pm show
+/// --json` reflects all" the flags `pm new` accepts, including
+/// `--blocked-by`). `pub(crate)`: `crate::read` reuses this for `pm list
+/// --json`.
 pub(crate) fn ticket_json(ws: &Workspace, store: &Store, t: &Ticket) -> Result<Value> {
     let Value::Object(fields) = serde_json::to_value(t).expect("a ticket serializes") else {
         unreachable!("a ticket serializes to an object");
@@ -940,7 +994,7 @@ pub(crate) fn ticket_json(ws: &Workspace, store: &Store, t: &Ticket) -> Result<V
         .filter(|r| r.kind == RelationKind::Blocks && r.to == t.id)
         .map(|r| {
             Ok(match store.ticket(r.from)? {
-                Some(other) => display_id(ws, &other),
+                Some(other) => ref_id(ws, &other),
                 None => r.from.to_string(),
             })
         })

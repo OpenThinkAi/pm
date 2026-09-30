@@ -12,18 +12,19 @@ use ulid::Ulid;
 
 use crate::exit::{CliError, Result};
 use crate::markers::{describe_hold, require_project};
-use crate::verbs::{Ctx, SCHEMA, display_id, now_ms, print_json};
+use crate::verbs::{Ctx, SCHEMA, now_ms, print_json, ref_id};
 
 pub fn check(ctx: &Ctx<'_>, project: Option<&str>) -> Result<()> {
     let (store, ws) = ctx.open()?;
     if let Some(p) = project {
         require_project(&store, p)?;
     }
-    // One snapshot serves both the checker and the id → AGT-N names.
+    // One snapshot serves both the checker and the id → AGT-N names. A
+    // finding names tickets to act on (`pm set <id> …`), so a ticket still
+    // awaiting its hub number is named by ULID (`ref_id`), not `AGT-?`.
     let tickets = store.all_tickets()?;
     let findings = pm_core::check::check(&ws, &tickets, &store.all_relations()?, now_ms(), project);
-    let names: BTreeMap<Ulid, String> =
-        tickets.iter().map(|t| (t.id, display_id(&ws, t))).collect();
+    let names: BTreeMap<Ulid, String> = tickets.iter().map(|t| (t.id, ref_id(&ws, t))).collect();
     let name = |id: &Ulid| names.get(id).cloned().unwrap_or_else(|| id.to_string());
 
     if ctx.json {

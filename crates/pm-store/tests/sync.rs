@@ -566,6 +566,75 @@ fn the_pending_marker_survives_a_rebuild() {
     assert_eq!(store.pending_numbers().unwrap(), vec![a]);
 }
 
+/// AGT-1398: `commit_batch_pending` lands the ops and the pending flags
+/// together — a numberless ticket, flagged, in one transaction — and a
+/// failing batch leaves neither behind.
+#[test]
+fn commit_batch_pending_creates_unnumbered_and_flags_atomically() {
+    let (_dir, mut store) = store();
+    let before = store.sync_status().unwrap().outbox;
+    let (a, b) = (Ulid::new(), Ulid::new());
+    let tickets = store
+        .commit_batch_pending(&[create(a, 1), create(b, 2)], &[a, b])
+        .unwrap();
+    assert_eq!(
+        tickets.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![a, b],
+        "returned in `pending` order"
+    );
+    assert!(tickets.iter().all(|t| t.number.is_none()));
+    assert_eq!(store.pending_numbers().unwrap(), {
+        let mut ids = vec![a, b];
+        ids.sort();
+        ids
+    });
+    // No `field.set number` was logged: only the two creates are outbox.
+    assert_eq!(store.sync_status().unwrap().outbox, before + 2);
+
+    // A batch whose second op fails (a relation to a ticket that does not
+    // exist) commits nothing and flags nothing.
+    let c = Ulid::new();
+    let dangling = op(
+        c,
+        4,
+        "matt",
+        Payload::RelationAdd(RelationAdd {
+            relation: Relation {
+                kind: RelationKind::Blocks,
+                from: Ulid::new(),
+                to: c,
+            },
+        }),
+    );
+    let err = store
+        .commit_batch_pending(&[create(c, 3), dangling], &[c])
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::UnknownRelationTarget { .. }),
+        "{err}"
+    );
+    assert!(store.ticket(c).unwrap().is_none());
+    assert_eq!(store.pending_numbers().unwrap().len(), 2);
+    assert_eq!(store.sync_status().unwrap().outbox, before + 2);
+
+    // Flagging a ticket the batch did not create is refused (and the
+    // batch rolled back), so a flag can never point at nothing.
+    let d = Ulid::new();
+    let err = store
+        .commit_batch_pending(&[create(d, 5)], &[Ulid::new()])
+        .unwrap_err();
+    assert!(matches!(err, StoreError::UnknownTicket { .. }), "{err}");
+    assert!(store.ticket(d).unwrap().is_none());
+
+    // The hub's number clears the flag, as for any pending ticket.
+    store
+        .apply_pulled(&[op(a, 30, "hub", Payload::FieldSet(FieldSet::Number(7)))])
+        .unwrap();
+    assert_eq!(store.pending_numbers().unwrap(), vec![b]);
+    assert_eq!(store.ticket(a).unwrap().unwrap().number, Some(7));
+    assert!(store.doctor().unwrap().is_healthy());
+}
+
 // ---- config kinds (AGT-1384, folded since AGT-1385) ----
 
 /// A pulled batch may carry config ops in any order: a `project.set`

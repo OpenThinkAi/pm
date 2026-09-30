@@ -233,6 +233,33 @@ pub(crate) fn configured_hub(env: &Env) -> Result<Option<String>> {
     Ok(crate::workspace::Config::load(&path)?.and_then(|c| c.hub))
 }
 
+/// Whether ticket numbers on this machine come from the hub rather than
+/// the local allocator (AGT-1398) — **the one place that decides it**.
+/// `pm new` (single, `--from-file`, `--batch`) asks this before every
+/// create: `true` means the ticket is committed without a number and
+/// flagged pending ([`pm_store::Store::commit_batch_pending`]), reads
+/// `AGT-?` and is addressed by its ULID until a sync brings the hub's
+/// `field.set number`; `false` means `pm new` numbers it locally as it
+/// always has.
+///
+/// Today this is "a `hub` is configured" (`pm hub login`), exactly what
+/// `docs/hub-api.md` §Ticket numbers promises: a ticket made after login
+/// is pending a hub number, whether the workspace is still in seed mode —
+/// the first sync's `POST /seeded` (AGT-1396) numbers every create the
+/// seed left unnumbered — or already authoritative. Numbering locally
+/// while a hub is configured but unseeded would be *wrong*, not merely
+/// slower: two replicas of one workspace could each mint the same local
+/// number before either seeds, and the hub would refuse the second as
+/// `duplicate_number`. Never contacts the hub and needs no token, so `pm
+/// new` stays offline-safe.
+///
+/// AGT-1396: if a hub-authoritative bit lands in pm-store's sync state,
+/// wire it *here* (e.g. add a `&Store` parameter and AND it in) rather
+/// than at the call sites, so `pm new` and its tests keep one answer.
+pub(crate) fn numbers_are_hub_assigned(env: &Env) -> Result<bool> {
+    Ok(configured_hub(env)?.is_some())
+}
+
 /// The token this machine holds for `ws` and where it came from:
 /// `PM_HUB_TOKEN` (`"env"`) wins, else the keychain item (`"keychain"`).
 fn load_token(env: &Env, ws: &Workspace) -> Option<(String, &'static str)> {
