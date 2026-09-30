@@ -32,6 +32,14 @@ toml = "1.1"
 # hub calls are two tiny GETs, and the JSON is parsed with serde_json.
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 ulid = { version = "1.2", features = ["serde"] }
+# `pm app` (AGT-1401): the localhost API the ui-leaf views talk to. axum
+# and tokio are the versions `crates/pm-hub` already locks; `getrandom`
+# mints the one-shot token from the OS CSPRNG as pm-hub mints its tokens;
+# `futures-util` (already in the tree under axum) builds the SSE stream.
+axum = "0.8"
+futures-util = { version = "0.3", default-features = false }
+getrandom = "0.3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 # Tests corrupt a materialized row directly to prove `pm doctor` catches it.
@@ -39,7 +47,6 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 tempfile = "3.27"
 # `tests/sync.rs` (AGT-1395) runs the real `pm-hub` against a throwaway
 # Postgres through pm-hub's own test harness (`crates/pm-hub/tests/common`,
-# included by path), which reaches Postgres with tokio-postgres. Both are
-# already in the workspace's lockfile for pm-hub.
-tokio = { version = "1", features = ["rt"] }
+# included by path), which reaches Postgres with tokio-postgres (already in
+# the lockfile for pm-hub; tokio itself is a regular dependency above).
 tokio-postgres = "0.7"

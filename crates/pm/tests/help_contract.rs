@@ -27,6 +27,7 @@ const PATHS: &[&[&str]] = &[
     &["done"],
     &["unclaim"],
     &["edit"],
+    &["app"],
     &["claim"],
     &["list"],
     &["log"],

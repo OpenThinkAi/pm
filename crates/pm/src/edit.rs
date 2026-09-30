@@ -408,16 +408,26 @@ pub(crate) fn plan(
     }
 
     if before.body != after.body {
-        let body_err = |e: pm_core::BodyError| CliError::error(format!("editing description: {e}"));
-        let mut body = Body::with_peer(peer).map_err(body_err)?;
-        body.apply(&view.body.snapshot().map_err(body_err)?)
-            .map_err(body_err)?;
-        let update = body.diff_from_text(&after.body).map_err(body_err)?;
         out.push(Payload::BodyEdit(BodyEdit {
-            update: update.into_bytes(),
+            update: body_update(view, &after.body, peer)?,
         }));
     }
     Ok(out)
+}
+
+/// The `body.edit` update that turns `view`'s description into `text`,
+/// minted under `peer` (one fresh [`session_peer`] per editing session —
+/// see the module docs): a [`Body`] rebuilt from the view's Loro snapshot,
+/// then `diff_from_text`, so the update is relative to the state that was
+/// edited and merges with anything that landed meanwhile. `pub(crate)`:
+/// `pm app`'s body endpoint (AGT-1401) takes whole text the same way.
+pub(crate) fn body_update(view: &TicketView, text: &str, peer: u64) -> Result<Vec<u8>> {
+    let body_err = |e: pm_core::BodyError| CliError::error(format!("editing description: {e}"));
+    let mut body = Body::with_peer(peer).map_err(body_err)?;
+    body.apply(&view.body.snapshot().map_err(body_err)?)
+        .map_err(body_err)?;
+    let update = body.diff_from_text(text).map_err(body_err)?;
+    Ok(update.into_bytes())
 }
 
 // ----------------------------------------------------------------- editor

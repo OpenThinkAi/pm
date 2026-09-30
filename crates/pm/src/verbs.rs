@@ -1222,8 +1222,9 @@ pub fn show(
 /// Parses one `key=value`. Empty values clear optional fields. A key this
 /// crate does not know as a scalar field is not an error (AC1): it lands in
 /// `ext` under that key, with a warning to stderr so a typo is still
-/// noticeable.
-fn parse_assignment(assignment: &str) -> Result<FieldSet> {
+/// noticeable. `pub(crate)`: `pm app`'s field endpoint (AGT-1401) parses
+/// the same `key=value` grammar so the API and the CLI agree on it.
+pub(crate) fn parse_assignment(assignment: &str) -> Result<FieldSet> {
     let Some((key, value)) = assignment.split_once('=') else {
         return Err(CliError::usage(format!(
             "'{assignment}' is not key=value (e.g. title=\"New title\")"

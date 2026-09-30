@@ -41,6 +41,15 @@ impl Store {
         read_ops(&self.conn, "WHERE seq > ?1", params![since])
     }
 
+    /// The newest `seq` in the log (`0` when empty): where a follower
+    /// such as `pm app`'s event stream (AGT-1401) starts reading from, so
+    /// it never replays the whole log on start.
+    pub fn head_seq(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM ops", [], |r| r.get(0))?)
+    }
+
     /// The `seq` `target` (an opaque string a caller keys by; `pm backup`
     /// uses the backup directory's absolute path) last received. `0` if
     /// this target has never backed up.

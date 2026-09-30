@@ -328,7 +328,9 @@ fn status_str(status: ProjectStatus) -> &'static str {
     }
 }
 
-fn project_json(p: &Project) -> Value {
+/// The **Project** `--json` shape. `pub(crate)`: `pm app` (AGT-1401)
+/// serves it unchanged.
+pub(crate) fn project_json(p: &Project) -> Value {
     let Value::Object(fields) = serde_json::to_value(p).expect("a project serializes") else {
         unreachable!("a project serializes to an object");
     };

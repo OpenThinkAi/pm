@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod app;
 mod archive;
 mod backup;
 mod batch;
@@ -192,6 +193,15 @@ enum Cmd {
     Unclaim {
         /// Ticket id (e.g. PM-12) or ULID
         id: String,
+    },
+    /// Serve the localhost API the ui-leaf views use (127.0.0.1, random port, one-shot token); prints the URL and token, exits when the last view disconnects
+    App {
+        /// Seconds without a connected view before exiting (0 = never)
+        #[arg(long, value_name = "SECS", default_value_t = 30)]
+        idle: u64,
+        /// A browser origin allowed to call the API (e.g. the view's http://127.0.0.1:5173); repeat for several. Default: none
+        #[arg(long = "allow-origin", value_name = "ORIGIN")]
+        allow_origin: Vec<String>,
     },
     /// Edit a ticket in $EDITOR (frontmatter + markdown); the save becomes ops
     Edit {
@@ -547,6 +557,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         ),
         Cmd::Unclaim { id } => mutate::unclaim(ctx, &id),
         Cmd::Edit { id, view } => edit::edit(ctx, &id, view),
+        Cmd::App { idle, allow_origin } => app::app(ctx, app::AppArgs { idle, allow_origin }),
         Cmd::Claim {
             id,
             ready,
