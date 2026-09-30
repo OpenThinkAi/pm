@@ -11,7 +11,7 @@
 //! rewritten text is exactly what a fresh materialization produces.
 
 use pm_core::op::BodyEdit;
-use pm_core::{DocView, TicketView};
+use pm_core::{DocView, ProjectView, TicketView, WorkspaceView};
 use rusqlite::{Transaction, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -49,6 +49,36 @@ pub(crate) fn run(tx: &Transaction<'_>) -> Result<Rewritten> {
             "project_doc_view.view",
         )?,
     })
+}
+
+/// Migration 0011 (AGT-1436): re-serialize every stored merge-state view
+/// through the current types, so a row written before a view gained a
+/// defaulted field (`WorkspaceView.docs_owned_by`, AGT-1406) is rewritten
+/// to the text a replay produces today. Re-runnable: a row already in the
+/// current form round-trips to itself and is skipped. Returns the rows
+/// rewritten.
+pub(crate) fn views(tx: &Transaction<'_>) -> Result<usize> {
+    Ok(rewrite::<WorkspaceView>(
+        tx,
+        "SELECT workspace, view FROM workspace_view",
+        "UPDATE workspace_view SET view = ?2 WHERE workspace = ?1",
+        "workspace_view.view",
+    )? + rewrite::<ProjectView>(
+        tx,
+        "SELECT project, view FROM project_view",
+        "UPDATE project_view SET view = ?2 WHERE project = ?1",
+        "project_view.view",
+    )? + rewrite::<TicketView>(
+        tx,
+        "SELECT ticket, view FROM ticket_view",
+        "UPDATE ticket_view SET view = ?2 WHERE ticket = ?1",
+        "ticket_view.view",
+    )? + rewrite::<DocView>(
+        tx,
+        "SELECT doc_id, view FROM project_doc_view",
+        "UPDATE project_doc_view SET view = ?2 WHERE doc_id = ?1",
+        "project_doc_view.view",
+    )?)
 }
 
 /// Re-serializes every `(key, text)` row `select_sql` yields through `T`

@@ -1,0 +1,10 @@
+-- AGT-1436: re-serialize every stored merge-state view (`workspace_view`,
+-- `project_view`, `ticket_view`, `project_doc_view`) through the current
+-- pm-core types. A workspace upgraded from schema <= 9 kept a
+-- `workspace_view` row written before `WorkspaceView` gained
+-- `docs_owned_by` (AGT-1406), so its text differed from what a replay
+-- writes. There is no SQL effect: the rewrite is Rust
+-- (`src/reencode.rs::views`, run by `Store::open` in this migration's
+-- transaction). It is re-runnable — a row already in the current form
+-- round-trips to itself and is skipped — and touches derived tables only,
+-- never `ops`.

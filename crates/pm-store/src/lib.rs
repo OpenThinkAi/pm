@@ -83,10 +83,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (8, include_str!("../migrations/0008_doc_identity.sql")),
     (9, include_str!("../migrations/0009_sync_seeded.sql")),
     (10, include_str!("../migrations/0010_docs_owned_by.sql")),
+    (11, include_str!("../migrations/0011_reserialize_views.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// The migration whose work is Rust, not SQL: after its (comment-only)
 /// SQL file runs, [`reencode::run`] rewrites every stored byte payload in
@@ -112,6 +113,11 @@ const SYNC_SEEDED_VERSION: u32 = 9;
 /// And for `workspace.docs_owned_by` (AGT-1406): the column is added by
 /// [`config::add_docs_owned_by_column`], idempotently.
 const DOCS_OWNED_BY_VERSION: u32 = 10;
+
+/// And for stored view rows (AGT-1436): its (comment-only) SQL file is
+/// followed by [`reencode::views`], which re-serializes every view row
+/// through the current types; a no-op on rows already in that form.
+const RESERIALIZE_VIEWS_VERSION: u32 = 11;
 
 /// How long a writer waits for the database lock before giving up. Sized
 /// for many concurrent CLI invocations (build loops fan out), not for a
@@ -182,6 +188,9 @@ impl Store {
             }
             if *version == DOCS_OWNED_BY_VERSION {
                 config::add_docs_owned_by_column(&tx)?;
+            }
+            if *version == RESERIALIZE_VIEWS_VERSION {
+                reencode::views(&tx)?;
             }
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
