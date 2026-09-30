@@ -27,14 +27,17 @@ prints **one line** and keeps running:
 
 - `url` — the server: `127.0.0.1` only, on a port the OS picked.
 - `token` — the bearer token, minted once per launch (`pma_` + 32 CSPRNG
-  bytes as hex). It is printed here and nowhere else; the launcher
-  (AGT-1402) hands it to the view. Keep it out of URLs, logs and argv.
+  bytes as hex). It is printed here and nowhere else. Keep it out of URLs,
+  logs and argv.
 - `actor` — who every op this server commits is attributed to: the usual
   resolution (`PM_ACTOR`, `--as`, `$USER`) at launch.
 - `idle_secs` — see [Lifetime](#lifetime).
 - `allowed_origins` — the `--allow-origin` values, normalized.
 
-Without `--json` the same facts print as `url:` and `token:` lines.
+`pm app` without `--json` launches the board instead (see
+[Launching a view](#launching-a-view)) and prints neither; only when it
+cannot (no display, no pinned ui-leaf) does it serve headless and print
+the same facts as `url:` and `token:` lines.
 
 ## Access
 
@@ -236,3 +239,68 @@ stderr — measured from launch too, so a launch nobody connects to does
 not linger. A view that reloads within the grace simply reconnects.
 `--idle 0` never exits (for `curl`-driven use). Killing the process at
 any point is safe: every write was its own transaction.
+
+When pm launched the view itself (below) the grace after a disconnect is
+`--idle` (default `5` — it is how long `pm edit` lingers after its window
+closes) and the first connection gets 60 s (a cold browser plus ui-leaf
+compiling the view); ui-leaf exiting ends the server too.
+
+## Launching a view
+
+`pm edit <ID>` (the ticket view) and `pm app` without `--json` (the board)
+start this server in-process and mount a view in
+[ui-leaf](https://github.com/OpenThinkAi/ui-leaf) over its stdio protocol
+(`ui-leaf mount`, line-delimited JSON; `crates/pm/src/app/launch.rs`).
+
+**Runtime.** `ui_leaf.path` in config.toml, else the first `ui-leaf` on
+`PATH`. When that is the npm package's Node shim, pm runs the native
+`ui-leaf-bin` beside it. It must report (`--version`) a version in
+`>=1.6.0, <2.0.0` — 1.6.0 is the release the views were built against, and
+ui-leaf's wire protocol `"1"` may only break at a new major. Otherwise pm
+does not launch it (and says why). No display — `UI_LEAF_NO_OPEN` truthy,
+an SSH session, or Linux/BSD without `DISPLAY`/`WAYLAND_DISPLAY` — means no
+launch either; `UI_LEAF_NO_OPEN=0` forces one.
+
+**The mount.** Config line: `view` (`ticket` or `board`), an absolute
+`viewsRoot` (below), `data` = `{"schema":1,"view":…,"ticket":"AGT-12"}`,
+`mutations: ["session"]`, `port: 0`, `shell: "app"`, and `csp` = ui-leaf's
+strict preset with this API's origin added to `connect-src`.
+
+**How the view gets the URL and token: the `session` mutation.** Never a
+URL: ui-leaf's `ready` URL carries no token, and its launch fragment
+(`#token=`) is ui-leaf's own token, not pm's. Never `data`: ui-leaf
+inlines `data` into the page HTML, which its `GET /` serves to any local
+process without a token. The view calls `mutate("session")`; the request
+travels ui-leaf's token-gated `/mutate` channel and pm replies
+`{"schema":1,"url":"http://127.0.0.1:<port>","token":"pma_…"}`. Any other
+mutation name is refused — views write through this API. When ui-leaf
+reports `ready`, pm adds `http://127.0.0.1:<its port>` (and the
+`localhost` spelling) to the allowed origins, before any view can hold
+the token.
+
+**Closing.** The view keeps `GET /events` open while it shows. When the
+window closes the stream drops; after the grace pm sends ui-leaf
+`{"type":"close"}` (killing it after 5 s) and returns. ui-leaf's
+`disconnected` event is ignored: it is heartbeat silence, which a
+minimized window also produces.
+
+## Views
+
+The views are TSX in `crates/pm/views/`, one file per view plus
+`lib/pm.ts`, the shared client (`connect` → the `session` mutation;
+`Api.get`/`post` with the bearer token; `Api.events`, the fetch-streamed
+SSE reader; the `useApi`/`useEvents` hooks). ui-leaf passes each view
+`{data, mutate}` and bundles relative imports, React included.
+
+They ship inside the `pm` binary (`include_str!`, listed in
+`crates/pm/src/app/views.rs` — a unit test fails if a file under
+`crates/pm/views/` is missing from that list) and are unpacked on launch
+into `$XDG_CACHE_HOME/pm/views/<fingerprint>/` (else `~/.cache/…`),
+reused until the sources change. `PM_VIEWS_DIR=<dir>` mounts `<dir>`
+instead, for developing a view without rebuilding pm.
+
+| View | Opened by | Today (AGT-1402) | Becomes |
+|---|---|---|---|
+| `ticket` | `pm edit <ID>` | read-only ticket, live | the CRDT-bound editor (AGT-1403) |
+| `board` | `pm app` | tickets in a column per state, read-only, live | the board (AGT-1404) |
+| (project) | — | — | the project view (AGT-1405) |

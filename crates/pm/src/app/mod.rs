@@ -39,12 +39,14 @@
 
 mod auth;
 mod events;
+pub(crate) mod launch;
 mod routes;
+mod views;
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -55,16 +57,30 @@ use tokio::sync::{Notify, broadcast};
 use crate::exit::{CliError, Result};
 use crate::verbs::{Ctx, SCHEMA};
 use crate::workspace;
+use launch::{Choice, Ended, Runtime, Target};
 
 /// Every token starts with this, so a leaked one is recognisable.
 const TOKEN_PREFIX: &str = "pma_";
 const TOKEN_BYTES: usize = 32;
 
+/// `--idle`'s default for a server nobody launched a view for
+/// (`pm app --json`, or `pm app` without a display or ui-leaf).
+pub const HEADLESS_IDLE_SECS: u64 = 30;
+/// `--idle`'s default when pm launched the view: how long a closed window
+/// may take to come back (a reload reconnects well inside it) before pm
+/// ends. Short, because it is how long `pm edit` lingers after the window
+/// closes.
+pub const LAUNCHED_IDLE_SECS: u64 = 5;
+/// When pm launched the view: how long it has to connect the first time
+/// (a cold browser start plus ui-leaf compiling the view).
+const LAUNCH_STARTUP_GRACE: Duration = Duration::from_secs(60);
+
 /// `pm app`'s flags.
 pub struct AppArgs {
     /// Seconds without a connected event stream before the server exits;
-    /// `0` never exits.
-    pub idle: u64,
+    /// `0` never exits; `None` is [`HEADLESS_IDLE_SECS`] or
+    /// [`LAUNCHED_IDLE_SECS`].
+    pub idle: Option<u64>,
     /// Origins allowed to call the API from a browser context.
     pub allow_origin: Vec<String>,
 }
@@ -77,7 +93,9 @@ pub(crate) struct AppState {
     actor: ActorId,
     token: String,
     port: u16,
-    allowed_origins: Vec<String>,
+    /// `--allow-origin`, plus the launched view's origin once ui-leaf
+    /// reports its port.
+    allowed_origins: RwLock<Vec<String>>,
     /// Every op the watcher sees, fanned out to the event streams.
     events: broadcast::Sender<events::OpEvent>,
     /// The newest `seq` the watcher has read.
@@ -87,7 +105,35 @@ pub(crate) struct AppState {
     nudge: Notify,
     /// Open event streams; the idle timer runs while this is zero.
     viewers: AtomicUsize,
+    /// Whether any event stream has ever opened (the idle timer's startup
+    /// grace ends then).
+    connected_once: AtomicBool,
     viewers_changed: Notify,
+}
+
+impl AppState {
+    fn origin_allowed(&self, origin: &str) -> bool {
+        self.allowed_origins
+            .read()
+            .map(|list| list.iter().any(|a| a == origin))
+            .unwrap_or(false)
+    }
+
+    /// Allows one more (already normalized) origin.
+    fn allow_origin(&self, origin: String) {
+        if let Ok(mut list) = self.allowed_origins.write()
+            && !list.contains(&origin)
+        {
+            list.push(origin);
+        }
+    }
+
+    fn origins(&self) -> Vec<String> {
+        self.allowed_origins
+            .read()
+            .map(|list| list.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// `pma_` + 32 CSPRNG bytes, hex: the one-shot bearer token.
@@ -120,28 +166,112 @@ fn parse_origin(raw: &str) -> Result<String> {
     Ok(value)
 }
 
-/// `pm app [--idle SECS] [--allow-origin ORIGIN]...`
-pub fn app(ctx: &Ctx<'_>, args: AppArgs) -> Result<()> {
-    let actor = ctx.actor()?;
-    let dir = workspace::resolve(ctx.workspace, ctx.env)?;
-    // Open once now so a missing workspace is exit 1 before anything
-    // listens, and the event stream can start from the log's head.
-    let (store, _ws) = workspace::open(&dir)?;
-    let head = store.head_seq()?;
-    drop(store);
-    let allowed_origins = args
-        .allow_origin
-        .iter()
-        .map(|o| parse_origin(o))
-        .collect::<Result<Vec<_>>>()?;
-    let token = mint_token()?;
-    let idle = Duration::from_secs(args.idle);
+/// What the server does besides serving.
+enum Mode {
+    /// Announce the URL and token and serve until idle (`--json`, or no
+    /// view could be launched).
+    Headless,
+    /// Launch `target` in `runtime` and serve until the view closes.
+    View { runtime: Runtime, target: Target },
+}
 
+/// Everything a server run needs, resolved before anything listens.
+struct Launch {
+    dir: PathBuf,
+    actor: ActorId,
+    head: i64,
+    allowed_origins: Vec<String>,
+    idle: u64,
+}
+
+impl Launch {
+    /// Resolves the actor and workspace (exit 1 before anything listens
+    /// when it cannot be opened) and validates `allow_origin`.
+    fn resolve(ctx: &Ctx<'_>, allow_origin: &[String], idle: u64) -> Result<Launch> {
+        let actor = ctx.actor()?;
+        let dir = workspace::resolve(ctx.workspace, ctx.env)?;
+        // Open once now so a missing workspace is exit 1 before anything
+        // listens, and the event stream can start from the log's head.
+        let (store, _ws) = workspace::open(&dir)?;
+        let head = store.head_seq()?;
+        drop(store);
+        let allowed_origins = allow_origin
+            .iter()
+            .map(|o| parse_origin(o))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Launch {
+            dir,
+            actor,
+            head,
+            allowed_origins,
+            idle,
+        })
+    }
+}
+
+/// `pm app [--idle SECS] [--allow-origin ORIGIN]...`: with `--json`, the
+/// headless server for tooling; otherwise the board in ui-leaf, falling
+/// back to the headless server (with a note) when there is no display or
+/// no pinned ui-leaf.
+pub fn app(ctx: &Ctx<'_>, args: AppArgs) -> Result<()> {
+    // The workspace and flags are checked before ui-leaf is probed.
+    let mut launch = Launch::resolve(ctx, &args.allow_origin, 0)?;
+    let choice = if ctx.json {
+        Choice::Fallback(None)
+    } else {
+        launch::choose(ctx.env, true)?
+    };
+    let (mode, default_idle) = match choice {
+        Choice::Launch(runtime) => (
+            Mode::View {
+                runtime,
+                target: Target::Board,
+            },
+            LAUNCHED_IDLE_SECS,
+        ),
+        Choice::Fallback(note) => {
+            if let Some(note) = note {
+                eprintln!("pm app: {note}; serving the API only");
+            }
+            (Mode::Headless, HEADLESS_IDLE_SECS)
+        }
+    };
+    launch.idle = args.idle.unwrap_or(default_idle);
+    match serve(ctx, launch, mode)? {
+        Ended::Closed => Ok(()),
+        Ended::Failed(why) => Err(CliError::error(format!("pm app: {why}"))),
+    }
+}
+
+/// `pm edit <id>` in ui-leaf: the ticket view, until its window closes.
+/// `id` must already be resolved (a display id that exists).
+pub(crate) fn edit_ticket(ctx: &Ctx<'_>, runtime: Runtime, id: &str) -> Result<Ended> {
+    let launch = Launch::resolve(ctx, &[], LAUNCHED_IDLE_SECS)?;
+    serve(
+        ctx,
+        launch,
+        Mode::View {
+            runtime,
+            target: Target::Ticket { id: id.to_string() },
+        },
+    )
+}
+
+/// Binds, serves, and — in [`Mode::View`] — drives the ui-leaf mount;
+/// returns when the server went idle or the view closed.
+fn serve(ctx: &Ctx<'_>, launch: Launch, mode: Mode) -> Result<Ended> {
+    let views_root = match &mode {
+        Mode::View { .. } => Some(views::root(ctx.env)?),
+        Mode::Headless => None,
+    };
+    let token = mint_token()?;
+    let idle_secs = launch.idle;
+    let grace = Duration::from_secs(idle_secs);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the app runtime")?;
-    runtime.block_on(async move {
+    let ended = runtime.block_on(async move {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .context("binding 127.0.0.1")?;
@@ -151,32 +281,62 @@ pub fn app(ctx: &Ctx<'_>, args: AppArgs) -> Result<()> {
             .port();
         let (events, _) = broadcast::channel(events::BUFFER);
         let state = Arc::new(AppState {
-            dir: dir.clone(),
-            actor: actor.clone(),
+            dir: launch.dir.clone(),
+            actor: launch.actor.clone(),
             token: token.clone(),
             port,
-            allowed_origins: allowed_origins.clone(),
+            allowed_origins: RwLock::new(launch.allowed_origins.clone()),
             events,
-            head: AtomicI64::new(head),
+            head: AtomicI64::new(launch.head),
             nudge: Notify::new(),
             viewers: AtomicUsize::new(0),
+            connected_once: AtomicBool::new(false),
             viewers_changed: Notify::new(),
         });
-
-        announce(ctx, &state, args.idle);
-
         tokio::spawn(events::watch(state.clone()));
-        let idle_state = state.clone();
-        let shutdown = async move {
-            events::idle(idle_state, idle).await;
-            eprintln!("pm app: no view connected for {}s; exiting", args.idle);
-        };
-        axum::serve(listener, routes::router(state))
-            .with_graceful_shutdown(shutdown)
-            .await
-            .context("serving the app API")?;
-        Ok(())
-    })
+
+        match mode {
+            Mode::Headless => {
+                announce(ctx, &state, idle_secs);
+                let idle_state = state.clone();
+                let shutdown = async move {
+                    events::idle(idle_state, grace, grace).await;
+                    eprintln!("pm app: no view connected for {idle_secs}s; exiting");
+                };
+                axum::serve(listener, routes::router(state))
+                    .with_graceful_shutdown(shutdown)
+                    .await
+                    .context("serving the app API")?;
+                Ok(Ended::Closed)
+            }
+            Mode::View { runtime, target } => {
+                let config = launch::mount_config(
+                    &target,
+                    views_root.as_deref().unwrap_or(std::path::Path::new(".")),
+                    &format!("http://127.0.0.1:{port}"),
+                );
+                let server = tokio::spawn(
+                    axum::serve(listener, routes::router(state.clone())).into_future(),
+                );
+                let startup = if grace.is_zero() {
+                    grace
+                } else {
+                    LAUNCH_STARTUP_GRACE.max(grace)
+                };
+                let stop = events::idle(state.clone(), startup, grace);
+                let ended = launch::drive(&runtime, config, state, stop).await;
+                // The view is gone: stop answering. A stream the closed
+                // page left open must not hold the process, so this is an
+                // abort, not a graceful drain.
+                server.abort();
+                ended
+            }
+        }
+    });
+    // Nothing is left to flush (every write was its own transaction); do
+    // not wait on a blocking read a request left behind.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    ended
 }
 
 /// The launch line: with `--json`, one compact line a launcher can read
@@ -195,7 +355,7 @@ fn announce(ctx: &Ctx<'_>, state: &AppState, idle: u64) {
             "workspace": state.dir,
             "actor": state.actor.as_str(),
             "idle_secs": idle,
-            "allowed_origins": state.allowed_origins,
+            "allowed_origins": state.origins(),
         });
         let _ = writeln!(out, "{line}");
     } else {

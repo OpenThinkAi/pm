@@ -81,7 +81,11 @@ impl Sandbox {
     }
 
     /// `pm` with a cleared environment (HOME = sandbox, USER = tester) and
-    /// `EDITOR` = `editor`, if given.
+    /// `EDITOR` = `editor`, if given. `PATH` is the system directories only,
+    /// so no real ui-leaf is ever found (and no browser ever opens): the
+    /// default view falls back to `$EDITOR`. `DISPLAY` is set so that holds
+    /// on Linux for the same reason it does on macOS — ui-leaf is missing,
+    /// not the display. `tests/launch.rs` covers a (fake) ui-leaf.
     fn run(&self, args: &[&str], editor: Option<&Path>) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_pm"));
         cmd.args(args)
@@ -90,7 +94,8 @@ impl Sandbox {
             .env("USER", "tester")
             // Aborted edits keep their temp file; keep it in the sandbox.
             .env("TMPDIR", self.home.path())
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("PATH", "/usr/bin:/bin")
+            .env("DISPLAY", ":0")
             .stdin(Stdio::null());
         if let Some(editor) = editor {
             cmd.env("EDITOR", editor);
@@ -322,33 +327,58 @@ fn an_editor_that_keeps_saving_garbage_is_bounded() {
 }
 
 #[test]
-fn ui_leaf_is_not_yet_available_by_flag_or_config() {
+fn without_ui_leaf_every_view_choice_uses_the_editor() {
     let sb = Sandbox::new();
     let editor = sb.editor(&[]);
+    let note = "ui-leaf not found";
+
+    // The default (ui-leaf) run non-interactively, as here, is the editor
+    // flow without a word.
+    let out = sb.run(&["edit", "AGT-1"], Some(&editor));
+    assert_ok(&out);
+    assert!(!stderr(&out).contains("ui-leaf"), "{}", stderr(&out));
+    assert_eq!(sb.invocations(), 1);
+
+    // Asked for by flag: falls back with one note, no longer "not yet
+    // available".
     let out = sb.run(&["edit", "AGT-1", "--view=ui-leaf"], Some(&editor));
-    assert_code(&out, 1);
-    assert!(
-        stderr(&out).contains("not yet available"),
+    assert_ok(&out);
+    assert!(stderr(&out).contains(note), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out)
+            .lines()
+            .filter(|l| l.contains("ui-leaf"))
+            .count(),
+        1,
         "{}",
         stderr(&out)
     );
+    assert!(!stderr(&out).contains("not yet available"));
+    assert_eq!(sb.invocations(), 2);
 
+    // Asked for by config: same.
     let config = sb.path(".config/pm/config.toml");
     let base = std::fs::read_to_string(&config).unwrap();
     std::fs::write(&config, format!("{base}\n[edit]\nview = \"ui-leaf\"\n")).unwrap();
     let out = sb.run(&["edit", "AGT-1"], Some(&editor));
-    assert_code(&out, 1);
-    assert!(
-        stderr(&out).contains("not yet available"),
-        "{}",
-        stderr(&out)
-    );
-    // The flag overrides config.
-    assert_ok(&sb.run(&["edit", "AGT-1", "--view", "editor"], Some(&editor)));
+    assert_ok(&out);
+    assert!(stderr(&out).contains(note), "{}", stderr(&out));
+    assert_eq!(sb.invocations(), 3);
+
+    // --view editor (overriding config) and edit.view = editor: the
+    // $EDITOR flow with no ui-leaf note at all.
+    let out = sb.run(&["edit", "AGT-1", "--view", "editor"], Some(&editor));
+    assert_ok(&out);
+    assert!(!stderr(&out).contains("ui-leaf"), "{}", stderr(&out));
+    std::fs::write(&config, format!("{base}\n[edit]\nview = \"editor\"\n")).unwrap();
+    let out = sb.run(&["edit", "AGT-1"], Some(&editor));
+    assert_ok(&out);
+    assert!(!stderr(&out).contains("ui-leaf"), "{}", stderr(&out));
+    assert_eq!(sb.invocations(), 5);
 
     std::fs::write(&config, format!("{base}\n[edit]\nview = \"emacs\"\n")).unwrap();
     assert_code(&sb.run(&["edit", "AGT-1"], Some(&editor)), 2);
-    assert_eq!(sb.invocations(), 1, "the editor ran only for --view editor");
+    assert_eq!(sb.invocations(), 5, "a bad edit.view never opens an editor");
 }
 
 #[test]
