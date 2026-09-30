@@ -89,12 +89,17 @@ export class Api {
     return this.parse<T>(await fetch(this.url + path, { headers: this.headers(false) }));
   }
 
-  async post<T>(path: string, body: unknown): Promise<T> {
+  /**
+   * `keepalive` lets the request outlive the page — for a last write
+   * sent as the window closes (the ticket editor's unsent description).
+   */
+  async post<T>(path: string, body: unknown, opts: { keepalive?: boolean } = {}): Promise<T> {
     return this.parse<T>(
       await fetch(this.url + path, {
         method: "POST",
         headers: this.headers(true),
         body: JSON.stringify(body),
+        keepalive: opts.keepalive ?? false,
       }),
     );
   }

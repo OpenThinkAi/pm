@@ -487,8 +487,13 @@ still opens ui-leaf without a TTY.
 **`ui-leaf`** (AGT-1402, README decision 6) opens the ticket's view in
 ui-leaf, backed by the same localhost API `pm app` serves
 (`docs/app-api.md` §Launching a view), and returns when the window closes
-(a few seconds after its event stream drops). Every change the view makes
-is already an op by then. The ticket is resolved first: an unknown id is
+(a few seconds after its event stream drops). The view is the ticket
+editor (AGT-1403): title, priority, project, labels and state, and the
+description in CodeMirror bound to the body's text CRDT; every change is
+an op within a second of being made, and changes from anywhere else — a
+second window, `pm set`, `pm edit` in a terminal, a sync — appear in it
+live. Every change the view makes is already an op by the time `pm edit`
+returns. The ticket is resolved first: an unknown id is
 exit `3` before any window opens. It falls back to the `editor` flow below
 when:
 

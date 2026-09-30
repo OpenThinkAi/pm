@@ -10,6 +10,13 @@
 //! written temp directory, so a present directory is always complete and
 //! two `pm`s unpacking at once cannot tear it.
 //!
+//! `views/vendor/` is third-party code the ticket editor bundles —
+//! `loro-crdt` (its wasm inlined as base64, ~4.7 MB) and CodeMirror with
+//! `loro-codemirror` — generated from pinned versions by
+//! `crates/pm/views-vendor/build.ts` and committed, so neither building nor
+//! running pm needs a JavaScript toolchain (ui-leaf bundles relative
+//! imports; it resolves no npm packages but React).
+//!
 //! `PM_VIEWS_DIR=<dir>` mounts `<dir>` instead: edit a `.tsx`, re-run
 //! `pm edit`/`pm app`, see it — no rebuild. (That is how AGT-1403..1405
 //! develop the real views; a file they add must also be listed in
@@ -29,6 +36,12 @@ pub(crate) const FILES: &[(&str, &str)] = &[
     ("ticket.tsx", include_str!("../../views/ticket.tsx")),
     ("lib/board.ts", include_str!("../../views/lib/board.ts")),
     ("lib/pm.ts", include_str!("../../views/lib/pm.ts")),
+    ("lib/body.ts", include_str!("../../views/lib/body.ts")),
+    ("vendor/loro.js", include_str!("../../views/vendor/loro.js")),
+    (
+        "vendor/codemirror.js",
+        include_str!("../../views/vendor/codemirror.js"),
+    ),
 ];
 
 /// FNV-1a over every file's path and bytes: the unpacked directory's name,

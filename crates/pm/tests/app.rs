@@ -873,6 +873,68 @@ fn a_board_move_is_a_state_transition_by_ref() {
     );
 }
 
+/// `GET /tickets/AGT-1/body?since=…` for an encoded version vector,
+/// percent-encoded as a view's `encodeURIComponent` does.
+fn since_path(version: &[u8]) -> String {
+    let b64 = pm_core::bytes::encode(version)
+        .replace('+', "%2B")
+        .replace('/', "%2F")
+        .replace('=', "%3D");
+    format!("/tickets/AGT-1/body?since={b64}")
+}
+
+#[test]
+fn body_since_a_version_ships_only_what_the_editor_lacks() {
+    let sb = Sandbox::new();
+    let app = App::start(&sb, &["--idle", "0"]);
+
+    // An editor bound to the snapshot, with an edit of its own the server
+    // has not seen yet.
+    let (_, body) = app.get("/tickets/AGT-1/body");
+    let mut doc = Body::new();
+    doc.apply(&BodyUpdate::from_bytes(
+        pm_core::bytes::decode(body["snapshot"].as_str().unwrap()).unwrap(),
+    ))
+    .unwrap();
+    doc.diff_from_text("LINE ONE\nline two").unwrap();
+
+    // Another window's edit lands through the API.
+    let (status, _) = app.post(
+        "/tickets/AGT-1/body",
+        json!({"text": "line one\nline two\nline three"}),
+    );
+    assert_eq!(status, 200);
+
+    // The editor asks for what it lacks: exactly that edit, no snapshot.
+    let (status, caught_up) = app.get(&since_path(&doc.version()));
+    assert_eq!(status, 200, "{caught_up}");
+    assert_eq!(caught_up["id"], "AGT-1");
+    assert_eq!(caught_up["text"], "line one\nline two\nline three");
+    assert!(caught_up.get("snapshot").is_none(), "{caught_up}");
+    let update = pm_core::bytes::decode(caught_up["update"].as_str().unwrap()).unwrap();
+    doc.apply(&BodyUpdate::from_bytes(update)).unwrap();
+    assert_eq!(doc.text(), "LINE ONE\nline two\nline three");
+
+    // Caught up: the next answer changes nothing.
+    let (_, again) = app.get(&since_path(&doc.version()));
+    let nothing = pm_core::bytes::decode(again["update"].as_str().unwrap()).unwrap();
+    doc.apply(&BodyUpdate::from_bytes(nothing)).unwrap();
+    assert_eq!(doc.text(), "LINE ONE\nline two\nline three");
+
+    // An empty version is "everything"; garbage is a 400.
+    let (status, all) = app.get("/tickets/AGT-1/body?since=");
+    assert_eq!(status, 200, "{all}");
+    let mut fresh = Body::new();
+    fresh
+        .apply(&BodyUpdate::from_bytes(
+            pm_core::bytes::decode(all["update"].as_str().unwrap()).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(fresh.text(), "line one\nline two\nline three");
+    assert_eq!(app.get("/tickets/AGT-1/body?since=not%20base64!").0, 400);
+    assert_eq!(app.get("/tickets/AGT-1/body?since=%2F%2F%2F%2F").0, 400);
+}
+
 #[test]
 fn a_cli_write_in_another_process_reaches_the_stream_within_a_second() {
     let sb = Sandbox::new();

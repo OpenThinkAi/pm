@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use loro::{ExportMode, LoroDoc, LoroText};
+use loro::{ExportMode, LoroDoc, LoroText, VersionVector};
 
 /// The single text container inside every body document.
 const TEXT_ID: &str = "body";
@@ -195,6 +195,32 @@ impl Body {
     pub fn snapshot(&self) -> Result<BodyUpdate, BodyError> {
         self.doc
             .export(ExportMode::Snapshot)
+            .map(BodyUpdate)
+            .map_err(|e| BodyError::Export(e.to_string()))
+    }
+
+    /// This replica's version: its oplog version vector in Loro's own
+    /// encoding (`VersionVector.encode()` in `loro-crdt`), which names
+    /// every op it holds. Hand it to [`Body::updates_since`] on another
+    /// replica to learn what this one is missing.
+    pub fn version(&self) -> Vec<u8> {
+        self.doc.oplog_vv().encode()
+    }
+
+    /// Every op this replica holds that `version` (an encoded version
+    /// vector, [`Body::version`]'s bytes) does not cover, as one update.
+    /// A version that is *ahead* of this replica for some peer is fine —
+    /// those ops are simply not included — so an editor may send its own
+    /// version, unsent local edits and all. Empty `version` means "from
+    /// the beginning".
+    pub fn updates_since(&self, version: &[u8]) -> Result<BodyUpdate, BodyError> {
+        let from = if version.is_empty() {
+            VersionVector::default()
+        } else {
+            VersionVector::decode(version).map_err(|e| BodyError::Import(e.to_string()))?
+        };
+        self.doc
+            .export(ExportMode::updates(&from))
             .map(BodyUpdate)
             .map_err(|e| BodyError::Export(e.to_string()))
     }
@@ -660,6 +686,40 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Body>();
         assert_send_sync::<BodyUpdate>();
+    }
+
+    #[test]
+    fn updates_since_ships_only_what_the_other_side_lacks() {
+        let mut server = body(1);
+        server.diff_from_text("one\ntwo").unwrap();
+        let mut editor = body(2);
+        editor.apply(&server.snapshot().unwrap()).unwrap();
+
+        // The editor edits locally (not yet sent) while the server moves on.
+        editor.diff_from_text("ONE\ntwo").unwrap();
+        server.diff_from_text("one\ntwo\nthree").unwrap();
+
+        // The editor's version is ahead of the server for peer 2 and behind
+        // for peer 1: the server ships exactly its own new op.
+        let catch_up = server.updates_since(&editor.version()).unwrap();
+        editor.apply(&catch_up).unwrap();
+        assert_eq!(editor.text(), "ONE\ntwo\nthree");
+
+        // Nothing new once the editor is caught up: an update that applies
+        // cleanly and changes nothing.
+        let nothing = server.updates_since(&server.version()).unwrap();
+        let before = editor.text();
+        assert!(!editor.apply_awaiting(&nothing).unwrap());
+        assert_eq!(editor.text(), before);
+
+        // Empty means everything; garbage is an import error.
+        let mut fresh = body(3);
+        fresh.apply(&server.updates_since(&[]).unwrap()).unwrap();
+        assert_eq!(fresh.text(), server.text());
+        assert!(matches!(
+            server.updates_since(&[0xff, 0xff, 0xff]),
+            Err(BodyError::Import(_))
+        ));
     }
 
     #[test]

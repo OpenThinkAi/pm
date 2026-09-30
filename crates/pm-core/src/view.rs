@@ -112,6 +112,12 @@ impl BodyState {
         self.body.apply_awaiting(update)
     }
 
+    /// The ops this replica holds that `version` (an encoded version
+    /// vector) lacks, as one update ([`Body::updates_since`]).
+    pub fn updates_since(&self, version: &[u8]) -> Result<BodyUpdate, BodyError> {
+        self.body.updates_since(version)
+    }
+
     /// Everything this replica knows, as one blob: what serde writes.
     pub fn snapshot(&self) -> Result<BodyUpdate, BodyError> {
         self.body.snapshot()
