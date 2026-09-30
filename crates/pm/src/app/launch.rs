@@ -30,7 +30,8 @@
 //! declares one mutation, `session`, and pm answers it — over ui-leaf's
 //! token-gated `/mutate` channel — with `{schema, url, token}`. The mount's
 //! CSP is ui-leaf's strict preset with pm's API origin added to
-//! `connect-src`, and once ui-leaf reports its port the view's origin is
+//! `connect-src` (and `'wasm-unsafe-eval'` to `script-src`, for the
+//! editor's `loro-crdt`), and once ui-leaf reports its port the view's origin is
 //! allowed on the API (what `--allow-origin` does for an external view).
 //!
 //! **Lifetime.** The view holds `GET /events` open while it shows. When the
@@ -345,7 +346,12 @@ pub(crate) enum Target {
     Ticket { id: String },
 }
 
-/// ui-leaf's strict CSP preset with `api` added to `connect-src`.
+/// ui-leaf's strict CSP preset with `api` added to `connect-src`, and
+/// `'wasm-unsafe-eval'` added to `script-src`: the ticket editor's
+/// `loro-crdt` compiles its WebAssembly module from bytes inlined in the
+/// page (`views/vendor/loro.js`), which a CSP without that source refuses.
+/// It allows WebAssembly compilation only — not `eval` or `new Function` —
+/// and every other directive is the preset's.
 fn csp(api: &str) -> String {
     [
         "default-src 'self'".to_string(),
@@ -354,7 +360,7 @@ fn csp(api: &str) -> String {
         "img-src 'self' data: https:".to_string(),
         "font-src 'self' https: data:".to_string(),
         "style-src 'self' 'unsafe-inline' https:".to_string(),
-        "script-src 'self' 'unsafe-inline'".to_string(),
+        "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'".to_string(),
     ]
     .join("; ")
 }
@@ -718,6 +724,12 @@ mod tests {
             csp.contains("connect-src 'self' http://127.0.0.1:4242;"),
             "{csp}"
         );
+        // WebAssembly for loro-crdt, and nothing looser: no `unsafe-eval`.
+        assert!(
+            csp.contains("script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'"),
+            "{csp}"
+        );
+        assert!(!csp.contains("'unsafe-eval'"), "{csp}");
         let text = config.to_string();
         assert!(!text.contains("pma_") && !text.contains("token"), "{text}");
         let board = mount_config(&Target::Board, Path::new("/views"), "http://127.0.0.1:1");

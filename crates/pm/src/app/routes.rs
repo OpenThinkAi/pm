@@ -219,25 +219,60 @@ async fn ticket(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> A
     .await
 }
 
-/// `GET /tickets/{id}/body`: the description's Loro snapshot (base64),
-/// for an editor that binds a `loro-crdt` document to it, plus the text.
-async fn body(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult {
+/// `GET /tickets/{id}/body[?since=<base64 version>]`: the description as
+/// a CRDT document plus its text. Without `since`, the whole Loro
+/// snapshot (base64), for an editor binding a fresh `loro-crdt` document
+/// to it. With `since` — the editor document's encoded oplog version
+/// vector (`doc.oplogVersion().encode()`) — only the ops it lacks, as one
+/// update: how an open editor catches up after an op event.
+#[derive(Deserialize, Default)]
+struct BodyQuery {
+    since: Option<String>,
+}
+
+async fn body(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<BodyQuery>,
+) -> ApiResult {
+    // A `+` a client forgot to percent-encode arrives as a space.
+    let since = q
+        .since
+        .map(|b64| {
+            pm_core::bytes::decode(&b64.replace(' ', "+"))
+                .map_err(|e| CliError::usage(format!("since: not a base64 version vector: {e}")))
+        })
+        .transpose()?;
     with_store(&state, move |store, ws| {
         let t = find(store, ws, &id)?;
         let view = store
             .ticket_view(t.id)?
             .ok_or_else(|| CliError::not_found(format!("no ticket {}", display_id(ws, &t))))?;
-        let snapshot = view
-            .body
-            .snapshot()
-            .map_err(|e| CliError::error(format!("reading description history: {e}")))?;
-        Ok(Json(json!({
+        let mut out = json!({
             "schema": SCHEMA,
             "id": display_id(ws, &t),
             "ulid": t.id.to_string(),
             "text": view.body.text(),
-            "snapshot": pm_core::bytes::encode(snapshot.as_bytes()),
-        })))
+        });
+        match since {
+            None => {
+                let snapshot = view
+                    .body
+                    .snapshot()
+                    .map_err(|e| CliError::error(format!("reading description history: {e}")))?;
+                out["snapshot"] = json!(pm_core::bytes::encode(snapshot.as_bytes()));
+            }
+            Some(version) => {
+                let update = view.body.updates_since(&version).map_err(|e| match e {
+                    pm_core::BodyError::Import(e) => {
+                        CliError::usage(format!("since: not a Loro version vector: {e}"))
+                    }
+                    e => CliError::error(format!("reading description history: {e}")),
+                })?;
+                out["update"] = json!(pm_core::bytes::encode(update.as_bytes()));
+            }
+        }
+        Ok(Json(out))
     })
     .await
 }

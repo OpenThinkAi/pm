@@ -101,7 +101,7 @@ booleans `held` and `archived` (`true`/`false`).
 cli-contract §Ticket ids). The list and ready shapes above carry no
 `comments`, exactly as `pm list`/`pm ready` do not.
 
-### `GET /tickets/{id}/body`
+### `GET /tickets/{id}/body[?since=<base64>]`
 
 The description as a CRDT document, for an editor that binds a
 `loro-crdt` document to it:
@@ -115,6 +115,20 @@ The description as a CRDT document, for an editor that binds a
   "snapshot": "<base64>"          // the Loro snapshot; import it into a fresh LoroDoc
 }
 ```
+
+**Catching up.** With `since` — the editor document's version vector,
+`doc.oplogVersion().encode()`, base64 (percent-encode it: `+`, `/` and
+`=` are not query-safe; an unencoded `+` read back as a space is
+tolerated) — the answer carries `"update"` instead of `"snapshot"`: every
+op this replica holds that the version does not cover, as one Loro
+update to `doc.import()`. A version *ahead* of the server (the editor's
+own unsent edits) is fine; those ops are simply not in the answer, which
+is how an open editor pulls another window's, the CLI's or a sync's edits
+without a snapshot. When there is nothing new the update is valid and
+changes nothing. `since=` (empty) means "from the beginning"; bytes that
+are not base64 or not a version vector are `400`. The ticket editor pulls
+on every `body.edit` op event for its ticket and after every (re)connect
+(`crates/pm/views/lib/body.ts`).
 
 ### `GET /projects[?status=…]`
 
@@ -264,7 +278,12 @@ launch either; `UI_LEAF_NO_OPEN=0` forces one.
 **The mount.** Config line: `view` (`ticket` or `board`), an absolute
 `viewsRoot` (below), `data` = `{"schema":1,"view":…,"ticket":"AGT-12"}`,
 `mutations: ["session"]`, `port: 0`, `shell: "app"`, and `csp` = ui-leaf's
-strict preset with this API's origin added to `connect-src`.
+strict preset with this API's origin added to `connect-src` and
+`'wasm-unsafe-eval'` added to `script-src`. The latter is the one
+loosening, and only for WebAssembly: the ticket editor's `loro-crdt`
+compiles its wasm module from bytes inlined in the page (ui-leaf serves a
+view as a single HTML page, so there is no `.wasm` URL to load), which
+CSP otherwise refuses. It does not allow `eval` or `new Function`.
 
 **How the view gets the URL and token: the `session` mutation.** Never a
 URL: ui-leaf's `ready` URL carries no token, and its launch fragment
@@ -288,17 +307,40 @@ minimized window also produces.
 
 The views are TSX in `crates/pm/views/`, one file per view plus
 `lib/pm.ts`, the shared client (`connect` → the `session` mutation;
-`Api.get`/`post` with the bearer token; `Api.events`, the fetch-streamed
+`Api.get`/`post` with the bearer token (`post` takes `{keepalive}`); `Api.events`, the fetch-streamed
 SSE reader; the `useApi`/`useEvents` hooks). ui-leaf passes each view
 `{data, mutate}` and bundles relative imports, React included.
 
 A view imports only relative files and `react`/`react-dom` (ui-leaf
 aliases those two; it resolves no other npm package), so the views carry
-no dependencies. Logic worth testing lives in plain `.ts` beside them
+no npm dependencies; third-party code a view needs is vendored as relative
+files (the ticket editor's, below). Logic worth testing lives in plain `.ts` beside them
 (`lib/board.ts`), written in erasable TypeScript so Node runs it
 directly: `node --test crates/pm/views-test/*.test.ts` (Node ≥ 22.18; no
 install, no browser). Those tests sit outside `crates/pm/views/` so they
 are not shipped, and are not part of `cargo test`.
+
+The ticket editor also imports `views/vendor/`: `loro.js` (`loro-crdt`'s
+`base64` build — the wasm inlined, ~4.7 MB) and `codemirror.js`
+(CodeMirror 6 and `loro-codemirror`, minified, importing `./loro.js` so
+there is one Loro instance). ui-leaf bundles relative imports but
+resolves no npm package except React, so pm vendors them: they are
+generated from the exact versions pinned in
+`crates/pm/views-vendor/package.json` by
+`cd crates/pm/views-vendor && bun install --frozen-lockfile && bun build.ts`,
+and committed. Building or installing pm needs no JavaScript toolchain.
+
+The editor's description binding (`lib/body.ts`, `BodySync`) is
+DOM-free: a fresh `LoroDoc` (fresh random peer, never 0) imported from the
+snapshot; local commits are exported as updates holding only this
+session's own ops and POSTed 250 ms after the last keystroke (at most
+750 ms after the first unsent one), one request at a time, retried until
+a `200`; on close (`pagehide`, or the window going hidden) whatever is
+unsent is flushed with `keepalive`. Its tests
+(`crates/pm/tests/views/*.test.ts`) run under node against a real
+`pm app` from `cargo test` (`crates/pm/tests/views_js.rs`); without node
+>= 22 on `PATH` that test skips, and `PM_REQUIRE_NODE_TESTS=1` makes the
+skip a failure.
 
 They ship inside the `pm` binary (`include_str!`, listed in
 `crates/pm/src/app/views.rs` — a unit test fails if a file under
@@ -309,7 +351,7 @@ instead, for developing a view without rebuilding pm.
 
 | View | Opened by | Today (AGT-1402) | Becomes |
 |---|---|---|---|
-| `ticket` | `pm edit <ID>` | read-only ticket, live | the CRDT-bound editor (AGT-1403) |
+| `ticket` | `pm edit <ID>` | the editor: title, priority, project, labels, state, and the description bound to the text CRDT; live (AGT-1403) | — |
 | `board` | `pm app` | the board (AGT-1404, below) | — |
 | (project) | — | — | the project view (AGT-1405) |
 

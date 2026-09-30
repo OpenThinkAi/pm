@@ -1,0 +1,17 @@
+{
+  "name": "pm-views-vendor",
+  "private": true,
+  "description": "Builds crates/pm/views/vendor/*.js — the third-party code the pm ticket editor bundles (see build.ts).",
+  "type": "module",
+  "scripts": {
+    "build": "bun build.ts"
+  },
+  "dependencies": {
+    "@codemirror/commands": "6.11.1",
+    "@codemirror/language": "6.12.4",
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.13",
+    "loro-codemirror": "0.3.3",
+    "loro-crdt": "1.16.2"
+  }
+}
