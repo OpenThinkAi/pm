@@ -326,7 +326,11 @@ fn rows(conn: &Connection, table: &str) -> Result<BTreeMap<String, Row>> {
     let rows = stmt.query_map([], |r| {
         let mut columns = Map::new();
         for (i, name) in names.iter().enumerate() {
-            columns.insert(name.clone(), json_cell(r.get::<_, Sql>(i)?));
+            let mut cell = json_cell(r.get::<_, Sql>(i)?);
+            if name == "view" {
+                cell = canonical_view(table, cell);
+            }
+            columns.insert(name.clone(), cell);
         }
         let key: Vec<Value> = key_columns.iter().map(|c| columns[*c].clone()).collect();
         Ok(Row { key, columns })
@@ -336,6 +340,32 @@ fn rows(conn: &Connection, table: &str) -> Result<BTreeMap<String, Row>> {
         Ok((Value::Array(row.key.clone()).to_string(), row))
     })
     .collect()
+}
+
+/// A view column normalized through its type (AGT-1436): text that decodes
+/// as the table's view is shown as what the current serializer writes for
+/// it, so a row stored before a view gained a defaulted field compares
+/// equal to the replay's. Only spelling is forgiven — a row whose *content*
+/// differs, or that no longer decodes (left as stored), is still drift.
+/// The rule for a future view field: add it with `#[serde(default)]`; no
+/// migration is needed for doctor to stay clean.
+fn canonical_view(table: &str, cell: Value) -> Value {
+    fn norm<T: serde::Serialize + serde::de::DeserializeOwned>(text: &str) -> Option<String> {
+        serde_json::from_str::<T>(text)
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok())
+    }
+    let Value::String(text) = &cell else {
+        return cell;
+    };
+    let canonical = match table {
+        "workspace_view" => norm::<pm_core::WorkspaceView>(text),
+        "project_view" => norm::<pm_core::ProjectView>(text),
+        "ticket_view" => norm::<pm_core::TicketView>(text),
+        "project_doc_view" => norm::<pm_core::DocView>(text),
+        _ => None,
+    };
+    canonical.map_or(cell, Value::String)
 }
 
 /// A cell as JSON. Text and blobs compare byte-for-byte; a blob (none in

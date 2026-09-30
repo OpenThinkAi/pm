@@ -611,3 +611,44 @@ fn once_seeded_the_hub_arbitrates_claims_first_come() {
             .collect()
     );
 }
+
+/// AGT-1436: a workspace view stored before AGT-1406 has no
+/// `docs_owned_by`; `Views::load` must decode it (the hub used to panic on
+/// every push) and the next fold writes the current shape back.
+#[test]
+fn a_workspace_view_stored_before_docs_owned_by_still_loads() {
+    let Some((_container, url)) =
+        postgres_for("a_workspace_view_stored_before_docs_owned_by_still_loads")
+    else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    wait_for_health(&mut hub, port);
+    let studio = create_token(&url, "studio", "saltline");
+    let ws = Ulid::new();
+    push_ok(
+        port,
+        &studio,
+        &[&state_upsert(ws, 1, "triage", StateCategory::Unstarted, 0)],
+    );
+
+    // Age the stored view to the pre-1406 shape.
+    query_rows(
+        &url,
+        "UPDATE workspace_views SET view = (view::jsonb - 'docs_owned_by')::text",
+    )
+    .unwrap();
+    let stale = query_rows(&url, "SELECT view FROM workspace_views").unwrap();
+    assert!(!stale[0][0].as_deref().unwrap().contains("docs_owned_by"));
+
+    // A push that loads it succeeds instead of panicking the request.
+    push_ok(
+        port,
+        &studio,
+        &[&state_upsert(ws, 2, "done", StateCategory::Completed, 1)],
+    );
+    let fresh = query_rows(&url, "SELECT view FROM workspace_views").unwrap();
+    assert!(fresh[0][0].as_deref().unwrap().contains("docs_owned_by"));
+    assert_eq!(hub_states(&url).len(), 2);
+}
