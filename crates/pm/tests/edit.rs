@@ -332,25 +332,27 @@ fn without_ui_leaf_every_view_choice_uses_the_editor() {
     let editor = sb.editor(&[]);
     let note = "ui-leaf not found";
 
-    // The default is ui-leaf; missing, it falls back with a one-line note.
+    // The default (ui-leaf) run non-interactively, as here, is the editor
+    // flow without a word.
     let out = sb.run(&["edit", "AGT-1"], Some(&editor));
     assert_ok(&out);
-    assert!(stderr(&out).contains(note), "{}", stderr(&out));
-    assert!(
-        stderr(&out)
-            .lines()
-            .filter(|l| l.contains("ui-leaf"))
-            .count()
-            == 1,
-        "{}",
-        stderr(&out)
-    );
+    assert!(!stderr(&out).contains("ui-leaf"), "{}", stderr(&out));
     assert_eq!(sb.invocations(), 1);
 
-    // Asked for by flag: same fallback, no longer "not yet available".
+    // Asked for by flag: falls back with one note, no longer "not yet
+    // available".
     let out = sb.run(&["edit", "AGT-1", "--view=ui-leaf"], Some(&editor));
     assert_ok(&out);
     assert!(stderr(&out).contains(note), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out)
+            .lines()
+            .filter(|l| l.contains("ui-leaf"))
+            .count(),
+        1,
+        "{}",
+        stderr(&out)
+    );
     assert!(!stderr(&out).contains("not yet available"));
     assert_eq!(sb.invocations(), 2);
 

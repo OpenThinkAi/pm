@@ -38,7 +38,9 @@
 //! of edits each) is a few bytes.
 //!
 //! **Which editor** (AGT-1402, decision 6): `--view`, then `edit.view` in
-//! config.toml, else ui-leaf. ui-leaf opens the ticket view through
+//! config.toml, else ui-leaf — the default only when stdin and stdout are
+//! terminals (a non-interactive `pm edit` that did not ask for ui-leaf is
+//! the `$EDITOR` flow, silently). ui-leaf opens the ticket view through
 //! `pm app`'s launcher ([`crate::app::launch`]) and `pm edit` returns when
 //! its window closes — every change it made is already an op. Without a
 //! display, without a pinned ui-leaf, or with `editor` chosen, it is the
@@ -143,9 +145,23 @@ fn resolve_view(flag: Option<View>, env: &Env) -> Result<(View, bool)> {
     Ok((View::UiLeaf, false))
 }
 
+/// Whether ui-leaf may open at all: always when it was asked for (flag or
+/// config); as the *default* only for an interactive invocation (stdin and
+/// stdout both a terminal). A scripted `pm edit` — an agent with a scripted
+/// `$EDITOR`, no TTY — must never pop a window on someone's screen and block
+/// on it, so it gets the `$EDITOR` flow, silently.
+fn default_may_launch(explicit: bool, interactive: bool) -> bool {
+    explicit || interactive
+}
+
 /// The ui-leaf path of `pm edit`: `Ok(true)` when the view opened and has
 /// closed (the command is done), `Ok(false)` to continue with `$EDITOR`.
 fn edit_in_ui_leaf(ctx: &Ctx<'_>, reference: &str, explicit: bool) -> Result<bool> {
+    use std::io::IsTerminal as _;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !default_may_launch(explicit, interactive) {
+        return Ok(false);
+    }
     let runtime = match launch::choose(ctx.env, explicit)? {
         Choice::Launch(runtime) => runtime,
         Choice::Fallback(note) => {
@@ -649,6 +665,14 @@ mod tests {
     use super::*;
     use pm_core::op::{StateTransition, TicketCreate};
     use pm_core::{Hlc, Op, State, StateCategory, apply};
+
+    #[test]
+    fn the_default_view_needs_a_terminal_an_explicit_one_does_not() {
+        assert!(default_may_launch(false, true), "interactive default");
+        assert!(!default_may_launch(false, false), "scripted default");
+        assert!(default_may_launch(true, false), "asked for, no TTY");
+        assert!(default_may_launch(true, true));
+    }
 
     fn ws() -> Workspace {
         Workspace {

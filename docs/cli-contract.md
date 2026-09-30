@@ -132,8 +132,9 @@ apparent exception, `pm edit` / `pm project edit`, launches `$EDITOR` (or
 inherits whatever stdio `pm` itself was given, so a non-interactive editor
 invocation (no TTY) fails fast rather than hanging, and `pm edit` reports
 that as an aborted edit (exit `1`), never a hang. `pm edit`'s default
-ui-leaf view (and `pm app` without `--json`) instead waits on a window
-until it closes; agents pass `--view=editor` or use the other verbs.
+ui-leaf view is used only at a terminal (stdin and stdout both TTYs) or
+when asked for explicitly, and then waits on a window until it closes;
+`pm app` without `--json` always opens (and waits on) the board.
 
 ### Ticket ids
 
@@ -474,7 +475,14 @@ note, and leaves the state untouched.
 ### `pm edit <ID>`
 
 Flags: `--view <VIEW>` (`ui-leaf` or `editor`; default: `edit.view` in
-config.toml, else `ui-leaf`).
+config.toml, else `ui-leaf` — for an interactive invocation only).
+
+**Non-interactive `pm edit` never opens a window it was not asked for.**
+When the view is the default (no `--view`, no `edit.view`) and stdin or
+stdout is not a terminal — an agent or script with a scripted
+`$EDITOR`/`$VISUAL` — it is the `editor` flow, silently, even with a
+display and ui-leaf present. `--view=ui-leaf` or `edit.view = "ui-leaf"`
+still opens ui-leaf without a TTY.
 
 **`ui-leaf`** (AGT-1402, README decision 6) opens the ticket's view in
 ui-leaf, backed by the same localhost API `pm app` serves
@@ -527,6 +535,10 @@ on stdout: the API's URL and token go to the view only. It exits `0` when
 the board's window has been closed for `--idle` seconds, or when ui-leaf
 exits. With no display or no pinned ui-leaf it says why on stderr and
 serves headless instead, printing `url:` and `token:` lines.
+
+It opens the board whether or not stdin/stdout are terminals: `pm app`
+is itself the request to open it (unlike `pm edit`'s default). Scripts and
+agents that want only the API use `--json`.
 
 **With `--json`** it never launches anything: the headless server for
 tooling and tests.

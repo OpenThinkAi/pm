@@ -356,7 +356,7 @@ fn pm_edit_opens_the_ticket_view_and_returns_when_it_closes() {
     let sb = Sandbox::new();
     let editor = sb.editor();
     let mut child = sb.spawn(
-        &["edit", "AGT-1", "--json"],
+        &["edit", "AGT-1", "--view=ui-leaf", "--json"],
         &[("EDITOR", editor.to_str().unwrap())],
     );
     let session = Session::from_reply(&sb.wait_for_session(&mut child));
@@ -452,11 +452,47 @@ fn ui_leaf_from_config_wins_over_path() {
 }
 
 #[test]
-fn without_ui_leaf_pm_edit_is_the_editor_flow_with_one_note() {
+fn a_non_interactive_default_is_the_editor_even_with_ui_leaf_present() {
+    // stdin is /dev/null and stdout a pipe: a scripted `pm edit` (an agent)
+    // never opens a window unless it asked for one.
+    let sb = Sandbox::new();
+    let editor = sb.editor();
+    let out = sb.run(&["edit", "AGT-1"], &[("EDITOR", editor.to_str().unwrap())]);
+    assert_ok(&out);
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("ui-leaf"),
+        "silently"
+    );
+    assert!(!sb.was_mounted(), "the fake on PATH was never run");
+    assert_eq!(sb.editor_runs(), 1);
+
+    // edit.view = ui-leaf in config is a request too: it launches.
+    let config = sb.path(".config/pm/config.toml");
+    let base = std::fs::read_to_string(&config).unwrap_or_default();
+    std::fs::write(&config, format!("{base}\n[edit]\nview = \"ui-leaf\"\n")).unwrap();
+    let mut child = sb.spawn(
+        &["edit", "AGT-1"],
+        &[
+            ("EDITOR", editor.to_str().unwrap()),
+            ("FAKE_UI_LEAF_MODE", "quit"),
+        ],
+    );
+    sb.wait_for_session(&mut child);
+    std::fs::write(sb.rec().join("quit"), "").unwrap();
+    let (code, _, stderr) = wait(child, 30);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(sb.editor_runs(), 1, "$EDITOR did not run again");
+}
+
+#[test]
+fn without_ui_leaf_an_explicit_request_is_the_editor_flow_with_one_note() {
     let sb = Sandbox::new();
     std::fs::remove_file(sb.path("bin/ui-leaf")).unwrap();
     let editor = sb.editor();
-    let out = sb.run(&["edit", "AGT-1"], &[("EDITOR", editor.to_str().unwrap())]);
+    let out = sb.run(
+        &["edit", "AGT-1", "--view=ui-leaf"],
+        &[("EDITOR", editor.to_str().unwrap())],
+    );
     assert_ok(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let notes: Vec<_> = stderr.lines().filter(|l| l.contains("ui-leaf")).collect();
@@ -506,7 +542,7 @@ fn no_display_uses_the_editor_quietly_unless_ui_leaf_was_asked_for() {
     );
     // ui-leaf's own switch counts as no display too.
     let out = sb.run(
-        &["edit", "AGT-1"],
+        &["edit", "AGT-1", "--view=ui-leaf"],
         &[
             ("EDITOR", editor.to_str().unwrap()),
             ("UI_LEAF_NO_OPEN", "1"),
@@ -523,7 +559,7 @@ fn an_unpinned_ui_leaf_is_not_launched() {
     let editor = sb.editor();
     for version in ["2.0.0", "1.5.1"] {
         let out = sb.run(
-            &["edit", "AGT-1"],
+            &["edit", "AGT-1", "--view=ui-leaf"],
             &[
                 ("EDITOR", editor.to_str().unwrap()),
                 ("FAKE_UI_LEAF_VERSION", version),
@@ -545,7 +581,7 @@ fn a_mount_that_fails_before_ready_falls_back_to_the_editor() {
     let sb = Sandbox::new();
     let editor = sb.editor();
     let out = sb.run(
-        &["edit", "AGT-1"],
+        &["edit", "AGT-1", "--view=ui-leaf"],
         &[
             ("EDITOR", editor.to_str().unwrap()),
             ("FAKE_UI_LEAF_MODE", "fail"),
@@ -568,7 +604,7 @@ fn a_mount_that_fails_before_ready_falls_back_to_the_editor() {
 #[test]
 fn a_missing_ticket_is_not_found_before_any_window() {
     let sb = Sandbox::new();
-    let out = sb.run(&["edit", "AGT-99"], &[]);
+    let out = sb.run(&["edit", "AGT-99", "--view=ui-leaf"], &[]);
     assert_eq!(out.status.code(), Some(3));
     assert!(!sb.was_mounted());
 }
