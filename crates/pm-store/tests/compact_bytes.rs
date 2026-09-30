@@ -14,6 +14,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 use ulid::Ulid;
 
+/// Migration 0005, the one under test.
+const COMPACT_BYTES_VERSION: u32 = 5;
+
 fn workspace() -> Workspace {
     Workspace {
         id: Ulid::new(),
@@ -140,9 +143,12 @@ fn downgrade(conn: &Connection) {
         )
         .unwrap();
     }
+    // Back to schema 4: forget 0005 and everything after it. Later
+    // migrations (0006, AGT-1393) are written idempotently, so re-running
+    // them over their own tables on reopen is a no-op.
     conn.execute(
-        "DELETE FROM schema_version WHERE version = ?1",
-        params![SCHEMA_VERSION],
+        "DELETE FROM schema_version WHERE version >= ?1",
+        params![COMPACT_BYTES_VERSION],
     )
     .unwrap();
 }

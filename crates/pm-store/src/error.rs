@@ -68,6 +68,17 @@ pub enum StoreError {
         #[source]
         source: Box<StoreError>,
     },
+    /// [`crate::Store::apply_pulled`] could not commit a foreign op; the
+    /// whole pulled batch was rolled back. A dependency error (an unknown
+    /// ticket, relation target, document, project or state) here means
+    /// nothing in the batch — or already in the store — supplied it.
+    #[error("applying pulled op {op_id} ({kind}) failed: {source}")]
+    Pull {
+        op_id: Ulid,
+        kind: &'static str,
+        #[source]
+        source: Box<StoreError>,
+    },
 }
 
 impl StoreError {

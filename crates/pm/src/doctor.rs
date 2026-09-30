@@ -102,6 +102,12 @@ fn print_report(report: &Report) {
         }
     }
 
+    let sync = &report.sync;
+    println!(
+        "sync            outbox {} op(s), pushed through #{}, cursor {}, {} ticket(s) awaiting a hub number",
+        sync.outbox, sync.pushed_through, sync.cursor, sync.pending_numbers
+    );
+
     match &report.replay_error {
         Some(error) => println!("replay          FAILED: {error}"),
         None if report.drift.is_empty() => {

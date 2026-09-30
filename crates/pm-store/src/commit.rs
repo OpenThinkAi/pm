@@ -172,6 +172,20 @@ fn commit_in(
     materialize(tx, &view, op)
 }
 
+/// Commits an op that came from the hub (AGT-1393, [`Store::apply_pulled`]):
+/// the same ensure-actor → apply → append → materialize path as
+/// [`commit_in`], except a `claim` is not re-checked for admissibility —
+/// the hub is the claim authority and already admitted it (README
+/// §Conflict semantics: "replicas apply admitted claims as plain LWW
+/// writes"), exactly as [`replay_in`] treats one. The caller has already
+/// ruled out a duplicate op id.
+pub(crate) fn commit_foreign_in(tx: &Transaction<'_>, op: &Op) -> Result<Ticket> {
+    ensure_actor(tx, &op.actor)?;
+    let view = next_view(tx, op, false)?;
+    append_op(tx, op)?;
+    materialize(tx, &view, op)
+}
+
 /// Re-applies an op that is already in the log: the same load → apply →
 /// materialize path as [`commit_in`], without appending. `pm doctor
 /// --rebuild` runs this over `ops` in `seq` order against emptied ticket

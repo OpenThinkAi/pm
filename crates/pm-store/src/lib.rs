@@ -24,6 +24,9 @@
 //!   `pm import vault` (AGT-1347)
 //! - `reencode` — migration 0005's in-place rewrite of byte payloads from
 //!   JSON arrays to base64 (AGT-1378)
+//! - `sync` — client sync state (AGT-1393): the outbox of ops the hub has
+//!   not acknowledged, the pull cursor, [`Store::apply_pulled`] for foreign
+//!   ops, and the pending-number marker for tickets awaiting a hub number
 //! - [`StoreError`] — typed failures (R2/R4/R5 violations, claim rejection, …)
 
 mod backup;
@@ -38,6 +41,7 @@ mod project;
 mod query;
 mod ready;
 mod reencode;
+mod sync;
 
 use std::path::Path;
 use std::time::Duration;
@@ -52,6 +56,7 @@ pub use doctor::{
 pub use error::{Result, StoreError};
 pub use query::TicketFilter;
 pub use ready::ReadyQuery;
+pub use sync::{Pulled, SyncStatus};
 
 /// Embedded migrations, in order. Each runs once, inside its own
 /// transaction, and is recorded in `schema_version`.
@@ -61,10 +66,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (3, include_str!("../migrations/0003_project_doc_bodies.sql")),
     (4, include_str!("../migrations/0004_number_floor.sql")),
     (5, include_str!("../migrations/0005_compact_bytes.sql")),
+    (6, include_str!("../migrations/0006_sync_state.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// The migration whose work is Rust, not SQL: after its (comment-only)
 /// SQL file runs, [`reencode::run`] rewrites every stored byte payload in

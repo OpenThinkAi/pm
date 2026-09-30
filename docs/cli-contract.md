@@ -634,15 +634,23 @@ report what changed, then run the same report).
     "schema": 1,
     "healthy": true,
     "rebuilt": {"tables": [...]} | null,   // a Diff, only present with --rebuild
-    "schema_version": 5,                    // 5 since AGT-1378 (byte payloads stored as base64)
+    "schema_version": 6,                    // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state)
     "op_count": 30,
     "tables": {"ticket": 5, "comment": 2, ...},
     "integrity": [],                        // SQLite integrity_check messages, if any
     "foreign_keys": [],                     // foreign_key_check violations, if any
     "replay_error": "string" | null,
-    "drift": {"tables": [...]}              // rows where replaying the op log differs from the materialized tables
+    "drift": {"tables": [...]},             // rows where replaying the op log differs from the materialized tables
+    "sync": {                               // client sync state (AGT-1393); informational, never affects "healthy"
+      "outbox": 30,                         // local ops the hub has not acknowledged (the whole log until a first push)
+      "pushed_through": 0,                  // every op with seq <= this is known to the hub
+      "cursor": 0,                          // hub seq the last pull got through; 0 = never pulled
+      "pending_numbers": 0                  // tickets created with a hub configured, still awaiting a number
+    }
   }
   ```
+- Text output adds a `sync` line: `outbox N op(s), pushed through #S,
+  cursor C, P ticket(s) awaiting a hub number`.
 
 ### `pm archive [ID]`
 
