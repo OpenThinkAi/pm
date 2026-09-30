@@ -28,6 +28,15 @@
 //! and never overwritten. A batch is all-or-nothing: one bad op and nothing
 //! in it is stored.
 //!
+//! **Numbers (AGT-1391, see `numbers`).** Once the workspace is seeded,
+//! every fresh `ticket.create` in a batch is numbered here, in the same
+//! transaction: the hub's `field.set number` ops go into the log right
+//! after the batch (their own seqs, contiguous after the batch's) and
+//! come back in the response's `numbers`. A pushed `field.set number` is
+//! then refused (`number_not_allowed`). While the workspace is still
+//! seeding the roles flip: pushed number ops are recorded and the hub
+//! allocates nothing.
+//!
 //! **Limits.** [`MAX_BATCH_OPS`] ops per batch, [`MAX_BODY_BYTES`] of body
 //! (the Studio's seed log holds one 23 MB `body.edit`, so the byte limit
 //! leaves room for a single large op plus a batch around it). A body over
@@ -43,12 +52,14 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_LENGTH;
 use axum::response::{IntoResponse, Response};
-use pm_core::{OP_VERSION, Op};
+use pm_core::{Hlc, OP_VERSION, Op, Payload};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use tokio_postgres::Transaction;
 
 use crate::Db;
 use crate::auth::Authed;
+use crate::numbers::{self, Allocator, Create, Numbered};
 
 /// Most ops in one batch.
 pub const MAX_BATCH_OPS: usize = 1000;
@@ -65,6 +76,11 @@ struct Batch<'a> {
 struct Pushed {
     /// One entry per op in the batch, in batch order.
     ops: Vec<Ack>,
+    /// The number of every ticket a `ticket.create` in this batch made,
+    /// in the order the numbers were issued: allocated by this push, or
+    /// already held (a re-pushed create, a seeded number). Empty while
+    /// the workspace is seeding and nothing in the batch is numbered.
+    numbers: Vec<Numbered>,
 }
 
 #[derive(Serialize)]
@@ -76,17 +92,28 @@ struct Ack {
     stored: bool,
 }
 
-/// The structured error body of every 4xx this route returns.
+/// The structured error body of every 4xx the write routes return.
 #[derive(Serialize)]
-struct ErrorBody {
+pub struct ErrorBody {
     error: &'static str,
     reason: String,
-    /// The offending op's position in the batch (`invalid_op` only).
+    /// The offending op's position in the batch (per-op errors only).
     #[serde(skip_serializing_if = "Option::is_none")]
     index: Option<usize>,
-    /// The offending op's `op_id`, when the JSON had one (`invalid_op` only).
+    /// The offending op's `op_id`, when the JSON had one (per-op errors only).
     #[serde(skip_serializing_if = "Option::is_none")]
     op_id: Option<String>,
+}
+
+impl ErrorBody {
+    pub fn new(error: &'static str, reason: String) -> Self {
+        ErrorBody {
+            error,
+            reason,
+            index: None,
+            op_id: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -96,6 +123,18 @@ enum PushError {
     Op {
         index: usize,
         op_id: Option<String>,
+        reason: String,
+    },
+    /// A `field.set number` pushed to a seeded workspace.
+    NumberNotAllowed {
+        index: usize,
+        op_id: String,
+    },
+    /// A seeded `field.set number` that collides with a number already
+    /// issued, or re-numbers a ticket.
+    DuplicateNumber {
+        index: usize,
+        op_id: String,
         reason: String,
     },
     NoWorkspace,
@@ -142,6 +181,31 @@ impl IntoResponse for PushError {
                     op_id,
                 },
             ),
+            PushError::NumberNotAllowed { index, op_id } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "number_not_allowed",
+                    reason: "this workspace is seeded: only the hub issues ticket numbers \
+                             (push the ticket.create without one and read the number \
+                             from the response or a pull)"
+                        .to_string(),
+                    index: Some(index),
+                    op_id: Some(op_id),
+                },
+            ),
+            PushError::DuplicateNumber {
+                index,
+                op_id,
+                reason,
+            } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "duplicate_number",
+                    reason,
+                    index: Some(index),
+                    op_id: Some(op_id),
+                },
+            ),
             // The token authenticated, so the workspace row was there a
             // moment ago; answer as auth does when there is nothing there.
             PushError::NoWorkspace => return StatusCode::NOT_FOUND.into_response(),
@@ -154,16 +218,80 @@ impl IntoResponse for PushError {
     }
 }
 
+/// What the number allocator needs to know about an op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Create,
+    /// A `field.set number` carrying this number.
+    Number(i64),
+    Other,
+}
+
 /// One op of a batch, parsed for its indexed columns; `raw` is what gets
 /// stored.
 struct Parsed<'a> {
     op_id: String,
+    hlc: Hlc,
     hlc_wall_ms: i64,
     hlc_counter: i64,
     actor: String,
     entity: String,
     kind: &'static str,
+    role: Role,
     raw: &'a str,
+}
+
+/// One row for [`insert_ops`]: a client op as parsed, or a hub op.
+pub struct OpRow<'a> {
+    pub op_id: String,
+    pub hlc_wall_ms: i64,
+    pub hlc_counter: i64,
+    pub actor: &'a str,
+    pub entity: String,
+    pub kind: &'static str,
+    pub raw: &'a str,
+}
+
+/// Appends `rows` to `workspace`'s log in order, under the caller's
+/// workspace lock, and returns each `(op_id, seq)` in the same order.
+pub async fn insert_ops(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    rows: &[OpRow<'_>],
+) -> Result<Vec<(String, i64)>, tokio_postgres::Error> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let op_ids: Vec<&str> = rows.iter().map(|p| p.op_id.as_str()).collect();
+    let wall_ms: Vec<i64> = rows.iter().map(|p| p.hlc_wall_ms).collect();
+    let counters: Vec<i64> = rows.iter().map(|p| p.hlc_counter).collect();
+    let actors: Vec<&str> = rows.iter().map(|p| p.actor).collect();
+    let entities: Vec<&str> = rows.iter().map(|p| p.entity.as_str()).collect();
+    let kinds: Vec<&str> = rows.iter().map(|p| p.kind).collect();
+    let raws: Vec<&str> = rows.iter().map(|p| p.raw).collect();
+    // `ORDER BY ordinality` feeds rows to the insert in batch order, so
+    // `nextval` runs in that order too. `::json` from text keeps the text
+    // verbatim (a `json` value is its input).
+    let inserted = tx
+        .query(
+            "INSERT INTO ops
+                 (workspace_id, op_id, hlc_wall_ms, hlc_counter, actor, entity, kind, op)
+             SELECT $1, n.op_id, n.wall_ms, n.counter, n.actor, n.entity, n.kind, n.op::json
+             FROM unnest($2::text[], $3::bigint[], $4::bigint[],
+                         $5::text[], $6::text[], $7::text[], $8::text[])
+                  WITH ORDINALITY
+                  AS n (op_id, wall_ms, counter, actor, entity, kind, op, i)
+             ORDER BY n.i
+             RETURNING op_id, seq",
+            &[
+                &workspace, &op_ids, &wall_ms, &counters, &actors, &entities, &kinds, &raws,
+            ],
+        )
+        .await?;
+    Ok(inserted
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
 }
 
 /// `op_id` alone, for naming an op that failed to parse as a whole.
@@ -193,13 +321,22 @@ fn parse_op(index: usize, raw: &RawValue) -> Result<Parsed<'_>, PushError> {
     }
     let hlc_wall_ms = i64::try_from(op.hlc.wall_ms)
         .map_err(|_| invalid(format!("hlc.wall_ms {} is out of range", op.hlc.wall_ms)))?;
+    let role = match (&op.payload, numbers::number_value(&op)) {
+        (Payload::TicketCreate(_), _) => Role::Create,
+        (_, Some(n)) => Role::Number(
+            i64::try_from(n).map_err(|_| invalid(format!("number {n} is out of range")))?,
+        ),
+        _ => Role::Other,
+    };
     Ok(Parsed {
         op_id: op.op_id.to_string(),
+        hlc: op.hlc,
         hlc_wall_ms,
         hlc_counter: i64::from(op.hlc.counter),
         actor: op.actor.as_str().to_string(),
         entity: op.entity.to_string(),
         kind: op.kind(),
+        role,
         raw: raw.get(),
     })
 }
@@ -260,20 +397,15 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
     }
 
     let mut seq_of: HashMap<String, (i64, bool)> = HashMap::with_capacity(unique.len());
+    let numbers;
     {
         let mut writer = db.writer.lock().await;
         let tx = writer.transaction().await?;
         // Held until commit: this is what orders seqs per workspace (see
-        // the module doc).
-        let locked = tx
-            .query_opt(
-                "SELECT id FROM workspaces WHERE id = $1 FOR NO KEY UPDATE",
-                &[&workspace],
-            )
-            .await?;
-        if locked.is_none() {
+        // the module doc) and serialises number allocation.
+        let Some(mut allocator) = Allocator::lock(&tx, workspace).await? else {
             return Err(PushError::NoWorkspace);
-        }
+        };
 
         let op_ids: Vec<&str> = unique.iter().map(|p| p.op_id.as_str()).collect();
         let existing = tx
@@ -290,37 +422,63 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
             .iter()
             .filter(|p| !seq_of.contains_key(&p.op_id))
             .collect();
-        if !fresh.is_empty() {
-            let op_ids: Vec<&str> = fresh.iter().map(|p| p.op_id.as_str()).collect();
-            let wall_ms: Vec<i64> = fresh.iter().map(|p| p.hlc_wall_ms).collect();
-            let counters: Vec<i64> = fresh.iter().map(|p| p.hlc_counter).collect();
-            let actors: Vec<&str> = fresh.iter().map(|p| p.actor.as_str()).collect();
-            let entities: Vec<&str> = fresh.iter().map(|p| p.entity.as_str()).collect();
-            let kinds: Vec<&str> = fresh.iter().map(|p| p.kind).collect();
-            let raws: Vec<&str> = fresh.iter().map(|p| p.raw).collect();
-            // `ORDER BY ordinality` feeds rows to the insert in batch
-            // order, so `nextval` runs in that order too. `::json` from
-            // text keeps the text verbatim (a `json` value is its input).
-            let inserted = tx
-                .query(
-                    "INSERT INTO ops
-                         (workspace_id, op_id, hlc_wall_ms, hlc_counter, actor, entity, kind, op)
-                     SELECT $1, n.op_id, n.wall_ms, n.counter, n.actor, n.entity, n.kind, n.op::json
-                     FROM unnest($2::text[], $3::bigint[], $4::bigint[],
-                                 $5::text[], $6::text[], $7::text[], $8::text[])
-                          WITH ORDINALITY
-                          AS n (op_id, wall_ms, counter, actor, entity, kind, op, i)
-                     ORDER BY n.i
-                     RETURNING op_id, seq",
-                    &[
-                        &workspace, &op_ids, &wall_ms, &counters, &actors, &entities, &kinds, &raws,
-                    ],
-                )
-                .await?;
-            for row in inserted {
-                seq_of.insert(row.get(0), (row.get(1), true));
+        // Seeded client numbers are checked before anything is written;
+        // the whole batch is refused on the first problem.
+        let seeded_numbers = if allocator.seeded {
+            if let Some(p) = fresh.iter().find(|p| matches!(p.role, Role::Number(_))) {
+                return Err(PushError::NumberNotAllowed {
+                    index: first_at[&p.op_id],
+                    op_id: p.op_id.clone(),
+                });
             }
+            Vec::new()
+        } else {
+            check_seeded_numbers(&tx, workspace, &fresh, &first_at).await?
+        };
+
+        let rows: Vec<OpRow<'_>> = fresh
+            .iter()
+            .map(|p| OpRow {
+                op_id: p.op_id.clone(),
+                hlc_wall_ms: p.hlc_wall_ms,
+                hlc_counter: p.hlc_counter,
+                actor: &p.actor,
+                entity: p.entity.clone(),
+                kind: p.kind,
+                raw: p.raw,
+            })
+            .collect();
+        for (op_id, seq) in insert_ops(&tx, workspace, &rows).await? {
+            seq_of.insert(op_id, (seq, true));
         }
+        for (entity, number, op_id) in seeded_numbers {
+            numbers::record(&tx, workspace, &entity, number, seq_of[&op_id].0).await?;
+        }
+
+        // Number the batch's creates. Every fresh op moves the hub's
+        // clock, so its number ops are stamped after all of them.
+        let creates: Vec<Create> = unique
+            .iter()
+            .filter(|p| p.role == Role::Create)
+            .filter_map(|p| {
+                Some(Create {
+                    entity: p.entity.parse().ok()?,
+                    hlc: p.hlc,
+                })
+            })
+            .collect();
+        let allocated = if allocator.seeded && !creates.is_empty() {
+            if let Some(latest) = fresh.iter().map(|p| p.hlc).max() {
+                allocator.observe(latest);
+            }
+            let allocated = allocator.allocate_all(&tx, workspace, &creates).await?;
+            allocator.save(&tx, workspace).await?;
+            allocated
+        } else {
+            Vec::new()
+        };
+        let entities: Vec<String> = creates.iter().map(|c| c.entity.to_string()).collect();
+        numbers = numbers::report(&tx, workspace, &entities, allocated).await?;
         tx.commit().await?;
     }
 
@@ -340,7 +498,60 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
             }
         })
         .collect();
-    Ok(Pushed { ops })
+    Ok(Pushed { ops, numbers })
+}
+
+/// Seed mode: the fresh `field.set number` ops of a batch, as `(entity,
+/// number, op_id)`, checked against the numbers already issued and
+/// against each other. A ticket may be numbered once and a number may
+/// name one ticket; the client (pm-store) enforces the same locally.
+async fn check_seeded_numbers(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    fresh: &[&Parsed<'_>],
+    first_at: &HashMap<String, usize>,
+) -> Result<Vec<(String, i64, String)>, PushError> {
+    let numbered: Vec<&Parsed> = fresh
+        .iter()
+        .copied()
+        .filter(|p| matches!(p.role, Role::Number(_)))
+        .collect();
+    if numbered.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entities: Vec<String> = numbered.iter().map(|p| p.entity.clone()).collect();
+    let values: Vec<i64> = numbered
+        .iter()
+        .map(|p| match p.role {
+            Role::Number(n) => n,
+            _ => unreachable!(),
+        })
+        .collect();
+    let mut held = numbers::numbered(tx, workspace, &entities).await?;
+    let mut taken = numbers::taken(tx, workspace, &values).await?;
+    let mut out = Vec::with_capacity(numbered.len());
+    for (p, number) in numbered.iter().zip(values) {
+        let duplicate = |reason: String| PushError::DuplicateNumber {
+            index: first_at[&p.op_id],
+            op_id: p.op_id.clone(),
+            reason,
+        };
+        if let Some((have, _)) = held.get(&p.entity) {
+            return Err(duplicate(format!(
+                "ticket {} already has number {have}",
+                p.entity
+            )));
+        }
+        if let Some(by) = taken.get(&number) {
+            return Err(duplicate(format!(
+                "number {number} is already ticket {by}'s"
+            )));
+        }
+        held.insert(p.entity.clone(), (number, 0));
+        taken.insert(number, p.entity.clone());
+        out.push((p.entity.clone(), number, p.op_id.clone()));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

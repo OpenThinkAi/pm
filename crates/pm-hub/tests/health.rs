@@ -31,7 +31,10 @@ fn migrates_on_start_and_serves_health() {
     )
     .unwrap();
     let tables: Vec<&str> = tables.iter().filter_map(|r| r[0].as_deref()).collect();
-    assert_eq!(tables, ["ops", "schema_version", "tokens", "workspaces"]);
+    assert_eq!(
+        tables,
+        ["numbers", "ops", "schema_version", "tokens", "workspaces"]
+    );
     let seq = query_rows(
         &url,
         "SELECT data_type, column_default FROM information_schema.columns
