@@ -18,9 +18,11 @@
 //! handed out and committed in the same order, with no gaps between a
 //! batch's ops. `NO KEY` leaves the row open to `FOR KEY SHARE`, which is
 //! what inserting a token for the workspace takes. Inside a batch, seq
-//! order is batch order. Pushes go through one dedicated connection behind
-//! a mutex (a transaction needs the connection to itself); reads and auth
-//! stay on the other connection and never wait for a push.
+//! order is batch order. A push takes its workspace's in-process write
+//! lock and then a connection from the writer pool (`writer`, AGT-1463):
+//! pushes to one workspace queue behind each other, pushes to different
+//! workspaces run side by side, and reads and auth stay on their own
+//! connection and never wait for a push.
 //!
 //! **Idempotency.** `op_id` is an op's identity. An op the workspace
 //! already has (from an earlier batch, or earlier in this one) is answered
@@ -60,6 +62,17 @@
 //! the old hub's number ops). Refusal is `400 actor_not_allowed` /
 //! `reserved_actor`, and the batch is refused whole.
 //!
+//! **Actors named in payloads (AGT-1463).** A fresh op's payload fields
+//! that name an actor — a `claim`'s `assignee`, a `hold.set`'s `hold.by`,
+//! a `field.set assignee` value and an `actor.upsert`'s `id` — are held to
+//! the same two rules as the op's own actor, so a bound token can neither
+//! claim nor hold a ticket in someone else's name. One exception: a
+//! `field.set assignee` that restates the ticket's current assignee at the
+//! hub (at that point in the batch) is accepted from any token — it
+//! changes nothing, and it is what a client logs to reconcile after the
+//! hub refused its claim (`rejected.taken_by`). Unassigning
+//! (`field.set assignee null`) names nobody and is always accepted.
+//!
 //! **Stamps (oaudit 2026-09-30).** Every op's HLC must be storable and
 //! leave its counter room to advance (`pm_core::Hlc::check_range`:
 //! `wall_ms <= i64::MAX`, `counter < u32::MAX`; else `400
@@ -89,7 +102,8 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_LENGTH;
 use axum::response::{IntoResponse, Response};
-use pm_core::{Hlc, MAX_FUTURE_SKEW_MS, OP_VERSION, Op, Payload};
+use pm_core::op::FieldSet;
+use pm_core::{ActorId, Hlc, MAX_FUTURE_SKEW_MS, OP_VERSION, Op, Payload};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio_postgres::Transaction;
@@ -583,7 +597,7 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
     let mut outcome: HashMap<String, Outcome> = HashMap::with_capacity(unique.len());
     let numbers;
     {
-        let mut writer = db.writer.lock().await;
+        let mut writer = db.writer.acquire(workspace).await;
         let tx = writer.transaction().await?;
         // Held until commit: this is what orders seqs per workspace (see
         // the module doc) and serialises number allocation.
@@ -632,6 +646,13 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
         let mut views = Views::load(&tx, workspace, &entities).await?;
         let mut admitted: Vec<&Parsed> = Vec::with_capacity(fresh.len());
         for p in &fresh {
+            check_named_actors(
+                caller,
+                allocator.seeded,
+                p,
+                first_at[&p.op_id],
+                views.assignee(p.op.entity),
+            )?;
             match views.fold(&p.op, allocator.seeded) {
                 Ok(Verdict::Folded) => admitted.push(p),
                 Ok(Verdict::Rejected(rejection)) => {
@@ -726,22 +747,74 @@ fn check_actor(
     p: &Parsed<'_>,
     index: usize,
 ) -> Result<(), PushError> {
-    if p.actor == numbers::HUB_ACTOR && (seeded || !caller.actors.unrestricted()) {
+    check_actor_value(caller, seeded, p, index, None, &p.actor)
+}
+
+/// The rules every actor a fresh op carries is held to — its author, or
+/// (`field`) an actor its payload names: the reserved `hub` actor only
+/// from an unrestricted token while seeding, and otherwise only an actor
+/// the token's binding permits.
+fn check_actor_value(
+    caller: &Authed,
+    seeded: bool,
+    p: &Parsed<'_>,
+    index: usize,
+    field: Option<&str>,
+    actor: &str,
+) -> Result<(), PushError> {
+    if actor == numbers::HUB_ACTOR && (seeded || !caller.actors.unrestricted()) {
         return Err(PushError::ReservedActor {
             index,
             op_id: p.op_id.clone(),
         });
     }
-    if !caller.actors.permits(&p.actor) {
+    if !caller.actors.permits(actor) {
         let allowed = caller.actors.describe();
+        let what = match field {
+            None => format!("author ops as {actor:?}"),
+            Some(field) => format!("name {actor:?} as a {} op's {field}", p.kind),
+        };
         return Err(PushError::ActorNotAllowed {
             index,
             op_id: p.op_id.clone(),
             reason: format!(
-                "token {} ({}) may not author ops as {:?}; it may act as: {allowed}",
-                caller.token_id, caller.token_label, p.actor
+                "token {} ({}) may not {what}; it may act as: {allowed}",
+                caller.token_id, caller.token_label
             ),
         });
+    }
+    Ok(())
+}
+
+/// The actors an op's payload names, by field (see the module doc).
+fn named_actors(op: &Op) -> Vec<(&'static str, &ActorId)> {
+    match &op.payload {
+        Payload::Claim(c) => vec![("assignee", &c.assignee)],
+        Payload::HoldSet(h) => vec![("hold.by", &h.hold.by)],
+        Payload::FieldSet(FieldSet::Assignee(Some(a))) => vec![("assignee", a)],
+        Payload::ActorUpsert(a) => vec![("id", &a.id)],
+        _ => Vec::new(),
+    }
+}
+
+/// Checks the actors `p`'s payload names against `caller`'s binding.
+/// `current` is the ticket's assignee at the hub just before `p` folds:
+/// a `field.set assignee` restating it is accepted from any token.
+fn check_named_actors(
+    caller: &Authed,
+    seeded: bool,
+    p: &Parsed<'_>,
+    index: usize,
+    current: Option<&ActorId>,
+) -> Result<(), PushError> {
+    let restates = |a: &ActorId| {
+        matches!(p.op.payload, Payload::FieldSet(FieldSet::Assignee(_))) && current == Some(a)
+    };
+    for (field, actor) in named_actors(&p.op) {
+        if restates(actor) {
+            continue;
+        }
+        check_actor_value(caller, seeded, p, index, Some(field), actor.as_str())?;
     }
     Ok(())
 }
@@ -966,6 +1039,45 @@ mod tests {
             r#"{{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{{"wall_ms":1,"counter":0}},
                 "actor":"{actor}","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"tombstone","version":1}}"#
         )
+    }
+
+    #[test]
+    fn named_actors_cover_every_actor_valued_payload_field() {
+        let op = |kind: &str, payload: &str| -> Op {
+            serde_json::from_str(&format!(
+                r#"{{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{{"wall_ms":1,"counter":0}},
+                    "actor":"a","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"{kind}",
+                    "payload":{payload},"version":1}}"#
+            ))
+            .unwrap()
+        };
+        let named = |o: &Op| -> Vec<(&str, String)> {
+            named_actors(o)
+                .into_iter()
+                .map(|(f, a)| (f, a.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            named(&op("claim", r#"{"state":"s","assignee":"m"}"#)),
+            [("assignee", "m".to_string())]
+        );
+        assert_eq!(
+            named(&op(
+                "hold.set",
+                r#"{"hold":{"reason":"r","by":"m","at":{"wall_ms":1,"counter":0}}}"#
+            )),
+            [("hold.by", "m".to_string())]
+        );
+        assert_eq!(
+            named(&op("field.set", r#"{"field":"assignee","value":"m"}"#)),
+            [("assignee", "m".to_string())]
+        );
+        assert!(named(&op("field.set", r#"{"field":"assignee","value":null}"#)).is_empty());
+        assert_eq!(
+            named(&op("actor.upsert", r#"{"id":"m","kind":"human"}"#)),
+            [("id", "m".to_string())]
+        );
+        assert!(named(&op("label.add", r#"{"label":"l"}"#)).is_empty());
     }
 
     #[test]

@@ -1,14 +1,16 @@
 //! End-to-end trust checks on pushed ops (AGT-1450, oaudit 2026-09-30):
 //! tokens bound to actor patterns, legacy tokens (minted before bindings)
 //! staying unrestricted across the migration, the reserved `hub` actor,
-//! stamp range / far-future checks, and the checked number floor. See
-//! `common` for where Postgres comes from.
+//! stamp range / far-future checks, and the checked number floor; and
+//! (AGT-1463) actors named in payloads, who may end a seed, and `token
+//! create` needing `--actor` or `--any`. See `common` for where Postgres
+//! comes from.
 
 mod common;
 
 use common::*;
-use pm_core::op::{FieldSet, LabelAdd, TicketCreate};
-use pm_core::{ActorId, Hlc, MAX_FUTURE_SKEW_MS, Op, Payload, Priority};
+use pm_core::op::{ActorUpsert, Claim, FieldSet, HoldSet, LabelAdd, TicketCreate};
+use pm_core::{ActorId, ActorKind, Hlc, Hold, MAX_FUTURE_SKEW_MS, Op, Payload, Priority};
 use serde_json::{Value, json};
 use ulid::Ulid;
 
@@ -140,7 +142,7 @@ fn bound_tokens_author_only_their_actors_and_legacy_tokens_survive_the_migration
     let port = free_port();
     let mut hub = spawn_hub(&url, port);
     wait_for_health(&mut hub, port);
-    let (_, _, _) = mint(&url, "bootstrap", &[]);
+    let (_, _, _) = mint(&url, "bootstrap", &["--any"]);
 
     // --- a token from before bindings: rewind the schema to version 3
     // and insert the row the way the old hub's `token create` did.
@@ -244,8 +246,31 @@ fn bound_tokens_author_only_their_actors_and_legacy_tokens_survive_the_migration
     assert_eq!(status, 200, "{body}");
     assert_eq!(stored(&body), [false, true]);
 
-    // A token minted without --actor is recorded as `*`, with a note.
-    let (open, open_id, stderr) = mint(&url, "open", &[]);
+    // `create` needs --actor or an explicit --any (AGT-1463): no default
+    // any-actor token, and not both.
+    let (ok, stdout, stderr) = admin(
+        &url,
+        &["token", "create", "plain", "--workspace", "saltline"],
+    );
+    assert!(!ok, "minted without --actor/--any: {stdout}");
+    assert!(stdout.is_empty(), "no token printed: {stdout}");
+    assert!(stderr.contains("--any"), "{stderr}");
+    let (ok, _, _) = admin(
+        &url,
+        &[
+            "token",
+            "create",
+            "both",
+            "--workspace",
+            "saltline",
+            "--any",
+            "--actor",
+            "matt",
+        ],
+    );
+    assert!(!ok, "--any with --actor");
+    // --any is recorded as `*`, with a note.
+    let (open, open_id, stderr) = mint(&url, "open", &["--any"]);
     assert!(stderr.contains("may author ops as any actor"), "{stderr}");
     assert!(
         stderr.contains(&format!("token bind {open_id}")),
@@ -333,7 +358,7 @@ fn the_hub_actor_is_reserved_and_seeding_history_still_lands() {
     let port = free_port();
     let mut hub = spawn_hub(&url, port);
     wait_for_health(&mut hub, port);
-    let (studio, _, _) = mint(&url, "studio", &[]);
+    let (studio, _, _) = mint(&url, "studio", &["--any"]);
     let (agent, _, _) = mint(&url, "agent", &["--actor", "claude:*"]);
 
     // Seed mode: an unrestricted token uploads years-old history by many
@@ -384,6 +409,19 @@ fn the_hub_actor_is_reserved_and_seeding_history_still_lands() {
         err["reason"].as_str().unwrap().contains("out of range"),
         "{err}"
     );
+    // Only an unrestricted token may end the seed (AGT-1463): a bound one
+    // is refused and the workspace stays seeding.
+    let (status, err) = post(
+        port,
+        &agent,
+        "/w/saltline/seeded",
+        &json!({ "number_floor": 9_007_199_254_740_990_u64 }).to_string(),
+    );
+    assert_eq!(status, 400, "{err}");
+    assert_eq!(err["error"], "seed_not_allowed");
+    assert!(err["reason"].as_str().unwrap().contains("(agent)"), "{err}");
+    let seeded = query_rows(&url, "SELECT seeded_at IS NULL FROM workspaces").unwrap();
+    assert_eq!(seeded[0][0].as_deref(), Some("t"), "still seeding");
     let (status, body) = post(
         port,
         &studio,
@@ -392,6 +430,15 @@ fn the_hub_actor_is_reserved_and_seeding_history_still_lands() {
     );
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["number_floor"], 100);
+    // Once ended, every token hears it is done.
+    let (status, err) = post(
+        port,
+        &agent,
+        "/w/saltline/seeded",
+        &json!({ "number_floor": 1 }).to_string(),
+    );
+    assert_eq!(status, 409, "{err}");
+    assert_eq!(err["error"], "already_seeded");
 
     // Seeded: nobody speaks as the hub, not even an unrestricted token.
     let forged = label_as("hub", Hlc::new(recent(), 0));
@@ -416,7 +463,7 @@ fn pushed_stamps_are_range_checked_and_bounded_in_the_future() {
     let port = free_port();
     let mut hub = spawn_hub(&url, port);
     wait_for_health(&mut hub, port);
-    let (studio, _, _) = mint(&url, "studio", &[]);
+    let (studio, _, _) = mint(&url, "studio", &["--any"]);
     let now = recent() + 60_000;
 
     let ok = label_as("matt", Hlc::new(1_000, 0));
@@ -477,4 +524,170 @@ fn pushed_stamps_are_range_checked_and_bounded_in_the_future() {
     let (status, body) = push(port, &studio, &[&ok, &ahead]);
     assert_eq!(status, 200, "{body}");
     assert_eq!(stored(&body), [true, true]);
+}
+
+fn on(ticket: Ulid, actor: &str, hlc: Hlc, payload: Payload) -> Op {
+    Op::new(Ulid::new(), hlc, ActorId::new(actor), ticket, payload)
+}
+
+fn assign(ticket: Ulid, actor: &str, hlc: Hlc, to: Option<&str>) -> Op {
+    on(
+        ticket,
+        actor,
+        hlc,
+        Payload::FieldSet(FieldSet::Assignee(to.map(ActorId::new))),
+    )
+}
+
+#[test]
+fn actors_named_in_payloads_are_held_to_the_token_binding() {
+    let Some((_container, url)) =
+        postgres_for("actors_named_in_payloads_are_held_to_the_token_binding")
+    else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    wait_for_health(&mut hub, port);
+    let (studio, _, _) = mint(&url, "studio", &["--any"]);
+    let (agent, _, _) = mint(&url, "agent", &["--actor", "claude:*"]);
+    let t = recent();
+    let ticket = Ulid::new();
+    let (status, body) = push(port, &studio, &[&create_as("matt", ticket, t)]);
+    assert_eq!(status, 200, "{body}");
+
+    // A bound token may not name an actor outside its patterns in a
+    // claim, a hold, an assignment or an actor registration: a structured
+    // 400 naming the field, and the batch is refused whole.
+    let claim_as_matt = on(
+        ticket,
+        "claude:x",
+        Hlc::new(t, 1),
+        Payload::Claim(Claim {
+            state: "in-progress".into(),
+            assignee: ActorId::new("matt"),
+        }),
+    );
+    let hold_by_matt = on(
+        ticket,
+        "claude:x",
+        Hlc::new(t, 2),
+        Payload::HoldSet(HoldSet {
+            hold: Hold {
+                reason: "r".into(),
+                by: ActorId::new("matt"),
+                at: Hlc::new(t, 2),
+            },
+        }),
+    );
+    let assign_matt = assign(ticket, "claude:x", Hlc::new(t, 3), Some("matt"));
+    let register_matt = on(
+        Ulid::new(),
+        "claude:x",
+        Hlc::new(t, 4),
+        Payload::ActorUpsert(ActorUpsert {
+            id: ActorId::new("matt"),
+            kind: ActorKind::Human,
+        }),
+    );
+    for (bad, field) in [
+        (&claim_as_matt, "claim op's assignee"),
+        (&hold_by_matt, "hold.set op's hold.by"),
+        (&assign_matt, "field.set op's assignee"),
+        (&register_matt, "actor.upsert op's id"),
+    ] {
+        let before = count_ops(&url);
+        let fine = label_as("claude:x", Hlc::new(t, 5));
+        let (status, err) = push(port, &agent, &[&fine, bad]);
+        assert_eq!(status, 400, "{field}: {err}");
+        assert_eq!(err["error"], "actor_not_allowed", "{field}");
+        assert_eq!(err["index"], 1, "{field}");
+        assert_eq!(err["op_id"], bad.op_id.to_string(), "{field}");
+        let reason = err["reason"].as_str().unwrap();
+        assert!(reason.contains(field), "{field}: {reason}");
+        assert!(reason.contains("\"matt\""), "{field}: {reason}");
+        assert_eq!(count_ops(&url), before, "{field}: nothing stored");
+    }
+    // The reserved actor, named in a payload, is refused like an author.
+    let claim_as_hub = on(
+        ticket,
+        "claude:x",
+        Hlc::new(t, 6),
+        Payload::Claim(Claim {
+            state: "in-progress".into(),
+            assignee: ActorId::new("hub"),
+        }),
+    );
+    let (status, err) = push(port, &agent, &[&claim_as_hub]);
+    assert_eq!(
+        (status, err["error"].as_str()),
+        (400, Some("reserved_actor")),
+        "{err}"
+    );
+
+    // Its own actors, and unassigning, are fine.
+    let own = [
+        assign(ticket, "claude:x", Hlc::new(t, 10), Some("claude:x")),
+        assign(ticket, "claude:x", Hlc::new(t, 11), None),
+        on(
+            ticket,
+            "claude:x",
+            Hlc::new(t, 12),
+            Payload::HoldSet(HoldSet {
+                hold: Hold {
+                    reason: "r".into(),
+                    by: ActorId::new("claude:x"),
+                    at: Hlc::new(t, 12),
+                },
+            }),
+        ),
+    ];
+    let (status, body) = push(port, &agent, &own.iter().collect::<Vec<_>>());
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored(&body), [true; 3]);
+
+    // Restating the ticket's current assignee is accepted from any token
+    // (a client reconciling after a refused claim logs exactly this);
+    // naming someone new is not.
+    let (status, body) = push(
+        port,
+        &studio,
+        &[&assign(ticket, "matt", Hlc::new(t, 20), Some("matt"))],
+    );
+    assert_eq!(status, 200, "{body}");
+    let restate = assign(ticket, "claude:x", Hlc::new(t, 21), Some("matt"));
+    let (status, body) = push(port, &agent, &[&restate]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored(&body), [true]);
+    let (status, err) = push(
+        port,
+        &agent,
+        &[&assign(ticket, "claude:x", Hlc::new(t, 22), Some("alice"))],
+    );
+    assert_eq!(
+        (status, err["error"].as_str()),
+        (400, Some("actor_not_allowed")),
+        "{err}"
+    );
+    // ...and "current" is read at that point in the batch: once the
+    // batch itself reassigns, restating the old assignee is naming them.
+    let (status, err) = push(
+        port,
+        &agent,
+        &[
+            &assign(ticket, "claude:x", Hlc::new(t, 23), Some("claude:x")),
+            &assign(ticket, "claude:x", Hlc::new(t, 24), Some("matt")),
+        ],
+    );
+    assert_eq!(status, 400, "{err}");
+    assert_eq!(err["index"], 1);
+
+    // An unrestricted token names anyone, as before.
+    let (status, body) = push(
+        port,
+        &studio,
+        &[&claim_as_matt, &hold_by_matt, &register_matt],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored(&body), [true; 3]);
 }

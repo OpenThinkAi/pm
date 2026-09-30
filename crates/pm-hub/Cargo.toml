@@ -39,3 +39,5 @@ webpki-roots = { version = "1.0.9", default-features = false }
 # views with the client's own rebuild of it (AGT-1392).
 pm-store = { path = "../pm-store" }
 tempfile = "3.27"
+# `writer`'s unit tests time out a lock wait.
+tokio = { version = "1", features = ["time"] }

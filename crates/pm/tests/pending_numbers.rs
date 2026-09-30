@@ -480,7 +480,10 @@ fn with_a_hub_configured_pm_new_is_pending_and_addressed_by_ulid() {
 // ---------------------------------------------------------- AC3: two replicas
 
 fn create_token(url: &str, name: &str, workspace: &str) -> String {
-    let (ok, stdout, stderr) = admin(url, &["token", "create", name, "--workspace", workspace]);
+    let (ok, stdout, stderr) = admin(
+        url,
+        &["token", "create", name, "--workspace", workspace, "--any"],
+    );
     assert!(ok, "token create failed: {stderr}");
     stdout.trim().to_string()
 }

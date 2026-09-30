@@ -55,18 +55,20 @@ async fn check_schema(db: &Client) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `token create <name> --workspace <id> [--actor <pattern>...]`: mints a
-/// token, stores its hash and prints the plaintext once on stdout. Creates
-/// the workspace if this is its first token (nothing else creates
-/// workspaces yet). With `--actor` the token may author ops only as the
-/// matching actors (AGT-1450); without, it is recorded as `*` (any actor)
-/// and a note says so — binding is opt-in, so existing mint scripts keep
-/// working.
+/// `token create <name> --workspace <id> (--actor <pattern>... | --any)`:
+/// mints a token, stores its hash and prints the plaintext once on
+/// stdout. Creates the workspace if this is its first token (nothing else
+/// creates workspaces yet). The token may author ops only as the
+/// `--actor` patterns (AGT-1450); an unrestricted token takes an explicit
+/// `--any` (recorded as `*`, like `--actor '*'`). Since AGT-1463 one of
+/// the two is required: a plain `create` no longer mints an any-actor
+/// token by default. Tokens minted earlier are untouched.
 pub async fn token_create(
     db: &mut Client,
     name: &str,
     workspace: &str,
     actors: &[String],
+    any: bool,
 ) -> Result<(), Box<dyn Error>> {
     if !valid_workspace_id(workspace) {
         return Err(format!(
@@ -78,12 +80,19 @@ pub async fn token_create(
     if name.is_empty() || name.chars().count() > MAX_TOKEN_NAME {
         return Err(format!("token name must be 1-{MAX_TOKEN_NAME} characters").into());
     }
-    let unbound = actors.is_empty();
-    let actors = if unbound {
-        vec!["*".to_string()]
-    } else {
-        auth::parse_actor_patterns(actors)?
+    let actors = match (any, actors.is_empty()) {
+        (true, true) => vec!["*".to_string()],
+        (false, false) => auth::parse_actor_patterns(actors)?,
+        (true, false) => return Err("give either --actor or --any, not both".into()),
+        (false, true) => {
+            return Err(
+                "give --actor <pattern> (repeatable), or --any for a token that may \
+                        act as any actor"
+                    .into(),
+            );
+        }
     };
+    let unrestricted = actors.iter().any(|p| p == "*");
     check_schema(db).await?;
     let token = auth::generate_token()?;
     let tx = db.transaction().await?;
@@ -107,10 +116,10 @@ pub async fn token_create(
     if created_workspace {
         eprintln!("created workspace {workspace}");
     }
-    if unbound {
+    if unrestricted {
         eprintln!(
-            "note: token {id} may author ops as any actor; restrict it with \
-             `pm-hub token bind {id} --actor <pattern>`"
+            "note: token {id} may author ops as any actor and end the seed; restrict it \
+             with `pm-hub token bind {id} --actor <pattern>`"
         );
     } else {
         eprintln!("token {id} may author ops as: {}", actors.join(","));

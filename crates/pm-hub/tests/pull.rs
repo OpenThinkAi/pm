@@ -40,7 +40,10 @@ struct Item<'a> {
 }
 
 fn create_token(url: &str, name: &str, workspace: &str) -> String {
-    let (ok, stdout, stderr) = admin(url, &["token", "create", name, "--workspace", workspace]);
+    let (ok, stdout, stderr) = admin(
+        url,
+        &["token", "create", name, "--workspace", workspace, "--any"],
+    );
     assert!(ok, "token create failed: {stderr}");
     stdout.trim().to_string()
 }

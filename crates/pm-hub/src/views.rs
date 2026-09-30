@@ -128,6 +128,12 @@ impl Views {
             .unwrap_or_default()
     }
 
+    /// The ticket's assignee as folded so far (`None` for a ticket the
+    /// hub has no view of yet, or one nobody is assigned).
+    pub fn assignee(&self, ticket: Ulid) -> Option<&ActorId> {
+        self.tickets.get(&ticket)?.assignee.value.as_ref()
+    }
+
     /// Folds `op`. With `arbitrate`, a `claim` is first judged by
     /// [`TicketView::claim_admissible`] against the workspace's states
     /// and, when refused, left out ([`Verdict::Rejected`]); without it

@@ -382,6 +382,11 @@ struct Seeded {
 enum SeedError {
     Body(String),
     AlreadySeeded,
+    /// An actor-restricted token asked to end the seed (AGT-1463).
+    NotAllowed {
+        token_id: i64,
+        token_label: String,
+    },
     NoWorkspace,
     Db(tokio_postgres::Error),
     Internal(String),
@@ -419,6 +424,21 @@ impl IntoResponse for SeedError {
                 )),
             )
                 .into_response(),
+            SeedError::NotAllowed {
+                token_id,
+                token_label,
+            } => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody::new(
+                    "seed_not_allowed",
+                    format!(
+                        "token {token_id} ({token_label}) is bound to actors; only an \
+                         unrestricted token (legacy, or minted with --any / bound to '*') \
+                         may end the seed"
+                    ),
+                )),
+            )
+                .into_response(),
             SeedError::NoWorkspace => StatusCode::NOT_FOUND.into_response(),
             SeedError::Db(e) => {
                 eprintln!("pm-hub: seeded: {e}");
@@ -437,14 +457,21 @@ pub const MAX_SEED_BODY_BYTES: usize = 1024;
 
 /// `POST /w/{workspace}/seeded` with `{"number_floor": <n>}`: ends the
 /// seed (see the module doc). `409 already_seeded` the second time.
+///
+/// Ending the seed is one-way and sets the floor, so only an unrestricted
+/// token may do it (AGT-1463, oaudit r2): a token bound to actor patterns
+/// gets `400 seed_not_allowed` while the workspace is still seeding. Once
+/// the seed has ended every token gets the `409`, which tells a client
+/// nothing `whoami` does not.
 pub async fn finish_seed(State(db): State<Db>, caller: Authed, body: String) -> Response {
-    match finish(&db, &caller.workspace, &body).await {
+    match finish(&db, &caller, &body).await {
         Ok(seeded) => Json(seeded).into_response(),
         Err(e) => e.into_response(),
     }
 }
 
-async fn finish(db: &Db, workspace: &str, body: &str) -> Result<Seeded, SeedError> {
+async fn finish(db: &Db, caller: &Authed, body: &str) -> Result<Seeded, SeedError> {
+    let workspace = caller.workspace.as_str();
     let SeedEnd { number_floor } =
         serde_json::from_str(body).map_err(|e| SeedError::Body(format!("body: {e}")))?;
     let number_floor = i64::try_from(number_floor)
@@ -456,13 +483,19 @@ async fn finish(db: &Db, workspace: &str, body: &str) -> Result<Seeded, SeedErro
             ))
         })?;
 
-    let mut writer = db.writer.lock().await;
+    let mut writer = db.writer.acquire(workspace).await;
     let tx = writer.transaction().await?;
     let Some(mut allocator) = Allocator::lock(&tx, workspace).await? else {
         return Err(SeedError::NoWorkspace);
     };
     if allocator.seeded {
         return Err(SeedError::AlreadySeeded);
+    }
+    if !caller.actors.unrestricted() {
+        return Err(SeedError::NotAllowed {
+            token_id: caller.token_id,
+            token_label: caller.token_label.clone(),
+        });
     }
     let seeded_max: i64 = tx
         .query_one(

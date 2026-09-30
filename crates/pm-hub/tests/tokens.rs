@@ -16,7 +16,10 @@ fn whoami(port: u16, workspace: &str, token: Option<&str>) -> Response {
 
 /// Mints a token and returns `(plaintext, id)`.
 fn create_token(url: &str, name: &str, workspace: &str) -> (String, String) {
-    let (ok, stdout, stderr) = admin(url, &["token", "create", name, "--workspace", workspace]);
+    let (ok, stdout, stderr) = admin(
+        url,
+        &["token", "create", name, "--workspace", workspace, "--any"],
+    );
     assert!(ok, "token create failed: {stderr}");
     let token = stdout.trim().to_string();
     assert!(
@@ -53,7 +56,14 @@ fn tokens_create_use_revoke_and_every_failure_is_a_plain_404() {
     // Create: plaintext once on stdout, only its SHA-256 at rest.
     let (ok, stdout, stderr) = admin(
         &url,
-        &["token", "create", "studio", "--workspace", "saltline"],
+        &[
+            "token",
+            "create",
+            "studio",
+            "--workspace",
+            "saltline",
+            "--any",
+        ],
     );
     assert!(ok, "{stderr}");
     assert!(stderr.contains("created workspace saltline"), "{stderr}");
@@ -83,11 +93,17 @@ fn tokens_create_use_revoke_and_every_failure_is_a_plain_404() {
             assert!(!row.contains(t.as_str()), "plaintext token stored: {row}");
         }
     }
-    let (ok, _, stderr) = admin(&url, &["token", "create", "x", "--workspace", "Bad Id"]);
+    let (ok, _, stderr) = admin(
+        &url,
+        &["token", "create", "x", "--workspace", "Bad Id", "--any"],
+    );
     assert!(!ok);
     assert!(stderr.contains("workspace id"), "{stderr}");
     let long = "n".repeat(129);
-    let (ok, _, stderr) = admin(&url, &["token", "create", &long, "--workspace", "saltline"]);
+    let (ok, _, stderr) = admin(
+        &url,
+        &["token", "create", &long, "--workspace", "saltline", "--any"],
+    );
     assert!(!ok);
     assert!(stderr.contains("token name must be"), "{stderr}");
 

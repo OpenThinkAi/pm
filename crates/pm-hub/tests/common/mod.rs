@@ -19,7 +19,11 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-const POSTGRES_IMAGE: &str = "postgres:17-alpine";
+/// Pinned by digest like the Dockerfile's bases (AGT-1452, AGT-1463): a
+/// moved tag cannot change what the tests run. Bump deliberately with
+/// `docker buildx imagetools inspect postgres:17-alpine`.
+const POSTGRES_IMAGE: &str =
+    "postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24";
 const PASSWORD: &str = "pm-hub-test";
 
 /// A docker container removed when dropped.
