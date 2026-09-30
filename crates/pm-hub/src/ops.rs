@@ -642,7 +642,8 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
         // Fold the batch into the views in order; once seeded, that is
         // where a claim is decided. A refused claim is answered, not
         // stored (`views`).
-        let entities: Vec<String> = fresh.iter().map(|p| p.entity.clone()).collect();
+        // Also the document ids the batch binds (AGT-1464 admission).
+        let entities = crate::views::batch_entities(fresh.iter().map(|p| &p.op));
         let mut views = Views::load(&tx, workspace, &entities).await?;
         let mut admitted: Vec<&Parsed> = Vec::with_capacity(fresh.len());
         for p in &fresh {

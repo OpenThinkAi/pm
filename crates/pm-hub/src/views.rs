@@ -53,13 +53,15 @@
 //! though the views carry no project state: a `project.create` for a
 //! project the log already has one for is refused (a second, backdated
 //! create would move the creation stamp pm-core anchors document identity
-//! to — `pm_core::DocClaims`), and so is a `ticket.create` whose entity is
-//! already bound as a project document (tickets and documents share the
-//! entity namespace, and a `body.edit` is routed by it). pm-store refuses
+//! to — `pm_core::DocClaims`), and so are a `ticket.create` whose entity
+//! is already bound as a project document and a document binding whose
+//! `doc_id` is already a ticket (tickets and documents share the entity
+//! namespace, and a `body.edit` is routed by it). pm-store refuses
 //! the same ops on every commit path, a pull included, so a log the hub
 //! admitted is one every replica folds; refusing them at the push keeps
 //! them out of that log, where they would fail every replica's pull.
-//! [`Views::load`] reads what the rules need for the batch's entities;
+//! [`Views::load`] reads what the rules need for the batch's entities and
+//! the document ids it binds ([`batch_entities`]);
 //! a rebuild ([`rebuild`]) does not re-judge the stored log.
 //!
 //! **Order.** The hub folds ops in seq order. pm-core's rules are
@@ -142,33 +144,68 @@ pub struct Views {
 struct Admission {
     created: HashSet<Ulid>,
     docs: HashSet<Ulid>,
+    /// Entities with a `ticket.create`, so a document binding cannot take
+    /// a ticket's id (the mirror of the `ticket.create` rule).
+    tickets: HashSet<Ulid>,
+}
+
+/// The entities [`Views::load`] reads for a batch: every op's entity, and
+/// every `doc_id` a `project.create` / `project.doc_add` binds (so the
+/// admission rules can tell whether that id is already a ticket's).
+pub fn batch_entities<'a>(ops: impl IntoIterator<Item = &'a Op>) -> Vec<String> {
+    let mut out = Vec::new();
+    for op in ops {
+        out.push(op.entity.to_string());
+        let doc_id = match &op.payload {
+            Payload::ProjectCreate(create) => create.doc_id,
+            Payload::ProjectDocAdd(add) => Some(add.doc_id),
+            _ => None,
+        };
+        out.extend(doc_id.map(|id| id.to_string()));
+    }
+    out
 }
 
 impl Admission {
     /// Checks `op` against the rules and records what it creates or binds.
     fn admit(&mut self, op: &Op) -> Result<(), ConfigApplyError> {
-        match &op.payload {
+        let doc_id = match &op.payload {
             Payload::ProjectCreate(create) => {
-                if !self.created.insert(op.entity) {
+                if self.created.contains(&op.entity) {
                     return Err(ConfigApplyError::DuplicateCreate {
                         op_id: op.op_id,
                         project: op.entity,
                     });
                 }
-                self.docs.extend(create.doc_id);
+                create.doc_id
             }
-            Payload::ProjectDocAdd(add) => {
-                self.docs.insert(add.doc_id);
+            Payload::ProjectDocAdd(add) => Some(add.doc_id),
+            Payload::TicketCreate(_) => {
+                if self.docs.contains(&op.entity) {
+                    return Err(ConfigApplyError::EntityInUse {
+                        op_id: op.op_id,
+                        entity: op.entity,
+                        holder: "a project document",
+                    });
+                }
+                self.tickets.insert(op.entity);
+                return Ok(());
             }
-            Payload::TicketCreate(_) if self.docs.contains(&op.entity) => {
-                return Err(ConfigApplyError::EntityInUse {
-                    op_id: op.op_id,
-                    entity: op.entity,
-                    holder: "a project document",
-                });
-            }
-            _ => {}
+            _ => return Ok(()),
+        };
+        if let Some(doc_id) = doc_id
+            && self.tickets.contains(&doc_id)
+        {
+            return Err(ConfigApplyError::EntityInUse {
+                op_id: op.op_id,
+                entity: doc_id,
+                holder: "a ticket",
+            });
         }
+        if matches!(op.payload, Payload::ProjectCreate(_)) {
+            self.created.insert(op.entity);
+        }
+        self.docs.extend(doc_id);
         Ok(())
     }
 }
@@ -296,6 +333,16 @@ impl Views {
             .await?
         {
             admission.docs.extend(parse_ulid(row.get(0)));
+        }
+        for row in tx
+            .query(
+                "SELECT DISTINCT entity FROM ops
+                 WHERE workspace_id = $1 AND kind = 'ticket.create' AND entity = ANY($2)",
+                &[&workspace, &entities],
+            )
+            .await?
+        {
+            admission.tickets.extend(parse_ulid(row.get(0)));
         }
         views.admission = Some(admission);
         Ok(views)
@@ -798,10 +845,31 @@ mod tests {
             Ulid::new(),
         );
         let (mut views, _) = configured();
+        let ticket = Ulid::new();
         views.admission = Some(Admission {
             created: [known].into(),
             docs: [bound].into(),
+            tickets: [ticket].into(),
         });
+        // A binding of a stored ticket's id, or of one created earlier in
+        // the batch.
+        assert!(matches!(
+            views.fold(&doc_add(known, ticket), true),
+            Err(FoldError::Config(ConfigApplyError::EntityInUse { entity, holder: "a ticket", .. })) if entity == ticket
+        ));
+        let batch_ticket = Ulid::new();
+        views
+            .fold(&create(batch_ticket, 1, "triage"), true)
+            .unwrap();
+        assert!(
+            views
+                .fold(&project(Ulid::new(), 1, Some(batch_ticket)), true)
+                .is_err()
+        );
+        assert_eq!(
+            batch_entities([&doc_add(known, notes)]),
+            [known.to_string(), notes.to_string()]
+        );
         // In the log already.
         assert!(matches!(
             views.fold(&project(known, 0, None), true),

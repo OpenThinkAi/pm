@@ -778,7 +778,21 @@ fn pushed_project_identity_is_admission_checked() {
             "{err}"
         );
     }
-    assert_eq!(count_ops(&url), 2, "nothing more stored");
+    // And the mirror: a document binding of a stored ticket's id.
+    let ticket = Ulid::new();
+    let (status, body) = push(port, &studio, &[&create_as("matt", ticket, 3_000)]);
+    assert_eq!(status, 200, "{body}");
+    let (status, err) = push(port, &studio, &[&doc_add("other", ticket)]);
+    assert_eq!(
+        (status, err["error"].as_str()),
+        (400, Some("invalid_op")),
+        "{err}"
+    );
+    assert!(
+        err["reason"].as_str().unwrap().contains("already a ticket"),
+        "{err}"
+    );
+    assert_eq!(count_ops(&url), 3, "nothing more stored");
 
     // A re-push of the stored create (a lost ack) is still idempotent.
     let (status, body) = push_values(
