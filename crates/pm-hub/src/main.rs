@@ -187,7 +187,10 @@ fn app(db: Db) -> Router {
             post(ops::push).layer(DefaultBodyLimit::max(ops::MAX_BODY_BYTES)),
         )
         .route("/w/{workspace}/ops", get(pull::pull))
-        .route("/w/{workspace}/seeded", post(numbers::finish_seed))
+        .route(
+            "/w/{workspace}/seeded",
+            post(numbers::finish_seed).layer(DefaultBodyLimit::max(numbers::MAX_SEED_BODY_BYTES)),
+        )
         .route_layer(middleware::from_fn_with_state(
             db.clone(),
             auth::require_auth,

@@ -39,7 +39,9 @@ workspace's sync mode.
 `seeded: false` means the workspace is still in **seed mode** (see
 [Ticket numbers](#ticket-numbers-agt-1391)): the first sync (AGT-1396)
 has yet to upload the client's log and end the seed. `true` means the
-hub is the workspace's number authority.
+hub is the workspace's number authority. `seeded` is read from the
+database, so this route can answer `503` after the token authenticated
+(a transient database error; retry).
 
 ## `POST /w/{workspace}/ops` — push (AGT-1389)
 

@@ -321,7 +321,7 @@ fn parse_op(index: usize, raw: &RawValue) -> Result<Parsed<'_>, PushError> {
     }
     let hlc_wall_ms = i64::try_from(op.hlc.wall_ms)
         .map_err(|_| invalid(format!("hlc.wall_ms {} is out of range", op.hlc.wall_ms)))?;
-    let role = match (&op.payload, numbers::is_number_op(&op)) {
+    let role = match (&op.payload, numbers::number_value(&op)) {
         (Payload::TicketCreate(_), _) => Role::Create,
         (_, Some(n)) => Role::Number(
             i64::try_from(n).map_err(|_| invalid(format!("number {n} is out of range")))?,

@@ -144,6 +144,8 @@ impl Allocator {
     ) -> Result<Vec<Numbered>, tokio_postgres::Error> {
         let entities: Vec<String> = creates.iter().map(|c| c.entity.to_string()).collect();
         let known = numbered(tx, workspace, &entities).await?;
+        // One wall-clock reading for the whole batch: within it the
+        // clock's counter keeps the hub's ops strictly ascending.
         let now_ms = now_ms();
         let mut ops: Vec<Op> = Vec::new();
         for create in creates {
@@ -216,10 +218,15 @@ impl Allocator {
     }
 }
 
+/// An HLC from its two stored columns. Both are written from the
+/// unsigned types, so they always fit; should a row ever not (a corrupt
+/// or hand-edited one), each component falls back to 0, the
+/// conservative minimum — the clock then only moves forward from what
+/// it next observes, rather than jumping to an inflated stamp.
 fn hlc_from_row(wall_ms: i64, counter: i64) -> Hlc {
     Hlc::new(
         u64::try_from(wall_ms).unwrap_or(0),
-        u32::try_from(counter).unwrap_or(u32::MAX),
+        u32::try_from(counter).unwrap_or(0),
     )
 }
 
@@ -375,6 +382,9 @@ impl IntoResponse for SeedError {
     }
 }
 
+/// Largest `POST /seeded` body, in bytes: the body is one integer field.
+pub const MAX_SEED_BODY_BYTES: usize = 1024;
+
 /// `POST /w/{workspace}/seeded` with `{"number_floor": <n>}`: ends the
 /// seed (see the module doc). `409 already_seeded` the second time.
 pub async fn finish_seed(State(db): State<Db>, caller: Authed, body: String) -> Response {
@@ -475,8 +485,9 @@ pub async fn is_seeded(
         .map(|r| r.get(0)))
 }
 
-/// `true` for the op kind the hub reserves for itself after seeding.
-pub fn is_number_op(op: &Op) -> Option<u64> {
+/// The number a `field.set number` op carries — the one op kind the hub
+/// reserves for itself after seeding — or `None` for any other op.
+pub fn number_value(op: &Op) -> Option<u64> {
     match &op.payload {
         Payload::FieldSet(FieldSet::Number(n)) => Some(*n),
         _ => None,
@@ -506,7 +517,7 @@ mod tests {
         assert_eq!(first.actor.as_str(), HUB_ACTOR);
         assert_eq!(first.entity, create.entity);
         assert_eq!(first.version, pm_core::OP_VERSION);
-        assert_eq!(is_number_op(&first), Some(1377));
+        assert_eq!(number_value(&first), Some(1377));
         let second = a.allocate(
             &Create {
                 entity: Ulid::new(),
@@ -515,7 +526,7 @@ mod tests {
             60,
         );
         assert!(second.hlc > first.hlc);
-        assert_eq!(is_number_op(&second), Some(1378));
+        assert_eq!(number_value(&second), Some(1378));
         assert_eq!(a.next_number, 1379);
         assert_eq!(a.clock.latest(), second.hlc);
 
