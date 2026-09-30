@@ -9,8 +9,9 @@
 //! named document `pm project doc add` creates — is a `body.edit` op
 //! against that document's own `doc_id`, the same op kind and
 //! [`pm_core::Body`] CRDT a ticket's description uses (AGT-1338): there is
-//! exactly one body format in the op log, ever. `pm project delete` is the
-//! one direct write left: it removes the row, and the log keeps the ops.
+//! exactly one body format in the op log, ever. `pm project delete` commits a
+//! `project.delete` tombstone (AGT-1386) whose materialization removes the
+//! row and its documents; the log keeps every op.
 //!
 //! `pm project edit` opens the design doc the same way `pm edit` opens a
 //! ticket (`crate::edit::{run_editor, TempFile}`, AGT-1345): `$VISUAL`,
@@ -274,7 +275,8 @@ fn edit(ctx: &Ctx<'_>, id: &str) -> Result<()> {
 fn delete(ctx: &Ctx<'_>, id: &str) -> Result<()> {
     let (mut store, _ws) = ctx.open()?;
     store.project(id)?.ok_or_else(|| not_found(id))?;
-    store.delete_project(id)?;
+    let actor = ctx.actor()?;
+    store.delete_project(id, &actor)?;
     if ctx.json {
         print_json(&json!({"schema": SCHEMA, "id": id, "deleted": true}));
     } else {

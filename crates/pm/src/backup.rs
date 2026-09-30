@@ -709,9 +709,10 @@ pub fn restore(ctx: &Ctx<'_>, dir: &Path) -> Result<()> {
     for project in store.projects()? {
         if !listed.contains(&project.id) {
             // Created by the log, gone from the snapshot: deleted before
-            // the backup (`pm project delete` removes the row, never the
-            // ops). Nothing references it, or the delete was refused.
-            store.delete_project(&project.id)?;
+            // the backup with no `project.delete` in the log (a backup
+            // from before AGT-1386's tombstone kind). Nothing references
+            // it, or the delete is refused.
+            store.delete_project(&project.id, &actor)?;
         }
     }
     // Reassign each document's original doc_id before any op replays

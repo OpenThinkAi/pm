@@ -340,6 +340,56 @@ fn log_lists_ops_oldest_first_with_hlc_actor_kind_and_summary() {
     assert!(human.contains("tester"), "{human}");
 }
 
+/// AGT-1386: `pm log` with no id lists the workspace's config ops, each
+/// with a readable summary (a project's slug, field and value), including a
+/// deleted project's `project.delete`.
+#[test]
+fn log_with_no_id_lists_config_ops_with_readable_summaries() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&[
+        "project", "new", "scratch", "--title", "Scratch", "--repo", "a/b",
+    ]));
+    assert_ok(&sb.pm(&["workspace", "gate-label", "add", "matt-gated"]));
+    assert_ok(&sb.pm(&["project", "delete", "scratch"]));
+
+    let ops = json(&sb.pm(&["log", "--json"]));
+    let summaries: Vec<(&str, &str)> = ops
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| (o["kind"].as_str().unwrap(), o["summary"].as_str().unwrap()))
+        .collect();
+    let has = |kind: &str, text: &str| {
+        summaries
+            .iter()
+            .any(|(k, s)| *k == kind && s.contains(text))
+    };
+    assert!(
+        has("workspace.set", "set workspace prefix to 'AGT'"),
+        "{summaries:?}"
+    );
+    assert!(
+        has("workspace.set", "added gate label 'matt-gated'"),
+        "{summaries:?}"
+    );
+    assert!(has("state.upsert", "set state "), "{summaries:?}");
+    assert!(
+        has("project.create", "created project 'scratch' \"Scratch\""),
+        "{summaries:?}"
+    );
+    assert!(
+        has("project.set", "added repo 'a/b' to project 'scratch'"),
+        "{summaries:?}"
+    );
+    assert!(
+        has("project.delete", "deleted project 'scratch'"),
+        "{summaries:?}"
+    );
+    assert!(!summaries.iter().any(|(_, s)| s.contains("upserted")));
+    let human = stdout(&sb.pm(&["log"]));
+    assert!(human.contains("project.delete"), "{human}");
+}
+
 #[test]
 fn log_of_an_unknown_ticket_is_not_found() {
     let sb = Sandbox::initialized();

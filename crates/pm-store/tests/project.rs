@@ -290,7 +290,9 @@ fn delete_project_is_refused_while_it_has_tickets() {
         .unwrap();
     store.commit(&create_ticket(Ulid::new(), 1, "pm")).unwrap();
 
-    let err = store.delete_project("pm").unwrap_err();
+    let err = store
+        .delete_project("pm", &ActorId::new("matt"))
+        .unwrap_err();
     assert!(matches!(err, StoreError::ProjectHasTickets { project } if project == "pm"));
     assert!(store.project("pm").unwrap().is_some());
 }
@@ -317,7 +319,9 @@ fn delete_project_is_refused_while_it_has_children() {
         )
         .unwrap();
 
-    let err = store.delete_project("parent").unwrap_err();
+    let err = store
+        .delete_project("parent", &ActorId::new("matt"))
+        .unwrap_err();
     assert!(matches!(err, StoreError::ProjectHasChildren { project } if project == "parent"));
 }
 
@@ -337,7 +341,7 @@ fn delete_project_removes_it_and_its_document_view_rows() {
         .commit_doc_edit(doc_id, &body_edit_op(doc_id, 1, None, "text"))
         .unwrap();
 
-    store.delete_project("pm").unwrap();
+    store.delete_project("pm", &ActorId::new("matt")).unwrap();
     assert!(store.project("pm").unwrap().is_none());
     assert!(store.doc_view(doc_id).unwrap().is_none());
 }
@@ -380,7 +384,7 @@ fn doctor_and_rebuild_survive_a_deleted_project_that_had_document_edits() {
         .unwrap();
     let ticket = Ulid::new();
     store.commit(&create_ticket(ticket, 2, "other")).unwrap();
-    store.delete_project("pm").unwrap();
+    store.delete_project("pm", &ActorId::new("matt")).unwrap();
 
     let report = store.doctor().unwrap();
     assert!(report.is_healthy(), "{report:#?}");

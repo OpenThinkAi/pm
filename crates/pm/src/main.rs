@@ -228,10 +228,10 @@ enum Cmd {
         #[arg(long)]
         archived: bool,
     },
-    /// List a ticket's ops, oldest first
+    /// List a ticket's ops, oldest first (no id: the workspace's config ops)
     Log {
-        /// Ticket id (e.g. PM-12) or ULID
-        id: String,
+        /// Ticket id (e.g. PM-12) or ULID; omit for workspace/project config ops
+        id: Option<String>,
     },
     /// Counts of tickets per state, plus held/parked
     Status {
@@ -556,7 +556,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
                 archived,
             },
         ),
-        Cmd::Log { id } => read::log(ctx, &id),
+        Cmd::Log { id } => read::log(ctx, id.as_deref()),
         Cmd::Status { project } => read::status(ctx, project),
         Cmd::Graph { project, ids } => read::graph(ctx, read::GraphArgs { project, ids }),
         Cmd::Ready {

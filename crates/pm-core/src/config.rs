@@ -116,6 +116,12 @@ pub struct ProjectView {
     pub status: Lww<ProjectStatus>,
     pub parent: Lww<Option<String>>,
     pub repos: OrSet<String>,
+    /// Tombstone: the earliest `project.delete` stamp seen. Permanent —
+    /// no later op un-deletes the project (README §Conflict semantics,
+    /// the ticket tombstone's rule) — and, being a minimum, independent
+    /// of the order ops arrive in.
+    #[serde(default)]
+    pub deleted_at: Option<Stamp>,
 }
 
 impl ProjectView {
@@ -131,6 +137,7 @@ impl ProjectView {
             status: Lww::default(),
             parent: Lww::default(),
             repos: OrSet::default(),
+            deleted_at: None,
         }
     }
 
@@ -262,6 +269,11 @@ pub fn apply_project(view: &mut ProjectView, op: &Op) -> Result<(), ConfigApplyE
             ProjectSet::RepoAdd(repo) => view.repos.add(repo.clone(), op.op_id),
             ProjectSet::RepoRemove { repo, observed } => view.repos.remove(repo, observed),
         },
+        Payload::ProjectDelete => {
+            if view.deleted_at.as_ref().is_none_or(|s| stamp < *s) {
+                view.deleted_at = Some(stamp.clone());
+            }
+        }
         other => {
             return Err(ConfigApplyError::WrongKind {
                 op_id: op.op_id,
@@ -659,6 +671,32 @@ mod tests {
     }
 
     #[test]
+    fn project_delete_is_permanent_and_order_independent() {
+        let id = Ulid::new();
+        let del = |wall, actor: &str| op(id, wall, actor, Payload::ProjectDelete);
+        let (early, late) = (del(5, "matt"), del(9, "zed"));
+        let rename = ps(id, 7, "matt", ProjectSet::Title("after".into()));
+        let mut view = ProjectView::new(id);
+        for o in [&create(id, 1), &late, &rename, &early] {
+            apply_project(&mut view, o).unwrap();
+        }
+        // The earliest tombstone stamp wins; a later write folds in but
+        // does not undo the delete.
+        assert_eq!(view.deleted_at, Some(early.stamp()));
+        assert_eq!(view.title.value, "after");
+        // A delete that syncs before the create still sticks.
+        let mut ahead = ProjectView::new(id);
+        apply_project(&mut ahead, &early).unwrap();
+        apply_project(&mut ahead, &create(id, 1)).unwrap();
+        assert!(ahead.deleted_at.is_some());
+        // A view stored before AGT-1386 (no `deleted_at` key) still loads.
+        let mut json = serde_json::to_value(ProjectView::new(id)).unwrap();
+        json.as_object_mut().unwrap().remove("deleted_at");
+        let back: ProjectView = serde_json::from_value(json).unwrap();
+        assert_eq!(back.deleted_at, None);
+    }
+
+    #[test]
     fn ops_for_another_entity_or_the_wrong_kind_are_rejected_untouched() {
         let (id, other) = (Ulid::new(), Ulid::new());
         let mut workspace = WorkspaceView::new(id);
@@ -750,6 +788,7 @@ mod tests {
         Parent(Option<u8>),
         RepoAdd(u8),
         RepoRemove(u8, Vec<Index>),
+        Delete,
     }
 
     fn cites() -> impl Strategy<Value = Vec<Index>> {
@@ -777,6 +816,7 @@ mod tests {
             prop::option::of(any::<u8>()).prop_map(Spec::Parent),
             (0u8..3).prop_map(Spec::RepoAdd),
             ((0u8..3), cites()).prop_map(|(r, c)| Spec::RepoRemove(r, c)),
+            Just(Spec::Delete),
         ]
     }
 
@@ -916,11 +956,12 @@ mod tests {
                     );
                     Payload::ProjectSet(ProjectSet::RepoRemove { repo, observed })
                 }
+                Spec::Delete => Payload::ProjectDelete,
             };
             let op = Op::new(Ulid::new(), stamp.hlc, stamp.actor, entity, payload);
             if matches!(
                 op.payload,
-                Payload::ProjectCreate(_) | Payload::ProjectSet(_)
+                Payload::ProjectCreate(_) | Payload::ProjectSet(_) | Payload::ProjectDelete
             ) {
                 project.push(op);
             } else {

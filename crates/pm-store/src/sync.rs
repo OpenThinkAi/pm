@@ -236,7 +236,7 @@ fn outbox_len(conn: &Connection) -> Result<u64> {
 /// and config entities; a `body.edit` whose entity is a known document
 /// goes to the document path, and everything else — ticket kinds and the
 /// config kinds (AGT-1384: `workspace.set`, `state.upsert`,
-/// `actor.upsert`, `project.create`, `project.set`, folded by
+/// `actor.upsert`, `project.create`, `project.set`, `project.delete`, folded by
 /// [`crate::config`] since AGT-1385) — to [`commit_foreign_in`], which
 /// dispatches on the kind. The match lists every kind so a new one has to
 /// be routed here deliberately.
@@ -250,6 +250,7 @@ fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
         | Payload::ActorUpsert(_)
         | Payload::ProjectCreate(_)
         | Payload::ProjectSet(_)
+        | Payload::ProjectDelete
         | Payload::TicketCreate(_)
         | Payload::FieldSet(_)
         | Payload::LabelAdd(_)
