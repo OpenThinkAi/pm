@@ -122,8 +122,8 @@ pub fn log(ctx: &Ctx<'_>, reference: Option<&str>) -> Result<()> {
     }
     for op in &ops {
         println!(
-            "{:<20}  {:<28}  {:<16}  {}",
-            op.hlc,
+            "{:<23}  {:<28}  {:<16}  {}",
+            crate::verbs::when_secs(&op.hlc),
             op.actor.as_str(),
             op.kind(),
             op_summary_in(op, &slugs)

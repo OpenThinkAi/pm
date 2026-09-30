@@ -222,6 +222,21 @@ fn a_second_claim_exits_75_with_taken_by_and_at_and_writes_nothing() {
     let out = sb.run(&["claim", &id], &[("PM_ACTOR", "bob")]);
     assert_code(&out, 75);
     assert!(stdout(&out).is_empty());
+    // AGT-1449: the holder's claim time reads as a UTC date-time, never
+    // the raw `<wall_ms>.<counter>` HLC.
+    let text = stderr(&out);
+    let since = text.split("(since ").nth(1).unwrap_or_default();
+    let stamp = &since[..since.find(')').unwrap_or(0)];
+    let b = stamp.as_bytes();
+    assert!(
+        stamp.len() == 20
+            && stamp.ends_with(" UTC")
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b[10] == b' '
+            && b[13] == b':',
+        "{text}"
+    );
 
     // The holder cannot re-claim either: a claim is once per ticket.
     assert_code(&sb.run(&["claim", &id], &[("PM_ACTOR", "alice")]), 75);
