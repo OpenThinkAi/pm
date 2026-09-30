@@ -20,7 +20,7 @@
 //! All of it is bookkeeping written directly, like `backup_target`: not
 //! derived from the op log, untouched by `pm doctor --rebuild`.
 
-use pm_core::{DocApplyError, Op, Payload};
+use pm_core::{ApplyError, DocApplyError, Op, Payload};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use ulid::Ulid;
@@ -119,8 +119,8 @@ impl Store {
     ///
     /// Order-independent within the batch: an op whose ticket, relation
     /// target, document, project, project entity or state is not there
-    /// yet is deferred
-    /// and retried once the rest of the batch has landed, so a batch
+    /// yet — or a document or ticket-description edit whose predecessor
+    /// edits are not — is deferred and retried once the rest of the batch has landed, so a batch
     /// applies to the same state in any order (pm-core's merge is
     /// order-independent; this makes the existence checks so too). Ops
     /// are appended to the local log in the order they actually landed,
@@ -282,7 +282,8 @@ fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
 /// ticket, relation target, document, project (by slug — a ticket's
 /// `project`, a project's `parent`), project entity (a `project.set` or
 /// `project.doc_add` ahead of its `project.create`) or state, or a
-/// document edit ahead of the edits it builds on (AGT-1413).
+/// document (AGT-1413) or ticket-description (AGT-1415) edit ahead of the
+/// edits it builds on.
 fn is_dependency(e: &StoreError) -> bool {
     matches!(
         e,
@@ -293,6 +294,7 @@ fn is_dependency(e: &StoreError) -> bool {
             | StoreError::UnknownProjectEntity { .. }
             | StoreError::UnknownState { .. }
             | StoreError::DocApply(DocApplyError::MissingDependency { .. })
+            | StoreError::Apply(ApplyError::MissingDependency { .. })
     )
 }
 

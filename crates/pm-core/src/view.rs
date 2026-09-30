@@ -191,6 +191,12 @@ pub enum ApplyError {
     /// [`crate::doc::DocApplyError::WrongKind`] is.
     #[error("op {op_id}: a ticket does not accept the config op '{kind}'")]
     WrongKind { op_id: Ulid, kind: &'static str },
+    /// [`apply_persisted`] only: the `body.edit` builds on description
+    /// edits this view has not seen yet (AGT-1415, the ticket analogue of
+    /// [`crate::doc::DocApplyError::MissingDependency`]). A caller that
+    /// pulls edits in any order retries it once they have landed.
+    #[error("op {op_id}: the edit builds on description history not seen yet")]
+    MissingDependency { op_id: Ulid },
 }
 
 /// Why the authority refused a `claim`.
@@ -298,6 +304,22 @@ impl TicketView {
 /// Fold `op` into `view`. Pure and idempotent: no clock, no IO, and
 /// applying the same op again leaves `view` unchanged.
 pub fn apply(view: &mut TicketView, op: &Op) -> Result<(), ApplyError> {
+    fold(view, op, false)
+}
+
+/// [`apply`] for a caller that persists the view between ops and takes
+/// ops in any order (pm-store's pull path): a `body.edit` whose causal
+/// dependencies the view has not seen is refused with
+/// [`ApplyError::MissingDependency`] rather than queued, since a persisted
+/// view (its [`BodyState`] snapshot) keeps no queue and the edit would
+/// silently be lost (AGT-1415; [`crate::doc::apply_doc_persisted`] is the
+/// document analogue). On that error `view` has taken the update into its
+/// in-memory queue — discard it.
+pub fn apply_persisted(view: &mut TicketView, op: &Op) -> Result<(), ApplyError> {
+    fold(view, op, true)
+}
+
+fn fold(view: &mut TicketView, op: &Op, persisted: bool) -> Result<(), ApplyError> {
     if op.entity != view.id {
         return Err(ApplyError::EntityMismatch {
             op_id: op.op_id,
@@ -407,12 +429,16 @@ pub fn apply(view: &mut TicketView, op: &Op) -> Result<(), ApplyError> {
             view.hold.set(None, stamp.clone());
         }
         Payload::BodyEdit(b) => {
-            view.body
-                .apply(&BodyUpdate::from_bytes(b.update.clone()))
+            let awaiting = view
+                .body
+                .apply_awaiting(&BodyUpdate::from_bytes(b.update.clone()))
                 .map_err(|source| ApplyError::BodyImport {
                     op_id: op.op_id,
                     source,
                 })?;
+            if awaiting && persisted {
+                return Err(ApplyError::MissingDependency { op_id: op.op_id });
+            }
         }
         Payload::Tombstone => {
             if view.deleted_at.as_ref().is_none_or(|s| stamp < *s) {
@@ -1008,5 +1034,34 @@ mod tests {
         let json = serde_json::to_string(&view).unwrap();
         let back: TicketView = serde_json::from_str(&json).unwrap();
         assert_eq!(back, view);
+    }
+
+    /// AGT-1415: in memory a description edit ahead of its history is
+    /// queued; the persisted fold refuses it instead (the ticket analogue
+    /// of the document test in `doc.rs`), and folds it once its
+    /// predecessor has landed.
+    #[test]
+    fn the_persisted_fold_refuses_a_body_edit_ahead_of_its_history() {
+        let t = Ulid::new();
+        let mut author = Body::with_peer(7).unwrap();
+        let first = author.diff_from_text("v1").unwrap().into_bytes();
+        let second = author.diff_from_text("v1 v2").unwrap().into_bytes();
+        let (first, second) = (
+            body_edit(t, 2, "matt", first),
+            body_edit(t, 3, "matt", second),
+        );
+
+        let mut view = TicketView::new(t);
+        apply_persisted(&mut view, &create(t, 1)).unwrap();
+        let err = apply_persisted(&mut view.clone(), &second).unwrap_err();
+        assert_eq!(
+            err,
+            ApplyError::MissingDependency {
+                op_id: second.op_id
+            }
+        );
+        apply_persisted(&mut view, &first).unwrap();
+        apply_persisted(&mut view, &second).unwrap();
+        assert_eq!(view.body.text(), "v1 v2");
     }
 }
