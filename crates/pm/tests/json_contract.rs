@@ -201,6 +201,11 @@ fn normalize_value(v: &mut Value) {
                         *val = Value::String("<TIMESTAMP>".into());
                         continue;
                     }
+                    // `pm hub`: `<prefix>.<workspace ULID>`.
+                    "keychain_service" if val.is_string() => {
+                        *val = Value::String("<SERVICE>".into());
+                        continue;
+                    }
                     // `pm ready`: today's date.
                     "today" if val.is_string() => {
                         *val = Value::String("<TODAY>".into());
@@ -314,7 +319,18 @@ fn capture(
     expect_code: i32,
     failures: &mut Vec<String>,
 ) -> Option<String> {
-    let out = sb.pm(args);
+    capture_env(sb, name, args, &[], expect_code, failures)
+}
+
+fn capture_env(
+    sb: &Sandbox,
+    name: &str,
+    args: &[&str],
+    extra: &[(&str, &str)],
+    expect_code: i32,
+    failures: &mut Vec<String>,
+) -> Option<String> {
+    let out = sb.run(args, extra);
     if out.status.code() != Some(expect_code) {
         failures.push(format!(
             "{name}: `pm {}` exited {:?}, expected {expect_code}\nstdout: {}\nstderr: {}",
@@ -789,6 +805,59 @@ fn every_verbs_json_output_matches_its_fixture() {
         0,
         &mut failures,
     );
+
+    // ---- pm hub ----
+    // macOS only: the keychain half of the shapes (`token_stored`,
+    // `keychain_service`) is platform-specific.
+    #[cfg(target_os = "macos")]
+    // Token via PM_HUB_TOKEN; a throwaway keychain (macOS) keeps the real
+    // one untouched. No hub is reachable in a sandbox, so `status` is
+    // captured while not configured; the reachable shape is documented in
+    // docs/cli-contract.md and exercised by tests/hub.rs against a loopback hub.
+    {
+        let kc = sb.path("hub-fixture.keychain-db");
+        let mut extra: Vec<(&str, String)> = vec![
+            ("PM_HUB_TOKEN", "pmh_fixture-token".to_string()),
+            (
+                "PM_HUB_KEYCHAIN_SERVICE_PREFIX",
+                "pm-hub-test.json-contract".to_string(),
+            ),
+        ];
+        if cfg!(target_os = "macos") {
+            for args in [
+                ["create-keychain", "-p", "pw", kc.to_str().unwrap()],
+                ["unlock-keychain", "-p", "pw", kc.to_str().unwrap()],
+            ] {
+                let out = Command::new("security")
+                    .args(args)
+                    .env("HOME", sb.home.path())
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "security {args:?}");
+            }
+            extra.push(("PM_HUB_KEYCHAIN", kc.to_str().unwrap().to_string()));
+        }
+        let extra_ref: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        for (name, args) in [
+            (
+                "hub_status_not_configured",
+                &["hub", "status", "--json"][..],
+            ),
+            (
+                "hub_login",
+                &["hub", "login", "https://hub.example", "--json"],
+            ),
+            ("hub_logout", &["hub", "logout", "--json"]),
+        ] {
+            capture_env(&sb, name, args, &extra_ref, 0, &mut failures);
+        }
+        if cfg!(target_os = "macos") {
+            let _ = Command::new("security")
+                .args(["delete-keychain", kc.to_str().unwrap()])
+                .env("HOME", sb.home.path())
+                .output();
+        }
+    }
 
     // ---- pm project delete ----
     // The creation here is only scaffolding for the delete below (already

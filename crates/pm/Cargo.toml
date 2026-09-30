@@ -27,6 +27,10 @@ serde_yaml_ng = "0.10"
 # `~/.config/pm/config.toml` (README §Surfaces). Later config keys
 # (`edit.view`, hub settings) land in the same file.
 toml = "1.1"
+# `pm hub status`/`login` (AGT-1394): a small blocking HTTP client. ureq 3
+# with only the rustls feature (no gzip, json, cookies, or native-tls):
+# hub calls are two tiny GETs, and the JSON is parsed with serde_json.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 ulid = { version = "1.2", features = ["serde"] }
 
 [dev-dependencies]

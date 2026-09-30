@@ -1,0 +1,8 @@
+{
+  "config": "<HOME>/.config/pm/config.toml",
+  "hub": "https://hub.example",
+  "keychain_service": "<SERVICE>",
+  "schema": 1,
+  "token_stored": true,
+  "workspace": "<ULID>"
+}
