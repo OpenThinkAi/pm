@@ -53,7 +53,7 @@ pub use domain::{
 };
 pub use hlc::{Clock, Hlc, Stamp};
 pub use op::{OP_VERSION, Op, Payload};
-pub use view::{ApplyError, BodyState, ClaimRejected, TicketView, apply};
+pub use view::{ApplyError, BodyState, ClaimRejected, TicketView, apply, apply_persisted};
 
 /// This crate's own version, exposed so dependents can sanity-check they
 /// are linked against the crate they expect.

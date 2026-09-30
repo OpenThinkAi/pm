@@ -9,7 +9,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pm_core::op::FieldSet;
-use pm_core::{ActorId, Clock, Hlc, Op, Payload, Ticket, TicketView, apply};
+use pm_core::{ActorId, Clock, Hlc, Op, Payload, Ticket, TicketView, apply, apply_persisted};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use ulid::Ulid;
 
@@ -178,7 +178,7 @@ fn commit_in(
         return Ok(None);
     }
     ensure_actor(tx, &op.actor)?;
-    let view = next_view(tx, op, true)?;
+    let view = next_view(tx, op, Fold::Local)?;
     append_op(tx, op)?;
     between()?;
     materialize(tx, &view, op).map(Some)
@@ -192,13 +192,18 @@ fn commit_in(
 /// writes"), exactly as [`replay_in`] treats one. A config op takes the
 /// config path unchanged (nothing about it is authority-checked). The
 /// caller has already ruled out a duplicate op id.
+///
+/// A pulled `body.edit` ahead of the description edits it builds on is
+/// refused ([`pm_core::ApplyError::MissingDependency`], AGT-1415) rather
+/// than queued in a view that is persisted right after — which would drop
+/// it — so the pull defers it until its history lands.
 pub(crate) fn commit_foreign_in(tx: &Transaction<'_>, op: &Op) -> Result<Option<Ticket>> {
     if op.payload.is_config() {
         commit_config_in(tx, op, || Ok(()))?;
         return Ok(None);
     }
     ensure_actor(tx, &op.actor)?;
-    let view = next_view(tx, op, false)?;
+    let view = next_view(tx, op, Fold::Foreign)?;
     append_op(tx, op)?;
     materialize(tx, &view, op).map(Some)
 }
@@ -209,24 +214,42 @@ pub(crate) fn commit_foreign_in(tx: &Transaction<'_>, op: &Op) -> Result<Option<
 /// tables, so a rebuilt row is produced by exactly the code that produced
 /// the original.
 pub(crate) fn replay_in(tx: &Transaction<'_>, op: &Op) -> Result<Ticket> {
-    let view = next_view(tx, op, false)?;
+    let view = next_view(tx, op, Fold::Replay)?;
     materialize(tx, &view, op)
 }
 
-/// The ticket's view with `op` folded in. `admit_claims` runs the
-/// authority's conditional check on a `claim`; a replay skips it, since
-/// the claim was admitted when it was logged (README §Conflict semantics:
-/// "replicas apply admitted claims as plain LWW writes").
-fn next_view(tx: &Transaction<'_>, op: &Op, admit_claims: bool) -> Result<TicketView> {
+/// Which commit path is folding an op into a ticket's view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fold {
+    /// [`commit_in`]: a claim is checked for admissibility.
+    Local,
+    /// [`commit_foreign_in`]: the hub admitted any claim, and a
+    /// `body.edit` ahead of its history is refused (AGT-1415).
+    Foreign,
+    /// [`replay_in`]: the log is replayed as it was committed.
+    Replay,
+}
+
+/// The ticket's view with `op` folded in. A local commit runs the
+/// authority's conditional check on a `claim`; a pulled op and a replay
+/// skip it, since the claim was admitted when it was logged (README
+/// §Conflict semantics: "replicas apply admitted claims as plain LWW
+/// writes"). A pulled op folds through [`apply_persisted`]: pulls arrive
+/// in any order, and the view is persisted right after.
+fn next_view(tx: &Transaction<'_>, op: &Op, fold: Fold) -> Result<TicketView> {
     let mut view = match load_view(tx, op.entity)? {
         Some(view) => view,
         None if matches!(op.payload, Payload::TicketCreate(_)) => TicketView::new(op.entity),
         None => return Err(StoreError::UnknownTicket { ticket: op.entity }),
     };
-    if admit_claims && matches!(op.payload, Payload::Claim(_)) {
+    if fold == Fold::Local && matches!(op.payload, Payload::Claim(_)) {
         view.claim_admissible(&states(tx)?)?;
     }
-    apply(&mut view, op)?;
+    if fold == Fold::Foreign {
+        apply_persisted(&mut view, op)?;
+    } else {
+        apply(&mut view, op)?;
+    }
     Ok(view)
 }
 
