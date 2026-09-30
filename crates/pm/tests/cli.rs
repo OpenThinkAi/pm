@@ -1378,3 +1378,100 @@ fn source_flag_requires_a_type() {
         2,
     );
 }
+
+// AGT-1383: `pm relate` edits blockers on existing tickets.
+fn relate_sandbox() -> Sandbox {
+    let sb = Sandbox::initialized();
+    for title in ["A", "B", "C"] {
+        assert_ok(&sb.pm(&["new", "--title", title]));
+    }
+    sb
+}
+
+#[test]
+fn relate_adds_and_removes_blockers() {
+    let sb = relate_sandbox();
+    let v = json(&sb.pm(&["relate", "AGT-3", "--blocked-by", "AGT-1,AGT-2", "--json"]));
+    assert_eq!(v["id"], "AGT-3");
+    assert_eq!(sorted_strings(&v["blocked_by"]), ["AGT-1", "AGT-2"]);
+
+    // Adding an existing blocker again is a no-op.
+    let again = json(&sb.pm(&["relate", "AGT-3", "--blocked-by", "AGT-1", "--json"]));
+    assert_eq!(sorted_strings(&again["blocked_by"]), ["AGT-1", "AGT-2"]);
+
+    let v = json(&sb.pm(&["relate", "AGT-3", "--unblock", "AGT-1", "--json"]));
+    assert_eq!(sorted_strings(&v["blocked_by"]), ["AGT-2"]);
+    let shown = json(&sb.pm(&["show", "AGT-3", "--json"]));
+    assert_eq!(sorted_strings(&shown["blocked_by"]), ["AGT-2"]);
+
+    // Unblocking something that is not a blocker is a no-op too.
+    assert_ok(&sb.pm(&["relate", "AGT-3", "--unblock", "AGT-1"]));
+
+    // The op log records relation.add / relation.remove.
+    let log = json(&sb.pm(&["log", "AGT-3", "--json"]));
+    let text = log.to_string();
+    assert!(text.contains("relation.add"), "{text}");
+    assert!(text.contains("relation.remove"), "{text}");
+}
+
+#[test]
+fn relate_can_add_and_remove_in_one_call() {
+    let sb = relate_sandbox();
+    assert_ok(&sb.pm(&["relate", "AGT-3", "--blocked-by", "AGT-1"]));
+    let v = json(&sb.pm(&[
+        "relate",
+        "AGT-3",
+        "--blocked-by",
+        "AGT-2",
+        "--unblock",
+        "AGT-1",
+        "--json",
+    ]));
+    assert_eq!(sorted_strings(&v["blocked_by"]), ["AGT-2"]);
+}
+
+#[test]
+fn relate_unknown_ids_exit_3_and_write_nothing() {
+    let sb = relate_sandbox();
+    assert_code(&sb.pm(&["relate", "AGT-99", "--blocked-by", "AGT-1"]), 3);
+    assert_code(
+        &sb.pm(&["relate", "AGT-3", "--blocked-by", "AGT-1,AGT-99"]),
+        3,
+    );
+    assert_code(&sb.pm(&["relate", "AGT-3", "--unblock", "AGT-99"]), 3);
+    let v = json(&sb.pm(&["show", "AGT-3", "--json"]));
+    assert_eq!(v["blocked_by"], serde_json::json!([]));
+}
+
+#[test]
+fn relate_refuses_self_block_cycles_and_empty_calls_with_exit_2() {
+    let sb = relate_sandbox();
+    assert_code(&sb.pm(&["relate", "AGT-1", "--blocked-by", "AGT-1"]), 2);
+    assert_code(&sb.pm(&["relate", "AGT-1"]), 2);
+    assert_code(
+        &sb.pm(&[
+            "relate",
+            "AGT-1",
+            "--blocked-by",
+            "AGT-2",
+            "--unblock",
+            "AGT-2",
+        ]),
+        2,
+    );
+
+    // AGT-2 blocked by AGT-1, AGT-3 blocked by AGT-2.
+    assert_ok(&sb.pm(&["relate", "AGT-2", "--blocked-by", "AGT-1"]));
+    assert_ok(&sb.pm(&["relate", "AGT-3", "--blocked-by", "AGT-2"]));
+    // Direct and transitive cycles are refused, and write nothing.
+    let out = sb.pm(&["relate", "AGT-1", "--blocked-by", "AGT-2"]);
+    assert_code(&out, 2);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cycle"));
+    assert_code(&sb.pm(&["relate", "AGT-1", "--blocked-by", "AGT-3"]), 2);
+    let v = json(&sb.pm(&["show", "AGT-1", "--json"]));
+    assert_eq!(v["blocked_by"], serde_json::json!([]));
+
+    // Removing the middle link in the same call makes the add legal.
+    assert_ok(&sb.pm(&["relate", "AGT-3", "--unblock", "AGT-2"]));
+    assert_ok(&sb.pm(&["relate", "AGT-1", "--blocked-by", "AGT-3"]));
+}

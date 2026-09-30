@@ -172,7 +172,7 @@ referenced below as **Ticket** rather than repeated per verb:
 Verbs that print exactly this shape (a single object, or — for `pm list`
 and `pm new --batch`'s `tickets` — an array/field of them): `pm new`
 (single, `--from-file`), `pm show` (no `--field`/`--section`), `pm set`,
-`pm label`, `pm comment`, `pm move`, `pm done`, `pm unclaim`, `pm claim`
+`pm label`, `pm relate`, `pm comment`, `pm move`, `pm done`, `pm unclaim`, `pm claim`
 (on success), `pm edit`, `pm list` (a bare JSON array of Ticket, no
 wrapping object), `pm ready`'s `ready` array, `pm holds`'s `tickets`
 array, `pm new --batch`'s `tickets` array.
@@ -314,6 +314,23 @@ No flags beyond the globals (see the `pm label` flag-ordering note under
 - Exit `2`: a token is not `+label` or `-label`, or is empty after the
   sign.
 - `--json`: **Ticket**.
+
+### `pm relate <ID>`
+
+Flags: `--blocked-by <ID>[,…]` (each named ticket blocks `<ID>`: one
+`relation.add` per new blocker; repeatable or comma-separated) and
+`--unblock <ID>[,…]` (one `relation.remove` per current blocker, citing
+the add-tags this replica observes). At least one flag is required. Every
+id is resolved before anything is written and the whole call lands in one
+batch. Adding a blocker that is already present, or removing one that is
+not, is a no-op.
+
+- Exit `2`: neither flag given, `<ID>` blocking itself, an id named by
+  both flags, or an add that would create a blocker cycle (detected with
+  `pm_core::check::blocker_cycles` over the graph as it would stand after
+  the call; nothing is written).
+- Exit `3`: `<ID>` or any id in either flag does not exist.
+- `--json`: **Ticket** (with `blocked_by` reflecting the result).
 
 ### `pm comment <ID> [TEXT]`
 

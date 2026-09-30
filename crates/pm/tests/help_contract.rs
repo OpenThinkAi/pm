@@ -21,6 +21,7 @@ const PATHS: &[&[&str]] = &[
     &["show"],
     &["set"],
     &["label"],
+    &["relate"],
     &["comment"],
     &["move"],
     &["done"],

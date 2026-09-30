@@ -130,6 +130,17 @@ enum Cmd {
         )]
         changes: Vec<String>,
     },
+    /// Add or remove blockers on an existing ticket (`--blocked-by X` means X blocks <id>)
+    Relate {
+        /// Ticket id (e.g. PM-12) or ULID
+        id: String,
+        /// Ticket(s) that block this one: PM-N or ULID, repeat or comma-separate
+        #[arg(long = "blocked-by", value_name = "ID", value_delimiter = ',')]
+        blocked_by: Vec<String>,
+        /// Blocker(s) to remove: PM-N or ULID, repeat or comma-separate
+        #[arg(long, value_name = "ID", value_delimiter = ',')]
+        unblock: Vec<String>,
+    },
     /// Append a comment
     Comment {
         /// Ticket id (e.g. PM-12) or ULID
@@ -478,6 +489,11 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         }
         Cmd::Set { id, assignments } => verbs::set(ctx, &id, &assignments),
         Cmd::Label { id, changes } => mutate::label(ctx, &id, &changes),
+        Cmd::Relate {
+            id,
+            blocked_by,
+            unblock,
+        } => mutate::relate(ctx, &id, &blocked_by, &unblock),
         Cmd::Comment { id, text, file } => {
             mutate::comment(ctx, &id, text.as_deref(), file.as_deref())
         }
