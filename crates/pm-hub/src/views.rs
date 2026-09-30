@@ -592,6 +592,36 @@ mod tests {
         assert_eq!(view.created.as_ref().unwrap().hlc, Hlc::new(10, 0));
     }
 
+    /// AGT-1406: a pushed `workspace.set docs_owned_by` folds on the hub
+    /// like any other config field (LWW by stamp).
+    #[test]
+    fn docs_owned_by_folds_on_the_hub() {
+        use pm_core::DocsOwner;
+        let (mut views, ws) = configured();
+        let set = |wall_ms, owner| {
+            op(
+                ws,
+                wall_ms,
+                "matt",
+                Payload::WorkspaceSet(WorkspaceSet::DocsOwnedBy(owner)),
+            )
+        };
+        assert_eq!(
+            views.workspace.as_ref().unwrap().snapshot().docs_owned_by,
+            DocsOwner::Vault
+        );
+        assert_eq!(
+            views.fold(&set(10, DocsOwner::Pm), true).unwrap(),
+            Verdict::Folded
+        );
+        views.fold(&set(5, DocsOwner::Vault), true).unwrap();
+        assert_eq!(
+            views.workspace.as_ref().unwrap().snapshot().docs_owned_by,
+            DocsOwner::Pm,
+            "the older write loses"
+        );
+    }
+
     #[test]
     fn config_for_a_second_workspace_ulid_is_foreign() {
         let (mut views, ws) = configured();

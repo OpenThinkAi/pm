@@ -708,6 +708,7 @@ mod tests {
             model_labels: Default::default(),
             template_sections: vec![],
             stale_days: 30,
+            docs_owned_by: Default::default(),
         }
     }
 

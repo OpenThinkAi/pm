@@ -253,6 +253,7 @@ pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>, join: Option<Ul
                 model_labels: Default::default(),
                 template_sections: Vec::new(),
                 stale_days: 30,
+                docs_owned_by: Default::default(),
             }
         }
         None => {
@@ -264,6 +265,7 @@ pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>, join: Option<Ul
                 model_labels: Default::default(),
                 template_sections: vec!["Problem Statement".into(), "Acceptance Criteria".into()],
                 stale_days: 30,
+                docs_owned_by: Default::default(),
             };
             // The workspace's first ops (AGT-1385): one `workspace.set` per
             // field and gate label, one `state.upsert` per state, under this

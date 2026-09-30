@@ -914,6 +914,16 @@ listed in the report header with its rationale, or *unexplained*, listed
 with both values; a source file with no ticket in pm is an unexplained
 `missing`).
 
+**Who owns project docs** (AGT-1406): the workspace setting
+`docs_owned_by` (`vault`, the default, or `pm`; set with `pm workspace
+docs-owned-by`) decides whether the import refreshes design docs. While
+`vault`, every README and named document is imported as above. Once it is
+`pm`, the import still creates/updates project metadata and tickets, but
+skips `projects/*/README.md` and their sibling documents (`docs.skipped`
+lists each as `projects/<id>/README.md` / `projects/<id>/<name>.md`), so a
+re-import cannot overwrite a doc edited in pm. A project that is new to pm
+is still created, with an empty design doc.
+
 Dates: every op is stamped from the file. A ticket's record ops (fields,
 body, state, markers) never run backwards within the ticket — one dated
 before `created` lands at `created` — but a comment keeps its entry's own
@@ -942,7 +952,7 @@ a comment.
     "archived": 1137,                        // files under archive/20*/
     "projects": 69,                          // READMEs read (live + retired)
     "project_stubs": ["id", ...],            // projects a ticket names that have no README; created empty, abandoned
-    "docs": {"created": 0, "updated": 0, "unchanged": 0},
+    "docs": {"created": 0, "updated": 0, "unchanged": 0, "skipped": []},  // skipped: doc paths left alone because docs_owned_by = pm
     "ops": 0,                                // committed (or, with --dry-run, planned)
     "ops_by_kind": {"ticket.create": 0, "field.set": 0, ...},
     "comments": 0,                           // comment.add ops among them
@@ -1112,6 +1122,19 @@ dedicated backup-side code.
 - `add`/`remove`: Exit `2`: empty `<LABEL>`.
 - `--json` (all three): `{"schema": 1, "gate_labels": ["manual", ...]}` —
   the full set after the write (`list`: the current set).
+
+### `pm workspace docs-owned-by [vault|pm]`
+
+No flags beyond the globals. With a value, commits a `workspace.set
+docs_owned_by` config op (AGT-1406; a last-writer-wins scalar, default
+`vault`, committed only when it changes) and prints the result; with none,
+prints the current setting. Being an op it syncs to the hub and replays
+under `pm doctor --rebuild`. `pm import vault` reads it: `pm` makes a
+re-import skip project design docs (see that verb). The op is an additive
+`workspace.set` field, so `OP_VERSION` is unchanged.
+
+- Exit `2`: a value other than `vault` or `pm`.
+- `--json`: `{"schema": 1, "docs_owned_by": "vault"}`.
 
 ### `pm ticket list <DIR>` / `pm ticket show <PATH>`
 

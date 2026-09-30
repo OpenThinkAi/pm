@@ -31,7 +31,9 @@ use std::collections::btree_map::Entry;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::domain::{Actor, ActorId, ActorKind, Project, ProjectStatus, State, Workspace};
+use crate::domain::{
+    Actor, ActorId, ActorKind, DocsOwner, Project, ProjectStatus, State, Workspace,
+};
 use crate::hlc::Stamp;
 use crate::merge::{Lww, OrSet};
 use crate::op::{Op, Payload, ProjectDocAdd, ProjectSet, WorkspaceSet};
@@ -48,6 +50,7 @@ pub struct WorkspaceView {
     pub model_labels: BTreeMap<String, Lww<Option<String>>>,
     pub template_sections: Lww<Vec<String>>,
     pub stale_days: Lww<u32>,
+    pub docs_owned_by: Lww<DocsOwner>,
     /// Keyed by state name; the register holds the whole record, since
     /// `state.upsert` always writes `category` and `position` together.
     pub states: BTreeMap<String, Lww<State>>,
@@ -65,6 +68,7 @@ impl WorkspaceView {
             model_labels: BTreeMap::new(),
             template_sections: Lww::default(),
             stale_days: Lww::default(),
+            docs_owned_by: Lww::default(),
             states: BTreeMap::new(),
             actors: BTreeMap::new(),
         }
@@ -90,6 +94,7 @@ impl WorkspaceView {
                 .collect(),
             template_sections: self.template_sections.value.clone(),
             stale_days: self.stale_days.value,
+            docs_owned_by: self.docs_owned_by.value,
         }
     }
 
@@ -293,6 +298,9 @@ pub fn apply_workspace(view: &mut WorkspaceView, op: &Op) -> Result<(), ConfigAp
             }
             WorkspaceSet::StaleDays(v) => {
                 view.stale_days.set(*v, stamp.clone());
+            }
+            WorkspaceSet::DocsOwnedBy(v) => {
+                view.docs_owned_by.set(*v, stamp.clone());
             }
         },
         Payload::StateUpsert(s) => upsert(
@@ -697,6 +705,22 @@ mod tests {
             apply_project(&mut reverse, op).unwrap();
         }
         assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn docs_owned_by_is_a_default_vault_lww_scalar() {
+        let id = Ulid::new();
+        let mut view = WorkspaceView::new(id);
+        assert_eq!(view.snapshot().docs_owned_by, DocsOwner::Vault);
+        let pm = ws(id, 5, "matt", WorkspaceSet::DocsOwnedBy(DocsOwner::Pm));
+        let vault = ws(id, 3, "matt", WorkspaceSet::DocsOwnedBy(DocsOwner::Vault));
+        apply_workspace(&mut view, &pm).unwrap();
+        apply_workspace(&mut view, &vault).unwrap();
+        apply_workspace(&mut view, &pm).unwrap();
+        assert_eq!(view.snapshot().docs_owned_by, DocsOwner::Pm);
+        let later = ws(id, 9, "matt", WorkspaceSet::DocsOwnedBy(DocsOwner::Vault));
+        apply_workspace(&mut view, &later).unwrap();
+        assert_eq!(view.snapshot().docs_owned_by, DocsOwner::Vault);
     }
 
     #[test]

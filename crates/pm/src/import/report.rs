@@ -53,6 +53,9 @@ pub struct DocOutcome {
     pub created: usize,
     pub updated: usize,
     pub unchanged: usize,
+    /// Documents left alone because the workspace's `docs_owned_by` is
+    /// `pm` (AGT-1406): `projects/<id>/README.md`, `projects/<id>/<name>.md`.
+    pub skipped: Vec<String>,
 }
 
 impl Report {
@@ -87,12 +90,13 @@ impl Report {
             self.archived
         );
         println!(
-            "projects:   {} ({} stubs); docs: {} created, {} updated, {} unchanged",
+            "projects:   {} ({} stubs); docs: {} created, {} updated, {} unchanged, {} skipped (owned by pm)",
             self.projects,
             self.project_stubs.len(),
             self.docs.created,
             self.docs.updated,
-            self.docs.unchanged
+            self.docs.unchanged,
+            self.docs.skipped.len()
         );
         let kinds: Vec<String> = self
             .ops_by_kind
@@ -135,6 +139,7 @@ impl Report {
             .collect();
         section("ext keys", &ext);
         section("project stubs", &self.project_stubs);
+        section("skipped docs (docs_owned_by = pm)", &self.docs.skipped);
         section("renumbered", &self.renumbered);
         section("anomalies", &self.anomalies);
         section("changes", &self.changes);

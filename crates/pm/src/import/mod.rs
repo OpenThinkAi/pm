@@ -19,8 +19,12 @@
 //!   it against its source file: the round-trip evidence.
 //!
 //! The vault is only ever read (and `git show`n); pm never writes to it.
-//! Project design docs stay owned by the vault until P4 (README A3): what
-//! lands here is a snapshot, refreshed by re-importing.
+//! Project design docs stay owned by the vault until the handover (README
+//! A3): what lands here is a snapshot, refreshed by re-importing. Once
+//! `pm workspace docs-owned-by pm` flips the workspace setting (AGT-1406)
+//! the import still brings project metadata and tickets but leaves every
+//! `projects/*/README.md` and sibling document alone, listing them as
+//! skipped in the report.
 
 mod parity;
 mod plan;
@@ -158,7 +162,20 @@ pub fn vault(
 
     // Document bodies: one body.edit per document whose text differs.
     let mut intents = plan.intents;
+    let docs_owned_by_pm = ws.docs_owned_by == pm_core::DocsOwner::Pm;
     for p in &snapshot.projects {
+        if docs_owned_by_pm {
+            report
+                .docs
+                .skipped
+                .push(format!("projects/{}/README.md", p.id));
+            report.docs.skipped.extend(
+                p.documents
+                    .keys()
+                    .map(|n| format!("projects/{}/{n}.md", p.id)),
+            );
+            continue;
+        }
         let current = store.project(&p.id)?;
         let mut docs: Vec<(Option<&str>, &str, u64)> = vec![(None, p.doc.as_str(), p.doc_mtime_ms)];
         docs.extend(

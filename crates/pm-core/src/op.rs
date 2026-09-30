@@ -309,6 +309,10 @@ pub enum WorkspaceSet {
     /// The whole ordered list: sections are an ordered template, not a set.
     TemplateSections(Vec<String>),
     StaleDays(u32),
+    /// Who owns project design docs (AGT-1406). An additive variant like
+    /// the config kinds of AGT-1384: ops already in a log keep their
+    /// shape, so [`OP_VERSION`] does not bump.
+    DocsOwnedBy(crate::domain::DocsOwner),
 }
 
 /// Insert or replace one workflow state, keyed by `name` (`entity` = the
@@ -536,6 +540,16 @@ mod tests {
             json["payload"],
             serde_json::json!({"field": "stale_days", "value": 30})
         );
+        let owned = op(Payload::WorkspaceSet(WorkspaceSet::DocsOwnedBy(
+            crate::domain::DocsOwner::Pm,
+        )));
+        let json = serde_json::to_value(&owned).unwrap();
+        assert_eq!(
+            json["payload"],
+            serde_json::json!({"field": "docs_owned_by", "value": "pm"})
+        );
+        assert_eq!(json["version"], OP_VERSION, "additive: no version bump");
+        assert_eq!(serde_json::from_value::<Op>(json).unwrap(), owned);
         let json = serde_json::to_value(op(Payload::ProjectSet(ProjectSet::RepoRemove {
             repo: "OpenThinkAi/pm".into(),
             observed: vec![],

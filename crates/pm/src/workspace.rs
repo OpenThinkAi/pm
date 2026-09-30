@@ -313,6 +313,13 @@ pub enum WorkspaceCmd {
         #[command(subcommand)]
         cmd: GateLabelCmd,
     },
+    /// Show or set who owns project design docs (AGT-1406): `vault`
+    /// (default; `pm import vault` refreshes them) or `pm` (a re-import
+    /// skips them). With no value, prints the current setting.
+    DocsOwnedBy {
+        /// `vault` or `pm`
+        owner: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -328,7 +335,30 @@ pub enum GateLabelCmd {
 pub fn run(ctx: &crate::verbs::Ctx<'_>, cmd: WorkspaceCmd) -> Result<()> {
     match cmd {
         WorkspaceCmd::GateLabel { cmd } => gate_label(ctx, cmd),
+        WorkspaceCmd::DocsOwnedBy { owner } => docs_owned_by(ctx, owner),
     }
+}
+
+fn docs_owned_by(ctx: &crate::verbs::Ctx<'_>, owner: Option<String>) -> Result<()> {
+    let (mut store, ws) = ctx.open()?;
+    let current = match owner {
+        None => ws.docs_owned_by,
+        Some(v) => {
+            let wanted: pm_core::DocsOwner = v.parse().map_err(CliError::usage)?;
+            let actor = ctx.actor()?;
+            store.set_docs_owned_by(wanted, &actor)?;
+            wanted
+        }
+    };
+    if ctx.json {
+        crate::verbs::print_json(&serde_json::json!({
+            "schema": crate::verbs::SCHEMA,
+            "docs_owned_by": current,
+        }));
+    } else {
+        println!("{}", current.as_str());
+    }
+    Ok(())
 }
 
 fn gate_label(ctx: &crate::verbs::Ctx<'_>, cmd: GateLabelCmd) -> Result<()> {
