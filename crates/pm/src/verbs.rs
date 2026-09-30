@@ -1043,6 +1043,57 @@ pub(crate) fn ticket_json(ws: &Workspace, store: &Store, t: &Ticket) -> Result<V
     Ok(Value::Object(out))
 }
 
+/// [`ticket_json`] plus `comments: [{author, at, body}]`, oldest first
+/// (`at` is the UTC `YYYY-MM-DD` date, as in `pm export md`). Only `pm
+/// show` uses this: every other Ticket-shaped output (list items,
+/// mutating-verb echoes) stays comment-free so `pm list --json` is light
+/// (AGT-1430).
+pub(crate) fn ticket_json_with_comments(
+    ws: &Workspace,
+    store: &Store,
+    t: &Ticket,
+) -> Result<Value> {
+    let mut value = ticket_json(ws, store, t)?;
+    let comments: Vec<Value> = store
+        .comments(t.id)?
+        .into_iter()
+        .map(|c| {
+            json!({
+                "author": c.author.as_str(),
+                "at": pm_core::markers::date_from_ms(c.hlc.wall_ms),
+                "body": c.body,
+            })
+        })
+        .collect();
+    value["comments"] = json!(comments);
+    Ok(value)
+}
+
+fn print_comments(store: &Store, t: &Ticket) -> Result<()> {
+    let comments = store.comments(t.id)?;
+    if comments.is_empty() {
+        return Ok(());
+    }
+    println!();
+    println!("Comments ({}):", comments.len());
+    for c in comments {
+        println!();
+        println!(
+            "{} — {}",
+            pm_core::markers::date_from_ms(c.hlc.wall_ms),
+            c.author
+        );
+        for line in c.body.trim_end().lines() {
+            if line.is_empty() {
+                println!();
+            } else {
+                println!("  {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn print_human(ws: &Workspace, t: &Ticket) {
     let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
     println!("{}  {}", display_id(ws, t), t.title);
@@ -1152,9 +1203,16 @@ pub fn show(
         return crate::read::print_section(ctx, &ticket, section);
     }
     match field {
-        Some(field) => print_field(ctx, &ticket_json(&ws, &store, &ticket)?, field)?,
-        None if ctx.json => print_json(&ticket_json(&ws, &store, &ticket)?),
-        None => print_human(&ws, &ticket),
+        Some(field) => print_field(
+            ctx,
+            &ticket_json_with_comments(&ws, &store, &ticket)?,
+            field,
+        )?,
+        None if ctx.json => print_json(&ticket_json_with_comments(&ws, &store, &ticket)?),
+        None => {
+            print_human(&ws, &ticket);
+            print_comments(&store, &ticket)?;
+        }
     }
     Ok(())
 }

@@ -352,7 +352,17 @@ each other).
   unknown field; `<ID>` is `AGT-?` (see **Ticket ids**).
 - Exit `3`: unknown ticket id; `--section` names a heading the ticket's
   description does not have.
-- `--json` (no flag): **Ticket**.
+- Text output lists the ticket's comments after the description,
+  oldest first: a blank line, `Comments (N):`, then per comment a blank
+  line, `<YYYY-MM-DD> — <author>`, and the body indented two spaces
+  (multi-line bodies keep their line breaks). A ticket with no comments
+  prints nothing extra (AGT-1430).
+- `--json` (no flag): **Ticket** plus `"comments": [{"author": "string",
+  "at": "YYYY-MM-DD", "body": "string"}, ...]` — oldest first (HLC
+  order), `[]` when there are none. `at` is the UTC date, the same form
+  `pm export md` writes. Only `pm show` carries `comments`: `pm list`,
+  `pm ready`, and every mutating verb's Ticket echo omit it (they stay
+  light; use `pm show`). `--field comments` works.
 - `--json --field NAME`: `{"schema": 1, "<field>": <value>}` — `NAME`'s
   hyphens become underscores (`linked-github` -> `linked_github`) to match
   the Ticket key.
