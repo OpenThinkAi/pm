@@ -1028,19 +1028,24 @@ regardless of `--no-load`), `--no-load` (write without loading).
 
 Where this machine keeps the hub URL and bearer token for the resolved
 workspace (AGT-1394). None of these write an op; only `status` touches the
-network. **Reads (`pm list`, `show`, `ready`, `status`, `graph`, `log`, …)
-never contact the hub** — `tests/hub.rs` runs them against a loopback
-listener and asserts it sees no connection.
+network (`pm sync`, below, is the other verb that does). **Reads (`pm list`,
+`show`, `ready`, `status`, `graph`, `log`, …) never contact the hub** —
+`tests/hub.rs` runs them against a loopback listener and asserts it sees
+no connection.
 
 - **URL**: `hub = "<URL>"` in config.toml. `login` edits only that key
   (other keys survive; comments do not). The URL must be `http(s)://host[:port][/path]`
   with no credentials, query or fragment (exit `2`); a trailing `/` is dropped.
 - **Token**: never in config.toml.
   - macOS: login keychain, service `pm-hub.<workspace-id>`, account `pm`.
-    `<workspace-id>` is the workspace's ULID (`workspace.id`, the id the hub
-    keys a workspace by in `/w/{workspace}/…`). It is stable if the prefix is
-    renamed and distinct per workspace. The token is handed to
-    `security -i` on its stdin, so it is never on argv.
+    `<workspace-id>` is the workspace's ULID (`workspace.id`). It is stable
+    if the prefix is renamed and distinct per workspace. The token is handed
+    to `security -i` on its stdin, so it is never on argv.
+  - **On the hub** the workspace is keyed by that ULID in **lowercase**
+    (`/w/{workspace}/…`, `pm-hub token create --workspace <id>`): the hub's
+    workspace-id alphabet is `[a-z0-9_-]`, and a ULID's canonical spelling
+    is uppercase. `status` and `sync` both route with the lowercase form;
+    the keychain service keeps the canonical one.
   - Elsewhere: no keychain. The token is read only from `PM_HUB_TOKEN`;
     `login` writes the URL, stores nothing, and says so on stderr.
   - `PM_HUB_TOKEN`, when set, wins over the keychain on every platform.
@@ -1048,8 +1053,8 @@ listener and asserts it sees no connection.
 - Test hooks: `PM_HUB_KEYCHAIN_SERVICE_PREFIX` replaces `pm-hub` in the
   service name; `PM_HUB_KEYCHAIN=<file>` points every keychain call at that
   keychain file instead of the login keychain.
-- A configured `hub` still makes `pm claim` refuse until the sync protocol
-  lands (P3); `pm hub logout` restores local claiming.
+- A configured `hub` still makes `pm claim` refuse until the hub-side
+  claim lands (AGT-1397); `pm hub logout` restores local claiming.
 
 `login` reads the token from `PM_HUB_TOKEN`, else stdin (macOS), stores it
 (updating any existing item), then writes `hub`. It does not contact the hub.
@@ -1069,7 +1074,7 @@ listener and asserts it sees no connection.
 `status` reports the URL, workspace, token presence (never its value) and,
 when a hub is configured, `GET <hub>/health` (5 s timeout) and — if a token
 is present and the hub is reachable — `GET <hub>/w/<workspace-id>/whoami`
-(a bare `404` means the token is not accepted). Exit `1` if the hub is
+(lowercase ULID; a bare `404` means the token is not accepted). Exit `1` if the hub is
 unreachable or rejects the token; exit `0` when no hub is configured.
 `--json`:
 
@@ -1095,6 +1100,72 @@ from config.toml; running it twice is not an error. `--json`:
 ```jsonc
 { "schema": 1, "hub_removed": true, "token_removed": true, "workspace": "01M3…" }
 ```
+
+### `pm sync`
+
+The client half of README §Sync & hub (AGT-1395): push the outbox to the
+configured hub, then pull and apply everyone else's ops since the cursor.
+Both sides merge by the same `pm-core` rules; the hub only orders. Needs a
+`hub` in config.toml and a token (`PM_HUB_TOKEN`, else the keychain) —
+`pm hub login`. `pm doctor`'s `sync` block reports the state this verb
+moves. Flag: `--watch <SECS>` (an integer `>= 1`, else exit `2`): repeat
+the sync every `SECS` seconds until interrupted.
+
+One sync is **push, then pull**, in units the database commits on its own,
+so an interruption at any point (crash, Ctrl-C, a dropped connection)
+leaves the outbox and cursor consistent:
+
+- **Push.** The outbox (local ops the hub has not acknowledged; the whole
+  log until the first push) goes up in batches sized under both hub limits
+  — 1000 ops and 64 MiB of request body per batch (`docs/hub-api.md`); a
+  single op over the byte limit is an error. Ops leave the outbox only
+  for the `op_id`s the hub's `200` acknowledges, after the response is
+  read. A crash between the hub's commit and that mark re-sends the batch
+  next time; the hub answers `stored: false` for each (idempotent on
+  `op_id`), nothing is lost or doubled.
+- **Pull.** `GET …/ops?since=<cursor>&limit=1000`, page by page until
+  `next >= head`. Each page is applied in one transaction (foreign ops go
+  through the normal commit path; an op already present by `op_id` — this
+  replica's own, echoed back — is skipped and counts as pushed), and the
+  cursor moves to the page's `next` only after that transaction commits.
+  A hub-authored `field.set number` (AGT-1391) arrives like any other op
+  and clears the ticket's pending-number flag.
+- Exit `1`, with the cause on stderr and nothing printed on stdout
+  (no partial `--json`), when: no hub is configured or no token is held
+  (the message names `pm hub login`); the hub cannot be reached or times
+  out (`cannot reach the hub at <url>: …`); the hub answers `404` (its one
+  answer for a rejected token or an unknown workspace; the message says to
+  run `pm hub status`); the hub refuses a batch or query with a structured
+  `400`/`413` (`error` and `reason` are quoted, with the op's index and id
+  when given); `503`; or the store refuses a pulled op. Local state stays
+  exactly as it was apart from what had already been committed — every
+  batch the hub acknowledged is marked, every page applied has advanced
+  the cursor.
+- A second sync with nothing new pushes and pulls nothing (`0` counts,
+  `cursor == head`).
+- `--watch`: each round prints its report — one line per round in text
+  mode, one JSON object per line under `--json` — and a failed round is
+  reported on stderr (`pm: sync failed: …`) and retried after the interval
+  rather than ending the loop; Ctrl-C stops it.
+- `--json` (one round):
+  ```jsonc
+  {
+    "schema": 1,
+    "hub": "https://hub.example",
+    "workspace": "01M3…",       // workspace ULID (canonical, uppercase)
+    "pushed": 3,                // outbox ops the hub acknowledged this round
+    "pulled": 5,                // ops received from the hub this round
+    "applied": 4,               // of those, foreign ops committed into the log
+    "skipped": 1,               // of those, already present (this replica's own, echoed back)
+    "cursor": 42,               // hub seq the pull got through (= pm doctor's sync.cursor)
+    "head": 42,                 // the hub's largest seq as of the last page
+    "outbox": 0,                // ops still unacknowledged after the round
+    "pending_numbers": 0        // tickets still awaiting a hub-issued number
+  }
+  ```
+- Text output is one line: `pushed 3 op(s); pulled 5 op(s): 4 applied,
+  1 skipped; cursor 42 (hub head 42)`, with `; N op(s) still in the outbox`
+  and `; N ticket(s) still awaiting a hub number` appended when non-zero.
 
 ## Verbs with no `--json` output
 

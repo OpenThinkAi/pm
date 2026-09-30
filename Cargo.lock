@@ -1509,6 +1509,8 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
+ "tokio",
+ "tokio-postgres",
  "toml",
  "ulid",
  "ureq",

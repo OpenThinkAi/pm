@@ -23,10 +23,16 @@
 //!   scripted route that keeps the secret off argv. Tokens are therefore
 //!   restricted to `[A-Za-z0-9_-]`, the hub's own token alphabet, so no
 //!   quoting is needed.
-//! - Only `pm hub status` talks to the hub (`GET /health`, and
-//!   `GET /w/<id>/whoami` when a token is present). Login and logout are
-//!   local, and every other verb — the reads above all — never constructs an
-//!   HTTP client.
+//! - Only `pm hub status` (`GET /health`, and `GET /w/<id>/whoami` when a
+//!   token is present) and `pm sync` (`crate::sync`, AGT-1395) talk to the
+//!   hub. Login and logout are local, and every other verb — the reads
+//!   above all — never constructs an HTTP client.
+//! - The id in `/w/{workspace}/…` is [`hub_workspace_id`]: the workspace
+//!   ULID in lowercase. The hub's workspace-id alphabet (`pm-hub token
+//!   create --workspace`) is `[a-z0-9_-]`, and a ULID's canonical spelling
+//!   is uppercase, which the hub refuses; lowercase is the same ULID
+//!   (Crockford base32 parses case-insensitively). The keychain service
+//!   name keeps the canonical uppercase form.
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -39,6 +45,12 @@ use serde_json::{Value, json};
 use crate::exit::{CliError, Result};
 use crate::verbs::{Ctx, SCHEMA, print_json};
 use crate::workspace::Env;
+
+/// The workspace's id on the hub (`/w/{workspace}/…`, `pm-hub token create
+/// --workspace`): its ULID, lowercased (module docs).
+pub(crate) fn hub_workspace_id(ws: &Workspace) -> String {
+    ws.id.to_string().to_ascii_lowercase()
+}
 
 #[derive(clap::Subcommand, Debug)]
 pub enum HubCmd {
@@ -214,11 +226,112 @@ fn write_hub_key(env: &Env, url: Option<&str>) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
-fn configured_hub(env: &Env) -> Result<Option<String>> {
+pub(crate) fn configured_hub(env: &Env) -> Result<Option<String>> {
     let Ok(path) = env.config_path() else {
         return Ok(None);
     };
     Ok(crate::workspace::Config::load(&path)?.and_then(|c| c.hub))
+}
+
+/// The token this machine holds for `ws` and where it came from:
+/// `PM_HUB_TOKEN` (`"env"`) wins, else the keychain item (`"keychain"`).
+fn load_token(env: &Env, ws: &Workspace) -> Option<(String, &'static str)> {
+    match env.hub_token.as_deref() {
+        Some(t) => Some((t.trim().to_string(), "env")),
+        None => keychain_load(env, &service_name(env, ws)).map(|t| (t, "keychain")),
+    }
+}
+
+// ----------------------------------------------------------------- client
+
+/// Everything a hub call needs, resolved once per command: the configured
+/// URL, the token, the workspace's hub id and an HTTP agent that never
+/// follows a redirect (which could carry the bearer token elsewhere) and
+/// never turns a status into an error (the caller reads the status).
+pub(crate) struct HubClient {
+    pub url: String,
+    pub workspace: String,
+    token: String,
+    agent: ureq::Agent,
+}
+
+/// A transport failure: nothing reached the hub, or no response came back
+/// in time. Every HTTP status, 404 included, is an `Ok` response instead.
+pub(crate) struct Transport(pub String);
+
+impl HubClient {
+    /// The hub for this machine and `ws`, or an error naming what to run
+    /// when no URL or no token is configured. Never contacts the hub.
+    pub(crate) fn resolve(env: &Env, ws: &Workspace, timeout: Duration) -> Result<HubClient> {
+        let Some(url) = configured_hub(env)? else {
+            return Err(CliError::error(
+                "no hub configured for this machine: run `pm hub login <url>` first",
+            ));
+        };
+        let Some((token, _)) = load_token(env, ws) else {
+            return Err(CliError::error(format!(
+                "no hub token for workspace {} ({}): run `pm hub login {url}` with the token \
+                 on stdin, or set PM_HUB_TOKEN",
+                ws.prefix, ws.id
+            )));
+        };
+        Ok(HubClient {
+            url,
+            workspace: hub_workspace_id(ws),
+            token,
+            agent: agent(timeout),
+        })
+    }
+
+    /// `GET <url>/w/<workspace>/<route>` with the bearer token:
+    /// `(status, body)`.
+    pub(crate) fn get(&self, route: &str) -> std::result::Result<(u16, String), Transport> {
+        let req = self
+            .agent
+            .get(self.route(route))
+            .header("Authorization", format!("Bearer {}", self.token));
+        let mut resp = req.call().map_err(|e| Transport(e.to_string()))?;
+        read_response(&mut resp)
+    }
+
+    /// `POST <url>/w/<workspace>/<route>` with a JSON body and the bearer
+    /// token: `(status, body)`.
+    pub(crate) fn post_json(
+        &self,
+        route: &str,
+        body: &str,
+    ) -> std::result::Result<(u16, String), Transport> {
+        let req = self
+            .agent
+            .post(self.route(route))
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Content-Type", "application/json");
+        let mut resp = req.send(body).map_err(|e| Transport(e.to_string()))?;
+        read_response(&mut resp)
+    }
+
+    fn route(&self, route: &str) -> String {
+        format!("{}/w/{}/{route}", self.url, self.workspace)
+    }
+}
+
+/// ureq's default `read_to_string` stops at 10 MiB; a pull page can carry
+/// a whole large document edit, so bodies are read up to the hub's own
+/// per-request ceiling (`docs/hub-api.md`: 64 MiB) plus a little JSON
+/// framing.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024 + 1024 * 1024;
+
+fn read_response(
+    resp: &mut ureq::http::Response<ureq::Body>,
+) -> std::result::Result<(u16, String), Transport> {
+    let status = resp.status().as_u16();
+    let body = resp
+        .body_mut()
+        .with_config()
+        .limit(MAX_RESPONSE_BYTES)
+        .read_to_string()
+        .map_err(|e| Transport(format!("reading the hub's response: {e}")))?;
+    Ok((status, body))
 }
 
 // ------------------------------------------------------------------ login
@@ -347,11 +460,18 @@ fn logout(ctx: &Ctx<'_>) -> Result<()> {
 
 // ----------------------------------------------------------------- status
 
+/// `pm hub status`'s two probes are tiny; `pm sync` (`crate::sync`) sets
+/// its own, longer budget for op batches.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-fn agent() -> ureq::Agent {
+/// How long any single call may take to connect; the rest of `timeout`
+/// is for moving the body.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) fn agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
-        .timeout_global(Some(TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT.min(timeout)))
+        .timeout_global(Some(timeout))
         .http_status_as_error(false)
         // A redirect must never carry the bearer token to another host.
         .max_redirects(0)
@@ -361,14 +481,12 @@ fn agent() -> ureq::Agent {
 
 /// `(status, body)`; a transport failure is `Err(message)`.
 fn get(url: &str, token: Option<&str>) -> std::result::Result<(u16, String), String> {
-    let mut req = agent().get(url);
+    let mut req = agent(TIMEOUT).get(url);
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
     }
     let mut resp = req.call().map_err(|e| e.to_string())?;
-    let status = resp.status().as_u16();
-    let body = resp.body_mut().read_to_string().unwrap_or_default();
-    Ok((status, body))
+    read_response(&mut resp).map_err(|Transport(e)| e)
 }
 
 fn status(ctx: &Ctx<'_>) -> Result<()> {
@@ -376,12 +494,9 @@ fn status(ctx: &Ctx<'_>) -> Result<()> {
     let service = service_name(ctx.env, &ws);
     let hub = configured_hub(ctx.env)?;
 
-    let (token, source) = match ctx.env.hub_token.as_deref() {
-        Some(t) => (Some(t.trim().to_string()), Some("env")),
-        None => match keychain_load(ctx.env, &service) {
-            Some(t) => (Some(t), Some("keychain")),
-            None => (None, None),
-        },
+    let (token, source) = match load_token(ctx.env, &ws) {
+        Some((t, source)) => (Some(t), Some(source)),
+        None => (None, None),
     };
 
     let mut reachable: Option<bool> = None;
@@ -408,7 +523,10 @@ fn status(ctx: &Ctx<'_>) -> Result<()> {
         if reachable == Some(true)
             && let Some(t) = &token
         {
-            match get(&format!("{hub}/w/{}/whoami", ws.id), Some(t)) {
+            match get(
+                &format!("{hub}/w/{}/whoami", hub_workspace_id(&ws)),
+                Some(t),
+            ) {
                 Ok((200, body)) => {
                     token_accepted = Some(true);
                     token_name = serde_json::from_str::<Value>(&body)

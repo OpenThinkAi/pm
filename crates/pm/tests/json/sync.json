@@ -1,0 +1,13 @@
+{
+  "applied": 0,
+  "cursor": 0,
+  "head": 0,
+  "hub": "<HUB>",
+  "outbox": 0,
+  "pending_numbers": 0,
+  "pulled": 0,
+  "pushed": 48,
+  "schema": 1,
+  "skipped": 0,
+  "workspace": "<ULID>"
+}

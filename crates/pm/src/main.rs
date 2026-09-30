@@ -19,6 +19,7 @@ mod mutate;
 mod project;
 mod read;
 mod ready;
+mod sync;
 mod ticket;
 mod verbs;
 mod workspace;
@@ -357,6 +358,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: hub::HubCmd,
     },
+    /// Push the outbox to the hub, then pull and apply everyone else's ops since the cursor (exit 1 if the hub cannot be reached)
+    Sync {
+        /// Keep syncing every SECS seconds until interrupted; a failed round is reported and retried
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        watch: Option<u64>,
+    },
     /// Markdown vault tickets (legacy, reads ticket files directly)
     Ticket {
         #[command(subcommand)]
@@ -616,6 +623,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         Cmd::Project { cmd } => project::run(ctx, cmd),
         Cmd::Workspace { cmd } => workspace::run(ctx, cmd),
         Cmd::Hub { cmd } => hub::run(ctx, cmd),
+        Cmd::Sync { watch } => sync::sync(ctx, sync::SyncArgs { watch }),
         Cmd::Ticket { cmd } => Ok(legacy_ticket(cmd)?),
         Cmd::Backup { to, restore, cmd } => match cmd {
             Some(BackupCmd::InstallTimer { dir, no_load }) => {

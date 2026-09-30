@@ -6,12 +6,15 @@
 //!    hub will create its tables in it);
 //! 2. a `postgres` container started with docker (removed afterwards);
 //! 3. neither — database-backed tests are skipped with a message.
+//!
+//! Another crate's tests (`crates/pm/tests/sync.rs`, AGT-1395) include
+//! this file with `#[path]`; [`hub_bin`] finds the hub binary either way.
 
 #![allow(dead_code)] // each test binary uses a different subset
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -128,8 +131,40 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// The `pm-hub` binary under test. In pm-hub's own test suite Cargo names
+/// it; in another crate's (this file included by `#[path]`) it is the
+/// sibling of that crate's test binary's profile directory
+/// (`target/<profile>/pm-hub`), built on demand so it is never stale —
+/// `cargo test -p pm` alone would not otherwise build it. The nested
+/// `cargo build` is fine: Cargo releases the build-directory lock before
+/// it runs test binaries.
+pub fn hub_bin() -> PathBuf {
+    if let Some(named) = option_env!("CARGO_BIN_EXE_pm-hub") {
+        return PathBuf::from(named);
+    }
+    let exe = std::env::current_exe().expect("the test binary's path");
+    // target/<profile>/deps/<test>-<hash> -> target/<profile>
+    let profile_dir = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("the test binary lives under target/<profile>/deps");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut build = Command::new(cargo);
+    build.args(["build", "-p", "pm-hub"]);
+    if profile_dir.file_name().is_some_and(|p| p == "release") {
+        build.arg("--release");
+    }
+    let out = build.output().expect("running cargo build -p pm-hub");
+    assert!(
+        out.status.success(),
+        "cargo build -p pm-hub failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    profile_dir.join(format!("pm-hub{}", std::env::consts::EXE_SUFFIX))
+}
+
 pub fn spawn_hub(database_url: &str, port: u16) -> Hub {
-    Hub(Command::new(env!("CARGO_BIN_EXE_pm-hub"))
+    Hub(Command::new(hub_bin())
         .env("DATABASE_URL", database_url)
         .env("PORT", port.to_string())
         .stdout(Stdio::null())
@@ -266,7 +301,7 @@ pub fn request_body(
 
 /// Runs `pm-hub <args>` against `database_url`: `(success, stdout, stderr)`.
 pub fn admin(database_url: &str, args: &[&str]) -> (bool, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_pm-hub"))
+    let out = Command::new(hub_bin())
         .env("DATABASE_URL", database_url)
         .args(args)
         .output()
