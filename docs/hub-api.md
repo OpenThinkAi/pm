@@ -160,9 +160,9 @@ to `pm_hub_app`'s (`crates/pm-hub/tests/health.rs`
 this). The default privileges are tied to the role that runs the
 migrations: if that role changes, re-run the grants for it.
 
-**Health checks.** Railway gates traffic on its own probe of `/health`
-(`railway.toml` `healthcheckPath`) and ignores a Dockerfile
-`HEALTHCHECK`. The image also declares `HEALTHCHECK CMD ["pm-hub",
+**Health checks.** Railway ignores a Dockerfile `HEALTHCHECK` and config-as-code
+(`railway.toml`); it gates traffic on `/health` only when the service's
+Healthcheck Path setting is `/health` (Settings → Deploy in the dashboard). The image also declares `HEALTHCHECK CMD ["pm-hub",
 "healthcheck"]` for `docker run` and other runtimes: that subcommand
 GETs `http://localhost:$PORT/health` (IPv4, then IPv6 loopback) and
 exits 0 only on a 200 — the image has no curl.

@@ -1,7 +1,9 @@
 # pm-hub image (AGT-1387). Build context is the workspace root, since the
 # hub links sibling crates:
 #   docker build -f crates/pm-hub/Dockerfile .
-# Railway picks this file up through the root railway.toml.
+# Railway builds this file because the hub service sets
+# RAILWAY_DOCKERFILE_PATH=crates/pm-hub/Dockerfile (config-as-code files are
+# ignored by Railway).
 
 # Same toolchain as the repo's stamp required_checks.
 # Base images are pinned by digest (AGT-1452): a moved tag can't change what
@@ -27,7 +29,7 @@ USER nobody
 # docs/hub-api.md §Deployment) come from the service's environment.
 # `pm-hub healthcheck` GETs the local /health (the image has no curl).
 # Railway ignores HEALTHCHECK and gates traffic on its own probe of
-# /health (railway.toml healthcheckPath); this one serves `docker run`
+# /health (the service's Healthcheck Path setting); this one serves `docker run`
 # and any other runtime.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD ["pm-hub", "healthcheck"]
