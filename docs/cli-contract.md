@@ -209,14 +209,14 @@ Creates a workspace database. Presets are data, not flavors of code path —
 starting with a letter — else exit `2`) always overrides that preset's
 default prefix when given.
 
-Every config write in the CLI is an op (AGT-1385/1386): `pm init` commits
-`workspace.set` / `state.upsert` ops, `pm project new` a `project.create`
-(+ `project.set repo_add`), `pm workspace gate-label` a `workspace.set`,
-`pm archive --auto`'s project retire a `project.set status`, and
-`pm project delete` a `project.delete`; `pm log` (no id) lists them. The
-only direct config-table writes left are the allocator floor
-(`workspace.number_floor`) and document identity (`project.doc_id`,
-`project_doc.doc_id`).
+Every config write in the CLI is an op (AGT-1385/1386/1413): `pm init`
+commits `workspace.set` / `state.upsert` ops, `pm project new` a
+`project.create` carrying the design doc's `doc_id` (+ `project.set
+repo_add`), `pm project doc add` a `project.doc_add` binding the new
+document's `doc_id`, `pm workspace gate-label` a `workspace.set`, `pm
+archive --auto`'s project retire a `project.set status`, and `pm project
+delete` a `project.delete`; `pm log` (no id) lists them. The only direct
+config-table write left is the allocator floor (`workspace.number_floor`).
 
 - `--preset default` (the default when `--preset` is omitted): a neutral
   workspace for outside users. Prefix `PM`. States `backlog` (category
@@ -464,9 +464,10 @@ across flags; `--held` (only tickets with a hold set); `--search <TEXT>`
 No flags beyond the globals. With an `<ID>`, that ticket's ops. With none
 (AGT-1386), the workspace's **config ops** instead — every
 `workspace.set`, `state.upsert`, `actor.upsert`, `project.create`,
-`project.set` and `project.delete`, oldest first, in the same shape; a
-`project.set` / `project.delete` summary names the project by its slug
-(from its `project.create` in the same listing).
+`project.set`, `project.delete` and `project.doc_add` (AGT-1413), oldest
+first, in the same shape; a `project.set` / `project.delete` /
+`project.doc_add` summary names the project by its slug (from its
+`project.create` in the same listing).
 
 - `--json`: a bare JSON array, oldest op first:
   ```jsonc
@@ -482,7 +483,8 @@ No flags beyond the globals. With an `<ID>`, that ticket's ops. With none
             | "body.edit" | "tombstone"
             // `pm log` with no <ID> (config ops, AGT-1386):
             | "workspace.set" | "state.upsert" | "actor.upsert"
-            | "project.create" | "project.set" | "project.delete",
+            | "project.create" | "project.set" | "project.delete"
+            | "project.doc_add",
       "summary": "string"   // one-line human description; relation endpoints are raw ULIDs, not display ids
     },
     ...
@@ -864,8 +866,8 @@ No flags beyond the globals. Same `$EDITOR`/`$VISUAL`/`vi` launch and
 no-TTY-fails-fast behavior as `pm edit`; edits the design doc (`doc`), not
 a named document.
 
-- Exit `1`: the project has no design doc to edit (should not happen for
-  a project made through `pm project new`); the editor aborts.
+- Exit `1`: the project has no design doc bound yet (only a project
+  pulled from a replica whose binding has not synced); the editor aborts.
 - `--json`: **Project** (as it reads after the save commits, or
   unchanged).
 

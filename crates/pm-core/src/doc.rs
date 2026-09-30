@@ -65,6 +65,11 @@ pub enum DocApplyError {
         #[source]
         source: BodyError,
     },
+    /// [`apply_doc_persisted`] only: the update builds on edits this view
+    /// has not seen yet (AGT-1413). A caller that pulls edits in any order
+    /// retries it once they have landed.
+    #[error("op {op_id}: the edit builds on document history not seen yet")]
+    MissingDependency { op_id: Ulid },
 }
 
 /// Fold `op` into `view`. Pure and idempotent, the document analogue of
@@ -72,6 +77,20 @@ pub enum DocApplyError {
 /// unchanged, and replaying every op for a document in any order converges
 /// (the text CRDT's own guarantee).
 pub fn apply_doc(view: &mut DocView, op: &Op) -> Result<(), DocApplyError> {
+    fold(view, op, false)
+}
+
+/// [`apply_doc`] for a caller that persists the view between ops
+/// (pm-store): an update whose causal dependencies the view has not seen
+/// is refused with [`DocApplyError::MissingDependency`] rather than
+/// queued, since a persisted view (its [`BodyState`] snapshot) keeps no
+/// queue and the update would silently be lost. On that error `view` has
+/// taken the update into its in-memory queue — discard it.
+pub fn apply_doc_persisted(view: &mut DocView, op: &Op) -> Result<(), DocApplyError> {
+    fold(view, op, true)
+}
+
+fn fold(view: &mut DocView, op: &Op, persisted: bool) -> Result<(), DocApplyError> {
     if op.entity != view.id {
         return Err(DocApplyError::EntityMismatch {
             op_id: op.op_id,
@@ -81,12 +100,16 @@ pub fn apply_doc(view: &mut DocView, op: &Op) -> Result<(), DocApplyError> {
     }
     match &op.payload {
         Payload::BodyEdit(b) => {
-            view.body
-                .apply(&BodyUpdate::from_bytes(b.update.clone()))
+            let awaiting = view
+                .body
+                .apply_awaiting(&BodyUpdate::from_bytes(b.update.clone()))
                 .map_err(|source| DocApplyError::BodyImport {
                     op_id: op.op_id,
                     source,
                 })?;
+            if awaiting && persisted {
+                return Err(DocApplyError::MissingDependency { op_id: op.op_id });
+            }
         }
         other => {
             return Err(DocApplyError::WrongKind {
@@ -227,6 +250,36 @@ mod tests {
 
         assert_eq!(forward.text(), "v1 v2");
         assert_eq!(forward.text(), reverse.text());
+    }
+
+    /// AGT-1413: in memory an edit ahead of its history is queued; the
+    /// persisted fold refuses it instead, since a serialized view would
+    /// drop the queue.
+    #[test]
+    fn the_persisted_fold_refuses_an_edit_ahead_of_its_history() {
+        let doc = Ulid::new();
+        let mut a = Body::new();
+        let first = a.diff_from_text("v1").unwrap();
+        let second = a.diff_from_text("v1 v2").unwrap();
+        let edit = |wall, u: crate::BodyUpdate| {
+            op(
+                doc,
+                wall,
+                Payload::BodyEdit(BodyEdit {
+                    update: u.into_bytes(),
+                }),
+            )
+        };
+        let (first, second) = (edit(1, first), edit(2, second));
+
+        let mut view = DocView::new(doc);
+        let err = apply_doc_persisted(&mut view, &second).unwrap_err();
+        assert!(matches!(err, DocApplyError::MissingDependency { .. }));
+
+        let mut view = DocView::new(doc);
+        apply_doc_persisted(&mut view, &first).unwrap();
+        apply_doc_persisted(&mut view, &second).unwrap();
+        assert_eq!(view.text(), "v1 v2");
     }
 
     #[test]

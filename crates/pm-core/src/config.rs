@@ -14,12 +14,16 @@
 //!   `state.upsert` and `actor.upsert`. States and actors are name-keyed
 //!   children of the workspace (one LWW register each), the way `ext`
 //!   keys are of a ticket.
-//! - [`ProjectView`], keyed by a per-project Ulid, folds `project.create`
-//!   and `project.set`. The kebab-case id (`pm`) is a register set by the
-//!   create, as a ticket's human number is separate from its Ulid.
+//! - [`ProjectView`], keyed by a per-project Ulid, folds `project.create`,
+//!   `project.set`, `project.delete` and `project.doc_add`. The kebab-case
+//!   id (`pm`) is a register set by the create, as a ticket's human
+//!   number is separate from its Ulid.
 //!
 //! Document bodies stay where they are: a project's design doc and named
-//! documents are [`crate::doc::DocView`]s under their own `doc_id`s.
+//! documents are [`crate::doc::DocView`]s under their own `doc_id`s. What
+//! the project view holds since AGT-1413 is their *identity* — which
+//! `doc_id` is the design doc and which is each named document
+//! ([`DocClaims`]) — so it travels with the project's own ops.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -30,7 +34,7 @@ use ulid::Ulid;
 use crate::domain::{Actor, ActorId, ActorKind, Project, ProjectStatus, State, Workspace};
 use crate::hlc::Stamp;
 use crate::merge::{Lww, OrSet};
-use crate::op::{Op, Payload, ProjectSet, WorkspaceSet};
+use crate::op::{Op, Payload, ProjectDocAdd, ProjectSet, WorkspaceSet};
 
 /// The workspace's merge state: its config, states and actors.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +126,64 @@ pub struct ProjectView {
     /// of the order ops arrive in.
     #[serde(default)]
     pub deleted_at: Option<Stamp>,
+    /// The design doc's identity (AGT-1413): a `project.create`'s
+    /// `doc_id`, or a `project.doc_add` without a name.
+    #[serde(default)]
+    pub design_doc: DocClaims,
+    /// Each named document's identity, by name (`project.doc_add`).
+    #[serde(default)]
+    pub documents: BTreeMap<String, DocClaims>,
+}
+
+/// Every `doc_id` ever bound to one document slot (the design doc, or one
+/// document name), with the earliest stamp that bound it. The slot's
+/// document is the earliest binding — [`DocClaims::winner`], by stamp
+/// then `doc_id` — so a document's identity never moves once made, and two
+/// replicas that bind the same slot offline converge on one id whatever
+/// order the ops arrive in. The losers stay listed: their `body.edit` ops
+/// are still documents' edits (a replica must route them as such) even
+/// though no row shows them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DocClaims(BTreeMap<Ulid, Stamp>);
+
+impl DocClaims {
+    /// Records that `stamp` bound `doc_id` to this slot; keeps the
+    /// earliest stamp per id, so re-applying an op changes nothing.
+    pub fn claim(&mut self, doc_id: Ulid, stamp: Stamp) {
+        match self.0.entry(doc_id) {
+            Entry::Vacant(slot) => {
+                slot.insert(stamp);
+            }
+            Entry::Occupied(mut slot) => {
+                if stamp < *slot.get() {
+                    slot.insert(stamp);
+                }
+            }
+        }
+    }
+
+    /// The slot's document: the earliest binding, `None` before any.
+    pub fn winner(&self) -> Option<Ulid> {
+        self.0
+            .iter()
+            .min_by(|(a_id, a), (b_id, b)| a.cmp(b).then_with(|| a_id.cmp(b_id)))
+            .map(|(id, _)| *id)
+    }
+
+    /// Whether `doc_id` was ever bound to this slot.
+    pub fn contains(&self, doc_id: Ulid) -> bool {
+        self.0.contains_key(&doc_id)
+    }
+
+    /// Every id ever bound to this slot, winner or not.
+    pub fn ids(&self) -> impl Iterator<Item = Ulid> + '_ {
+        self.0.keys().copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl ProjectView {
@@ -138,7 +200,29 @@ impl ProjectView {
             parent: Lww::default(),
             repos: OrSet::default(),
             deleted_at: None,
+            design_doc: DocClaims::default(),
+            documents: BTreeMap::new(),
         }
+    }
+
+    /// The design doc's `doc_id`, once one is bound.
+    pub fn design_doc_id(&self) -> Option<Ulid> {
+        self.design_doc.winner()
+    }
+
+    /// The named document `name`'s `doc_id`, once one is bound.
+    pub fn doc_id(&self, name: &str) -> Option<Ulid> {
+        self.documents.get(name).and_then(DocClaims::winner)
+    }
+
+    /// Every `doc_id` ever bound to one of this project's documents,
+    /// with its slot (`None` = the design doc) — winners and losers.
+    pub fn doc_ids(&self) -> impl Iterator<Item = (Option<&str>, Ulid)> + '_ {
+        self.design_doc.ids().map(|id| (None, id)).chain(
+            self.documents
+                .iter()
+                .flat_map(|(name, claims)| claims.ids().map(move |id| (Some(name.as_str()), id))),
+        )
     }
 
     /// The plain [`Project`]. The design doc and named documents are not
@@ -255,7 +339,18 @@ pub fn apply_project(view: &mut ProjectView, op: &Op) -> Result<(), ConfigApplyE
             view.title.set(c.title.clone(), stamp.clone());
             view.status.set(c.status, stamp.clone());
             view.parent.set(c.parent.clone(), stamp.clone());
+            if let Some(doc_id) = c.doc_id {
+                view.design_doc.claim(doc_id, stamp.clone());
+            }
         }
+        Payload::ProjectDocAdd(ProjectDocAdd { name, doc_id }) => match name {
+            None => view.design_doc.claim(*doc_id, stamp.clone()),
+            Some(name) => view
+                .documents
+                .entry(name.clone())
+                .or_default()
+                .claim(*doc_id, stamp.clone()),
+        },
         Payload::ProjectSet(field) => match field {
             ProjectSet::Title(v) => {
                 view.title.set(v.clone(), stamp.clone());
@@ -368,6 +463,7 @@ mod tests {
                 title: "pm".into(),
                 status: ProjectStatus::InProgress,
                 parent: None,
+                doc_id: None,
             }),
         )
     }
@@ -670,6 +766,54 @@ mod tests {
         assert_eq!(view.created, Some(create(id, 1).stamp()));
     }
 
+    /// AGT-1413: a document slot keeps its earliest binding, whichever
+    /// order the bindings arrive in, and remembers the losers.
+    #[test]
+    fn doc_identity_is_first_binding_wins_and_order_independent() {
+        let id = Ulid::new();
+        let (design, early, late) = (Ulid::new(), Ulid::new(), Ulid::new());
+        let mut with_doc = create(id, 1);
+        if let Payload::ProjectCreate(c) = &mut with_doc.payload {
+            c.doc_id = Some(design);
+        }
+        let add = |wall, actor: &str, name: Option<&str>, doc_id| {
+            op(
+                id,
+                wall,
+                actor,
+                Payload::ProjectDocAdd(ProjectDocAdd {
+                    name: name.map(str::to_string),
+                    doc_id,
+                }),
+            )
+        };
+        let ops = [
+            with_doc,
+            add(5, "zed", Some("notes"), late),
+            add(5, "amy", Some("notes"), early),
+            // A second design-doc binding, later than the create's.
+            add(9, "matt", None, Ulid::new()),
+        ];
+        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1]] {
+            let mut view = ProjectView::new(id);
+            for i in order {
+                apply_project(&mut view, &ops[i]).unwrap();
+                apply_project(&mut view, &ops[i]).unwrap();
+            }
+            assert_eq!(view.design_doc_id(), Some(design));
+            assert_eq!(view.doc_id("notes"), Some(early), "amy < zed at one hlc");
+            assert_eq!(view.doc_id("other"), None);
+            assert_eq!(view.doc_ids().count(), 4, "losers stay listed");
+        }
+        // A view stored before AGT-1413 (no identity keys) still loads.
+        let mut json = serde_json::to_value(ProjectView::new(id)).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("design_doc");
+        obj.remove("documents");
+        let back: ProjectView = serde_json::from_value(json).unwrap();
+        assert_eq!(back.design_doc_id(), None);
+    }
+
     #[test]
     fn project_delete_is_permanent_and_order_independent() {
         let id = Ulid::new();
@@ -782,7 +926,8 @@ mod tests {
         Stale(u32),
         State(u8, u8, u32),
         Actor(u8, bool),
-        Create(u8),
+        Create(u8, Option<u8>),
+        DocAdd(Option<u8>, u8),
         Title(u8),
         Status(u8),
         Parent(Option<u8>),
@@ -810,7 +955,8 @@ mod tests {
 
     fn project_spec() -> impl Strategy<Value = Spec> {
         prop_oneof![
-            any::<u8>().prop_map(Spec::Create),
+            (any::<u8>(), prop::option::of(0u8..3)).prop_map(|(t, d)| Spec::Create(t, d)),
+            (prop::option::of(0u8..2), 0u8..3).prop_map(|(n, d)| Spec::DocAdd(n, d)),
             any::<u8>().prop_map(Spec::Title),
             (0u8..3).prop_map(Spec::Status),
             prop::option::of(any::<u8>()).prop_map(Spec::Parent),
@@ -931,11 +1077,18 @@ mod tests {
                         ActorKind::Human
                     },
                 }),
-                Spec::Create(t) => Payload::ProjectCreate(ProjectCreate {
+                // A small pool of doc ids, so two slots and two bindings
+                // of one slot collide often.
+                Spec::Create(t, d) => Payload::ProjectCreate(ProjectCreate {
                     id: "p".into(),
                     title: t.to_string(),
                     status: ProjectStatus::InProgress,
                     parent: None,
+                    doc_id: d.map(|d| Ulid::from_parts(0, u128::from(d))),
+                }),
+                Spec::DocAdd(n, d) => Payload::ProjectDocAdd(crate::op::ProjectDocAdd {
+                    name: n.map(|n| format!("doc{n}")),
+                    doc_id: Ulid::from_parts(0, u128::from(*d)),
                 }),
                 Spec::Title(t) => Payload::ProjectSet(ProjectSet::Title(t.to_string())),
                 Spec::Status(s) => Payload::ProjectSet(ProjectSet::Status(status(*s))),
@@ -961,7 +1114,10 @@ mod tests {
             let op = Op::new(Ulid::new(), stamp.hlc, stamp.actor, entity, payload);
             if matches!(
                 op.payload,
-                Payload::ProjectCreate(_) | Payload::ProjectSet(_) | Payload::ProjectDelete
+                Payload::ProjectCreate(_)
+                    | Payload::ProjectSet(_)
+                    | Payload::ProjectDelete
+                    | Payload::ProjectDocAdd(_)
             ) {
                 project.push(op);
             } else {

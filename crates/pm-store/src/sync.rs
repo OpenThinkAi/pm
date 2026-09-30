@@ -20,7 +20,7 @@
 //! All of it is bookkeeping written directly, like `backup_target`: not
 //! derived from the op log, untouched by `pm doctor --rebuild`.
 
-use pm_core::{Op, Payload};
+use pm_core::{DocApplyError, Op, Payload};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use ulid::Ulid;
@@ -29,7 +29,7 @@ use crate::Store;
 use crate::codec::ulid;
 use crate::commit::commit_foreign_in;
 use crate::error::{Result, StoreError};
-use crate::project::commit_doc_edit_in;
+use crate::project::{commit_doc_edit_in, is_known_doc};
 use crate::query::read_ops;
 
 /// What [`Store::apply_pulled`] did with a batch.
@@ -236,10 +236,17 @@ fn outbox_len(conn: &Connection) -> Result<u64> {
 /// and config entities; a `body.edit` whose entity is a known document
 /// goes to the document path, and everything else — ticket kinds and the
 /// config kinds (AGT-1384: `workspace.set`, `state.upsert`,
-/// `actor.upsert`, `project.create`, `project.set`, `project.delete`, folded by
-/// [`crate::config`] since AGT-1385) — to [`commit_foreign_in`], which
-/// dispatches on the kind. The match lists every kind so a new one has to
-/// be routed here deliberately.
+/// `actor.upsert`, `project.create`, `project.set`, `project.delete`,
+/// `project.doc_add`, folded by [`crate::config`] since AGT-1385) — to
+/// [`commit_foreign_in`], which dispatches on the kind. The match lists
+/// every kind so a new one has to be routed here deliberately.
+///
+/// A document is "known" once any project has bound its id
+/// (`project_doc_owner`, AGT-1413), so a `body.edit` that arrives before
+/// the `project.create` / `project.doc_add` binding it falls through to the
+/// ticket path, fails as [`StoreError::UnknownTicket`] and defers until
+/// the binding lands; one whose binding lost to an earlier one, or whose
+/// project was deleted, is still a document edit and lands in the log.
 fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
     match &op.payload {
         Payload::BodyEdit(_) if is_known_doc(tx, op.entity)? => {
@@ -251,6 +258,7 @@ fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
         | Payload::ProjectCreate(_)
         | Payload::ProjectSet(_)
         | Payload::ProjectDelete
+        | Payload::ProjectDocAdd(_)
         | Payload::TicketCreate(_)
         | Payload::FieldSet(_)
         | Payload::LabelAdd(_)
@@ -270,19 +278,11 @@ fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
     Ok(())
 }
 
-fn is_known_doc(conn: &Connection, doc_id: Ulid) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM project WHERE doc_id = ?1)
-             OR EXISTS(SELECT 1 FROM project_doc WHERE doc_id = ?1)",
-        params![doc_id.to_string()],
-        |r| r.get(0),
-    )?)
-}
-
 /// Failures another op in the same batch may yet resolve: a missing
 /// ticket, relation target, document, project (by slug — a ticket's
-/// `project`, a project's `parent`), project entity (a `project.set`
-/// ahead of its `project.create`) or state.
+/// `project`, a project's `parent`), project entity (a `project.set` or
+/// `project.doc_add` ahead of its `project.create`) or state, or a
+/// document edit ahead of the edits it builds on (AGT-1413).
 fn is_dependency(e: &StoreError) -> bool {
     matches!(
         e,
@@ -292,6 +292,7 @@ fn is_dependency(e: &StoreError) -> bool {
             | StoreError::UnknownProject { .. }
             | StoreError::UnknownProjectEntity { .. }
             | StoreError::UnknownState { .. }
+            | StoreError::DocApply(DocApplyError::MissingDependency { .. })
     )
 }
 

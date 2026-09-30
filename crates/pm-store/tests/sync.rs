@@ -505,7 +505,10 @@ fn pulled_ops_interleaved_with_local_ones_keep_only_the_local_ones_outbox() {
 #[test]
 fn a_pulled_body_edit_on_a_project_document_takes_the_document_path() {
     let (_dir, mut store) = store();
-    let doc = store.add_named_doc("pm", "notes").unwrap();
+    let doc = store
+        .add_named_doc("pm", "notes", &ActorId::new("matt"))
+        .unwrap();
+    let local = store.outbox_len().unwrap();
     let mut body = Body::with_peer(9).unwrap();
     let update = body.diff_from_text("remote notes\n").unwrap();
     let edit = op(
@@ -521,7 +524,11 @@ fn a_pulled_body_edit_on_a_project_document_takes_the_document_path() {
         store.doc_view(doc).unwrap().unwrap().text(),
         "remote notes\n"
     );
-    assert_eq!(store.outbox_len().unwrap(), 0);
+    assert_eq!(
+        store.outbox_len().unwrap(),
+        local,
+        "only the local doc_add is outbox"
+    );
     assert!(store.doctor().unwrap().is_healthy());
 }
 
@@ -622,6 +629,7 @@ fn a_pulled_config_batch_folds_in_any_order_and_is_not_outbox() {
                 title: "pm-hub".into(),
                 status: ProjectStatus::InProgress,
                 parent: Some("pm".into()),
+                doc_id: None,
             }),
         ),
     ];

@@ -212,7 +212,7 @@ fn edit(ctx: &Ctx<'_>, id: &str) -> Result<()> {
     let project = store.project(id)?.ok_or_else(|| not_found(id))?;
     let doc_id = store.design_doc_id(id)?.ok_or_else(|| {
         CliError::error(format!(
-            "project '{id}' has no design doc to edit; recreate it with `pm project new` to get one"
+            "project '{id}' has no design doc bound yet (its binding has not synced here)"
         ))
     })?;
 
@@ -295,7 +295,7 @@ fn doc_add(ctx: &Ctx<'_>, id: &str, name: &str, from_file: &std::path::Path) -> 
 
     let (mut store, _ws) = ctx.open()?;
     store.project(id)?.ok_or_else(|| not_found(id))?;
-    let doc_id = store.add_named_doc(id, &name)?;
+    let doc_id = store.add_named_doc(id, &name, &actor)?;
 
     let mut body = Body::new();
     let update = body
