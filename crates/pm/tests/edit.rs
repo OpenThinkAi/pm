@@ -92,7 +92,7 @@ impl Sandbox {
             .env_clear()
             .env("HOME", self.home.path())
             .env("USER", "tester")
-            // Aborted edits keep their temp file; keep it in the sandbox.
+            // Temp dirs go in the sandbox.
             .env("TMPDIR", self.home.path())
             .env("PATH", "/usr/bin:/bin")
             .env("DISPLAY", ":0")

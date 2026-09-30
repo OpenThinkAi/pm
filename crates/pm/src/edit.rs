@@ -51,6 +51,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use pm_core::op::{BodyEdit, FieldSet, LabelAdd, LabelRemove};
@@ -174,7 +176,8 @@ pub(crate) fn ui_leaf_runtime(
         Choice::Fallback(note) => {
             if let Some(note) = note {
                 eprintln!(
-                    "{command}: {note}; using $EDITOR (set edit.view = \"editor\" to skip ui-leaf)"
+                    "{command}: {}; using $EDITOR (set edit.view = \"editor\" to skip ui-leaf)",
+                    crate::text::inline(&note)
                 );
             }
             Ok(None)
@@ -526,14 +529,46 @@ pub(crate) fn run_editor(path: &Path) -> Result<bool> {
         .filter_map(|k| std::env::var(k).ok())
         .find(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "vi".to_string());
-    let status = Command::new("sh")
+    // SIGINT/SIGTERM only set a flag (AGT-1468): the wait loop below sees
+    // it, stops the editor and returns, so the caller's `TempFile` drops
+    // and the private directory goes; dying on the default action would
+    // skip every destructor.
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut ids = Vec::new();
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        if let Ok(id) = signal_hook::flag::register(sig, Arc::clone(&stop)) {
+            ids.push(id);
+        }
+    }
+    let result = wait_editor(&editor, path, &stop);
+    for id in ids {
+        signal_hook::low_level::unregister(id);
+    }
+    result
+}
+
+fn wait_editor(editor: &str, path: &Path, stop: &AtomicBool) -> Result<bool> {
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(format!("{editor} \"$1\""))
         .arg("sh")
         .arg(path)
-        .status()
+        .spawn()
         .with_context(|| format!("running editor '{editor}'"))?;
-    Ok(status.success())
+    loop {
+        if let Some(status) = child.try_wait().context("waiting for the editor")? {
+            if stop.load(Ordering::Relaxed) {
+                return Err(CliError::error("edit interrupted; nothing was saved"));
+            }
+            return Ok(status.success());
+        }
+        if stop.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CliError::error("edit interrupted; nothing was saved"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 /// The file the editor sees after a save that did not parse: the error in
@@ -548,15 +583,26 @@ fn error_file(ws_id: &str, error: &str, saved: &str) -> String {
     out
 }
 
-/// A temp file the editor opens; removed on drop unless kept. `pub(crate)`
-/// alongside [`run_editor`], for the same reason.
+/// A temp file the editor opens (AGT-1468): it lives alone in a private
+/// directory (`0700`, fresh name) and is itself `0600`, so neither its
+/// name nor its contents are readable or guessable by another local user.
+/// The whole directory is removed on drop, which covers every exit path:
+/// a save, an abort, an editor failure, a propagated error and a panic
+/// (unwinding runs `Drop`). Signals are handled in [`run_editor`]. Nothing
+/// is ever kept: a rejected save's text is in the error message's hands,
+/// not in a file that outlives the command. `pub(crate)` alongside
+/// [`run_editor`], for the same reason.
 pub(crate) struct TempFile {
+    dir: PathBuf,
     path: PathBuf,
-    keep: bool,
 }
 
 impl TempFile {
     pub(crate) fn create(label: &str, contents: &str) -> Result<Self> {
+        Self::create_in(&std::env::temp_dir(), label, contents)
+    }
+
+    fn create_in(parent: &Path, label: &str, contents: &str) -> Result<Self> {
         // The label is a ticket or project id that may have arrived through
         // a synced op: keep it to plain filename characters.
         let label: String = label
@@ -570,17 +616,28 @@ impl TempFile {
             })
             .take(64)
             .collect();
-        let path = std::env::temp_dir().join(format!("pm-edit-{label}-{}.md", Ulid::new()));
+        let dir = parent.join(format!("pm-edit-{}", Ulid::new()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        // From here `guard` removes the directory if writing fails.
+        let guard = TempFile {
+            path: dir.join(format!("{label}.md")),
+            dir,
+        };
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options
-            .open(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
+            .open(&guard.path)
+            .with_context(|| format!("creating {}", guard.path.display()))?;
         std::io::Write::write_all(&mut file, contents.as_bytes())
-            .with_context(|| format!("writing {}", path.display()))?;
-        Ok(TempFile { path, keep: false })
+            .with_context(|| format!("writing {}", guard.path.display()))?;
+        Ok(guard)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -600,9 +657,7 @@ impl TempFile {
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        if !self.keep {
-            let _ = fs::remove_file(&self.path);
-        }
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -625,17 +680,17 @@ pub fn edit(ctx: &Ctx<'_>, reference: &str, view_flag: Option<View>) -> Result<(
     let original = render(&ws, &view)?;
     let before = parse(&original)
         .map_err(|e| CliError::error(format!("rendering {shown} for editing: {e}")))?;
-    let mut file = TempFile::create(&shown, &original)?;
+    let file = TempFile::create(&shown, &original)?;
 
     let mut written = original;
     let mut reopens = 0;
     let after = loop {
         if !run_editor(&file.path)? {
-            return Err(abort(&mut file, reopens, "the editor exited non-zero"));
+            return Err(abort("the editor exited non-zero"));
         }
         let saved = file.read()?;
         if reopens > 0 && saved == written {
-            return Err(abort(&mut file, reopens, "the file was left unchanged"));
+            return Err(abort("the file was left unchanged"));
         }
         match parse(&saved).and_then(|p| validate(&store, &p).map(|()| p)) {
             Ok(parsed) => break parsed,
@@ -645,11 +700,9 @@ pub fn edit(ctx: &Ctx<'_>, reference: &str, view_flag: Option<View>) -> Result<(
                 file.write(&written)?;
             }
             Err(error) => {
-                file.keep = true;
                 return Err(CliError::error(format!(
                     "{shown}: gave up after {MAX_REOPENS} failed saves: {error}; \
-                     nothing was saved (your edits are in {})",
-                    file.path.display()
+                     nothing was saved"
                 )));
             }
         }
@@ -692,18 +745,10 @@ fn validate(store: &Store, parsed: &Parsed) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Exit 1 with nothing saved. After a failed parse the user's text is
-/// worth keeping, so the temp file stays and the message says where.
-fn abort(file: &mut TempFile, reopens: usize, why: &str) -> CliError {
-    if reopens > 0 {
-        file.keep = true;
-        CliError::error(format!(
-            "edit aborted ({why}); nothing was saved (your edits are in {})",
-            file.path.display()
-        ))
-    } else {
-        CliError::error(format!("edit aborted ({why}); nothing was saved"))
-    }
+/// Exit 1 with nothing saved; the temp file goes with the caller's
+/// `TempFile`.
+fn abort(why: &str) -> CliError {
+    CliError::error(format!("edit aborted ({why}); nothing was saved"))
 }
 
 #[cfg(test)]
@@ -1048,5 +1093,62 @@ mod tests {
         );
         let t = converge(id, &base, &one, &two);
         assert_eq!(t.description, "ALPHA\nbeta\ngamma\nomega");
+    }
+
+    // ---- temp-file hygiene (AGT-1468)
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_file_is_private_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let file = TempFile::create_in(parent.path(), "AGT-1", "secret").unwrap();
+        let dir = file.path().parent().unwrap().to_path_buf();
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(file.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(file.read().unwrap(), "secret");
+        drop(file);
+        assert!(!dir.exists());
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn temp_file_is_removed_on_panic() {
+        let parent = tempfile::tempdir().unwrap();
+        let p = parent.path().to_path_buf();
+        let r = std::panic::catch_unwind(move || {
+            let _file = TempFile::create_in(&p, "AGT-1", "x").unwrap();
+            panic!("boom");
+        });
+        assert!(r.is_err());
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_failure_and_signals_leave_no_temp_file() {
+        let parent = tempfile::tempdir().unwrap();
+        // A failing editor: Ok(false), then the drop removes everything.
+        {
+            let file = TempFile::create_in(parent.path(), "AGT-2", "x").unwrap();
+            let stop = AtomicBool::new(false);
+            assert!(!wait_editor("false", file.path(), &stop).unwrap());
+        }
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        // A stop request kills a long-running editor and errors out.
+        {
+            let file = TempFile::create_in(parent.path(), "AGT-3", "x").unwrap();
+            let stop = AtomicBool::new(true);
+            let started = std::time::Instant::now();
+            assert!(wait_editor("sleep 30; true", file.path(), &stop).is_err());
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        }
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
     }
 }

@@ -203,7 +203,7 @@ pub fn load_dir(dir: &Path) -> anyhow::Result<Vec<Ticket>> {
         } else if path.extension().is_some_and(|e| e == "md") {
             match Ticket::load(&path) {
                 Ok(t) => tickets.push(t),
-                Err(e) => eprintln!("warning: {e:#}"),
+                Err(e) => eprintln!("warning: {}", crate::text::printable(&format!("{e:#}"))),
             }
         }
     }

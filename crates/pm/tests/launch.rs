@@ -620,7 +620,7 @@ fn no_display_uses_the_editor_quietly_unless_ui_leaf_was_asked_for() {
 fn an_unpinned_ui_leaf_is_not_launched() {
     let sb = Sandbox::new();
     let editor = sb.editor();
-    for version in ["2.0.0", "1.5.1"] {
+    for version in ["2.0.0", "1.7.0", "1.5.1"] {
         let out = sb.run(
             &["edit", "AGT-1", "--view=ui-leaf"],
             &[
@@ -636,7 +636,7 @@ fn an_unpinned_ui_leaf_is_not_launched() {
         );
     }
     assert!(!sb.was_mounted());
-    assert_eq!(sb.editor_runs(), 2);
+    assert_eq!(sb.editor_runs(), 3);
 }
 
 #[test]

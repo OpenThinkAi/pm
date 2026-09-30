@@ -20,10 +20,11 @@
 //! a compromised npm release still passes.
 //!
 //! **Pinned** means: `<runtime> --version` reports a version in
-//! [`PIN_MIN`]`..<`[`PIN_NEXT_MAJOR`]`.0.0`. The lower bound is the ui-leaf
-//! these views and this driver were built and tested against; the upper
-//! bound is ui-leaf's wire protocol `"1"`, which only a new major version
-//! may break. Anything else is treated as missing (with a note), never
+//! [`PIN_MIN`]`..<`[`PIN_BELOW`] — exactly the verified minor (AGT-1468).
+//! The runtime is handed pm's API token, so a release nobody has tested
+//! (or a hijacked one) must not launch after a routine `npm i -g`: a new
+//! minor is adopted only by bumping the pin (docs/app-api.md §Bumping the
+//! ui-leaf pin). Anything else is treated as missing (with a note), never
 //! launched.
 //!
 //! **A display.** ui-leaf's own `UI_LEAF_NO_OPEN` wins: truthy means no
@@ -69,10 +70,10 @@ use crate::verbs::SCHEMA;
 use crate::workspace::{Config, Env};
 
 /// The oldest ui-leaf pm launches: the release these views were built
-/// and tested against.
+/// and tested against (verified against 1.6.0).
 pub(crate) const PIN_MIN: (u64, u64, u64) = (1, 6, 0);
-/// The first ui-leaf major pm does not launch (its wire protocol is `"1"`).
-pub(crate) const PIN_NEXT_MAJOR: u64 = 2;
+/// The first ui-leaf version pm does not launch: the next minor.
+pub(crate) const PIN_BELOW: (u64, u64, u64) = (1, 7, 0);
 
 /// How long `ui-leaf --version` may take (the npm shim starts Node).
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -133,12 +134,14 @@ impl fmt::Display for Missing {
             }
             Missing::Unpinned { path, version } => write!(
                 f,
-                "ui-leaf {version} at {} is outside the supported range >={}.{}.{}, <{}.0.0",
+                "ui-leaf {version} at {} is outside the supported range >={}.{}.{}, <{}.{}.{}",
                 path.display(),
                 PIN_MIN.0,
                 PIN_MIN.1,
                 PIN_MIN.2,
-                PIN_NEXT_MAJOR
+                PIN_BELOW.0,
+                PIN_BELOW.1,
+                PIN_BELOW.2
             ),
         }
     }
@@ -161,9 +164,9 @@ pub(crate) fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-/// Inside the pin: `>= PIN_MIN, < PIN_NEXT_MAJOR.0.0`.
+/// Inside the pin: `>= PIN_MIN, < PIN_BELOW`.
 pub(crate) fn pinned(version: (u64, u64, u64)) -> bool {
-    version >= PIN_MIN && version.0 < PIN_NEXT_MAJOR
+    version >= PIN_MIN && version < PIN_BELOW
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -592,13 +595,15 @@ mod tests {
     }
 
     #[test]
-    fn the_pin_is_min_up_to_the_next_major() {
+    fn the_pin_is_exactly_the_verified_minor() {
         assert!(pinned(PIN_MIN));
         assert!(pinned((1, 6, 1)));
-        assert!(pinned((1, 99, 0)));
+        assert!(pinned((1, 6, 99)));
+        assert!(!pinned((1, 7, 0)));
+        assert!(!pinned((1, 99, 0)));
         assert!(!pinned((1, 5, 9)));
         assert!(!pinned((0, 8, 4)));
-        assert!(!pinned((PIN_NEXT_MAJOR, 0, 0)));
+        assert!(!pinned((2, 0, 0)));
     }
 
     #[cfg(unix)]
@@ -728,7 +733,7 @@ mod tests {
         );
         let old = script(tmp.path(), "old", "echo 1.5.1");
         assert!(matches!(probe(old), Err(Missing::Unpinned { version, .. }) if version == "1.5.1"));
-        let next = script(tmp.path(), "next", "echo 2.0.0");
+        let next = script(tmp.path(), "next", "echo 1.7.0");
         assert!(matches!(probe(next), Err(Missing::Unpinned { .. })));
         let garbage = script(tmp.path(), "garbage", "echo hello");
         assert!(matches!(probe(garbage), Err(Missing::Unrunnable { .. })));
@@ -816,7 +821,7 @@ mod tests {
             panic!()
         };
         assert!(
-            note.contains("2.1.0") && note.contains(">=1.6.0, <2.0.0"),
+            note.contains("2.1.0") && note.contains(">=1.6.0, <1.7.0"),
             "{note}"
         );
     }

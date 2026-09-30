@@ -685,10 +685,10 @@ fn legacy_ticket(cmd: TicketCmd) -> anyhow::Result<()> {
             let t = Ticket::load(&path)?;
             let project = t.project.as_deref().unwrap_or("-");
             println!("id:       {}", t.id);
-            println!("title:    {}", t.title);
+            println!("title:    {}", text::inline(&t.title));
             println!("state:    {}", t.state);
             println!("priority: {}", t.priority);
-            println!("project:  {project}");
+            println!("project:  {}", text::inline(project));
         }
     }
     Ok(())

@@ -238,7 +238,10 @@ pub fn app(ctx: &Ctx<'_>, args: AppArgs) -> Result<()> {
         ),
         Choice::Fallback(note) => {
             if let Some(note) = note {
-                eprintln!("pm app: {note}; serving the API only");
+                eprintln!(
+                    "pm app: {}; serving the API only",
+                    crate::text::inline(&note)
+                );
             }
             (Mode::Headless, HEADLESS_IDLE_SECS)
         }

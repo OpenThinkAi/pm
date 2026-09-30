@@ -163,12 +163,12 @@ pub(crate) fn ensure_seeded(
     if resumed {
         eprintln!(
             "seed: resuming the seed of hub workspace {}: {to_push} of {op_count} op(s) still to push",
-            hub.workspace
+            crate::text::inline(&hub.workspace)
         );
     } else {
         eprintln!(
             "seed: seeding hub workspace {} with {op_count} op(s)",
-            hub.workspace
+            crate::text::inline(&hub.workspace)
         );
     }
     // Config ops first — the order `pm doctor` replays in. Migrations

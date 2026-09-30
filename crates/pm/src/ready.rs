@@ -76,7 +76,7 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
             if models.is_empty() {
                 "-".to_string()
             } else {
-                models.join(",")
+                crate::text::inline(&models.join(","))
             },
             crate::text::inline(t.project.as_deref().unwrap_or("-")),
             crate::text::inline(&t.title),
@@ -87,11 +87,15 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
         let ex_w = frontier
             .excluded
             .iter()
-            .map(|(name, _)| name.len())
+            .map(|(name, _)| crate::text::inline(name).len())
             .max()
             .unwrap_or(2);
         for (name, message) in &frontier.excluded {
-            println!("  {name:<ex_w$}  {}", crate::text::inline(message));
+            println!(
+                "  {:<ex_w$}  {}",
+                crate::text::inline(name),
+                crate::text::inline(message)
+            );
         }
     }
     Ok(())
