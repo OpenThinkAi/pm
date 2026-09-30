@@ -72,7 +72,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # HAND-EDIT (AGT-1372 audit): enforced supply-chain gate. plan,
+  # build-local-artifacts, host and publish-npm all `needs:` this job, so a
+  # new advisory, license or source violation blocks the release. Runs
+  # `cargo deny check` against deny.toml; needs network for the RustSec DB.
+  # cargo-deny is built from crates.io at an exact version with --locked.
+  deny:
+    runs-on: "ubuntu-22.04"
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.20.2
+      - name: cargo deny check
+        run: cargo deny check
+
   plan:
+    needs:
+      - deny
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
@@ -112,16 +133,18 @@ jobs:
             echo "@openthink/pm@${{ steps.version.outputs.version }} not on npm — proceeding."
           fi
 
-      - name: Install dist
+      # HAND-EDIT (AGT-1372 audit): dist generates an unverified
+      # `curl | sh` installer here and uploads the binary as a `cargo-dist-cache`
+      # artifact for later jobs. Instead every job that runs `dist` (plan,
+      # build-local-artifacts, build-global-artifacts, host) runs
+      # scripts/install-dist.sh, which downloads the pinned release tarball and
+      # checks it against a SHA-256 committed in the repo. No binary is passed
+      # between jobs, so the privileged `host` job never runs a dist binary it
+      # did not verify itself.
+      - name: Install dist (pinned, SHA-256 verified)
         if: steps.check_npm.outputs.published == 'false'
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
-      - name: Cache dist
-        if: steps.check_npm.outputs.published == 'false'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/dist
+        run: bash scripts/install-dist.sh
       - id: plan
         if: steps.check_npm.outputs.published == 'false'
         run: |
@@ -141,6 +164,7 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
+      - deny
     # PATCHED: gate on `publishing` first (short-circuits the JSON parse
     # when the npm gate skipped, so val is empty). Also dropped the
     # pr_run_mode === 'upload' fallback since we no longer trigger on PRs.
@@ -179,8 +203,12 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+      # HAND-EDIT (AGT-1372 audit): dist emits `${{ matrix.install_dist.run }}`
+      # (an unverified curl | sh from the plan JSON). Use the pinned,
+      # SHA-256-verified installer instead; see the plan job.
+      - name: Install dist (pinned, SHA-256 verified)
+        shell: bash
+        run: bash scripts/install-dist.sh
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -237,12 +265,11 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install cached dist
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-      - run: chmod +x ~/.cargo/bin/dist
+      # HAND-EDIT (AGT-1372 audit): dist downloads a `cargo-dist-cache`
+      # artifact built by the plan job here. Re-install and re-verify instead.
+      - name: Install dist (pinned, SHA-256 verified)
+        shell: bash
+        run: bash scripts/install-dist.sh
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -275,8 +302,10 @@ jobs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
+      - deny
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    # HAND-EDIT: also require the cargo-deny gate to have passed.
+    if: ${{ always() && needs.deny.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
@@ -295,12 +324,11 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install cached dist
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-      - run: chmod +x ~/.cargo/bin/dist
+      # HAND-EDIT (AGT-1372 audit): dist downloads a `cargo-dist-cache`
+      # artifact built by the plan job here. Re-install and re-verify instead.
+      - name: Install dist (pinned, SHA-256 verified)
+        shell: bash
+        run: bash scripts/install-dist.sh
       # Fetch artifacts from scratch-storage
       - name: Fetch artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -362,11 +390,18 @@ jobs:
   #   4. --provenance                 (attaches an SLSA build attestation)
   #   5. NODE_AUTH_TOKEN env removed  (OIDC supplies the credential)
   #   6. GH_TOKEN env removed         (nothing here calls the GitHub API)
+  #   7. environment: npm-publish     (protected deployment environment;
+  #      the npm Trusted Publisher is bound to this name, so the OIDC token
+  #      is only accepted for runs that passed the environment's rules.
+  #      Must exist in GitHub repo settings; see RELEASING.md)
+  #   8. needs: deny                  (cargo-deny gate)
   publish-npm:
     needs:
       - plan
       - host
+      - deny
     runs-on: "ubuntu-22.04"
+    environment: npm-publish
     permissions:
       contents: read
       id-token: write

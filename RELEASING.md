@@ -19,6 +19,9 @@ version in `Cargo.toml`. Nobody pushes tags, runs `gh release`, or runs
 
 3. The stamp server mirrors `main` to GitHub. The push to `main` triggers
    `release.yml`, which:
+   - **deny** — `cargo deny check` (advisories, licenses, bans, sources).
+     `plan`, `build-local-artifacts`, `host` and `publish-npm` all `needs:`
+     it, so a violation blocks the release.
    - **plan** — reads the version from `Cargo.toml`. If
      `@openthink/pm@<version>` is already on npm, every later job is
      skipped, so pushes that don't bump the version are no-ops.
@@ -54,9 +57,17 @@ Listed so they can be checked or recreated.
 
 - **npm Trusted Publisher.** On npmjs.com: `@openthink/pm` → Settings →
   Trusted Publisher → GitHub Actions, with organization `OpenThinkAi`,
-  repository `pm`, workflow filename `release.yml`, environment left
-  blank. Trusted Publishing only works for a package that already exists; a
+  repository `pm`, workflow filename `release.yml`, **environment
+  `npm-publish`** (exactly that name; npm then rejects tokens from runs that
+  did not go through that environment). Trusted Publishing only works for a package that already exists; a
   brand-new package name needs one initial publish by an npm owner first.
+- **GitHub `npm-publish` environment.** `publish-npm` declares
+  `environment: npm-publish`. Create it under `OpenThinkAi/pm` → Settings →
+  Environments → New environment → `npm-publish`. Optionally add required
+  reviewers (a human approval gate before every publish) and restrict
+  deployment branches to `main`. Until the environment exists GitHub
+  auto-creates it with no rules, and the npm Trusted Publisher (which
+  requires this environment name) only accepts runs through it.
 - **GitHub repository settings.** `OpenThinkAi/pm` must be public (build
   provenance and anonymous release downloads need it). GitHub is a read-only
   mirror of the stamp server: add the `stamp-mirror-only` ruleset (block
@@ -92,6 +103,23 @@ dry run needs GitHub Actions, which only triggers from a push to `main` on
 the mirror; with the npm gate, any version not yet on npm will really
 publish. To rehearse without publishing, run the workflow from a fork with
 `publish-jobs` removed.
+
+## Supply-chain gate (cargo-deny)
+
+`deny.toml` is enforced by the `deny` job in `release.yml`. Run it locally
+before bumping a version (needs network for the RustSec advisory DB):
+
+```sh
+cargo install --locked cargo-deny --version 0.20.2   # once
+cargo deny check
+```
+
+Dev-dependencies are deliberately included in every check (no
+`exclude-dev`). The only dev-only finding, `yrs` -> `smallstr`
+(RUSTSEC-2026-0215, unmaintained), is ignored explicitly with a reason in
+`[advisories].ignore`. If a new advisory lands between releases the gate
+fails the release: fix or upgrade, or add a reasoned ignore in `deny.toml`
+through the normal stamp flow.
 
 ## Verifying a release
 
@@ -136,14 +164,29 @@ marked with a `HAND-EDIT` or `PATCHED` comment in the file:
 - the `Cargo.lock` check in `build-local-artifacts` (dist has no `--locked`
   setting and would otherwise silently update the lockfile);
 - `publish-npm`: OIDC (`id-token: write`, no `NODE_AUTH_TOKEN`), Node 22,
-  an exact pinned npm (`npx -y npm@<version>`) and `--provenance`.
+  an exact pinned npm (`npx -y npm@<version>`), `--provenance`, and
+  `environment: npm-publish` (must match the Trusted Publisher config);
+- the `deny` job, and `deny` in the `needs:` of `plan`,
+  `build-local-artifacts`, `host` (plus `needs.deny.result == 'success'` in
+  its `if`) and `publish-npm`;
+- dist install: every `Install dist` / `Install cached dist` step (plan,
+  build-local-artifacts, build-global-artifacts, host) runs
+  `bash scripts/install-dist.sh` (pinned version, tarball SHA-256 committed
+  in the script). dist's generated `curl | sh` installer, the
+  `matrix.install_dist.run` step and the `cargo-dist-cache` upload/download
+  (which carried one job's binary into the credentialed `host` job) are all
+  removed. Do not reintroduce the cache artifact. The container-only rustup
+  `curl | sh` step in build-local-artifacts never runs (all targets use
+  native runners); if a `container` target is ever added, pin that too.
 
 `allow-dirty = ["ci"]` in `Cargo.toml` stops dist from failing CI on this
 drift. Everything else — attestations in the `host` job, SHA-pinned Actions
 (`[workspace.metadata.dist.github-action-commits]`), `pr-run-mode = "skip"`
 — is dist configuration, so `dist generate` reproduces it.
 
-To upgrade dist or change its config: bump `cargo-dist-version`, run
+To upgrade dist or change its config: bump `cargo-dist-version` **and**
+`VERSION` plus the four SHA-256s in `scripts/install-dist.sh` (take them from
+the release's `sha256.sum`, and confirm by hashing the downloads), run
 `dist generate`, then use `git diff` to re-apply the marked patches that the
 regeneration dropped. To bump a pinned Action, update its SHA (and `# vX.Y.Z`
 comment) in both `github-action-commits` and `release.yml`; resolve a tag
