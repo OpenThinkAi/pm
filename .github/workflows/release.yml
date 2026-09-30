@@ -122,15 +122,28 @@ jobs:
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "pm version: $VERSION"
 
+      # HAND-EDIT (AGT-1372 audit r4): fail closed. Only a definite E404
+      # from the registry means "not published"; any other failure
+      # (network, registry 5xx, auth, malformed output) fails the job so a
+      # flaky lookup can never start a release. Version goes via env.
       - name: check if already on npm
         id: check_npm
+        env:
+          PM_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          if npm view "@openthink/pm@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
+          if out=$(npm view "@openthink/pm@${PM_VERSION}" version --json 2>/dev/null); then
             echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "@openthink/pm@${{ steps.version.outputs.version }} already on npm — skipping release."
+            echo "@openthink/pm@${PM_VERSION} already on npm — skipping release."
           else
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            echo "@openthink/pm@${{ steps.version.outputs.version }} not on npm — proceeding."
+            code=$(printf '%s' "$out" | jq -r '.error.code // empty' 2>/dev/null || true)
+            if [ "$code" = "E404" ]; then
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              echo "@openthink/pm@${PM_VERSION} not on npm (E404) — proceeding."
+            else
+              echo "npm view failed with code '${code:-unknown}', not E404; refusing to release." >&2
+              printf '%s\n' "$out" >&2
+              exit 1
+            fi
           fi
 
       # HAND-EDIT (AGT-1372 audit): dist generates an unverified
@@ -218,9 +231,16 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      # HAND-EDIT (AGT-1372 audit r4): plan-derived `packages_install` is
+      # passed via env and run from a quoted variable, never interpolated
+      # into the script text. (musl needs `musl-tools`, so the step stays.)
       - name: Install dependencies
+        env:
+          PACKAGES_INSTALL: ${{ matrix.packages_install }}
         run: |
-          ${{ matrix.packages_install }}
+          if [ -n "$PACKAGES_INSTALL" ]; then
+            bash -c "$PACKAGES_INSTALL"
+          fi
       # HAND-EDIT: dist has no setting to pass `--locked` to `cargo build`,
       # and will silently rewrite a stale Cargo.lock. Fail here instead, so
       # release binaries are always built from the committed lockfile.

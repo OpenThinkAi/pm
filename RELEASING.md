@@ -195,6 +195,12 @@ marked with a `HAND-EDIT` or `PATCHED` comment in the file:
   `container:` key on build-local-artifacts are removed (no pm target uses
   a container). If a `container` target is ever added, reinstate it with a
   pinned, checksum-verified rustup-init;
+- `plan`: the npm "already published" gate fails closed. Only an `E404`
+  from `npm view --json` means "not published"; any other error fails the
+  job. The version is passed via `env:`, not interpolated;
+- `build-global-artifacts` / `build-local-artifacts`: `matrix.packages_install`
+  is passed via `env:` and run as a quoted variable, not interpolated into
+  the `run:` script;
 - `host`: `environment: release`, so the job holding `contents: write`,
   `id-token` and attestations is gated by environment rules.
 
