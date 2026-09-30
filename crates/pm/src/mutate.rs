@@ -11,8 +11,10 @@
 use std::fs;
 use std::io::Read as _;
 
-use pm_core::op::{CommentAdd, FieldSet, LabelAdd, LabelRemove, StateTransition};
-use pm_core::{Payload, StateCategory};
+use pm_core::op::{
+    CommentAdd, FieldSet, LabelAdd, LabelRemove, RelationAdd, RelationRemove, StateTransition,
+};
+use pm_core::{Payload, Relation, RelationKind, StateCategory};
 use serde_json::Value;
 
 use crate::exit::{CliError, Result};
@@ -77,6 +79,144 @@ pub fn label(ctx: &Ctx<'_>, reference: &str, changes: &[String]) -> Result<()> {
         })
         .collect();
     store.commit_batch(&ops, &[])?;
+    print_ticket(ctx, &store, &ws, ticket.id)
+}
+
+// -------------------------------------------------------------- pm relate
+
+/// `pm relate AGT-N --blocked-by X,Y --unblock Z` (AGT-1383): edits the
+/// blockers of an existing ticket. `--blocked-by X` emits a `relation.add`
+/// for `X blocks N`; `--unblock Z` emits a `relation.remove` citing the
+/// add-tags this replica observes for `Z blocks N` (OR-set, add-wins).
+/// Every id is resolved before anything is written (unknown: exit 3), a
+/// ticket blocking itself is a usage error (exit 2), and so is an add
+/// that would close a blocker cycle — detected with
+/// `pm_core::check::blocker_cycles` over the graph as it would stand after
+/// the whole invocation. Adding an existing blocker or removing an absent
+/// one is a no-op, so the verb is idempotent. One `commit_batch`, so a
+/// multi-id invocation never lands partially.
+pub fn relate(
+    ctx: &Ctx<'_>,
+    reference: &str,
+    blocked_by: &[String],
+    unblock: &[String],
+) -> Result<()> {
+    if blocked_by.is_empty() && unblock.is_empty() {
+        return Err(CliError::usage(
+            "relate needs --blocked-by <ID>[,...] and/or --unblock <ID>[,...]",
+        ));
+    }
+    let actor = ctx.actor()?;
+    let (mut store, ws) = ctx.open()?;
+    let ticket = find(&store, &ws, reference)?;
+    let resolve = |refs: &[String]| -> Result<Vec<pm_core::Ticket>> {
+        let mut out: Vec<pm_core::Ticket> = Vec::new();
+        for r in refs {
+            let other = find(&store, &ws, r)?;
+            if !out.iter().any(|t| t.id == other.id) {
+                out.push(other);
+            }
+        }
+        Ok(out)
+    };
+    let to_add = resolve(blocked_by)?;
+    let to_remove = resolve(unblock)?;
+    for other in &to_add {
+        if other.id == ticket.id {
+            return Err(CliError::usage(format!(
+                "{} cannot be blocked by itself",
+                display_id(&ws, &ticket)
+            )));
+        }
+    }
+    if let Some(dup) = to_add
+        .iter()
+        .find(|a| to_remove.iter().any(|r| r.id == a.id))
+    {
+        return Err(CliError::usage(format!(
+            "{} is named by both --blocked-by and --unblock",
+            display_id(&ws, dup)
+        )));
+    }
+
+    let blocks = |from: ulid::Ulid| Relation {
+        kind: RelationKind::Blocks,
+        from,
+        to: ticket.id,
+    };
+    let view = store
+        .ticket_view(ticket.id)?
+        .ok_or_else(|| CliError::not_found(format!("no ticket {}", display_id(&ws, &ticket))))?;
+    let current: std::collections::BTreeSet<Relation> = store
+        .relations(ticket.id)?
+        .into_iter()
+        .filter(|r| r.kind == RelationKind::Blocks && r.to == ticket.id)
+        .collect();
+    let adds: Vec<Relation> = to_add
+        .iter()
+        .map(|t| blocks(t.id))
+        .filter(|r| !current.contains(r))
+        .collect();
+    let removes: Vec<Relation> = to_remove
+        .iter()
+        .map(|t| blocks(t.id))
+        .filter(|r| current.contains(r))
+        .collect();
+
+    // The blocker graph as it would stand afterwards: a cycle through a
+    // new edge (both endpoints in one component) refuses the whole call.
+    if !adds.is_empty() {
+        let mut edges: std::collections::BTreeSet<(ulid::Ulid, ulid::Ulid)> = store
+            .all_relations()?
+            .into_iter()
+            .filter(|r| r.kind == RelationKind::Blocks)
+            .map(|r| (r.from, r.to))
+            .collect();
+        for r in &removes {
+            edges.remove(&(r.from, r.to));
+        }
+        edges.extend(adds.iter().map(|r| (r.from, r.to)));
+        let edges: Vec<_> = edges.into_iter().collect();
+        for cycle in pm_core::check::blocker_cycles(&edges) {
+            if let Some(new) = adds
+                .iter()
+                .find(|r| cycle.contains(&r.from) && cycle.contains(&r.to))
+            {
+                let names: Vec<String> = cycle
+                    .iter()
+                    .map(|id| match store.ticket(*id) {
+                        Ok(Some(t)) => display_id(&ws, &t),
+                        _ => id.to_string(),
+                    })
+                    .collect();
+                let from = match store.ticket(new.from)? {
+                    Some(t) => display_id(&ws, &t),
+                    None => new.from.to_string(),
+                };
+                return Err(CliError::usage(format!(
+                    "{from} blocking {} would create a blocker cycle ({})",
+                    display_id(&ws, &ticket),
+                    names.join(", ")
+                )));
+            }
+        }
+    }
+
+    let mut stamper = Stamper::new(&store, actor)?;
+    let mut ops = Vec::new();
+    for relation in adds {
+        ops.push(stamper.op(ticket.id, Payload::RelationAdd(RelationAdd { relation })));
+    }
+    for relation in removes {
+        let observed = view.relations.observed(&relation);
+        ops.push(stamper.op(
+            ticket.id,
+            Payload::RelationRemove(RelationRemove { relation, observed }),
+        ));
+    }
+    if !ops.is_empty() {
+        store.commit_batch(&ops, &[])?;
+    }
     print_ticket(ctx, &store, &ws, ticket.id)
 }
 

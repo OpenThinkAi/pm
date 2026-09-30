@@ -580,6 +580,20 @@ fn every_verbs_json_output_matches_its_fixture() {
         0,
         &mut failures,
     );
+    // AGT-2 is already blocked by AGT-1 (`new_blocked_by`): unblock, then
+    // re-block, so later verbs see the graph unchanged.
+    cap(
+        "relate_unblock",
+        &["relate", "AGT-2", "--unblock", "AGT-1", "--json"],
+        0,
+        &mut failures,
+    );
+    cap(
+        "relate",
+        &["relate", "AGT-2", "--blocked-by", "AGT-1", "--json"],
+        0,
+        &mut failures,
+    );
     cap(
         "comment",
         &["comment", "AGT-1", "hello from the contract test", "--json"],
