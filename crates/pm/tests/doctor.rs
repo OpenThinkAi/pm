@@ -180,6 +180,14 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     assert!(text.contains("integrity       ok\n"), "{text}");
     assert!(text.contains("foreign keys    ok\n"), "{text}");
     assert!(text.contains("replay          ok"), "{text}");
+    // AGT-1393: nothing has been pushed, so the whole log is the outbox.
+    assert!(
+        text.contains(
+            "sync            outbox 9 op(s), pushed through seq 0, \
+             cursor 0 (never pulled), 0 ticket(s) awaiting a hub number\n"
+        ),
+        "{text}"
+    );
 
     let v = json(&sb.pm(&["doctor", "--json"]));
     assert_eq!(v["schema"], 1);
@@ -193,6 +201,10 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     assert_eq!(v["replay_error"], Value::Null);
     assert_eq!(v["drift"]["tables"], serde_json::json!([]));
     assert_eq!(v["rebuilt"], Value::Null);
+    assert_eq!(
+        v["sync"],
+        serde_json::json!({"outbox": 9, "pushed_through": 0, "cursor": 0, "pending_numbers": 0})
+    );
 }
 
 // ---------------------------------------------------------------- AC2

@@ -32,6 +32,7 @@ use crate::codec::ulid;
 use crate::commit::replay_in;
 use crate::error::{Result, StoreError};
 use crate::query::read_ops;
+use crate::sync::{SyncStatus, sync_status};
 
 /// The tables derived from `ops`, parents before children — the reverse
 /// is the order they are emptied in.
@@ -70,6 +71,9 @@ pub struct Report {
     /// Live ticket tables (`before`) against what the log produces
     /// (`after`). Empty when they match.
     pub drift: Diff,
+    /// Client sync state (AGT-1393): outbox size, pull cursor, tickets
+    /// awaiting a hub number. Informational — never affects health.
+    pub sync: SyncStatus,
 }
 
 impl Report {
@@ -153,6 +157,7 @@ impl Store {
         let tables = table_counts(&self.conn)?;
         let integrity = integrity_check(&self.conn)?;
         let foreign_keys = foreign_key_check(&self.conn)?;
+        let sync = sync_status(&self.conn)?;
 
         let tx = self
             .conn
@@ -171,6 +176,7 @@ impl Store {
             foreign_keys,
             replay_error,
             drift,
+            sync,
         })
     }
 

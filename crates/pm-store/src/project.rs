@@ -322,7 +322,7 @@ fn load_doc_view(conn: &rusqlite::Connection, doc_id: Ulid) -> Result<Option<Doc
     crate::codec::opt_from_json("project_doc_view.view", text)
 }
 
-fn commit_doc_edit_in(tx: &Transaction<'_>, doc_id: Ulid, op: &Op) -> Result<String> {
+pub(crate) fn commit_doc_edit_in(tx: &Transaction<'_>, doc_id: Ulid, op: &Op) -> Result<String> {
     if exists(
         tx,
         "SELECT 1 FROM ops WHERE op_id = ?1",

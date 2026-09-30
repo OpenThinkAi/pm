@@ -144,6 +144,9 @@ fn open_creates_a_wal_database_with_every_table_and_records_the_migration() {
         "ticket_view",
         "schema_version",
         "backup_target",
+        "sync_state",
+        "sync_pushed",
+        "pending_number",
     ] {
         assert!(
             tables.contains(expected),
