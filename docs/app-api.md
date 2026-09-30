@@ -292,6 +292,14 @@ The views are TSX in `crates/pm/views/`, one file per view plus
 SSE reader; the `useApi`/`useEvents` hooks). ui-leaf passes each view
 `{data, mutate}` and bundles relative imports, React included.
 
+A view imports only relative files and `react`/`react-dom` (ui-leaf
+aliases those two; it resolves no other npm package), so the views carry
+no dependencies. Logic worth testing lives in plain `.ts` beside them
+(`lib/board.ts`), written in erasable TypeScript so Node runs it
+directly: `node --test crates/pm/views-test/*.test.ts` (Node ≥ 22.18; no
+install, no browser). Those tests sit outside `crates/pm/views/` so they
+are not shipped, and are not part of `cargo test`.
+
 They ship inside the `pm` binary (`include_str!`, listed in
 `crates/pm/src/app/views.rs` — a unit test fails if a file under
 `crates/pm/views/` is missing from that list) and are unpacked on launch
@@ -302,5 +310,41 @@ instead, for developing a view without rebuilding pm.
 | View | Opened by | Today (AGT-1402) | Becomes |
 |---|---|---|---|
 | `ticket` | `pm edit <ID>` | read-only ticket, live | the CRDT-bound editor (AGT-1403) |
-| `board` | `pm app` | tickets in a column per state, read-only, live | the board (AGT-1404) |
+| `board` | `pm app` | the board (AGT-1404, below) | — |
 | (project) | — | — | the project view (AGT-1405) |
+
+### The board
+
+`pm app`'s view (`board.tsx`; its policy is `lib/board.ts`):
+
+- **Columns** — one per workflow state from `GET /workspace`, ordered by
+  `position`; each keeps `pm list`'s ticket order. A ticket whose state the
+  workspace no longer defines gets a trailing column rather than vanishing.
+- **Cards** — display id (`AGT-?` while the number is pending; the ULID is
+  its tooltip), priority, project, title, labels, assignee, and markers:
+  **held** (reason and holder in the tooltip), **parked** (only while the
+  park is active: `forever`, or `until` not yet past — pm-core's
+  `Parked::is_active`), and each **gate label** it carries.
+- **Moving** — drag a card onto a column, or pick a state from the card's
+  **Move…** menu (the keyboard route). Either sends
+  `POST /tickets/{ref}/state {"state": <target>, "keep_assignee": false}` —
+  exactly `pm move`: into an unstarted/backlog state it clears the assignee
+  (un-claims, AGT-1379), anywhere else it keeps it. `{ref}` is the display
+  id, or the ULID while the ticket is pending. The card moves at once and
+  the op's event refetches the truth; a failed write says so and refetches.
+  **Dropping into a `started` state is refused** (unless the card is
+  already in a started state): starting work is a claim, claims stay
+  CLI-only, and a bare move would leave the ticket started with nobody —
+  or a stale somebody — on it. The column outlines red, the drop shows a
+  toast naming `pm claim <ref>`, and the menu lists that state disabled.
+- **Filters** — project, label, assignee (or unassigned); AND across them.
+  They persist per viewer and per workspace in `localStorage`
+  (`pm.board.filters.<workspace ULID>`), and a blocked or broken storage
+  just means no persisted filters.
+- **Live** — every ticket, workspace or project op on `GET /events`
+  schedules a refetch, debounced 150 ms, so a batch or a sync pull is one
+  refetch; only the newest fetch may land.
+- **Opening a ticket** — clicking a card's title opens a read-only side
+  panel (`GET /tickets/{ref}`: description, comments, blockers, hold) that
+  stays live. ui-leaf gives a view no way to open another view, so editing
+  is `pm edit <ref>`, which the panel shows and copies.
