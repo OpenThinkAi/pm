@@ -1,7 +1,8 @@
-//! `pm sync` (AGT-1395) end to end: two replicas of one workspace
-//! converging through the real `pm-hub` on a throwaway Postgres (skipped,
-//! with a message, when neither docker nor `PM_HUB_TEST_DATABASE_URL` is
-//! available), plus the failure paths that need no hub at all.
+//! `pm sync` (AGT-1395) and `pm claim` against a hub (AGT-1397) end to
+//! end: two replicas of one workspace converging through the real `pm-hub`
+//! on a throwaway Postgres (skipped, with a message, when neither docker
+//! nor `PM_HUB_TEST_DATABASE_URL` is available), plus the failure paths
+//! that need no hub at all.
 //!
 //! Nothing here touches the real `~/.config/pm/config.toml`, the login
 //! keychain or a live workspace: every replica has its own temp HOME with
@@ -18,7 +19,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use hub::{admin, free_port, postgres_for, request_body, spawn_hub, wait_for_health};
@@ -162,6 +163,35 @@ impl Replica {
             .output()
             .unwrap();
         assert!(out.status.success(), "edit: {}", err(&out));
+    }
+
+    /// `pm log <id> --json`: every op on the ticket, in log order.
+    fn log(&self, id: &str) -> Vec<Value> {
+        let (code, v) = self.json(&["log", id]);
+        assert_eq!(code, 0, "log: {v}");
+        v.as_array().unwrap().clone()
+    }
+
+    /// The stamp of `actor`'s admitted `claim` on `id` in this log — what
+    /// the hub reports as `at` to a claim it refuses on that ticket.
+    fn claim_hlc(&self, id: &str, actor: &str) -> Value {
+        self.log(id)
+            .into_iter()
+            .find(|op| op["kind"] == "claim" && op["actor"] == actor)
+            .unwrap_or_else(|| panic!("no claim by {actor} on {id}"))["hlc"]
+            .clone()
+    }
+
+    /// Moves this replica's pull cursor `by` hub seqs behind the hub's
+    /// back. Pushed past the hub's head, the next pull asks from beyond
+    /// everything and brings nothing: a replica whose view stays stale
+    /// even though it syncs. Run only while no `pm` process has the
+    /// database open.
+    fn shift_cursor(&self, by: i64) {
+        rusqlite::Connection::open(self.ws.join("pm.sqlite"))
+            .unwrap()
+            .execute("UPDATE sync_state SET pulled_seq = pulled_seq + ?1", [by])
+            .unwrap();
     }
 }
 
@@ -465,4 +495,234 @@ fn watch_keeps_looping_through_failures() {
         .count();
     assert!(failures >= 2, "{}", err(&out));
     assert!(r.pm(&["doctor"]).status.success());
+}
+
+// ------------------------------------------------ pm claim via the hub (AGT-1397)
+
+/// AC1 + AC3: once the workspace is seeded the hub arbitrates claims. Two
+/// replicas racing for one ticket get exactly one `0` and one `75` naming
+/// the winner (with `at` the admitted claim's stamp), the loser logs
+/// nothing, and they agree once synced. A replica whose view is stale
+/// gets the same `75` for a ticket it still sees as free, and `--ready`
+/// skips such a candidate for the next one. Before the seed ends, a
+/// configured hub leaves the decision to the local database and the claim
+/// goes up with the seed. (The unreachable-hub path: `tests/claim.rs`.)
+#[test]
+fn claims_are_arbitrated_by_the_hub_once_seeded() {
+    let Some((_container, db)) = postgres_for("claims_are_arbitrated_by_the_hub_once_seeded")
+    else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&db, port);
+    wait_for_health(&mut hub, port);
+    let hub_url = format!("http://127.0.0.1:{port}");
+
+    let mut alice = Replica::init("alice");
+    let hub_ws = alice.workspace_id().to_ascii_lowercase();
+    let alice_token = create_token(&db, "alice", &hub_ws);
+    let bob_token = create_token(&db, "bob", &hub_ws);
+    // Numbered locally: filed before the hub is configured.
+    for title in ["one", "two", "three", "four"] {
+        alice.ok(&["new", "--title", title]);
+    }
+    alice.configure(&hub_url, &alice_token);
+
+    // Seed mode: the hub is configured but not yet the authority, so the
+    // claim is decided here and waits in the outbox with the rest of the
+    // seed; nothing has gone to the hub's log yet.
+    alice.ok(&["claim", "T-1", "--branch", "seed/one"]);
+    let one = alice.show("T-1");
+    assert_eq!(
+        (&one["assignee"], &one["ext"]["branch"]),
+        (&json!("alice"), &json!("seed/one"))
+    );
+    let state = alice.sync_state();
+    assert!(state["outbox"].as_u64().unwrap() > 0, "{state}");
+    assert_eq!(state["cursor"], 0, "{state}");
+
+    alice.sync();
+    end_seed(port, &hub_ws, &alice_token);
+    let mut bob = Replica::clone_from(&alice, "bob");
+    bob.configure(&hub_url, &bob_token);
+
+    // AC3: both claim T-2 at once.
+    let a = alice
+        .command(&["claim", "T-2", "--branch", "race/alice", "--json"])
+        .spawn()
+        .unwrap();
+    let b = bob
+        .command(&["claim", "T-2", "--branch", "race/bob", "--json"])
+        .spawn()
+        .unwrap();
+    let a = a.wait_with_output().unwrap();
+    let b = b.wait_with_output().unwrap();
+    let mut codes = [a.status.code().unwrap(), b.status.code().unwrap()];
+    codes.sort_unstable();
+    assert_eq!(
+        codes,
+        [0, 75],
+        "alice: {} {}\nbob: {} {}",
+        out_s(&a),
+        err(&a),
+        out_s(&b),
+        err(&b)
+    );
+    let (winner, won, loser, lost) = if a.status.success() {
+        (&alice, &a, &bob, &b)
+    } else {
+        (&bob, &b, &alice, &a)
+    };
+    let ticket: Value = serde_json::from_slice(&won.stdout).unwrap();
+    assert_eq!(ticket["id"], "T-2");
+    assert_eq!(ticket["assignee"], winner.actor);
+    assert_eq!(ticket["ext"]["branch"], format!("race/{}", winner.actor));
+    let taken: Value = serde_json::from_slice(&lost.stdout).unwrap();
+    assert_eq!(taken["schema"], 1);
+    assert_eq!(taken["id"], "T-2");
+    assert_eq!(taken["ulid"], ticket["ulid"]);
+    assert_eq!(taken["taken_by"], winner.actor, "{taken}");
+    assert_eq!(taken["state"], ticket["state"]);
+    assert_eq!(
+        taken["at"],
+        winner.claim_hlc("T-2", &winner.actor),
+        "at is the admitted claim's stamp"
+    );
+    assert!(
+        taken["reason"].as_str().unwrap().contains("not unstarted"),
+        "{taken}"
+    );
+    assert!(
+        err(lost).contains(&format!("taken by {}", winner.actor)),
+        "{}",
+        err(lost)
+    );
+    // The loser logged nothing of its own on the ticket.
+    let loser_ops = loser.log("T-2");
+    assert!(
+        !loser_ops
+            .iter()
+            .any(|op| op["kind"] == "claim" && op["actor"] == loser.actor),
+        "{loser_ops:?}"
+    );
+    assert_ne!(
+        loser.show("T-2")["ext"]["branch"],
+        format!("race/{}", loser.actor)
+    );
+
+    // Synced, both agree on the winner; the seed's claim stands.
+    alice.sync();
+    bob.sync();
+    alice.sync();
+    assert_eq!(alice.show("T-2"), bob.show("T-2"));
+    assert_eq!(bob.show("T-2")["assignee"], winner.actor);
+    assert_eq!(bob.show("T-1")["assignee"], "alice");
+
+    // A stale replica: Alice claims T-3 through the hub, and Bob's cursor
+    // is moved past the hub's head behind his back, so his syncs pull
+    // nothing and T-3 still reads free to him. The hub says otherwise.
+    alice.ok(&["claim", "T-3"]);
+    bob.shift_cursor(1_000_000);
+    let (code, taken) = bob.json(&["claim", "T-3"]);
+    assert_eq!(code, 75, "{taken}");
+    assert_eq!(taken["taken_by"], "alice");
+    assert_eq!(taken["at"], alice.claim_hlc("T-3", "alice"));
+    assert_eq!(bob.show("T-3")["assignee"], Value::Null, "nothing written");
+    // `--ready`: T-3 is Bob's lowest-numbered ready ticket; the hub's 75
+    // skips it and T-4 is admitted.
+    let (code, ticket) = bob.json(&["claim", "--ready"]);
+    assert_eq!(code, 0, "{ticket}");
+    assert_eq!(ticket["id"], "T-4");
+    assert_eq!(ticket["assignee"], "bob");
+    bob.shift_cursor(-1_000_000);
+
+    bob.sync();
+    alice.sync();
+    for id in ["T-1", "T-2", "T-3", "T-4"] {
+        assert_eq!(alice.show(id), bob.show(id), "{id}");
+    }
+    assert_eq!(alice.show("T-3")["assignee"], "alice");
+    assert_eq!(alice.show("T-4")["assignee"], "bob");
+    for r in [&alice, &bob] {
+        let state = r.sync_state();
+        assert_eq!(state["outbox"], 0, "{}: {state}", r.actor);
+        assert!(r.pm(&["doctor"]).status.success(), "{}", r.actor);
+    }
+}
+
+/// A claim the local database admitted while it was the authority (Bob
+/// claimed with no hub configured, after Alice's seed) that the hub
+/// refuses when it finally goes up: `pm sync` reads the `seq: null` ack
+/// (AGT-1392's shape, which AGT-1395's parser could not), marks the claim
+/// pushed, reports it, and logs the compensating writes in the same round,
+/// so both replicas converge on the hub's answer.
+#[test]
+fn sync_reconciles_a_claim_the_hub_refuses() {
+    let Some((_container, db)) = postgres_for("sync_reconciles_a_claim_the_hub_refuses") else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&db, port);
+    wait_for_health(&mut hub, port);
+    let hub_url = format!("http://127.0.0.1:{port}");
+
+    let mut alice = Replica::init("alice");
+    let hub_ws = alice.workspace_id().to_ascii_lowercase();
+    let alice_token = create_token(&db, "alice", &hub_ws);
+    let bob_token = create_token(&db, "bob", &hub_ws);
+    alice.ok(&["new", "--title", "contested"]);
+    alice.configure(&hub_url, &alice_token);
+    alice.sync();
+    end_seed(port, &hub_ws, &alice_token);
+
+    // Bob's copy was taken after the seed but has no hub configured: his
+    // own database admits his claim, which waits in his outbox.
+    let mut bob = Replica::clone_from(&alice, "bob");
+    bob.ok(&["claim", "T-1"]);
+    assert_eq!(bob.show("T-1")["assignee"], "bob");
+    let claim_op = bob
+        .log("T-1")
+        .into_iter()
+        .find(|op| op["kind"] == "claim")
+        .unwrap();
+    assert_eq!(bob.sync_state()["outbox"], 1);
+    // Meanwhile the hub admits Alice's.
+    alice.ok(&["claim", "T-1"]);
+
+    // Bob joins: his claim goes up alone and the hub refuses it.
+    bob.configure(&hub_url, &bob_token);
+    let out = bob.pm(&["sync", "--json"]);
+    assert!(out.status.success(), "{}", err(&out));
+    let round: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rejected = round["rejected"].as_array().unwrap();
+    assert_eq!(rejected.len(), 1, "{round}");
+    assert_eq!(rejected[0]["op_id"], claim_op["op_id"]);
+    assert_eq!(rejected[0]["ticket"], bob.show("T-1")["ulid"]);
+    assert_eq!(rejected[0]["taken_by"], "alice");
+    assert_eq!(rejected[0]["code"], "not_unstarted");
+    assert_eq!(rejected[0]["state"], alice.show("T-1")["state"]);
+    assert_eq!(rejected[0]["at"], alice.claim_hlc("T-1", "alice"));
+    assert!(
+        err(&out).contains("refused claim") && err(&out).contains("taken by alice"),
+        "{}",
+        err(&out)
+    );
+    // The claim was acknowledged, and the two compensating writes it
+    // triggered went up in the same round.
+    assert_eq!(round["pushed"], 3, "{round}");
+    assert_eq!(round["outbox"], 0, "{round}");
+    assert_eq!(bob.show("T-1")["assignee"], "alice", "reconciled");
+
+    // Alice pulls the compensation; the replicas agree, and a further
+    // round moves nothing and refuses nothing.
+    let a = alice.sync();
+    assert_eq!(counts(&a).2, 2, "{a}");
+    assert_eq!(alice.show("T-1"), bob.show("T-1"));
+    assert_eq!(alice.show("T-1")["assignee"], "alice");
+    let again = bob.sync();
+    assert_eq!(counts(&again), (0, 0, 0, 0), "{again}");
+    assert_eq!(again["rejected"], json!([]));
+    for r in [&alice, &bob] {
+        assert!(r.pm(&["doctor"]).status.success(), "{}", r.actor);
+    }
 }

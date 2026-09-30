@@ -7,6 +7,7 @@
   "pending_numbers": 0,
   "pulled": 0,
   "pushed": 48,
+  "rejected": [],
   "schema": 1,
   "skipped": 0,
   "workspace": "<ULID>"

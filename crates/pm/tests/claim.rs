@@ -301,23 +301,49 @@ fn twenty_concurrent_claims_yield_exactly_one_winner_and_nineteen_75s() {
 
 // ---------------------------------------------------------------- AC3
 
+/// AGT-1397 AC2: with a hub configured the hub decides, so one that
+/// cannot answer — unreachable, or no token to ask with — is exit 1 and
+/// writes nothing. (Claims through a reachable hub: `tests/sync.rs`.)
 #[test]
-fn claim_refuses_when_the_configured_authority_is_a_hub() {
+fn claim_needs_the_hub_when_one_is_configured() {
     let sb = Sandbox::new();
     let id = sb.new_ticket(&[]);
     let config = sb.home.path().join(".config/pm/config.toml");
     let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str("hub = \"https://pm-hub.example\"\n");
+    // Port 1: nothing listens, the connection is refused at once.
+    text.insert_str(0, "hub = \"http://127.0.0.1:1\"\n");
     std::fs::write(&config, text).unwrap();
     let before = sb.op_count();
+    let token = [("PM_HUB_TOKEN", "pmh_some-token")];
 
+    for args in [
+        vec!["claim", id.as_str()],
+        vec!["claim", id.as_str(), "--json"],
+        vec!["claim", "--ready"],
+    ] {
+        let out = sb.run(&args, &token);
+        assert_code(&out, 1);
+        assert!(
+            stderr(&out).contains("claims require the hub")
+                && stderr(&out).contains("cannot reach the hub at http://127.0.0.1:1"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).is_empty(),
+            "no partial output: {}",
+            stdout(&out)
+        );
+    }
+    // Without a token the hub could not have answered either.
     let out = sb.pm(&["claim", &id]);
     assert_code(&out, 1);
     assert!(
-        stderr(&out).contains("https://pm-hub.example") && stderr(&out).contains("unconfirmed"),
+        stderr(&out).contains("claims require the hub") && stderr(&out).contains("no hub token"),
         "{}",
         stderr(&out)
     );
+
     assert_eq!(sb.op_count(), before);
     assert_eq!(
         json(&sb.pm(&["show", &id, "--json"]))["assignee"],
