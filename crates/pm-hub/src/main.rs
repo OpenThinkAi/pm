@@ -1,10 +1,19 @@
-//! `pm-hub`: the sync hub (projects/pm/README.md §Sync & hub). Today it
-//! migrates its Postgres schema on start and serves `GET /health`; push,
-//! pull, conditional ops and auth build on this.
+//! `pm-hub`: the sync hub (projects/pm/README.md §Sync & hub). With no
+//! subcommand it migrates its Postgres schema on start and serves:
+//!
+//! - `GET /health` (open): status and schema version;
+//! - `GET /w/{workspace}/whoami` (bearer token): the token's workspace and
+//!   name, so a client can check a token before syncing with it.
+//!
+//! Push, pull and conditional ops land under `/w/{workspace}/` behind the
+//! same auth layer (AGT-1389 onward). `pm-hub token create|list|revoke`
+//! manage bearer tokens (see `admin`).
 //!
 //! Environment: `DATABASE_URL` (required; a Postgres URL) and `PORT`
 //! (default 8080; Railway sets it).
 
+mod admin;
+mod auth;
 mod migrate;
 
 use std::env;
@@ -16,15 +25,56 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Json, Router, middleware};
+use clap::{Parser, Subcommand};
 use serde::Serialize;
 use tokio_postgres::{Client, NoTls};
 
 const DEFAULT_PORT: u16 = 8080;
 
+/// pm-hub - the pm sync hub. With no subcommand, serve.
+#[derive(Parser, Debug)]
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Manage bearer tokens (run where DATABASE_URL reaches the hub's Postgres)
+    #[command(subcommand)]
+    Token(TokenCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum TokenCmd {
+    /// Mint a token for a machine or agent; prints it once on stdout (creates the workspace if new)
+    Create {
+        /// What holds the token, e.g. `studio` or `claude:pm-build`
+        name: String,
+        /// Workspace the token grants access to
+        #[arg(long, value_name = "ID")]
+        workspace: String,
+    },
+    /// List tokens (never their secrets)
+    List {
+        /// Only this workspace's tokens
+        #[arg(long, value_name = "ID")]
+        workspace: Option<String>,
+    },
+    /// Revoke a token by the id `token list` shows
+    Revoke { id: i64 },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run().await {
+    let cli = Cli::parse();
+    let result = match cli.cmd {
+        None => run().await,
+        Some(Cmd::Token(cmd)) => token(cmd).await,
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("pm-hub: {e}");
@@ -33,8 +83,28 @@ async fn main() -> ExitCode {
     }
 }
 
+fn database_url() -> Result<String, Box<dyn Error>> {
+    Ok(env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?)
+}
+
+async fn token(cmd: TokenCmd) -> Result<(), Box<dyn Error>> {
+    let (mut client, connection) = tokio_postgres::connect(&database_url()?, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("pm-hub: database connection: {e}");
+        }
+    });
+    match cmd {
+        TokenCmd::Create { name, workspace } => {
+            admin::token_create(&mut client, &name, &workspace).await
+        }
+        TokenCmd::List { workspace } => admin::token_list(&client, workspace.as_deref()).await,
+        TokenCmd::Revoke { id } => admin::token_revoke(&client, id).await,
+    }
+}
+
 async fn run() -> Result<(), Box<dyn Error>> {
-    let database_url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?;
+    let database_url = database_url()?;
     let port = match env::var("PORT") {
         Ok(port) => port
             .parse::<u16>()
@@ -57,15 +127,53 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let version = migrate::migrate(&mut client).await?;
     eprintln!("pm-hub: schema version {version}");
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .with_state(Arc::new(client));
+    let app = app(Arc::new(client));
     // `::` is dual-stack on Linux, so this serves both Railway's public
     // (IPv4) proxy and its private (IPv6) network.
     let listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).await?;
     eprintln!("pm-hub: listening on port {port}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// The HTTP surface. Routes added above `route_layer` require a bearer
+/// token for the `{workspace}` in their path; `/health` is added after it
+/// and stays open. Unknown paths, wrong methods and auth failures all get
+/// the same bare 404 (`auth::not_found`).
+fn app(db: Arc<Client>) -> Router {
+    let routes = Router::new()
+        .route("/w/{workspace}/whoami", get(whoami))
+        .route_layer(middleware::from_fn_with_state(
+            db.clone(),
+            auth::require_auth,
+        ))
+        .route("/health", get(health))
+        .fallback(auth::not_found)
+        .method_not_allowed_fallback(auth::not_found)
+        .with_state(db);
+    // Axum sets `Allow` outside any per-route layer, so strip it from a
+    // wrapper around the whole router.
+    Router::new()
+        .fallback_service(routes)
+        .layer(middleware::map_response(auth::strip_allow))
+}
+
+#[derive(Serialize)]
+struct Whoami {
+    workspace: String,
+    token_id: i64,
+    /// The token's name from `token create <name>`, never its secret.
+    name: String,
+}
+
+/// The authenticated caller. A tiny probe for clients (`pm hub login`,
+/// AGT-1394) and the auth tests; the sync routes reuse the same layer.
+async fn whoami(caller: auth::Authed) -> Json<Whoami> {
+    Json(Whoami {
+        workspace: caller.workspace,
+        token_id: caller.token_id,
+        name: caller.token_label,
+    })
 }
 
 #[derive(Serialize)]
