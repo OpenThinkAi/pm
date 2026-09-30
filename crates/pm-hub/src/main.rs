@@ -5,12 +5,15 @@
 //! - `GET /w/{workspace}/whoami` (bearer token): the token's workspace and
 //!   name, so a client can check a token before syncing with it;
 //! - `POST /w/{workspace}/ops` (bearer token): push a batch of ops and get
-//!   their seqs (see `ops`);
+//!   their seqs (see `ops`) — and, once the workspace is seeded, the
+//!   numbers the hub allocated for its creates (see `numbers`);
 //! - `GET /w/{workspace}/ops?since=&limit=` (bearer token): pull ops past
-//!   a seq, a page at a time (see `pull`).
+//!   a seq, a page at a time (see `pull`);
+//! - `POST /w/{workspace}/seeded` (bearer token): end the workspace's
+//!   seed and make the hub its number authority (see `numbers`).
 //!
-//! Conditional ops land under `/w/{workspace}/` behind the same auth layer
-//! (AGT-1391 onward). `pm-hub token create|list|revoke` manage bearer
+//! Claim arbitration lands under `/w/{workspace}/` behind the same auth
+//! layer (AGT-1392). `pm-hub token create|list|revoke` manage bearer
 //! tokens (see `admin`). The HTTP contract is `docs/hub-api.md`.
 //!
 //! Environment: `DATABASE_URL` (required; a Postgres URL) and `PORT`
@@ -19,6 +22,7 @@
 mod admin;
 mod auth;
 mod migrate;
+mod numbers;
 mod ops;
 mod pull;
 
@@ -30,6 +34,7 @@ use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, FromRef, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use clap::{Parser, Subcommand};
@@ -182,6 +187,7 @@ fn app(db: Db) -> Router {
             post(ops::push).layer(DefaultBodyLimit::max(ops::MAX_BODY_BYTES)),
         )
         .route("/w/{workspace}/ops", get(pull::pull))
+        .route("/w/{workspace}/seeded", post(numbers::finish_seed))
         .route_layer(middleware::from_fn_with_state(
             db.clone(),
             auth::require_auth,
@@ -203,16 +209,31 @@ struct Whoami {
     token_id: i64,
     /// The token's name from `token create <name>`, never its secret.
     name: String,
+    /// Whether the workspace's seed has ended, making the hub its number
+    /// authority (`numbers`): `false` means the first sync (AGT-1396)
+    /// still has to seed it, or finish seeding it.
+    seeded: bool,
 }
 
-/// The authenticated caller. A tiny probe for clients (`pm hub login`,
-/// AGT-1394) and the auth tests; the sync routes reuse the same layer.
-async fn whoami(caller: auth::Authed) -> Json<Whoami> {
-    Json(Whoami {
+/// The authenticated caller and the workspace's sync mode. A tiny probe
+/// for clients (`pm hub login`, AGT-1394; the first sync, AGT-1396) and
+/// the auth tests; the sync routes reuse the same layer.
+async fn whoami(State(db): State<Db>, caller: auth::Authed) -> Result<Json<Whoami>, Response> {
+    let seeded = numbers::is_seeded(&db.reader, &caller.workspace)
+        .await
+        .map_err(|e| {
+            eprintln!("pm-hub: whoami: {e}");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        })?
+        // The token authenticated a moment ago; answer as auth does when
+        // the workspace is gone.
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+    Ok(Json(Whoami {
         workspace: caller.workspace,
         token_id: caller.token_id,
         name: caller.token_label,
-    })
+        seeded,
+    }))
 }
 
 #[derive(Serialize)]

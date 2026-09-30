@@ -7,10 +7,13 @@
 use tokio_postgres::Client;
 
 /// Embedded migrations, in order.
-const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../migrations/0001_schema_v1.sql"))];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (1, include_str!("../migrations/0001_schema_v1.sql")),
+    (2, include_str!("../migrations/0002_numbers.sql")),
+];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Arbitrary, fixed key for `pg_advisory_xact_lock` (the ticket number).
 const MIGRATION_LOCK_KEY: i64 = 1387;
