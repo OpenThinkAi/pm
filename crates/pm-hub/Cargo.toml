@@ -2,6 +2,7 @@
 name = "pm-hub"
 version.workspace = true
 edition.workspace = true
+publish = false
 description = "pm-hub — the sync hub: Postgres-backed op log, sequence and auth (README §Sync & hub)"
 license.workspace = true
 repository.workspace = true

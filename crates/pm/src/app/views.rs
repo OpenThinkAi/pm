@@ -47,17 +47,58 @@ pub(crate) const FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// FNV-1a over every file's path and bytes: the unpacked directory's name,
-/// so a `pm` with different views never mounts a stale copy.
-fn fingerprint() -> u64 {
+/// FNV-1a over every file's path and bytes, in `FILES` order.
+fn fingerprint_of<'a>(files: impl Iterator<Item = (&'a str, &'a [u8])>) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for (name, text) in FILES {
-        for byte in name.bytes().chain([0]).chain(text.bytes()).chain([0]) {
+    for (name, bytes) in files {
+        for byte in name
+            .bytes()
+            .chain([0])
+            .chain(bytes.iter().copied())
+            .chain([0])
+        {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
     hash
+}
+
+/// The embedded views' fingerprint: the unpacked directory's name, so a
+/// `pm` with different views never mounts a stale copy.
+fn fingerprint() -> u64 {
+    fingerprint_of(FILES.iter().map(|(n, t)| (*n, t.as_bytes())))
+}
+
+/// True when `dir` holds exactly the embedded files: the same fingerprint
+/// computed over what is on disk, and no extra files. The directory name
+/// only proves which `pm` wrote it; this proves nobody (or a half-deleted
+/// cache, or a hand edit) changed it since, before ui-leaf compiles and
+/// serves it (AGT-1452).
+fn verified(dir: &Path) -> bool {
+    let mut contents = Vec::with_capacity(FILES.len());
+    for (name, _) in FILES {
+        match fs::read(dir.join(name)) {
+            Ok(bytes) => contents.push((*name, bytes)),
+            Err(_) => return false,
+        }
+    }
+    let disk = fingerprint_of(contents.iter().map(|(n, b)| (*n, b.as_slice())));
+    disk == fingerprint() && file_count(dir) == Some(FILES.len())
+}
+
+/// Number of files under `dir`, recursively (`None` on an I/O error).
+fn file_count(dir: &Path) -> Option<usize> {
+    let mut n = 0;
+    for entry in fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path.is_dir() {
+            n += file_count(&path)?;
+        } else {
+            n += 1;
+        }
+    }
+    Some(n)
 }
 
 /// The absolute `viewsRoot` to mount: `PM_VIEWS_DIR`, else the built-in
@@ -82,7 +123,19 @@ pub(crate) fn root(env: &Env) -> Result<PathBuf> {
 fn unpack(base: &Path) -> Result<PathBuf> {
     let dir = base.join(format!("{:016x}", fingerprint()));
     if dir.is_dir() {
-        return Ok(dir);
+        if verified(&dir) {
+            return Ok(dir);
+        }
+        // Tampered or damaged: set it aside (an atomic rename, so a
+        // concurrent pm never sees a half-deleted directory), then
+        // re-unpack below.
+        let stale = base.join(format!(".stale-{}", ulid::Ulid::new()));
+        if fs::rename(&dir, &stale).is_ok() {
+            let _ = fs::remove_dir_all(&stale);
+        } else {
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("removing the damaged view cache {}", dir.display()))?;
+        }
     }
     fs::create_dir_all(base).with_context(|| format!("creating {}", base.display()))?;
     let nonce = ulid::Ulid::new();
@@ -158,6 +211,67 @@ mod tests {
         }
         // Only the fingerprinted directory: no temp directory left behind.
         assert_eq!(fs::read_dir(&base).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_tampered_cache_is_repacked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("views");
+        let dir = unpack(&base).unwrap();
+        // Edited file, deleted file and an extra file each invalidate it.
+        fs::write(dir.join("vendor/loro.js"), "evil()").unwrap();
+        assert!(!verified(&dir));
+        assert_eq!(unpack(&base).unwrap(), dir);
+        assert!(verified(&dir));
+        fs::remove_file(dir.join("board.tsx")).unwrap();
+        assert!(!verified(&dir));
+        unpack(&base).unwrap();
+        assert!(verified(&dir));
+        fs::write(dir.join("extra.js"), "x").unwrap();
+        assert!(!verified(&dir));
+        unpack(&base).unwrap();
+        assert!(verified(&dir));
+        for (name, text) in FILES {
+            assert_eq!(fs::read_to_string(dir.join(name)).unwrap(), *text);
+        }
+        // No leftover temp or stale directories.
+        assert_eq!(fs::read_dir(&base).unwrap().count(), 1);
+    }
+
+    /// `views-vendor/vendor.sha256` (written by `build.ts`) pins the
+    /// committed bundles; a hand-edited one fails here, offline.
+    #[test]
+    fn vendored_bundles_match_manifest() {
+        use sha2::{Digest, Sha256};
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = fs::read_to_string(crate_dir.join("views-vendor/vendor.sha256")).unwrap();
+        let mut pinned = Vec::new();
+        for line in manifest.lines() {
+            let (digest, name) = line.split_once("  ").expect("`<sha256>  <file>` lines");
+            let bytes = fs::read(crate_dir.join("views/vendor").join(name))
+                .unwrap_or_else(|e| panic!("reading vendor/{name}: {e}"));
+            let actual: String = Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(
+                actual, digest,
+                "vendor/{name} differs from views-vendor/vendor.sha256: regenerate it \
+                 with `bun install --frozen-lockfile && bun build.ts` in \
+                 crates/pm/views-vendor, never by hand"
+            );
+            pinned.push(name.to_string());
+        }
+        pinned.sort();
+        let mut on_disk: Vec<String> = fs::read_dir(crate_dir.join("views/vendor"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        on_disk.sort();
+        assert_eq!(
+            pinned, on_disk,
+            "vendor/ and vendor.sha256 list different files"
+        );
     }
 
     #[test]

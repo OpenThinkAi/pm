@@ -48,6 +48,9 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 # Tests corrupt a materialized row directly to prove `pm doctor` catches it.
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 tempfile = "3.27"
+# `views::tests::vendored_bundles_match_manifest` (AGT-1452); the release
+# pm-hub and postgres-protocol already lock.
+sha2 = "0.11"
 # `tests/sync.rs` (AGT-1395) runs the real `pm-hub` against a throwaway
 # Postgres through pm-hub's own test harness (`crates/pm-hub/tests/common`,
 # included by path), which reaches Postgres with tokio-postgres (already in

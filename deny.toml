@@ -1,0 +1,67 @@
+# cargo-deny policy (AGT-1452). Run: `cargo deny check`
+# (needs network for the RustSec advisory DB; not a stamp required_check
+# for that reason — see SECURITY.md).
+
+[graph]
+all-features = true
+# Dev-dependencies (e.g. yrs -> smallstr, used by tests only) never ship.
+exclude-dev = true
+
+[advisories]
+# Unmaintained advisories on any crate in the tree count, not only direct
+# dependencies.
+unmaintained = "all"
+ignore = [
+    # The im-rs family (im, sized-chunks, bitmaps) is archived upstream and
+    # reaches pm only as loro 1.16.2 -> loro-internal -> im 15.1.0. loro
+    # 1.16.2 is the latest release, so there is no upgrade path; replacing
+    # loro's internals is not ours to do. Unmaintained, not a vulnerability:
+    # the unsoundness RUSTSEC-2020-0041 is patched in sized-chunks >= 0.6.3
+    # and the locked 0.6.5 is unaffected. Revisit when loro drops `im`.
+    { id = "RUSTSEC-2026-0248", reason = "im: archived; only via loro 1.16.2 (latest), no fix; unmaintained not exploitable (SECURITY.md)" },
+    { id = "RUSTSEC-2026-0251", reason = "sized-chunks: archived; only via loro -> im, no fix (SECURITY.md)" },
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps: archived; only via loro -> im, no fix (SECURITY.md)" },
+    # atomic-polyfill 1.0.3 (unmaintained), via loro-internal -> postcard
+    # 1.1.3 (latest) -> heapless 0.7. heapless pulls it in only on targets
+    # without native atomic CAS (thumbv6m, riscv32imc...): it is in
+    # Cargo.lock, so lockfile scanners (cargo audit) see it, but it is not
+    # compiled for any target pm ships. cargo-deny's graph omits it, hence
+    # "advisory-not-detected" if this entry is ever audited by deny alone.
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill: target-gated to no-atomic-CAS MCUs, not compiled for any pm target; postcard 1.1.3 is latest (SECURITY.md)" },
+]
+
+[licenses]
+confidence-threshold = 0.93
+# MPL-2.0 is file-level copyleft: using the im-rs crates unmodified as
+# dependencies places no obligation on pm's own MIT OR Apache-2.0 code, but
+# it is allowed only for exactly these crates (all via loro).
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "im" },
+    { allow = ["MPL-2.0"], crate = "sized-chunks" },
+    { allow = ["MPL-2.0"], crate = "bitmaps" },
+]
+# pm is MIT OR Apache-2.0: only permissive licenses compatible with that
+# dual license are allowed. Copyleft (GPL/AGPL/LGPL/MPL) is deliberately absent.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+# `pm` carries unversioned path deps on its sibling crates.
+wildcards = "warn"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
