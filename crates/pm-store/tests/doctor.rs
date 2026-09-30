@@ -260,8 +260,9 @@ fn dump_all(conn: &Connection, tables: &[&str]) -> BTreeMap<String, Vec<Vec<Valu
 
 /// Ops `store()`'s own `init_workspace` + `put_project` committed
 /// (AGT-1385: prefix, template sections, stale days, one gate label, three
-/// states; the project's create and one repo).
-const CONFIG_OPS: u64 = 9;
+/// states; the project's create and one repo; AGT-1413: its design doc's
+/// text as a `body.edit`).
+const CONFIG_OPS: u64 = 10;
 
 // ---- AC1: the report ----
 

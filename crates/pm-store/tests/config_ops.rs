@@ -150,9 +150,10 @@ fn legacy_config(conn: &Connection) -> BTreeMap<&'static str, Vec<Vec<Value>>> {
 fn downgrade_to_schema_6(conn: &Connection) {
     conn.execute_batch(
         "DELETE FROM ops WHERE kind IN ('workspace.set', 'state.upsert', 'actor.upsert',
-                                         'project.create', 'project.set');
+                                         'project.create', 'project.set', 'project.doc_add');
          DELETE FROM workspace_view;
          DELETE FROM project_view;
+         DROP TABLE project_doc_owner;
          UPDATE project SET ulid = NULL;
          DELETE FROM schema_version WHERE version >= 7;",
     )
@@ -212,6 +213,11 @@ fn migration_0007_backfills_config_ops_with_no_data_change_and_doctor_is_clean()
     assert_eq!(count("actor.upsert"), 2, "matt and claude:pm-build");
     assert_eq!(count("project.create"), 2);
     assert_eq!(count("project.set"), 2, "one repo each");
+    assert_eq!(
+        count("project.doc_add"),
+        4,
+        "migration 0008: a design doc and `notes` each"
+    );
     assert_eq!(kinds.len(), backfilled.len());
     assert_eq!(
         store.ops_since(0).unwrap().len(),

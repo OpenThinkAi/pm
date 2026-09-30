@@ -9,6 +9,11 @@
 //! kind and [`pm_core::Body`] CRDT a ticket's description uses (AGT-1338).
 //! There is exactly one body format in the op log, ever.
 //!
+//! The `doc_id`s themselves are bound by config ops since AGT-1413 (the
+//! design doc's by `project.create`, a named document's by
+//! `project.doc_add`) and materialized onto the rows by `config.rs`; this
+//! module only ever writes a document's *text*.
+//!
 //! [`commit_doc_edit`] is the write path — append the op, fold it into the
 //! document's [`DocView`], and update the cached text column in the same
 //! transaction, mirroring [`crate::commit::commit_in`] for tickets.
@@ -20,23 +25,26 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pm_core::{ActorId, DocView, Op, ProjectStatus, apply_doc};
+use pm_core::op::{BodyEdit, ProjectDocAdd};
+use pm_core::{
+    ActorId, Body, Clock, DocView, Op, Payload, ProjectStatus, apply_doc, apply_doc_persisted,
+};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use ulid::Ulid;
 
 use crate::Store;
 use crate::codec::{json, ulid};
-use crate::commit::{append_op, ensure_actor, exists};
-use crate::config::{project_exists, upsert_meta_in};
+use crate::commit::{append_op, ensure_actor, exists, latest_hlc, now_ms};
+use crate::config::{commit_payloads, project_ulid, upsert_meta_in};
 use crate::error::{Result, StoreError};
 use crate::query::read_ops;
 
 impl Store {
-    /// `pm project new` (AC1): commits the project's `project.create` (and
-    /// one `project.set repo_add` per repo) under `actor`, stamps the new
-    /// row with a fresh design-doc id, and returns that id. Fails if `id`
-    /// is already taken, or if `parent` is given and does not exist (R2,
-    /// the rule a ticket's `project` field already obeys).
+    /// `pm project new` (AC1): commits the project's `project.create` —
+    /// carrying a fresh design-doc id (AGT-1413) — and one `project.set
+    /// repo_add` per repo under `actor`, and returns the design doc's id.
+    /// Fails if `id` is already taken, or if `parent` is given and does not
+    /// exist (R2, the rule a ticket's `project` field already obeys).
     pub fn create_project(
         &mut self,
         id: &str,
@@ -51,6 +59,7 @@ impl Store {
         if exists(&tx, "SELECT 1 FROM project WHERE id = ?1", id)? {
             return Err(StoreError::DuplicateProject { id: id.to_string() });
         }
+        let doc_id = Ulid::new();
         upsert_meta_in(
             &tx,
             id,
@@ -58,21 +67,17 @@ impl Store {
             ProjectStatus::InProgress,
             parent,
             repos,
+            Some(doc_id),
             actor,
-        )?;
-        let doc_id = Ulid::new();
-        tx.execute(
-            "UPDATE project SET doc_id = ?1 WHERE id = ?2",
-            params![doc_id.to_string(), id],
         )?;
         tx.commit()?;
         Ok(doc_id)
     }
 
     /// The design doc's stable id (what a `pm project edit` targets), when
-    /// the project exists and has one. A project created before this
-    /// ticket (`put_project`, without a `doc_id`) reads as `None` until
-    /// `put_project` runs again and assigns one.
+    /// the project exists and has one bound. Every project pm writes has
+    /// one; only a project pulled from a replica that has not sent its
+    /// binding yet reads as `None`.
     pub fn design_doc_id(&self, project: &str) -> Result<Option<Ulid>> {
         let row: Option<Option<String>> = self
             .conn
@@ -106,19 +111,20 @@ impl Store {
     }
 
     /// `pm project doc add` (AC3): creates an empty named document with a
-    /// fresh id and returns it — the caller commits the first `body.edit`
-    /// against it (mirroring how a new ticket's description is its first
-    /// `body.edit`, `pm/src/verbs.rs::build_create_ops`). Fails if the
-    /// project does not exist, or `name` is already taken.
-    pub fn add_named_doc(&mut self, project: &str, name: &str) -> Result<Ulid> {
+    /// fresh id — a `project.doc_add` op under `actor` (AGT-1413) — and
+    /// returns the id; the caller commits the first `body.edit` against it
+    /// (mirroring how a new ticket's description is its first `body.edit`,
+    /// `pm/src/verbs.rs::build_create_ops`). Fails if the project does not
+    /// exist, or `name` is already taken.
+    pub fn add_named_doc(&mut self, project: &str, name: &str, actor: &ActorId) -> Result<Ulid> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !project_exists(&tx, project)? {
+        let Some(project_id) = project_ulid(&tx, project)? else {
             return Err(StoreError::UnknownProject {
                 project: project.to_string(),
             });
-        }
+        };
         let taken: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM project_doc WHERE project = ?1 AND name = ?2)",
             params![project, name],
@@ -131,9 +137,14 @@ impl Store {
             });
         }
         let doc_id = Ulid::new();
-        tx.execute(
-            "INSERT INTO project_doc (project, name, body, doc_id) VALUES (?1, ?2, '', ?3)",
-            params![project, name, doc_id.to_string()],
+        commit_payloads(
+            &tx,
+            project_id,
+            actor,
+            vec![Payload::ProjectDocAdd(ProjectDocAdd {
+                name: Some(name.to_string()),
+                doc_id,
+            })],
         )?;
         tx.commit()?;
         Ok(doc_id)
@@ -190,27 +201,15 @@ impl Store {
         Ok(text)
     }
 
-    /// Whether `doc_id` belongs to some project's design doc or a named
-    /// document. The op log shares one `entity` namespace between tickets
-    /// and documents (both are Ulids); this is how `pm backup --restore`
-    /// tells a document's `body.edit` apart from a ticket op when replaying
-    /// a log that interleaves both without otherwise knowing which is
-    /// which — see [`Store::commit_any`].
+    /// Whether some project has ever bound `doc_id` to one of its
+    /// documents (`project_doc_owner`, AGT-1413) — including a binding
+    /// that lost to an earlier one and a deleted project's documents. The
+    /// op log shares one `entity` namespace between tickets and documents
+    /// (both are Ulids); this is how `pm backup --restore` and
+    /// `apply_pulled` tell a document's `body.edit` apart from a ticket op
+    /// — see [`Store::commit_any`].
     pub fn is_known_doc_id(&self, doc_id: Ulid) -> Result<bool> {
-        let text = doc_id.to_string();
-        let in_project: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM project WHERE doc_id = ?1)",
-            params![text],
-            |r| r.get(0),
-        )?;
-        if in_project {
-            return Ok(true);
-        }
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM project_doc WHERE doc_id = ?1)",
-            params![text],
-            |r| r.get(0),
-        )?)
+        is_known_doc(&self.conn, doc_id)
     }
 
     /// Commits `op` against whichever entity it targets: a ticket
@@ -228,51 +227,61 @@ impl Store {
         }
         Ok(())
     }
-
-    /// Restores a design doc's original `doc_id` onto an existing project
-    /// row (`pm backup --restore`'s counterpart to [`Store::create_project`],
-    /// which always mints a fresh one) — so the log's `body.edit` ops for
-    /// it, replayed afterward via [`Store::commit_any`], still find their
-    /// row instead of being mistaken for ticket ops.
-    pub fn set_design_doc_id(&mut self, project: &str, doc_id: Ulid) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE project SET doc_id = ?1 WHERE id = ?2",
-            params![doc_id.to_string(), project],
-        )?;
-        if n == 0 {
-            return Err(StoreError::UnknownProject {
-                project: project.to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Restores a named document's original `doc_id` (`pm backup
-    /// --restore`'s counterpart to [`Store::add_named_doc`]). The row
-    /// itself is expected to already exist (`put_project`'s `documents`
-    /// map creates it with the restored body text but no `doc_id`); if it
-    /// somehow does not, this creates it empty rather than fail restore
-    /// over a document whose body a later op will fill in anyway.
-    pub fn set_named_doc_id(&mut self, project: &str, name: &str, doc_id: Ulid) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !project_exists(&tx, project)? {
-            return Err(StoreError::UnknownProject {
-                project: project.to_string(),
-            });
-        }
-        tx.execute(
-            "INSERT INTO project_doc (project, name, body, doc_id) VALUES (?1, ?2, '', ?3)
-             ON CONFLICT(project, name) DO UPDATE SET doc_id = excluded.doc_id",
-            params![project, name, doc_id.to_string()],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
 }
 
-fn load_doc_view(conn: &rusqlite::Connection, doc_id: Ulid) -> Result<Option<DocView>> {
+/// Whether a `project` or `project_doc` row shows document `doc_id`.
+fn doc_has_row(conn: &rusqlite::Connection, doc_id: Ulid) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM project WHERE doc_id = ?1)
+             OR EXISTS(SELECT 1 FROM project_doc WHERE doc_id = ?1)",
+        params![doc_id.to_string()],
+        |r| r.get(0),
+    )?)
+}
+
+/// Whether `doc_id` is bound to any project document, winner or not.
+pub(crate) fn is_known_doc(conn: &rusqlite::Connection, doc_id: Ulid) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM project_doc_owner WHERE doc_id = ?1)",
+        params![doc_id.to_string()],
+        |r| r.get(0),
+    )?)
+}
+
+/// Commits the `body.edit` (under `actor`) that takes document `doc_id`
+/// from the text its ops say now to `text` — nothing when they already
+/// agree. The diff continues the document's own history (its cached
+/// snapshot), so it merges with concurrent edits like any other.
+pub(crate) fn set_doc_text_in(
+    tx: &Transaction<'_>,
+    doc_id: Ulid,
+    text: &str,
+    actor: &ActorId,
+) -> Result<()> {
+    let view = load_doc_view(tx, doc_id)?;
+    if view.as_ref().map(DocView::text).unwrap_or_default() == text {
+        return Ok(());
+    }
+    let mut body = Body::new();
+    if let Some(view) = &view {
+        body.apply(&view.body.snapshot()?)?;
+    }
+    let update = body.diff_from_text(text)?;
+    let hlc = Clock::from_latest(latest_hlc(tx)?).send(now_ms());
+    let op = Op::new(
+        Ulid::new(),
+        hlc,
+        actor.clone(),
+        doc_id,
+        Payload::BodyEdit(BodyEdit {
+            update: update.into_bytes(),
+        }),
+    );
+    commit_doc_edit_in(tx, doc_id, &op)?;
+    Ok(())
+}
+
+pub(crate) fn load_doc_view(conn: &rusqlite::Connection, doc_id: Ulid) -> Result<Option<DocView>> {
     let text: Option<String> = conn
         .query_row(
             "SELECT view FROM project_doc_view WHERE doc_id = ?1",
@@ -292,16 +301,29 @@ pub(crate) fn commit_doc_edit_in(tx: &Transaction<'_>, doc_id: Ulid, op: &Op) ->
         return Err(StoreError::DuplicateOp { op_id: op.op_id });
     }
     ensure_actor(tx, &op.actor)?;
+    if !doc_has_row(tx, doc_id)? {
+        if !is_known_doc(tx, doc_id)? {
+            return Err(StoreError::UnknownDocument { doc_id });
+        }
+        // A document bound but shown by no row — a binding that lost to
+        // an earlier one, or a deleted project's document (AGT-1413): the
+        // edit joins the log, and nothing is materialized for it (the
+        // replay rebuilds rows' documents only), so there is no view to
+        // fold it into either.
+        append_op(tx, op)?;
+        return Ok(String::new());
+    }
     let mut view = load_doc_view(tx, doc_id)?.unwrap_or_else(|| DocView::new(doc_id));
-    apply_doc(&mut view, op)?;
+    // The view is persisted right after: an edit ahead of its history is
+    // refused (a pulled one defers), never half-kept.
+    apply_doc_persisted(&mut view, op)?;
     append_op(tx, op)?;
     materialize_doc(tx, &view)
 }
 
 /// Rewrites `project_doc_view` and whichever `project`/`project_doc` row
-/// owns `view.id`. Errors if `view.id` belongs to neither — only a foreign
-/// writer or a schema bug produces that, since `body.edit` op entities are
-/// always a `doc_id` this store itself assigned.
+/// owns `view.id`. Errors if no row does ([`StoreError::UnknownDocument`]):
+/// callers only materialize a row's document.
 fn materialize_doc(tx: &Transaction<'_>, view: &DocView) -> Result<String> {
     let doc_id = view.id;
     let text = view.text();

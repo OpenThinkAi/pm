@@ -17,8 +17,9 @@
 //!   config ops (AGT-1385): the commit/replay path for `workspace.set`,
 //!   `state.upsert`, `actor.upsert`, `project.create`, `project.set`, and
 //!   the diff-based writers (`init_workspace`, `put_project`, …)
-//! - `backfill` — migration 0007's one-off: config ops for every row a
-//!   pre-AGT-1385 database wrote directly
+//! - `backfill` — migrations 0007's and 0008's one-offs: config ops for
+//!   every row a pre-AGT-1385 database wrote directly, and `project.doc_add`
+//!   ops for every document identity a pre-AGT-1413 one did
 //! - `check` — the snapshot `pm check` runs over ([`Store::check`])
 //! - `doctor` — [`Store::doctor`] (verify) and [`Store::rebuild`] (replay the log)
 //! - `backup` — [`Store::ops_since`] and per-target progress (AGT-1350)
@@ -56,7 +57,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 pub use backfill::MIGRATE_ACTOR;
 pub use backup::BackupStatus;
-pub use config::{project_diff, workspace_diff};
+pub use config::{DocIds, project_diff, workspace_diff};
 pub use doctor::{
     CONFIG_TABLES, ColumnChange, Diff, ForeignKeyViolation, PROJECT_DOC_TABLES, Report, Row,
     RowChange, TICKET_TABLES, TableDiff,
@@ -76,10 +77,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (5, include_str!("../migrations/0005_compact_bytes.sql")),
     (6, include_str!("../migrations/0006_sync_state.sql")),
     (7, include_str!("../migrations/0007_config_ops.sql")),
+    (8, include_str!("../migrations/0008_doc_identity.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// The migration whose work is Rust, not SQL: after its (comment-only)
 /// SQL file runs, [`reencode::run`] rewrites every stored byte payload in
@@ -90,6 +92,11 @@ const COMPACT_BYTES_VERSION: u32 = 5;
 /// and `project.ulid`, [`backfill::run`] appends a config op for every
 /// existing workspace/state/actor/project row (AGT-1385).
 const CONFIG_OPS_VERSION: u32 = 7;
+
+/// And for document identity: after its SQL adds `project_doc_owner`,
+/// [`backfill::doc_identity`] appends a `project.doc_add` for every
+/// existing project document (AGT-1413).
+const DOC_IDENTITY_VERSION: u32 = 8;
 
 /// How long a writer waits for the database lock before giving up. Sized
 /// for many concurrent CLI invocations (build loops fan out), not for a
@@ -151,6 +158,9 @@ impl Store {
             }
             if *version == CONFIG_OPS_VERSION {
                 backfill::run(&tx)?;
+            }
+            if *version == DOC_IDENTITY_VERSION {
+                backfill::doc_identity(&tx)?;
             }
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",

@@ -990,13 +990,17 @@ fn projects_list_and_show_with_their_documents() {
         Err(StoreError::UnknownProject { project }) if project == "nope"
     ));
 
-    // Replacing a project replaces its documents.
+    // Putting a project again rewrites the documents it lists; one it
+    // does not list stays (AGT-1413: there is no document-remove kind).
     let mut pm = project("pm");
     pm.documents = [("research/spike".to_string(), "loro".to_string())].into();
     store
         .put_project(&pm, &pm_core::ActorId::new("matt"))
         .unwrap();
-    assert_eq!(store.project("pm").unwrap().unwrap(), pm);
+    let mut expected = pm.clone();
+    expected.documents.extend(project("pm").documents);
+    assert_eq!(store.project("pm").unwrap().unwrap(), expected);
+    assert!(store.doctor().unwrap().is_healthy());
 }
 
 // ---- AC6: every op has an actor and an HLC ----

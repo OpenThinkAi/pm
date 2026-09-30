@@ -187,7 +187,7 @@ pub fn vault(
                 None => store.design_doc_id(&p.id)?.ok_or_else(|| {
                     CliError::error(format!("project '{}' has no design doc id", p.id))
                 })?,
-                Some(n) => store.ensure_named_doc(&p.id, n)?,
+                Some(n) => store.ensure_named_doc(&p.id, n, &actor)?,
             };
             let err =
                 |e: pm_core::BodyError| CliError::error(format!("building document {}: {e}", p.id));

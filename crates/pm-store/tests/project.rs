@@ -232,7 +232,9 @@ fn add_named_doc_then_commit_doc_edit_materializes_project_doc_body() {
             &pm_core::ActorId::new("matt"),
         )
         .unwrap();
-    let doc_id = store.add_named_doc("pm", "research/spike").unwrap();
+    let doc_id = store
+        .add_named_doc("pm", "research/spike", &ActorId::new("matt"))
+        .unwrap();
     assert_eq!(
         store.named_doc_id("pm", "research/spike").unwrap(),
         Some(doc_id)
@@ -262,15 +264,21 @@ fn add_named_doc_rejects_a_duplicate_name_and_a_missing_project() {
             &pm_core::ActorId::new("matt"),
         )
         .unwrap();
-    store.add_named_doc("pm", "notes").unwrap();
-    let err = store.add_named_doc("pm", "notes").unwrap_err();
+    store
+        .add_named_doc("pm", "notes", &ActorId::new("matt"))
+        .unwrap();
+    let err = store
+        .add_named_doc("pm", "notes", &ActorId::new("matt"))
+        .unwrap_err();
     assert!(matches!(
         err,
         StoreError::DuplicateDocument { project, name }
             if project == "pm" && name == "notes"
     ));
 
-    let err = store.add_named_doc("nope", "notes").unwrap_err();
+    let err = store
+        .add_named_doc("nope", "notes", &ActorId::new("matt"))
+        .unwrap_err();
     assert!(matches!(err, StoreError::UnknownProject { project } if project == "nope"));
 }
 
@@ -446,11 +454,12 @@ fn doctor_rebuild_reproduces_project_doc_bodies_and_repairs_corruption() {
     assert!(store.doctor().unwrap().is_healthy());
 }
 
+/// AGT-1413: `put_project` no longer writes a document directly — it
+/// binds the design doc and commits its text as a `body.edit`, so doctor
+/// and rebuild reproduce it like any other document.
 #[test]
-fn doctor_rebuild_leaves_a_directly_written_document_alone() {
+fn put_project_documents_are_op_derived() {
     let (dir, mut store) = store();
-    // put_project (not create_project): no doc_id, so it's not op-derived
-    // and doctor/rebuild must not touch it (config.rs, project.rs docs).
     store
         .put_project(
             &pm_core::Project {
@@ -465,7 +474,11 @@ fn doctor_rebuild_leaves_a_directly_written_document_alone() {
             &pm_core::ActorId::new("matt"),
         )
         .unwrap();
-    assert_eq!(store.design_doc_id("legacy").unwrap(), None);
+    let doc_id = store.design_doc_id("legacy").unwrap().expect("bound");
+    assert_eq!(
+        store.doc_view(doc_id).unwrap().unwrap().text(),
+        "# written directly\n"
+    );
 
     let report = store.doctor().unwrap();
     assert!(report.is_healthy(), "{report:#?}");

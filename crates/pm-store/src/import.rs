@@ -15,9 +15,8 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use ulid::Ulid;
 
 use crate::Store;
-use crate::codec::ulid;
-use crate::config::upsert_meta_in;
-use crate::error::Result;
+use crate::config::{load_project_view, upsert_meta_in};
+use crate::error::{Result, StoreError};
 
 impl Store {
     /// The allocator floor (`workspace.number_floor`): the next allocated
@@ -45,7 +44,8 @@ impl Store {
 
     /// Creates or updates a project's metadata from a vault snapshot with
     /// config ops under `actor` (only what differs is committed) and
-    /// returns its design-doc id, assigning one if the row has none. The
+    /// returns its design-doc id, binding one (a `project.create`'s
+    /// `doc_id`, or a `project.doc_add`, AGT-1413) if it has none. The
     /// document bodies (`doc`, named documents) are untouched: they are
     /// op-derived (AGT-1344) and the importer edits them through
     /// [`Store::commit_doc_edit`]. A `parent` must already exist (R2).
@@ -61,26 +61,10 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        upsert_meta_in(&tx, id, title, status, parent, repos, actor)?;
-        let existing: Option<String> = tx
-            .query_row(
-                "SELECT doc_id FROM project WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        let doc_id = match existing {
-            Some(text) => ulid("project.doc_id", &text)?,
-            None => {
-                let doc_id = Ulid::new();
-                tx.execute(
-                    "UPDATE project SET doc_id = ?1 WHERE id = ?2",
-                    params![doc_id.to_string(), id],
-                )?;
-                doc_id
-            }
-        };
+        let project = upsert_meta_in(&tx, id, title, status, parent, repos, None, actor)?;
+        let doc_id = load_project_view(&tx, project)?
+            .and_then(|view| view.design_doc_id())
+            .ok_or(StoreError::UnknownProjectEntity { project })?;
         tx.commit()?;
         Ok(doc_id)
     }
@@ -88,11 +72,11 @@ impl Store {
     /// A named document's id, creating the (empty) document when the
     /// project has none by that name — [`Store::named_doc_id`] then
     /// [`Store::add_named_doc`], for a re-import that must land on the same
-    /// `doc_id` every time.
-    pub fn ensure_named_doc(&mut self, project: &str, name: &str) -> Result<Ulid> {
+    /// `doc_id` every time. A new document is bound under `actor`.
+    pub fn ensure_named_doc(&mut self, project: &str, name: &str, actor: &ActorId) -> Result<Ulid> {
         match self.named_doc_id(project, name)? {
             Some(id) => Ok(id),
-            None => self.add_named_doc(project, name),
+            None => self.add_named_doc(project, name, actor),
         }
     }
 }
@@ -184,8 +168,8 @@ mod tests {
             .upsert_project("pm", "pm", ProjectStatus::InProgress, None, &repos, &matt())
             .unwrap();
         assert_eq!(store.design_doc_id("pm").unwrap(), Some(first));
-        let doc = store.ensure_named_doc("pm", "notes").unwrap();
-        assert_eq!(store.ensure_named_doc("pm", "notes").unwrap(), doc);
+        let doc = store.ensure_named_doc("pm", "notes", &matt()).unwrap();
+        assert_eq!(store.ensure_named_doc("pm", "notes", &matt()).unwrap(), doc);
 
         let again = store
             .upsert_project(
@@ -203,8 +187,8 @@ mod tests {
         assert_eq!(p.status, ProjectStatus::Complete);
         assert!(p.documents.contains_key("notes"));
 
-        // A row written without a doc_id (put_project) gets one on upsert.
-        store
+        // put_project binds a design doc too (AGT-1413), and upsert keeps it.
+        let old = store
             .put_project(
                 &pm_core::Project {
                     id: "old".into(),
@@ -218,7 +202,9 @@ mod tests {
                 &matt(),
             )
             .unwrap();
-        assert_eq!(store.design_doc_id("old").unwrap(), None);
+        let _ = old;
+        let before = store.design_doc_id("old").unwrap();
+        assert!(before.is_some());
         let id = store
             .upsert_project(
                 "old",
@@ -230,6 +216,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.design_doc_id("old").unwrap(), Some(id));
+        assert_eq!(before, Some(id));
         assert_eq!(
             store.project("old").unwrap().unwrap().parent.as_deref(),
             Some("pm")

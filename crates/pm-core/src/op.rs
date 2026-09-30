@@ -34,9 +34,9 @@ pub struct Op {
     pub actor: ActorId,
     /// The ticket (or, for `ticket.create`, the new ticket's id) this op
     /// mutates — or, for a `body.edit` targeting a project document
-    /// (AGT-1344), that document's `doc_id`, a Ulid pm-store stamps on the
-    /// `project` or `project_doc` row it belongs to. Never a project's own
-    /// kebab-case `id`.
+    /// (AGT-1344), that document's `doc_id`, a Ulid bound to the project
+    /// by its `project.create` or a `project.doc_add` (AGT-1413). Never a
+    /// project's own kebab-case `id`.
     ///
     /// Config ops (AGT-1384) target the workspace's id for `workspace.set`,
     /// `state.upsert` and `actor.upsert` — states and actors are name-keyed
@@ -125,6 +125,12 @@ pub enum Payload {
     /// `project.create` under a new project Ulid.
     #[serde(rename = "project.delete")]
     ProjectDelete,
+    /// Names one of the project's documents (AGT-1413): binds a `doc_id`
+    /// — the entity its `body.edit` ops target — to the design doc or to a
+    /// named document, so a replica that pulls the project also learns
+    /// where its document edits go.
+    #[serde(rename = "project.doc_add")]
+    ProjectDocAdd(ProjectDocAdd),
 }
 
 impl Payload {
@@ -149,6 +155,7 @@ impl Payload {
             Payload::ProjectCreate(_) => "project.create",
             Payload::ProjectSet(_) => "project.set",
             Payload::ProjectDelete => "project.delete",
+            Payload::ProjectDocAdd(_) => "project.doc_add",
         }
     }
 
@@ -165,6 +172,7 @@ impl Payload {
                 | Payload::ProjectCreate(_)
                 | Payload::ProjectSet(_)
                 | Payload::ProjectDelete
+                | Payload::ProjectDocAdd(_)
         )
     }
 }
@@ -323,7 +331,14 @@ pub struct ActorUpsert {
 
 /// A project's initial scalars; `entity` is the project's own Ulid and
 /// `id` its kebab-case human id (`pm`). Repos follow as `project.set
-/// repo_add` ops, the way labels follow a `ticket.create`.
+/// repo_add` ops, the way labels follow a `ticket.create`; named
+/// documents as `project.doc_add` ops.
+///
+/// `doc_id` (AGT-1413) is the design doc's identity, minted with the
+/// project so a replica that pulls the create knows where the design
+/// doc's `body.edit` ops go. Absent on a create logged before that ticket
+/// (the key is omitted, and an old op still parses); such a project gets
+/// its design doc from a `project.doc_add` without a `name` instead.
 ///
 /// Two replicas creating the same `id` offline mint two Ulids; the
 /// authority (the hub, from P3) arbitrates that the way it does ticket
@@ -334,6 +349,21 @@ pub struct ProjectCreate {
     pub title: String,
     pub status: ProjectStatus,
     pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_id: Option<Ulid>,
+}
+
+/// Binds `doc_id` to one of the project's documents (`entity` = the
+/// project's Ulid): the design doc when `name` is absent, else the named
+/// document `name`. Each document slot keeps the *earliest* binding it has
+/// seen (by stamp, then `doc_id`) — a document's identity is fixed once
+/// made, and two replicas that add the same name offline converge on one
+/// of the two ids ([`crate::config::DocClaims`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDocAdd {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub doc_id: Ulid,
 }
 
 /// One project-metadata write; scalars are LWW registers and `repos` an
@@ -440,10 +470,15 @@ mod tests {
                 title: "pm".into(),
                 status: ProjectStatus::InProgress,
                 parent: None,
+                doc_id: Some(Ulid::new()),
             })),
             op(Payload::ProjectSet(ProjectSet::RepoRemove {
                 repo: "OpenThinkAi/pm".into(),
                 observed: vec![],
+            })),
+            op(Payload::ProjectDocAdd(ProjectDocAdd {
+                name: Some("notes".into()),
+                doc_id: Ulid::new(),
             })),
         ]
     }
@@ -472,6 +507,7 @@ mod tests {
             "actor.upsert",
             "project.create",
             "project.set",
+            "project.doc_add",
         ];
         let ops = all_kinds();
         assert_eq!(ops.len(), expected.len());
@@ -492,7 +528,7 @@ mod tests {
         let ops = all_kinds();
         let (tickets, config): (Vec<_>, Vec<_>) = ops.iter().partition(|o| !o.payload.is_config());
         assert_eq!(tickets.len(), 14);
-        assert_eq!(config.len(), 7);
+        assert_eq!(config.len(), 8);
 
         let json =
             serde_json::to_value(op(Payload::WorkspaceSet(WorkspaceSet::StaleDays(30)))).unwrap();
@@ -518,6 +554,29 @@ mod tests {
             serde_json::json!({"field": "status", "value": "complete"}),
             "project status keeps its kebab-case frontmatter spelling"
         );
+    }
+
+    /// AGT-1413: a create logged before `doc_id` existed still parses,
+    /// and one without it omits the key; a design-doc `project.doc_add`
+    /// omits `name`.
+    #[test]
+    fn doc_identity_fields_are_optional_on_the_wire() {
+        let legacy = serde_json::json!({
+            "id": "pm", "title": "pm", "status": "in-progress", "parent": null
+        });
+        let create: ProjectCreate = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(create.doc_id, None);
+        assert_eq!(serde_json::to_value(&create).unwrap(), legacy);
+
+        let doc_id = Ulid::new();
+        let design = ProjectDocAdd { name: None, doc_id };
+        assert_eq!(
+            serde_json::to_value(&design).unwrap(),
+            serde_json::json!({"doc_id": doc_id.to_string()})
+        );
+        let back: ProjectDocAdd =
+            serde_json::from_value(serde_json::json!({"doc_id": doc_id.to_string()})).unwrap();
+        assert_eq!(back, design);
     }
 
     #[test]

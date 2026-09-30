@@ -5,7 +5,8 @@
 //! Until AGT-1385 these were direct table writes, which push/pull could not
 //! carry. Now they have the shape the ticket tables have: a config op
 //! (`workspace.set`, `state.upsert`, `actor.upsert`, `project.create`,
-//! `project.set`, `project.delete`; AGT-1384, AGT-1386) is appended to the log and the rows it affects
+//! `project.set`, `project.delete`, `project.doc_add`; AGT-1384, AGT-1386,
+//! AGT-1413) is appended to the log and the rows it affects
 //! are rewritten in the same transaction ([`commit_config_in`], reached
 //! through [`Store::commit`]); the merge state lives in `workspace_view` /
 //! `project_view` (a [`WorkspaceView`] / [`ProjectView`] as JSON, the
@@ -22,15 +23,18 @@
 //! snapshot (`pm backup --restore` over a log that already carries its
 //! config ops) is a no-op on the log.
 //!
+//! Document identity is op-derived too (AGT-1413): `project.doc_id` and
+//! the `project_doc` rows (name → `doc_id`) are materialized from the
+//! project's view — a `project.create`'s `doc_id` and `project.doc_add`
+//! ops, earliest binding per document ([`pm_core::DocClaims`]) — together
+//! with `project_doc_owner`, every `doc_id` ever bound (winner or not).
+//! The *text* of a document (`project.doc`, `project_doc.body`) is the
+//! `body.edit` fold `project.rs` materializes under that id (AGT-1344); a
+//! newly bound document starts from whatever its own view holds.
+//!
 //! What is *not* op-derived, deliberately:
 //! - `workspace.number_floor` — allocator bookkeeping (`import.rs`), left
 //!   alone by materialization and rebuild, like `backup_target`.
-//! - `project.doc_id`, `project_doc` rows and their `doc_id`s — document
-//!   identity; a document's body is op-derived under that id (AGT-1344,
-//!   `project.rs`), the id itself is assigned once by the row's creator.
-//! - A project row's *document* columns and rows (see above): a
-//!   `project.delete` removes the row together with its documents, and the
-//!   ops stay in the log (never pruned).
 //!
 //! A project's existence *is* op-derived (AGT-1386): `project.delete`
 //! tombstones its [`ProjectView`] (`deleted_at`, permanent), and
@@ -52,7 +56,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pm_core::op::{ActorUpsert, ProjectCreate, ProjectSet, StateUpsert, WorkspaceSet};
+use pm_core::op::{
+    ActorUpsert, ProjectCreate, ProjectDocAdd, ProjectSet, StateUpsert, WorkspaceSet,
+};
 use pm_core::{
     ActorId, ActorKind, Clock, Op, Payload, Project, ProjectStatus, ProjectView, State, Workspace,
     WorkspaceView, apply_project, apply_workspace,
@@ -64,11 +70,24 @@ use crate::Store;
 use crate::codec::{enum_from_name, enum_name, from_json, json, opt_from_json, ulid};
 use crate::commit::{append_op, ensure_actor, exists, latest_hlc, now_ms};
 use crate::error::{Result, StoreError};
+use crate::project::set_doc_text_in;
 use crate::query::read_ops;
 
-/// The five config kinds, as `ops.kind` spells them — what
-/// [`replay_config`] selects and what `apply_pulled` routes here.
-pub(crate) const CONFIG_KINDS: &str = "'workspace.set', 'state.upsert', 'actor.upsert', 'project.create', 'project.set', 'project.delete'";
+/// The config kinds, as `ops.kind` spells them — what [`replay_config`]
+/// selects and what `apply_pulled` routes here.
+pub(crate) const CONFIG_KINDS: &str = "'workspace.set', 'state.upsert', 'actor.upsert', 'project.create', 'project.set', 'project.delete', 'project.doc_add'";
+
+/// The document ids a writer wants a project's documents to have when it
+/// binds them ([`Store::put_project_with_doc_ids`]): `pm backup --restore`
+/// passes the ids a backup's `body.edit` ops target, so a log written
+/// before those ids were op-carried (AGT-1413) still finds its documents.
+/// A document that already has an id keeps it; one not listed gets a
+/// fresh id.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DocIds {
+    pub design: Option<Ulid>,
+    pub named: BTreeMap<String, Ulid>,
+}
 
 impl Store {
     /// Brings the workspace and its states to `ws` by committing config
@@ -108,49 +127,70 @@ impl Store {
         workspace_row(&self.conn)
     }
 
-    /// Brings a project's metadata (title, status, parent, repos) to
-    /// `project` by committing config ops under `actor`, creating the
-    /// project if `project.id` is new, and then writes its design-doc text
-    /// and named documents directly — the *legacy* document path: unlike
-    /// [`crate::Store::create_project`] (AGT-1344, `pm project new`), this
-    /// never assigns a design-doc `doc_id`, so `project.doc` written this
-    /// way stays a plain cached column with no `body.edit` history that
-    /// `pm doctor`'s replay leaves alone (`project.rs::replay_project_docs`
-    /// only touches rows with a `doc_id`) and `pm project edit` refuses
-    /// until the project is recreated through `pm project new`. This path
-    /// exists for `pm backup --restore` and tests that construct a whole
-    /// [`Project`] at once. A `parent` must already exist (R2).
+    /// Brings a whole [`Project`] to `project` with ops under `actor`:
+    /// its metadata (title, status, parent, repos) with config ops,
+    /// creating the project if `project.id` is new; its design doc and
+    /// every named document in `project.documents` bound to a `doc_id`
+    /// (`project.create`'s `doc_id`, `project.doc_add`) when not yet; and
+    /// each document's text with a `body.edit` when it differs from what
+    /// the document's ops already say. A document the project has but
+    /// `project.documents` does not list is left alone (there is no
+    /// document-remove kind). Used by tests that construct a project at
+    /// once; `pm backup --restore` uses
+    /// [`Store::put_project_with_doc_ids`]. A `parent` must already exist
+    /// (R2).
     ///
     /// Returns the project's Ulid (the entity its config ops target).
     pub fn put_project(&mut self, project: &Project, actor: &ActorId) -> Result<Ulid> {
+        self.put_project_with_doc_ids(project, &DocIds::default(), actor)
+    }
+
+    /// [`Store::put_project`], binding each not-yet-bound document to the
+    /// id `ids` lists for it (see [`DocIds`]); a name only in `ids.named`
+    /// is bound (empty) too.
+    pub fn put_project_with_doc_ids(
+        &mut self,
+        project: &Project,
+        ids: &DocIds,
+        actor: &ActorId,
+    ) -> Result<Ulid> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let id = upsert_meta_in(
+        let ulid = upsert_meta_in(
             &tx,
             &project.id,
             &project.title,
             project.status,
             project.parent.as_deref(),
             &project.repos,
+            ids.design,
             actor,
         )?;
-        tx.execute(
-            "UPDATE project SET doc = ?1 WHERE id = ?2",
-            params![project.doc, project.id],
-        )?;
-        tx.execute(
-            "DELETE FROM project_doc WHERE project = ?1",
-            params![project.id],
-        )?;
+        let view = load_project_view(&tx, ulid)?.unwrap_or_else(|| ProjectView::new(ulid));
+        let names: BTreeSet<&String> = project.documents.keys().chain(ids.named.keys()).collect();
+        let adds: Vec<Payload> = names
+            .into_iter()
+            .filter(|name| view.doc_id(name).is_none())
+            .map(|name| {
+                Payload::ProjectDocAdd(ProjectDocAdd {
+                    name: Some(name.clone()),
+                    doc_id: ids.named.get(name).copied().unwrap_or_else(fresh_id),
+                })
+            })
+            .collect();
+        commit_payloads(&tx, ulid, actor, adds)?;
+        let view = load_project_view(&tx, ulid)?.unwrap_or_else(|| ProjectView::new(ulid));
+        if let Some(doc_id) = view.design_doc_id() {
+            set_doc_text_in(&tx, doc_id, &project.doc, actor)?;
+        }
         for (name, body) in &project.documents {
-            tx.execute(
-                "INSERT INTO project_doc (project, name, body) VALUES (?1, ?2, ?3)",
-                params![project.id, name, body],
-            )?;
+            if let Some(doc_id) = view.doc_id(name) {
+                set_doc_text_in(&tx, doc_id, body, actor)?;
+            }
         }
         tx.commit()?;
-        Ok(id)
+        Ok(ulid)
     }
 
     pub fn project(&self, id: &str) -> Result<Option<Project>> {
@@ -336,7 +376,10 @@ fn next_view(tx: &Transaction<'_>, op: &Op) -> Result<ConfigView> {
             apply_workspace(&mut view, op)?;
             Ok(ConfigView::Workspace(view))
         }
-        Payload::ProjectCreate(_) | Payload::ProjectSet(_) | Payload::ProjectDelete => {
+        Payload::ProjectCreate(_)
+        | Payload::ProjectSet(_)
+        | Payload::ProjectDelete
+        | Payload::ProjectDocAdd(_) => {
             let mut view = match load_project_view(tx, op.entity)? {
                 Some(view) => view,
                 // A delete needs no slug, so it may fold ahead of its
@@ -348,10 +391,11 @@ fn next_view(tx: &Transaction<'_>, op: &Op) -> Result<ConfigView> {
                 {
                     ProjectView::new(op.entity)
                 }
-                // A `project.set` ahead of its `project.create`: the view
-                // could fold it (pm-core allows it), but a row needs the
-                // slug the create carries — defer it (`apply_pulled` retries
-                // once the rest of the batch has landed).
+                // A `project.set` or `project.doc_add` ahead of its
+                // `project.create`: the view could fold it (pm-core allows
+                // it), but a row needs the slug the create carries — defer
+                // it (`apply_pulled` retries once the rest of the batch
+                // has landed).
                 None => {
                     return Err(StoreError::UnknownProjectEntity { project: op.entity });
                 }
@@ -421,13 +465,16 @@ fn materialize_workspace(tx: &Transaction<'_>, view: &WorkspaceView) -> Result<(
     Ok(())
 }
 
-/// Rewrites the project's metadata columns from its view and saves the
-/// view. Checks R2 for `parent` first so a violation names its rule, and
-/// that a new slug is free ([`StoreError::DuplicateProject`]); the
-/// document columns (`doc`, `doc_id`) are never touched.
+/// Rewrites the project's metadata columns and document identity
+/// ([`materialize_doc_identity`]) from its view and saves the view. Checks
+/// R2 for `parent` first so a violation names its rule, and that a new
+/// slug is free ([`StoreError::DuplicateProject`]). Every `doc_id` the
+/// view has bound is recorded in `project_doc_owner` first, whatever
+/// becomes of the row.
 fn materialize_project(tx: &Transaction<'_>, view: &ProjectView, mode: Mode) -> Result<()> {
     let p = view.snapshot(String::new(), BTreeMap::new());
     let ulid = view.id.to_string();
+    record_doc_owners(tx, view)?;
     if view.deleted_at.is_some() {
         remove_project_rows(tx, view.id, mode)?;
         return save_project_view(tx, view);
@@ -478,7 +525,111 @@ fn materialize_project(tx: &Transaction<'_>, view: &ProjectView, mode: Mode) -> 
             ],
         )?;
     }
+    materialize_doc_identity(tx, view, &p.id)?;
     save_project_view(tx, view)
+}
+
+/// Records every `doc_id` `view` has bound in `project_doc_owner` (see
+/// migration 0008). A `doc_id` already owned by another project or slot
+/// is refused: only a foreign writer reuses one.
+pub(crate) fn record_doc_owners(tx: &Transaction<'_>, view: &ProjectView) -> Result<()> {
+    let project = view.id.to_string();
+    for (name, doc_id) in view.doc_ids() {
+        let owner: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT project, name FROM project_doc_owner WHERE doc_id = ?1",
+                params![doc_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match owner {
+            None => {
+                tx.execute(
+                    "INSERT INTO project_doc_owner (doc_id, project, name) VALUES (?1, ?2, ?3)",
+                    params![doc_id.to_string(), project, name],
+                )?;
+            }
+            Some((p, n)) if p == project && n.as_deref() == name => {}
+            Some(_) => return Err(StoreError::DocIdInUse { doc_id }),
+        }
+    }
+    Ok(())
+}
+
+/// Points the project row's `doc_id` and its `project_doc` rows at the
+/// documents `view` binds (each slot's earliest binding). A document whose
+/// id changes — a binding that synced in earlier than the local one —
+/// takes the text its own view holds (empty until its `body.edit` ops
+/// land), and the displaced document's cached merge state goes: only a
+/// row's document has one ([`crate::project`]'s replay rebuilds exactly
+/// those).
+fn materialize_doc_identity(tx: &Transaction<'_>, view: &ProjectView, slug: &str) -> Result<()> {
+    let current: Option<String> = tx.query_row(
+        "SELECT doc_id FROM project WHERE ulid = ?1",
+        params![view.id.to_string()],
+        |r| r.get(0),
+    )?;
+    let want = view.design_doc_id();
+    if current != want.map(|id| id.to_string()) {
+        drop_doc_view(tx, current.as_deref())?;
+        tx.execute(
+            "UPDATE project SET doc_id = ?1, doc = ?2 WHERE ulid = ?3",
+            params![
+                want.map(|id| id.to_string()),
+                doc_text(tx, want)?,
+                view.id.to_string()
+            ],
+        )?;
+    }
+    for name in view.documents.keys() {
+        let Some(want) = view.doc_id(name) else {
+            continue;
+        };
+        let current: Option<Option<String>> = tx
+            .query_row(
+                "SELECT doc_id FROM project_doc WHERE project = ?1 AND name = ?2",
+                params![slug, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match current {
+            Some(Some(id)) if id == want.to_string() => {}
+            Some(old) => {
+                drop_doc_view(tx, old.as_deref())?;
+                tx.execute(
+                    "UPDATE project_doc SET doc_id = ?1, body = ?2 WHERE project = ?3 AND name = ?4",
+                    params![want.to_string(), doc_text(tx, Some(want))?, slug, name],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO project_doc (project, name, body, doc_id) VALUES (?1, ?2, ?3, ?4)",
+                    params![slug, name, doc_text(tx, Some(want))?, want.to_string()],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn drop_doc_view(tx: &Transaction<'_>, doc_id: Option<&str>) -> Result<()> {
+    if let Some(doc_id) = doc_id {
+        tx.execute(
+            "DELETE FROM project_doc_view WHERE doc_id = ?1",
+            params![doc_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// The text a document's cached merge state holds, `""` without one.
+fn doc_text(tx: &Transaction<'_>, doc_id: Option<Ulid>) -> Result<String> {
+    Ok(match doc_id {
+        Some(id) => crate::project::load_doc_view(tx, id)?
+            .map(|v| v.text())
+            .unwrap_or_default(),
+        None => String::new(),
+    })
 }
 
 fn save_project_view(tx: &Transaction<'_>, view: &ProjectView) -> Result<()> {
@@ -552,9 +703,13 @@ pub(crate) fn commit_payloads(
 }
 
 /// Creates or updates a project's metadata through config ops and returns
-/// its Ulid. Shared by [`Store::put_project`], `project.rs::create_project`
-/// and `import.rs::upsert_project`, which differ only in what they do with
-/// the project's documents afterwards.
+/// its Ulid; also binds the project's design doc when it has none yet
+/// (AGT-1413: a new project's `project.create` carries the `doc_id`, an
+/// older one gets a `project.doc_add`), to `design_doc` if given, else to
+/// a fresh id. Shared by [`Store::put_project`],
+/// `project.rs::create_project` and `import.rs::upsert_project`, which
+/// differ only in what they do with the project's documents afterwards.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn upsert_meta_in(
     tx: &Transaction<'_>,
     slug: &str,
@@ -562,6 +717,7 @@ pub(crate) fn upsert_meta_in(
     status: ProjectStatus,
     parent: Option<&str>,
     repos: &BTreeSet<String>,
+    design_doc: Option<Ulid>,
     actor: &ActorId,
 ) -> Result<Ulid> {
     if let Some(parent) = parent
@@ -594,9 +750,25 @@ pub(crate) fn upsert_meta_in(
         None => Ulid::new(),
     };
     let view = load_project_view(tx, ulid)?;
-    let payloads = project_diff(view.as_ref(), slug, title, status, parent, repos);
+    let design_doc = design_doc.unwrap_or_else(fresh_id);
+    let payloads = project_diff(
+        view.as_ref(),
+        slug,
+        title,
+        status,
+        parent,
+        repos,
+        design_doc,
+    );
     commit_payloads(tx, ulid, actor, payloads)?;
     Ok(ulid)
+}
+
+/// A newly minted id. (Not `Ulid::default()`, which clippy's
+/// `unwrap_or_default` suggests for `unwrap_or_else(Ulid::new)`: that is
+/// the nil id.)
+fn fresh_id() -> Ulid {
+    Ulid::new()
 }
 
 // ------------------------------------------------------------------ diffs
@@ -678,7 +850,10 @@ pub fn workspace_diff(current: Option<&WorkspaceView>, target: &Workspace) -> Ve
 /// The `project.create` / `project.set` payloads that take `current` to
 /// the given metadata: a create (plus one `repo_add` per repo) when the
 /// view has never seen one, otherwise a `project.set` per changed scalar
-/// and a repo add/remove per set difference.
+/// and a repo add/remove per set difference. `design_doc` is the design
+/// doc's id for a project that has none bound yet: carried by the create,
+/// or by a `project.doc_add` for a project created without one
+/// (AGT-1413); ignored once one is bound.
 pub fn project_diff(
     current: Option<&ProjectView>,
     slug: &str,
@@ -686,15 +861,18 @@ pub fn project_diff(
     status: ProjectStatus,
     parent: Option<&str>,
     repos: &BTreeSet<String>,
+    design_doc: Ulid,
 ) -> Vec<Payload> {
     let mut out = Vec::new();
     match current.filter(|v| v.created.is_some()) {
         None => {
+            let bound = current.and_then(ProjectView::design_doc_id);
             out.push(Payload::ProjectCreate(ProjectCreate {
                 id: slug.to_string(),
                 title: title.to_string(),
                 status,
                 parent: parent.map(str::to_string),
+                doc_id: bound.is_none().then_some(design_doc),
             }));
             for repo in repos {
                 out.push(Payload::ProjectSet(ProjectSet::RepoAdd(repo.clone())));
@@ -724,6 +902,12 @@ pub fn project_diff(
                         observed: view.repos.observed(repo),
                     }));
                 }
+            }
+            if view.design_doc_id().is_none() {
+                out.push(Payload::ProjectDocAdd(ProjectDocAdd {
+                    name: None,
+                    doc_id: design_doc,
+                }));
             }
         }
     }
@@ -1092,11 +1276,28 @@ mod tests {
         };
         let ulid = store.put_project(&p, &matt()).unwrap();
         let n = kinds(&store).len();
-        assert_eq!(&kinds(&store)[n - 2..], ["project.create", "project.set"]);
+        // AGT-1413: the create binds the design doc, a `project.doc_add`
+        // the named one, and each document's text is a `body.edit`.
+        assert_eq!(
+            &kinds(&store)[n - 5..],
+            [
+                "project.create",
+                "project.set",
+                "project.doc_add",
+                "body.edit",
+                "body.edit"
+            ]
+        );
         assert_eq!(store.project("pm").unwrap().unwrap(), p);
-        assert_eq!(store.project_view("pm").unwrap().unwrap().id, ulid);
+        let view = store.project_view("pm").unwrap().unwrap();
+        assert_eq!(view.id, ulid);
+        assert_eq!(view.design_doc_id(), store.design_doc_id("pm").unwrap());
+        assert_eq!(
+            view.doc_id("notes"),
+            store.named_doc_id("pm", "notes").unwrap()
+        );
 
-        // Same metadata again: no ops, documents rewritten.
+        // The same project again: no ops.
         assert_eq!(store.put_project(&p, &matt()).unwrap(), ulid);
         assert_eq!(kinds(&store).len(), n);
 

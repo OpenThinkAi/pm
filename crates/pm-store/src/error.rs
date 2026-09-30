@@ -55,12 +55,19 @@ pub enum StoreError {
     /// AGT-1344 AC3: `pm project doc add` against a name already taken.
     #[error("document '{name}' already exists on project '{project}'")]
     DuplicateDocument { project: String, name: String },
-    /// A `body.edit` targeting a `doc_id` no `project`/`project_doc` row
-    /// claims. Only a foreign writer or a schema bug can produce this: pm
-    /// always creates the row (with its `doc_id`) before committing an
-    /// edit against it.
+    /// A `body.edit` targeting a `doc_id` no project has ever bound
+    /// (`project_doc_owner`, AGT-1413). Within a pulled batch this defers
+    /// until the `project.create` / `project.doc_add` binding it lands.
     #[error("document {doc_id} does not belong to any project")]
     UnknownDocument { doc_id: Ulid },
+    /// A `project.create` / `project.doc_add` binding a `doc_id` another
+    /// project or document already has (AGT-1413). Only a foreign writer
+    /// reuses one: every writer mints a fresh id.
+    #[error("document id {doc_id} is already bound to another document")]
+    DocIdInUse { doc_id: Ulid },
+    /// A document's text could not be turned into a `body.edit`.
+    #[error(transparent)]
+    Body(#[from] pm_core::BodyError),
     /// AGT-1344 AC4 (R-style FK): a project cannot be deleted while a
     /// ticket still references it.
     #[error("project '{project}' has tickets; move or delete them first")]

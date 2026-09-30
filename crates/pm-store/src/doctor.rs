@@ -11,22 +11,21 @@
 //! Three replays, one diff, in dependency order:
 //! 1. Config (AGT-1385, [`crate::config::replay_config`]): the
 //!    [`CONFIG_TABLES`] — the `workspace` row (all but `number_floor`),
-//!    `state`, `actor`, a project's metadata columns and the two view
-//!    tables — from the config ops. `state`, `workspace_view` and
-//!    `project_view` are emptied first; the `workspace`, `actor` and
+//!    `state`, `actor`, a project's metadata columns and document identity
+//!    (`project.doc_id`, the `project_doc` rows, `project_doc_owner`;
+//!    AGT-1413) and the two view tables — from the config ops. `state`,
+//!    `workspace_view`, `project_view`, `project_doc` and
+//!    `project_doc_owner` are emptied first; the `workspace`, `actor` and
 //!    `project` rows are rewritten in place (`ops.actor` references
-//!    `actor`; a project row's existence is not op-derived — `config.rs`
-//!    module docs).
+//!    `actor`, and tickets `project`).
 //! 2. Tickets: [`TICKET_TABLES`] emptied and refilled, as before.
 //! 3. Project document bodies (AGT-1344, `project.rs`): `project.doc`,
 //!    `project_doc.body` and `project_doc_view` from `body.edit` ops the
-//!    same way `ticket.description` is — scoped to rows with a `doc_id`,
-//!    so a document written directly (`put_project`'s bulk `documents`
-//!    map, before one is assigned) is left alone.
+//!    same way `ticket.description` is — scoped to rows with a `doc_id`.
 //!
-//! What a rebuild never touches: `workspace.number_floor`, `project.doc_id`
-//! and `project_doc`'s names/ids, `backup_target`, `sync_*`,
-//! `pending_number` — bookkeeping and identity, not derived state.
+//! What a rebuild never touches: `workspace.number_floor`,
+//! `backup_target`, `sync_*`, `pending_number` — bookkeeping, not derived
+//! state.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,21 +57,23 @@ pub const TICKET_TABLES: [&str; 6] = [
 /// `project` and `project_doc` for their cached `doc`/`body` text, and
 /// `project_doc_view` (the document analogue of `ticket_view`), which is
 /// fully derived. [`crate::project::replay_project_docs`] only ever writes
-/// rows with a `doc_id`, so drift in a doc-id-less row (written directly)
-/// never appears here.
+/// rows with a `doc_id`.
 pub const PROJECT_DOC_TABLES: [&str; 3] = ["project", "project_doc", "project_doc_view"];
 
 /// The tables the config ops materialize (AGT-1385): the workspace row
-/// and its merge state, states, actors, project metadata (the `project`
-/// table is shared with [`PROJECT_DOC_TABLES`]: its metadata columns are
-/// config-derived, its `doc` column document-derived) and the project
-/// merge state.
-pub const CONFIG_TABLES: [&str; 6] = [
+/// and its merge state, states, actors, project metadata and document
+/// identity (AGT-1413; the `project` and `project_doc` tables are shared
+/// with [`PROJECT_DOC_TABLES`]: their metadata and `doc_id` columns are
+/// config-derived, their text columns document-derived), every bound
+/// document id, and the project merge state.
+pub const CONFIG_TABLES: [&str; 8] = [
     "workspace",
     "workspace_view",
     "state",
     "actor",
     "project",
+    "project_doc",
+    "project_doc_owner",
     "project_view",
 ];
 
@@ -251,8 +252,15 @@ fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
     // Config first (AGT-1385): the ticket replay needs the states and
     // projects it produces. `state` can only be emptied once no ticket
     // references it; `workspace`, `actor` and `project` rows are rewritten
-    // in place (module docs).
-    for table in ["state", "workspace_view", "project_view"] {
+    // in place (module docs). A project's documents are rebound from its
+    // view (AGT-1413); their text is refilled by the document replay.
+    for table in [
+        "state",
+        "workspace_view",
+        "project_view",
+        "project_doc",
+        "project_doc_owner",
+    ] {
         tx.execute(&format!("DELETE FROM {table}"), [])?;
     }
     crate::config::replay_config(tx)?;

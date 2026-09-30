@@ -18,9 +18,10 @@
 //!   config op in the JSONL (the states and projects everything else
 //!   needs — a migrated log carries them *after* the ticket ops they
 //!   configure, since migration 0007 appended them), then
-//!   `init_workspace` + `put_project` from the snapshot (which commit
-//!   nothing the log already said, and everything for a pre-AGT-1385
-//!   backup), then `Store::commit_any` over every other op, in file order
+//!   `init_workspace` + `put_project_with_doc_ids` from the snapshot
+//!   (which commit nothing the log already said, and everything for a
+//!   pre-AGT-1385 backup — document identity too for a pre-AGT-1413 one),
+//!   then `Store::commit_any` over every other op, in file order
 //!   (append order = `seq` order). A project the log created but the
 //!   snapshot no longer lists was deleted before the backup, and is
 //!   deleted again.
@@ -80,7 +81,7 @@ use std::process::Command;
 
 use anyhow::Context;
 use pm_core::{Op, Project, Workspace};
-use pm_store::Store;
+use pm_store::{DocIds, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use ulid::Ulid;
@@ -110,13 +111,14 @@ struct ConfigSnapshot {
     schema: u32,
     workspace: Workspace,
     projects: Vec<Project>,
-    /// A project's design-doc id, by project id (AGT-1344): present only
-    /// for a project created through `pm project new`, whose design doc's
-    /// `body.edit` ops in the JSONL target it. Restore must reassign the
-    /// same id to the recreated row *before* those ops replay
+    /// A project's design-doc id, by project id (AGT-1344), which its
+    /// `body.edit` ops in the JSONL target. Restore binds the recreated
+    /// project's design doc to the same id *before* those ops replay
     /// ([`Store::commit_any`]'s only way to recognize them as document
-    /// edits, not ticket ops) — `#[serde(default)]` so a backup written
-    /// before this ticket restores fine, just without any doc history.
+    /// edits, not ticket ops). Since AGT-1413 the log binds it too
+    /// (`project.create` / `project.doc_add`), so this matters for a
+    /// backup written before that — `#[serde(default)]` so one written
+    /// before AGT-1344 restores fine, just without any doc history.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     project_doc_ids: BTreeMap<String, Ulid>,
     /// A named document's id, by project id then document name.
@@ -699,12 +701,34 @@ pub fn restore(ctx: &Ctx<'_>, dir: &Path) -> Result<()> {
 
     // The snapshot: a no-op on what pass 1 already established, the
     // whole configuration for a backup written before config was
-    // op-logged, and in both cases the document text of any document the
-    // log does not carry (`put_project`'s direct doc writes).
+    // op-logged, and in both cases the text of any document the log does
+    // not carry. Each document is bound to the id the snapshot lists for
+    // it when the log has not bound it already (a backup from before
+    // AGT-1413, when document identity was not op-carried), so the log's
+    // `body.edit` ops for it — replayed below via `Store::commit_any`,
+    // which only recognizes a document edit by its bound id — find it. A
+    // document with a listed id takes its text from those ops, never from
+    // the snapshot: writing both would merge the text in twice.
     store.init_workspace(&snapshot.workspace, &actor)?;
     let listed: BTreeSet<String> = snapshot.projects.iter().map(|p| p.id.clone()).collect();
-    for project in topo_sorted(snapshot.projects)? {
-        store.put_project(&project, &actor)?;
+    for mut project in topo_sorted(snapshot.projects)? {
+        let ids = DocIds {
+            design: snapshot.project_doc_ids.get(&project.id).copied(),
+            named: snapshot
+                .named_doc_ids
+                .get(&project.id)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        if ids.design.is_some() {
+            project.doc.clear();
+        }
+        for (name, body) in &mut project.documents {
+            if ids.named.contains_key(name) {
+                body.clear();
+            }
+        }
+        store.put_project_with_doc_ids(&project, &ids, &actor)?;
     }
     for project in store.projects()? {
         if !listed.contains(&project.id) {
@@ -713,18 +737,6 @@ pub fn restore(ctx: &Ctx<'_>, dir: &Path) -> Result<()> {
             // from before AGT-1386's tombstone kind). Nothing references
             // it, or the delete is refused.
             store.delete_project(&project.id, &actor)?;
-        }
-    }
-    // Reassign each document's original doc_id before any op replays
-    // (AGT-1344): a `body.edit` in the JSONL below targets it, and
-    // `Store::commit_any` only recognizes a document edit by finding its
-    // doc_id already on a `project`/`project_doc` row.
-    for (project, doc_id) in &snapshot.project_doc_ids {
-        store.set_design_doc_id(project, *doc_id)?;
-    }
-    for (project, names) in &snapshot.named_doc_ids {
-        for (name, doc_id) in names {
-            store.set_named_doc_id(project, name, *doc_id)?;
         }
     }
 

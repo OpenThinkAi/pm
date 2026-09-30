@@ -756,6 +756,8 @@ fn strip_config_ops(work: &Path) -> usize {
                         | "actor.upsert"
                         | "project.create"
                         | "project.set"
+                        | "project.delete"
+                        | "project.doc_add"
                 );
                 stripped += usize::from(config);
                 !config
@@ -852,4 +854,89 @@ fn restore_of_a_pre_agt_1385_backup_synthesizes_config_ops_from_the_snapshot() {
     // The deleted project's ops were stripped with the rest, so it is
     // simply never created; everything else is synthesized once.
     assert!(op_count(&restored) < op_count(&sb));
+}
+
+/// Rewrites every shard under `work` the way a backup written before
+/// AGT-1413 looks: no `project.doc_add` ops and no `doc_id` on a
+/// `project.create` — document ids only in the snapshot.
+fn strip_doc_identity(work: &Path) -> usize {
+    let mut stripped = 0;
+    for entry in std::fs::read_dir(work.join("ops").join("agt")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut kept = Vec::new();
+        for line in text.lines() {
+            let mut op: Value = serde_json::from_str(line).unwrap();
+            match op["kind"].as_str().unwrap() {
+                "project.doc_add" => {
+                    stripped += 1;
+                    continue;
+                }
+                "project.create" => {
+                    let payload = op["payload"].as_object_mut().unwrap();
+                    stripped += usize::from(payload.remove("doc_id").is_some());
+                }
+                _ => {}
+            }
+            kept.push(serde_json::to_string(&op).unwrap());
+        }
+        std::fs::write(&path, format!("{}\n", kept.join("\n"))).unwrap();
+    }
+    stripped
+}
+
+/// AGT-1413: a backup written before document identity was op-carried
+/// restores its documents onto the ids its snapshot lists (so the log's
+/// `body.edit` ops find them), binding them with ops, and comes out
+/// doctor-clean — with every document's text exactly once.
+#[test]
+fn restore_of_a_pre_agt_1413_backup_binds_documents_from_the_snapshot() {
+    let (sb, id) = configured();
+    let script = sb.home.path().join("editor.sh");
+    std::fs::write(&script, "#!/bin/sh\necho 'the design' > \"$1\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_ok(&sb.run(
+        &["project", "edit", "pm"],
+        &[("EDITOR", script.to_str().unwrap())],
+    ));
+    let notes = sb.home.path().join("notes.md");
+    std::fs::write(&notes, "some notes\n").unwrap();
+    assert_ok(&sb.pm(&[
+        "project",
+        "doc",
+        "add",
+        "pm",
+        "notes",
+        "--from-file",
+        notes.to_str().unwrap(),
+    ]));
+    let before = json(&sb.pm(&["project", "show", "pm", "--json"]));
+
+    let remote = RemoteBackup::new();
+    assert_ok(&sb.pm(&["backup", "--to", remote.work.to_str().unwrap()]));
+    assert!(strip_doc_identity(&remote.work) > 0);
+
+    let restored = restore_into(&remote);
+    assert_configured(&restored, &id);
+    let ws = restored.ws_str();
+    let after = json(&restored.pm(&["project", "show", "pm", "--workspace", ws, "--json"]));
+    assert_eq!(after, before);
+    assert_eq!(after["doc"], "the design\n");
+    assert_eq!(after["documents"]["notes"], "some notes\n");
+    let log = json(&restored.pm(&["log", "--workspace", ws, "--json"]));
+    let rebound = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|op| op["kind"] == "project.doc_add")
+        .count();
+    assert_eq!(rebound, 3, "pm's and pm-hub's design docs, and notes");
+    assert_ok(&restored.pm(&["doctor", "--rebuild", "--workspace", ws]));
 }

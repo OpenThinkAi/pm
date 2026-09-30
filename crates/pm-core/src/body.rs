@@ -142,9 +142,19 @@ impl Body {
     /// and order-independent: an update whose causal dependencies have not
     /// arrived yet is queued and applied once they do.
     pub fn apply(&mut self, update: &BodyUpdate) -> Result<(), BodyError> {
+        self.apply_awaiting(update).map(|_| ())
+    }
+
+    /// [`Body::apply`], reporting whether part of `update` is still queued
+    /// behind causal dependencies this replica has not seen (Loro's
+    /// `ImportStatus::pending`). That queue lives only in memory — a
+    /// [`Body::snapshot`] leaves it out — so a caller that persists the
+    /// body between updates must not keep one that returns `true`: the
+    /// queued part would be lost (AGT-1413).
+    pub fn apply_awaiting(&mut self, update: &BodyUpdate) -> Result<bool, BodyError> {
         self.doc
             .import(update.as_bytes())
-            .map(|_| ())
+            .map(|status| status.pending.is_some())
             .map_err(|e| BodyError::Import(e.to_string()))
     }
 

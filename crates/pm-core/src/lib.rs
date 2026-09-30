@@ -43,8 +43,10 @@ pub mod view;
 pub use archive::{month_key, project_idle, ticket_archivable};
 pub use body::{Body, BodyError, BodyUpdate};
 pub use check::Finding;
-pub use config::{ConfigApplyError, ProjectView, WorkspaceView, apply_project, apply_workspace};
-pub use doc::{DocApplyError, DocView, apply_doc};
+pub use config::{
+    ConfigApplyError, DocClaims, ProjectView, WorkspaceView, apply_project, apply_workspace,
+};
+pub use doc::{DocApplyError, DocView, apply_doc, apply_doc_persisted};
 pub use domain::{
     Actor, ActorId, ActorKind, Comment, Hold, NotBefore, Parked, Priority, Project, ProjectStatus,
     Relation, RelationKind, Source, State, StateCategory, Ticket, Waiver, Workspace,

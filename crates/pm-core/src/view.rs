@@ -105,6 +105,13 @@ impl BodyState {
         self.body.apply(update)
     }
 
+    /// [`BodyState::apply`], reporting whether part of `update` still
+    /// awaits missing causal dependencies ([`Body::apply_awaiting`]) —
+    /// which serializing this state would drop.
+    pub fn apply_awaiting(&mut self, update: &BodyUpdate) -> Result<bool, BodyError> {
+        self.body.apply_awaiting(update)
+    }
+
     /// Everything this replica knows, as one blob: what serde writes.
     pub fn snapshot(&self) -> Result<BodyUpdate, BodyError> {
         self.body.snapshot()
@@ -417,7 +424,8 @@ pub fn apply(view: &mut TicketView, op: &Op) -> Result<(), ApplyError> {
         | Payload::ActorUpsert(_)
         | Payload::ProjectCreate(_)
         | Payload::ProjectSet(_)
-        | Payload::ProjectDelete => {
+        | Payload::ProjectDelete
+        | Payload::ProjectDocAdd(_) => {
             return Err(ApplyError::WrongKind {
                 op_id: op.op_id,
                 kind: op.kind(),

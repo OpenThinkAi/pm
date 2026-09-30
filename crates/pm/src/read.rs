@@ -93,7 +93,8 @@ pub fn list(ctx: &Ctx<'_>, args: ListArgs) -> Result<()> {
 /// `pm log [<id>]` (AC3): the ticket's ops, oldest first (`Store::ops`
 /// already returns them in append order). With no `<id>`, the workspace's
 /// config ops instead (AGT-1386): every `workspace.set`, `state.upsert`,
-/// `actor.upsert`, `project.create`, `project.set` and `project.delete`.
+/// `actor.upsert`, `project.create`, `project.set`, `project.delete` and
+/// `project.doc_add` (AGT-1413).
 pub fn log(ctx: &Ctx<'_>, reference: Option<&str>) -> Result<()> {
     let (store, ws) = ctx.open()?;
     let ops = match reference {
@@ -199,6 +200,10 @@ fn op_summary_in(op: &Op, slugs: &BTreeMap<Ulid, String>) -> String {
         ),
         Payload::ProjectSet(p) => project_summary(&project(), p),
         Payload::ProjectDelete => format!("deleted project {}", project()),
+        Payload::ProjectDocAdd(d) => match &d.name {
+            Some(name) => format!("added document '{name}' to project {}", project()),
+            None => format!("bound the design doc of project {}", project()),
+        },
     }
 }
 
