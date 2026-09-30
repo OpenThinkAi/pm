@@ -3,11 +3,13 @@
 //!
 //! - `GET /health` (open): status and schema version;
 //! - `GET /w/{workspace}/whoami` (bearer token): the token's workspace and
-//!   name, so a client can check a token before syncing with it.
+//!   name, so a client can check a token before syncing with it;
+//! - `POST /w/{workspace}/ops` (bearer token): push a batch of ops and get
+//!   their seqs (see `ops`).
 //!
-//! Push, pull and conditional ops land under `/w/{workspace}/` behind the
-//! same auth layer (AGT-1389 onward). `pm-hub token create|list|revoke`
-//! manage bearer tokens (see `admin`).
+//! Pull and conditional ops land under `/w/{workspace}/` behind the same
+//! auth layer (AGT-1390 onward). `pm-hub token create|list|revoke` manage
+//! bearer tokens (see `admin`). The HTTP contract is `docs/hub-api.md`.
 //!
 //! Environment: `DATABASE_URL` (required; a Postgres URL) and `PORT`
 //! (default 8080; Railway sets it).
@@ -15,6 +17,7 @@
 mod admin;
 mod auth;
 mod migrate;
+mod ops;
 
 use std::env;
 use std::error::Error;
@@ -22,12 +25,13 @@ use std::net::Ipv6Addr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, FromRef, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
+use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 
 const DEFAULT_PORT: u16 = 8080;
@@ -67,6 +71,22 @@ enum TokenCmd {
     Revoke { id: i64 },
 }
 
+/// The server's two database connections. `reader` answers auth, health
+/// and pulls concurrently (tokio-postgres pipelines them); `writer` is
+/// the one connection pushes run their transactions on, one at a time
+/// (`ops`). Cloned into every handler.
+#[derive(Clone)]
+struct Db {
+    reader: Arc<Client>,
+    writer: Arc<Mutex<Client>>,
+}
+
+impl FromRef<Db> for Arc<Client> {
+    fn from_ref(db: &Db) -> Self {
+        db.reader.clone()
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -103,6 +123,21 @@ async fn token(cmd: TokenCmd) -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// One of the server's connections. If it drops, exit and let the
+/// platform's restart policy reconnect rather than serve a hub that can
+/// no longer reach its database.
+async fn connect(database_url: &str) -> Result<Client, tokio_postgres::Error> {
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("pm-hub: database connection: {e}");
+        }
+        eprintln!("pm-hub: database connection closed; exiting");
+        std::process::exit(1);
+    });
+    Ok(client)
+}
+
 async fn run() -> Result<(), Box<dyn Error>> {
     let database_url = database_url()?;
     let port = match env::var("PORT") {
@@ -112,22 +147,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Err(_) => DEFAULT_PORT,
     };
 
-    let (mut client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
-    // One connection for the process. If it drops, exit and let the
-    // platform's restart policy reconnect rather than serve a hub that can
-    // no longer reach its database.
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("pm-hub: database connection: {e}");
-        }
-        eprintln!("pm-hub: database connection closed; exiting");
-        std::process::exit(1);
-    });
-
-    let version = migrate::migrate(&mut client).await?;
+    let mut reader = connect(&database_url).await?;
+    let version = migrate::migrate(&mut reader).await?;
     eprintln!("pm-hub: schema version {version}");
+    let writer = connect(&database_url).await?;
 
-    let app = app(Arc::new(client));
+    let app = app(Db {
+        reader: Arc::new(reader),
+        writer: Arc::new(Mutex::new(writer)),
+    });
     // `::` is dual-stack on Linux, so this serves both Railway's public
     // (IPv4) proxy and its private (IPv6) network.
     let listener = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, port)).await?;
@@ -139,10 +167,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
 /// The HTTP surface. Routes added above `route_layer` require a bearer
 /// token for the `{workspace}` in their path; `/health` is added after it
 /// and stays open. Unknown paths, wrong methods and auth failures all get
-/// the same bare 404 (`auth::not_found`).
-fn app(db: Arc<Client>) -> Router {
+/// the same bare 404 (`auth::not_found`). Only the push route accepts a
+/// body larger than axum's 2 MB default (`ops::MAX_BODY_BYTES`).
+fn app(db: Db) -> Router {
     let routes = Router::new()
         .route("/w/{workspace}/whoami", get(whoami))
+        .route(
+            "/w/{workspace}/ops",
+            post(ops::push).layer(DefaultBodyLimit::max(ops::MAX_BODY_BYTES)),
+        )
         .route_layer(middleware::from_fn_with_state(
             db.clone(),
             auth::require_auth,
@@ -185,8 +218,8 @@ struct Health {
 
 /// 200 with the schema version read live from the database (so a hub that
 /// cannot reach Postgres fails its health check), 503 otherwise.
-async fn health(State(db): State<Arc<Client>>) -> Result<Json<Health>, StatusCode> {
-    let schema_version = migrate::schema_version(&db).await.map_err(|e| {
+async fn health(State(db): State<Db>) -> Result<Json<Health>, StatusCode> {
+    let schema_version = migrate::schema_version(&db.reader).await.map_err(|e| {
         eprintln!("pm-hub: health: {e}");
         StatusCode::SERVICE_UNAVAILABLE
     })?;
