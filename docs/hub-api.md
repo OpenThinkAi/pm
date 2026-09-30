@@ -90,6 +90,57 @@ room for a single large op — the Studio's seed log holds one 23 MB
 `body.edit` — plus a batch around it; a client should size batches by
 both count and bytes.
 
+## `GET /w/{workspace}/ops?since=<seq>&limit=<n>` — pull (AGT-1390)
+
+The workspace's ops with `seq > since`, in seq order, at most `limit` of
+them. Both parameters are optional: `since` defaults to `0` (the whole
+log), `limit` to **500** and is clamped to **1000**
+(`pm_hub::pull::{DEFAULT_PAGE_OPS, MAX_PAGE_OPS}`, the push batch cap).
+Any other parameter is a `400`.
+
+Response `200`:
+
+```json
+{"ops": [{"seq": 41, "op": {"op_id": "01K6…", "hlc": {"wall_ms": 1790000000000, "counter": 0},
+                              "actor": "studio", "entity": "01K6…", "kind": "label.add",
+                              "payload": {"label": "x"}, "version": 1}},
+         {"seq": 42, "op": {…}}],
+ "next": 42,
+ "head": 1207}
+```
+
+- Each `op` is the op's JSON text **exactly as the hub stored it** — the
+  bytes a client pushed, spacing and key order included (the hub never
+  re-serializes an op). Ops the hub authored itself (number allocation,
+  AGT-1391) are in the log like any other and come back the same way.
+- `next` is the seq to pass as `since` on the next request: the last
+  `seq` in `ops`, or the request's own `since` when `ops` is empty.
+- `head` is the workspace's largest seq (`0` for an empty log), read in
+  the same snapshot as the page. `next < head` means more ops were
+  already waiting; `next >= head` means the client had everything as of
+  that snapshot. A client pages `since = next` until `next >= head`.
+- The cursor is gap-safe: seqs are handed out and committed in order
+  per workspace (see "How the order is kept"), so every seq at or below
+  `head` is committed when `head` is read, and no op with a seq at or
+  below a `next` the client has seen can appear later. Seqs are **not**
+  contiguous (one sequence serves every workspace; a rolled-back push
+  burns its values) — never count them or infer a missing op from a
+  hole.
+- `since` at or beyond `head` is `200 {"ops": [], "next": <since>,
+  "head": <head>}`.
+- Pulls run on a connection pushes never use and read only committed
+  rows, so a pull never waits for an in-flight push and never sees a
+  partial batch.
+
+Errors:
+
+| Status | `error` | When |
+|---|---|---|
+| `400` | `invalid_query` | `since` is not an integer `>= 0`, `limit` is not an integer `>= 1`, the query names another parameter, or it is not decodable |
+
+The body is `{"error": "invalid_query", "reason": "…"}`; `reason` quotes
+the offending value.
+
 ### How the order is kept
 
 Postgres's `bigserial` on its own does not commit in the order it hands
