@@ -21,6 +21,7 @@
 
 mod admin;
 mod auth;
+mod db;
 mod migrate;
 mod numbers;
 mod ops;
@@ -41,7 +42,7 @@ use axum::{Json, Router, middleware};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 
 const DEFAULT_PORT: u16 = 8080;
 
@@ -117,9 +118,9 @@ fn database_url() -> Result<String, Box<dyn Error>> {
 }
 
 async fn token(cmd: TokenCmd) -> Result<(), Box<dyn Error>> {
-    let (mut client, connection) = tokio_postgres::connect(&database_url()?, NoTls).await?;
+    let (mut client, connection) = db::connect(&database_url()?).await?;
     tokio::spawn(async move {
-        if let Err(e) = connection.await {
+        if let Err(e) = connection.drive().await {
             eprintln!("pm-hub: database connection: {e}");
         }
     });
@@ -135,10 +136,10 @@ async fn token(cmd: TokenCmd) -> Result<(), Box<dyn Error>> {
 /// One of the server's connections. If it drops, exit and let the
 /// platform's restart policy reconnect rather than serve a hub that can
 /// no longer reach its database.
-async fn connect(database_url: &str) -> Result<Client, tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+async fn connect(database_url: &str) -> Result<Client, Box<dyn Error>> {
+    let (client, connection) = db::connect(database_url).await?;
     tokio::spawn(async move {
-        if let Err(e) = connection.await {
+        if let Err(e) = connection.drive().await {
             eprintln!("pm-hub: database connection: {e}");
         }
         eprintln!("pm-hub: database connection closed; exiting");
