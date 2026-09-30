@@ -331,13 +331,21 @@ pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>, join: Option<Ul
             );
         }
     } else {
-        println!("initialized {} workspace at {}", ws.prefix, dir.display());
+        println!(
+            "initialized {} workspace at {}",
+            crate::text::inline(&ws.prefix),
+            dir.display()
+        );
         let states: Vec<String> = ws
             .states
             .iter()
             .map(|s| {
                 let category = serde_json::to_value(s.category).expect("a category serializes");
-                format!("{} ({})", s.name, category.as_str().unwrap_or_default())
+                format!(
+                    "{} ({})",
+                    crate::text::inline(&s.name),
+                    category.as_str().unwrap_or_default()
+                )
             })
             .collect();
         println!("states: {}", states.join(", "));
@@ -1010,9 +1018,12 @@ fn print_batch_result(
 /// `AGT-12`, or `AGT-?` before the authority numbers it. `pub(crate)`:
 /// `crate::read` prints display ids for `pm list`/`pm graph` too.
 pub(crate) fn display_id(ws: &Workspace, t: &Ticket) -> String {
+    // The prefix comes from a synced `workspace.set`, so it is scrubbed
+    // like every other printed field (AGT-1468).
+    let prefix = crate::text::inline(&ws.prefix);
     match t.number {
-        Some(n) => format!("{}-{n}", ws.prefix),
-        None => format!("{}-?", ws.prefix),
+        Some(n) => format!("{prefix}-{n}"),
+        None => format!("{prefix}-?"),
     }
 }
 

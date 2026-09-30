@@ -518,7 +518,8 @@ when:
   `ui-leaf` was asked for by flag or config, then one stderr line;
 - there is **no pinned ui-leaf** — `ui_leaf.path` in config.toml (else the
   first `ui-leaf` on `PATH`) is missing, does not run, or reports a version
-  outside `>=1.6.0, <2.0.0`; or the `PATH` hit is not the npm-installed
+  outside `>=1.6.0, <1.7.0` (the verified minor; docs/app-api.md
+  §Bumping the ui-leaf pin); or the `PATH` hit is not the npm-installed
   `@openthink/ui-leaf` package (AGT-1465; name it in `ui_leaf.path` to use it
   anyway). Always one stderr line saying which;
 - ui-leaf **exits before its view is ready**. One stderr line.

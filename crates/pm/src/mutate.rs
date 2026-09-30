@@ -344,8 +344,10 @@ pub fn mv(ctx: &Ctx<'_>, reference: &str, state: &str, keep_assignee: bool) -> R
     let (ops, cleared) = move_ops(&ws, &ticket, &mut stamper, &state, keep_assignee)?;
     if let Some(assignee) = cleared {
         eprintln!(
-            "pm: cleared assignee ({assignee}) moving {} to '{state}'; pass --keep-assignee to keep it",
+            "pm: cleared assignee ({}) moving {} to '{}'; pass --keep-assignee to keep it",
+            crate::text::inline(&assignee.to_string()),
             display_id(&ws, &ticket),
+            crate::text::inline(&state),
         );
     }
     store.commit_batch(&ops, &[])?;
@@ -479,8 +481,14 @@ pub fn unclaim(ctx: &Ctx<'_>, reference: &str) -> Result<()> {
         eprintln!(
             "pm: {} is already unstarted (state '{}'); cleared the stray assignee ({})",
             display_id(&ws, &ticket),
-            ticket.state,
-            ticket.assignee.as_ref().expect("checked Some above"),
+            crate::text::inline(&ticket.state),
+            crate::text::inline(
+                ticket
+                    .assignee
+                    .as_ref()
+                    .expect("checked Some above")
+                    .as_str()
+            ),
         );
         vec![stamper.op(ticket.id, Payload::FieldSet(FieldSet::Assignee(None)))]
     } else {

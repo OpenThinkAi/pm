@@ -184,7 +184,7 @@ fn list(ctx: &Ctx<'_>, status: Option<ProjectStatus>) -> Result<()> {
         for p in &projects {
             println!(
                 "{:<24} {:<12} {}",
-                p.id,
+                crate::text::inline(&p.id),
                 status_str(p.status),
                 crate::text::inline(&p.title)
             );
@@ -309,7 +309,7 @@ fn delete(ctx: &Ctx<'_>, id: &str) -> Result<()> {
     if ctx.json {
         print_json(&json!({"schema": SCHEMA, "id": id, "deleted": true}));
     } else {
-        println!("deleted {id}");
+        println!("deleted {}", crate::text::inline(id));
     }
     Ok(())
 }
@@ -342,7 +342,11 @@ fn doc_add(ctx: &Ctx<'_>, id: &str, name: &str, from_file: &std::path::Path) -> 
     if ctx.json {
         print_json(&json!({"schema": SCHEMA, "project": id, "doc": name}));
     } else {
-        println!("{id} doc/{name}");
+        println!(
+            "{} doc/{}",
+            crate::text::inline(id),
+            crate::text::inline(&name)
+        );
     }
     Ok(())
 }
@@ -374,21 +378,28 @@ fn print_project(ctx: &Ctx<'_>, project: &Project) -> Result<()> {
         print_json(&project_json(project));
         return Ok(());
     }
-    println!("{}  {}", project.id, crate::text::inline(&project.title));
+    println!(
+        "{}  {}",
+        crate::text::inline(&project.id),
+        crate::text::inline(&project.title)
+    );
     println!("status:  {}", status_str(project.status));
-    println!("parent:  {}", project.parent.as_deref().unwrap_or("-"));
+    println!(
+        "parent:  {}",
+        crate::text::inline(project.parent.as_deref().unwrap_or("-"))
+    );
     let repos: Vec<&str> = project.repos.iter().map(String::as_str).collect();
     println!(
         "repos:   {}",
         if repos.is_empty() {
             "-".into()
         } else {
-            repos.join(", ")
+            crate::text::inline(&repos.join(", "))
         }
     );
     if !project.documents.is_empty() {
         let names: Vec<&str> = project.documents.keys().map(String::as_str).collect();
-        println!("docs:    {}", names.join(", "));
+        println!("docs:    {}", crate::text::inline(&names.join(", ")));
     }
     if !project.doc.is_empty() {
         println!();

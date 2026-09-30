@@ -339,8 +339,9 @@ runs until the binary is named in `ui_leaf.path`. (Provenance, not
 integrity: pm hands the runtime its API token, so install ui-leaf from a
 trusted source.) When that is the npm package's Node shim, pm runs the native
 `ui-leaf-bin` beside it. It must report (`--version`) a version in
-`>=1.6.0, <2.0.0` — 1.6.0 is the release the views were built against, and
-ui-leaf's wire protocol `"1"` may only break at a new major. Otherwise pm
+`>=1.6.0, <1.7.0` — exactly the minor the views were built and verified
+against (AGT-1468; see [Bumping the ui-leaf pin](#bumping-the-ui-leaf-pin)),
+so a newer minor is never launched by a routine `npm i -g`. Otherwise pm
 does not launch it (and says why). No display — `UI_LEAF_NO_OPEN` truthy,
 an SSH session, or Linux/BSD without `DISPLAY`/`WAYLAND_DISPLAY` — means no
 launch either; `UI_LEAF_NO_OPEN=0` forces one.
@@ -509,3 +510,23 @@ instead, for developing a view without rebuilding pm.
   CRDT, live — with "← Back to tickets" to return. (The board, which
   predates this, still points at `pm edit <ref>`.)
 
+## Bumping the ui-leaf pin
+
+The runtime is handed pm's API token, so pm launches only the ui-leaf minor
+someone has verified: `PIN_MIN` (`>=`) and `PIN_BELOW` (`<`) in
+`crates/pm/src/app/launch.rs`. **Verified version: ui-leaf 1.6.0**
+(`ui-leaf --version`; range `>=1.6.0, <1.7.0`). Patch releases inside the
+minor are accepted; a new minor or major is not until the pin moves:
+
+1. Install the candidate from the npm registry and read its changelog and
+   the diff against the verified version (`npm diff`); note any change to
+   the stdio protocol, the `session` mutation, the CSP or what it does with
+   the token.
+2. Run the pm suite (`cargo test --workspace`, including `tests/launch.rs`
+   against the fake runtime) and one real `pm edit --view=ui-leaf` and
+   `pm app` session by hand against the candidate.
+3. Raise `PIN_MIN` to the candidate and `PIN_BELOW` to the next minor; update
+   the two `>=…, <…` ranges in this file and `docs/cli-contract.md`, the
+   `the_pin_is_exactly_the_verified_minor` and `an_unpinned_ui_leaf_is_not_launched`
+   tests, and the "Verified version" line above.
+4. Land it through the normal stamp flow.

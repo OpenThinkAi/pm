@@ -70,14 +70,18 @@ pub fn list(ctx: &Ctx<'_>, args: ListArgs) -> Result<()> {
             .map(|t| display_id(&ws, t).len())
             .max()
             .unwrap_or(2),
-        tickets.iter().map(|t| t.state.len()).max().unwrap_or(5),
+        tickets
+            .iter()
+            .map(|t| crate::text::inline(&t.state).len())
+            .max()
+            .unwrap_or(5),
     );
     for t in &tickets {
         let project = t.project.as_deref().unwrap_or("-");
         println!(
             "{:<id_w$}  {:<state_w$}  {:<8}  {:<12}  {}",
             display_id(&ws, t),
-            t.state,
+            crate::text::inline(&t.state),
             priority_str(&t.priority),
             crate::text::inline(project),
             crate::text::inline(&t.title),
@@ -124,7 +128,7 @@ pub fn log(ctx: &Ctx<'_>, reference: Option<&str>) -> Result<()> {
         println!(
             "{:<23}  {:<28}  {:<16}  {}",
             crate::verbs::when_secs(&op.hlc),
-            op.actor.as_str(),
+            crate::text::inline(op.actor.as_str()),
             op.kind(),
             crate::text::inline(&op_summary_in(op, &slugs))
         );
@@ -379,14 +383,14 @@ pub fn status(ctx: &Ctx<'_>, project: Option<String>) -> Result<()> {
     let width = ws
         .states
         .iter()
-        .map(|s| s.name.len())
+        .map(|s| crate::text::inline(&s.name).len())
         .max()
         .unwrap_or(5)
         .max(6);
     for state in &ws.states {
         println!(
             "{:<width$}  {}",
-            state.name,
+            crate::text::inline(&state.name),
             counts.get(state.name.as_str()).copied().unwrap_or(0)
         );
     }
@@ -512,7 +516,7 @@ pub fn graph(ctx: &Ctx<'_>, args: GraphArgs) -> Result<()> {
         return Ok(());
     }
     for (i, wave) in wave_ids.iter().enumerate() {
-        println!("wave {i}: {}", wave.join(" "));
+        println!("wave {i}: {}", crate::text::inline(&wave.join(" ")));
     }
     println!("done: {done}");
     Ok(())

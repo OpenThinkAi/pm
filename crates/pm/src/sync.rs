@@ -434,8 +434,8 @@ pub(crate) struct RejectedClaim {
 impl std::fmt::Display for RejectedClaim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let holder = match &self.rejected.taken_by {
-            Some(actor) => format!("taken by {actor}"),
-            None => format!("in state '{}'", self.rejected.state),
+            Some(actor) => format!("taken by {}", crate::text::inline(actor.as_str())),
+            None => format!("in state '{}'", crate::text::inline(&self.rejected.state)),
         };
         write!(
             f,
@@ -669,7 +669,7 @@ fn report(
         if let Some(seed) = &round.seed {
             line.push_str(&format!(
                 "seeded hub workspace {} ({}{} op(s), number floor {}, {} ticket(s) numbered by the hub); ",
-                hub.workspace,
+                crate::text::inline(&hub.workspace),
                 if seed.resumed { "resumed; " } else { "" },
                 seed.pushed,
                 seed.number_floor,
@@ -702,6 +702,31 @@ fn report(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refused_claim_prints_hub_fields_clean() {
+        let evil = "a\x1b]52;c;x\x07b\u{202e}c";
+        for taken_by in [Some(ActorId::new(evil)), None] {
+            let claim = RejectedClaim {
+                op_id: Ulid::new(),
+                ticket: Ulid::new(),
+                rejected: Rejected {
+                    taken_by,
+                    at: Hlc {
+                        wall_ms: 1,
+                        counter: 0,
+                    },
+                    state: evil.into(),
+                    code: "already_assigned".into(),
+                    reason: evil.into(),
+                },
+            };
+            let shown = claim.to_string();
+            assert!(shown.contains("a]52;c;xbc"), "{shown}");
+            assert!(!shown.chars().any(char::is_control), "{shown:?}");
+            assert!(!shown.contains('\u{202e}'), "{shown:?}");
+        }
+    }
+
     use super::*;
     use pm_core::op::CommentAdd;
     use pm_core::{ActorId, Hlc, Payload};

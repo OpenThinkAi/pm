@@ -208,7 +208,7 @@ fn print_auto_result(
         println!("{project_verb}: none");
     } else {
         let ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
-        println!("{project_verb}: {}", ids.join(", "));
+        println!("{project_verb}: {}", crate::text::inline(&ids.join(", ")));
     }
     Ok(())
 }

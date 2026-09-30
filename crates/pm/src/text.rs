@@ -3,7 +3,9 @@
 //! through `pm sync`, so anything printed for a human could carry ANSI/OSC
 //! escape sequences (rewrite the screen, set the window title, write the
 //! clipboard), C1 controls, or bidi overrides that reorder what the
-//! reader sees. Every human-readable (non-`--json`) sink routes such text
+//! reader sees. AGT-1468 extended that to every synced field: actors,
+//! assignees, labels, repos, project metadata, states, model labels and
+//! the hub's claim refusals (`tests/output_fields.rs` pins each). Every human-readable (non-`--json`) sink routes such text
 //! through [`printable`] or [`inline`]; `--json` stays byte-for-byte
 //! as stored (JSON escapes the C0 range itself, and a consumer is not a
 //! terminal).

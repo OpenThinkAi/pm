@@ -92,7 +92,7 @@ impl Sandbox {
             .env_clear()
             .env("HOME", self.home.path())
             .env("USER", "tester")
-            // Aborted edits keep their temp file; keep it in the sandbox.
+            // Temp dirs go in the sandbox.
             .env("TMPDIR", self.home.path())
             .env("PATH", "/usr/bin:/bin")
             .env("DISPLAY", ":0")
@@ -323,6 +323,18 @@ fn an_editor_that_keeps_saving_garbage_is_bounded() {
     let out = sb.run(&["edit", "AGT-1"], Some(&editor));
     assert_code(&out, 1);
     assert!(stderr(&out).contains("gave up"), "{}", stderr(&out));
+    // The last text is echoed, and no temp directory outlives the command.
+    assert!(
+        stderr(&out).contains("the text you saved last:"),
+        "{}",
+        stderr(&out)
+    );
+    let leftovers = std::fs::read_dir(sb.home.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("pm-edit-"))
+        .count();
+    assert_eq!(leftovers, 0);
     assert_eq!(sb.invocations(), 11);
 }
 

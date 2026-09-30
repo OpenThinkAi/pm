@@ -402,7 +402,7 @@ fn print_gate_labels(
         eprintln!("no gate labels");
     } else {
         for l in labels {
-            println!("{l}");
+            println!("{}", crate::text::inline(l));
         }
     }
     Ok(())

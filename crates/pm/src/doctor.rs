@@ -86,7 +86,7 @@ fn print_report(report: &Report) {
     } else {
         println!("integrity       {} problem(s)", report.integrity.len());
         for message in &report.integrity {
-            println!("  {message}");
+            println!("  {}", crate::text::inline(message));
         }
     }
 
@@ -98,7 +98,9 @@ fn print_report(report: &Report) {
             let rowid = v.rowid.map_or_else(|| "?".into(), |r| r.to_string());
             println!(
                 "  {} rowid {rowid} -> {} (foreign key #{})",
-                v.table, v.parent, v.fk_index
+                crate::text::inline(&v.table),
+                crate::text::inline(&v.parent),
+                v.fk_index
             );
         }
     }
@@ -122,7 +124,7 @@ fn print_report(report: &Report) {
     }
 
     match &report.replay_error {
-        Some(error) => println!("replay          FAILED: {error}"),
+        Some(error) => println!("replay          FAILED: {}", crate::text::inline(error)),
         None if report.drift.is_empty() => {
             println!("replay          ok: derived tables match the op log");
         }
@@ -139,7 +141,7 @@ fn print_report(report: &Report) {
 /// `before` is what the tables held, `after` what the log produces.
 fn print_diff(diff: &Diff) {
     for table in &diff.tables {
-        println!("  {}", table.table);
+        println!("  {}", crate::text::inline(&table.table));
         for row in &table.extra {
             println!("    - {}  (not produced by the log)", key(&row.key));
         }
@@ -150,7 +152,14 @@ fn print_diff(diff: &Diff) {
             let columns: Vec<String> = change
                 .columns
                 .iter()
-                .map(|c| format!("{}: {} -> {}", c.column, cell(&c.before), cell(&c.after)))
+                .map(|c| {
+                    format!(
+                        "{}: {} -> {}",
+                        crate::text::inline(&c.column),
+                        cell(&c.before),
+                        cell(&c.after)
+                    )
+                })
                 .collect();
             println!("    ~ {}  {}", key(&change.key), columns.join(", "));
         }
@@ -169,8 +178,23 @@ fn cell(value: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };
+    // Database values (titles, blobs) came from synced ops (AGT-1468).
+    let text = crate::text::inline(&text);
     match text.char_indices().nth(60) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
         None => text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_cells_drop_terminal_controls() {
+        let evil = Value::String("t\x1b]0;x\x07\u{202e}\nz".into());
+        let shown = cell(&evil);
+        assert_eq!(shown, "t]0;x z");
+        assert_eq!(key(&[evil]), "[t]0;x z]");
     }
 }
