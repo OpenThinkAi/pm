@@ -453,9 +453,12 @@ fn a_deleted_project_is_a_tombstone_op_that_a_rebuild_honours() {
     // A peer applying the old identity's ops (create ... tombstone) ends
     // without the project, and a `project.set` arriving after the delete
     // does not bring it back.
+    // An hour ahead: well after the delete, and inside the pull's
+    // far-future bound (`PULL_MAX_FUTURE_SKEW_MS`).
+    let an_hour_on = old_ops.last().unwrap().hlc.wall_ms + 60 * 60 * 1000;
     let late = Op::new(
         Ulid::new(),
-        Hlc::new(u64::MAX / 4, 0),
+        Hlc::new(an_hour_on, 0),
         matt(),
         ulid,
         Payload::ProjectSet(pm_core::op::ProjectSet::Title("late".into())),

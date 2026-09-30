@@ -70,33 +70,158 @@ impl Clock {
 
     /// Stamp a local event ("send" / "local" in the paper). The result is
     /// strictly greater than every stamp this clock has issued or received.
+    ///
+    /// Never overflows: a spent counter rolls over into the next
+    /// millisecond ([`Hlc::successor`]). It could only stop advancing at
+    /// `wall_ms == u64::MAX`, which no clock reaches — every clock is
+    /// restored from a stored stamp, and storage holds at most
+    /// [`MAX_WALL_MS`]. Use [`Clock::try_send`] where the stamp must also
+    /// stay storable.
     pub fn send(&mut self, now_ms: u64) -> Hlc {
-        let Hlc { wall_ms, counter } = self.latest;
-        self.latest = if now_ms > wall_ms {
+        let latest = self.latest;
+        self.latest = if now_ms > latest.wall_ms {
             Hlc::new(now_ms, 0)
         } else {
-            Hlc::new(wall_ms, counter + 1)
+            latest.successor()
         };
         self.latest
     }
 
     /// Fold a remote stamp into this clock and stamp the receive event. The
     /// result is strictly greater than both `remote` and this clock's
-    /// previous stamp.
+    /// previous stamp. A remote counter at `u32::MAX` rolls over into the
+    /// next millisecond instead of overflowing (oaudit 2026-09-30).
     pub fn receive(&mut self, remote: Hlc, now_ms: u64) -> Hlc {
         let local = self.latest;
         let wall_ms = now_ms.max(local.wall_ms).max(remote.wall_ms);
-        let counter = if wall_ms == local.wall_ms && wall_ms == remote.wall_ms {
-            local.counter.max(remote.counter) + 1
+        self.latest = if wall_ms == local.wall_ms && wall_ms == remote.wall_ms {
+            Hlc::new(wall_ms, local.counter.max(remote.counter)).successor()
         } else if wall_ms == local.wall_ms {
-            local.counter + 1
+            local.successor()
         } else if wall_ms == remote.wall_ms {
-            remote.counter + 1
+            remote.successor()
         } else {
-            0
+            Hlc::new(wall_ms, 0)
         };
-        self.latest = Hlc::new(wall_ms, counter);
         self.latest
+    }
+
+    /// [`Clock::send`], refused with [`ClockError::Exhausted`] (and the
+    /// clock left as it was) when the stamp would not be storable
+    /// ([`Hlc::check_range`]).
+    pub fn try_send(&mut self, now_ms: u64) -> Result<Hlc, ClockError> {
+        let before = *self;
+        let next = self.send(now_ms);
+        self.keep_in_range(before, next)
+    }
+
+    /// [`Clock::receive`], refused like [`Clock::try_send`].
+    pub fn try_receive(&mut self, remote: Hlc, now_ms: u64) -> Result<Hlc, ClockError> {
+        let before = *self;
+        let next = self.receive(remote, now_ms);
+        self.keep_in_range(before, next)
+    }
+
+    fn keep_in_range(&mut self, before: Clock, next: Hlc) -> Result<Hlc, ClockError> {
+        match next.check_range() {
+            Ok(()) if next > before.latest => Ok(next),
+            _ => {
+                *self = before;
+                Err(ClockError::Exhausted {
+                    latest: before.latest,
+                })
+            }
+        }
+    }
+}
+
+/// The largest storable `wall_ms`: both stores keep it in a signed 64-bit
+/// integer (SQLite `INTEGER`, Postgres `bigint`). Still the year 292
+/// million.
+pub const MAX_WALL_MS: u64 = i64::MAX as u64;
+
+/// The largest counter a stamp may carry across a trust boundary. One
+/// below `u32::MAX`, so a received stamp always leaves the counter room
+/// to advance within its millisecond.
+pub const MAX_COUNTER: u32 = u32::MAX - 1;
+
+/// How far ahead of the receiver's wall clock a remote stamp may be
+/// before the hub refuses it (oaudit 2026-09-30): one day. A stamp
+/// further ahead would win every LWW register until the world caught up
+/// with it, and drag every clock that saw it into the future.
+pub const MAX_FUTURE_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Why a stamp from another replica is not admissible
+/// ([`Hlc::check_range`], [`Hlc::check_not_after`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum StampError {
+    #[error("hlc.wall_ms {wall_ms} is out of range (at most {MAX_WALL_MS})")]
+    WallOutOfRange { wall_ms: u64 },
+    #[error("hlc.counter {counter} is out of range (at most {MAX_COUNTER})")]
+    CounterOutOfRange { counter: u32 },
+    #[error(
+        "hlc.wall_ms {wall_ms} is more than {max_skew_ms} ms ahead of the receiver's clock ({now_ms})"
+    )]
+    FarFuture {
+        wall_ms: u64,
+        now_ms: u64,
+        max_skew_ms: u64,
+    },
+}
+
+/// A clock that cannot issue another storable stamp.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ClockError {
+    #[error("the hybrid logical clock is exhausted at {latest}")]
+    Exhausted { latest: Hlc },
+}
+
+impl Hlc {
+    /// The least stamp strictly greater than this one: the next counter
+    /// value, or — when the counter is spent — the next millisecond at
+    /// counter 0. Checked arithmetic throughout: it saturates at
+    /// `(u64::MAX, u32::MAX)` instead of wrapping, which no stored stamp
+    /// can reach (see [`MAX_WALL_MS`]).
+    pub fn successor(self) -> Hlc {
+        match self.counter.checked_add(1) {
+            Some(counter) => Hlc::new(self.wall_ms, counter),
+            None => match self.wall_ms.checked_add(1) {
+                Some(wall_ms) => Hlc::new(wall_ms, 0),
+                None => self,
+            },
+        }
+    }
+
+    /// Whether this stamp is storable and leaves its counter room to
+    /// advance: `wall_ms <= MAX_WALL_MS` and `counter <= MAX_COUNTER`.
+    /// Every trust boundary (the hub's push, a replica's pull) checks
+    /// this before a remote stamp reaches a clock or a store.
+    pub fn check_range(self) -> Result<(), StampError> {
+        if self.wall_ms > MAX_WALL_MS {
+            return Err(StampError::WallOutOfRange {
+                wall_ms: self.wall_ms,
+            });
+        }
+        if self.counter > MAX_COUNTER {
+            return Err(StampError::CounterOutOfRange {
+                counter: self.counter,
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether this stamp is at most `max_skew_ms` ahead of `now_ms` (the
+    /// receiver's wall clock). Stamps from the past are always fine —
+    /// seeding uploads a log of historical ops.
+    pub fn check_not_after(self, now_ms: u64, max_skew_ms: u64) -> Result<(), StampError> {
+        if self.wall_ms > now_ms.saturating_add(max_skew_ms) {
+            return Err(StampError::FarFuture {
+                wall_ms: self.wall_ms,
+                now_ms,
+                max_skew_ms,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -161,6 +286,82 @@ mod tests {
         assert!(a < later);
     }
 
+    #[test]
+    fn a_spent_counter_rolls_over_instead_of_overflowing() {
+        // oaudit 2026-09-30: a remote counter at u32::MAX used to overflow.
+        let mut c = Clock::from_latest(Hlc::new(10, 3));
+        assert_eq!(c.receive(Hlc::new(10, u32::MAX), 5), Hlc::new(11, 0));
+        let mut c = Clock::from_latest(Hlc::new(10, u32::MAX));
+        assert_eq!(c.send(10), Hlc::new(11, 0));
+        let mut c = Clock::from_latest(Hlc::new(1, 1));
+        assert_eq!(c.receive(Hlc::new(20, u32::MAX), 5), Hlc::new(21, 0));
+        let mut c = Clock::from_latest(Hlc::new(20, u32::MAX));
+        assert_eq!(c.receive(Hlc::new(1, 1), 5), Hlc::new(21, 0));
+        // Saturates rather than wraps at the very top.
+        let top = Hlc::new(u64::MAX, u32::MAX);
+        assert_eq!(top.successor(), top);
+        let mut c = Clock::from_latest(top);
+        assert_eq!(c.send(0), top);
+    }
+
+    #[test]
+    fn try_send_and_try_receive_refuse_unstorable_stamps() {
+        let mut c = Clock::from_latest(Hlc::new(MAX_WALL_MS, u32::MAX));
+        assert_eq!(
+            c.try_send(0),
+            Err(ClockError::Exhausted {
+                latest: Hlc::new(MAX_WALL_MS, u32::MAX)
+            })
+        );
+        assert_eq!(
+            c.latest(),
+            Hlc::new(MAX_WALL_MS, u32::MAX),
+            "left as it was"
+        );
+        let mut c = Clock::from_latest(Hlc::new(5, 0));
+        assert!(c.try_receive(Hlc::new(MAX_WALL_MS + 1, 0), 5).is_err());
+        assert_eq!(c.latest(), Hlc::new(5, 0));
+        assert!(c.try_send(u64::MAX).is_err());
+        assert_eq!(c.try_send(6), Ok(Hlc::new(6, 0)));
+        assert_eq!(
+            c.try_receive(Hlc::new(MAX_WALL_MS, 7), 6),
+            Ok(Hlc::new(MAX_WALL_MS, 8))
+        );
+    }
+
+    #[test]
+    fn remote_stamps_are_range_and_skew_checked() {
+        assert_eq!(Hlc::new(MAX_WALL_MS, MAX_COUNTER).check_range(), Ok(()));
+        assert_eq!(
+            Hlc::new(MAX_WALL_MS + 1, 0).check_range(),
+            Err(StampError::WallOutOfRange {
+                wall_ms: MAX_WALL_MS + 1
+            })
+        );
+        assert_eq!(
+            Hlc::new(0, u32::MAX).check_range(),
+            Err(StampError::CounterOutOfRange { counter: u32::MAX })
+        );
+        let now = 1_790_000_000_000;
+        assert_eq!(
+            Hlc::new(0, 0).check_not_after(now, MAX_FUTURE_SKEW_MS),
+            Ok(())
+        );
+        assert_eq!(
+            Hlc::new(now + MAX_FUTURE_SKEW_MS, 9).check_not_after(now, MAX_FUTURE_SKEW_MS),
+            Ok(())
+        );
+        assert!(matches!(
+            Hlc::new(now + MAX_FUTURE_SKEW_MS + 1, 0).check_not_after(now, MAX_FUTURE_SKEW_MS),
+            Err(StampError::FarFuture { .. })
+        ));
+        // No overflow when the receiver's clock is itself absurd.
+        assert_eq!(
+            Hlc::new(u64::MAX, 0).check_not_after(u64::MAX, MAX_FUTURE_SKEW_MS),
+            Ok(())
+        );
+    }
+
     /// One replica's inputs: a physical-clock reading (possibly going
     /// backwards) and, optionally, a remote stamp to fold in.
     #[derive(Clone, Debug)]
@@ -173,6 +374,9 @@ mod tests {
         prop_oneof![
             (0u64..1000).prop_map(Event::Send),
             ((0u64..1000), (0u64..1000), (0u32..8))
+                .prop_map(|(now, w, c)| Event::Receive(now, Hlc::new(w, c))),
+            // Counters at the top of their range must roll over, not wrap.
+            ((0u64..1000), (0u64..1000), (u32::MAX - 2..=u32::MAX))
                 .prop_map(|(now, w, c)| Event::Receive(now, Hlc::new(w, c))),
         ]
     }

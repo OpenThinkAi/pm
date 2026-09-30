@@ -49,6 +49,26 @@
 //! seeding the roles flip: pushed number ops are recorded and the hub
 //! allocates nothing.
 //!
+//! **Actors (AGT-1450).** A token may author ops only as the actors it is
+//! bound to (`auth::ActorBinding`, set by `pm-hub token create --actor` /
+//! `token bind`). Every *fresh* op of a batch is checked; an op the
+//! workspace already has is acknowledged as before whoever authored it,
+//! since nothing is stored. A token minted before bindings (`actors IS
+//! NULL`) keeps accepting any actor. The reserved actor `hub` is refused
+//! for every client once the workspace is seeded, and while seeding is
+//! accepted only from an unrestricted token (a hub-to-hub reseed carries
+//! the old hub's number ops). Refusal is `400 actor_not_allowed` /
+//! `reserved_actor`, and the batch is refused whole.
+//!
+//! **Stamps (oaudit 2026-09-30).** Every op's HLC must be storable and
+//! leave its counter room to advance (`pm_core::Hlc::check_range`:
+//! `wall_ms <= i64::MAX`, `counter < u32::MAX`; else `400
+//! invalid_stamp`) and be at most `pm_core::MAX_FUTURE_SKEW_MS` (one day)
+//! ahead of the hub's wall clock (else `400 future_stamp`): a far-future
+//! stamp would win every LWW register and drag every clock that sees it
+//! forward. Stamps from the past are always accepted — a seed uploads
+//! historical ops.
+//!
 //! **Limits.** [`MAX_BATCH_OPS`] ops per batch, [`MAX_BODY_BYTES`] of body
 //! (the Studio's seed log holds one 23 MB `body.edit`, so the byte limit
 //! leaves room for a single large op plus a batch around it). A body over
@@ -64,7 +84,7 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_LENGTH;
 use axum::response::{IntoResponse, Response};
-use pm_core::{Hlc, OP_VERSION, Op, Payload};
+use pm_core::{Hlc, MAX_FUTURE_SKEW_MS, OP_VERSION, Op, Payload};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio_postgres::Transaction;
@@ -169,8 +189,40 @@ enum PushError {
         op_id: String,
         reason: String,
     },
+    /// An op whose HLC is out of range (`invalid_stamp`) or too far in
+    /// the future (`future_stamp`).
+    Stamp {
+        error: &'static str,
+        index: usize,
+        op_id: Option<String>,
+        reason: String,
+    },
+    /// A fresh op authored as an actor the token is not bound to.
+    ActorNotAllowed {
+        index: usize,
+        op_id: String,
+        reason: String,
+    },
+    /// A fresh op authored as the hub's own actor.
+    ReservedActor {
+        index: usize,
+        op_id: String,
+    },
+    /// Something the hub derives itself ran out of range (its clock or
+    /// number allocator). Unreachable with the stamp and number checks
+    /// above; answered as a 503, like a database failure, and logged.
+    Internal(String),
     NoWorkspace,
     Db(tokio_postgres::Error),
+}
+
+impl From<numbers::AllocError> for PushError {
+    fn from(e: numbers::AllocError) -> Self {
+        match e {
+            numbers::AllocError::Db(e) => PushError::Db(e),
+            numbers::AllocError::Exhausted(why) => PushError::Internal(why),
+        }
+    }
 }
 
 impl From<tokio_postgres::Error> for PushError {
@@ -251,6 +303,49 @@ impl IntoResponse for PushError {
                     op_id: Some(op_id),
                 },
             ),
+            PushError::Stamp {
+                error,
+                index,
+                op_id,
+                reason,
+            } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error,
+                    reason,
+                    index: Some(index),
+                    op_id,
+                },
+            ),
+            PushError::ActorNotAllowed {
+                index,
+                op_id,
+                reason,
+            } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "actor_not_allowed",
+                    reason,
+                    index: Some(index),
+                    op_id: Some(op_id),
+                },
+            ),
+            PushError::ReservedActor { index, op_id } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "reserved_actor",
+                    reason: format!(
+                        "actor {:?} is reserved for the hub's own ops",
+                        numbers::HUB_ACTOR
+                    ),
+                    index: Some(index),
+                    op_id: Some(op_id),
+                },
+            ),
+            PushError::Internal(why) => {
+                eprintln!("pm-hub: push: {why}");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             // The token authenticated, so the workspace row was there a
             // moment ago; answer as auth does when there is nothing there.
             PushError::NoWorkspace => return StatusCode::NOT_FOUND.into_response(),
@@ -346,12 +441,17 @@ struct OpIdOnly {
     op_id: Option<String>,
 }
 
-fn parse_op(index: usize, raw: &RawValue) -> Result<Parsed<'_>, PushError> {
+/// Parses one op of a batch and checks its stamp against the hub's wall
+/// clock `now_ms` (see the module doc).
+fn parse_op(index: usize, raw: &RawValue, now_ms: u64) -> Result<Parsed<'_>, PushError> {
+    let op_id_of = || {
+        serde_json::from_str::<OpIdOnly>(raw.get())
+            .ok()
+            .and_then(|o| o.op_id)
+    };
     let invalid = |reason: String| PushError::Op {
         index,
-        op_id: serde_json::from_str::<OpIdOnly>(raw.get())
-            .ok()
-            .and_then(|o| o.op_id),
+        op_id: op_id_of(),
         reason,
     };
     let op: Op =
@@ -365,12 +465,32 @@ fn parse_op(index: usize, raw: &RawValue) -> Result<Parsed<'_>, PushError> {
     if op.actor.as_str().is_empty() {
         return Err(invalid("actor is empty".to_string()));
     }
+    let stamp = |error: &'static str, e: pm_core::StampError| PushError::Stamp {
+        error,
+        index,
+        op_id: Some(op.op_id.to_string()),
+        reason: e.to_string(),
+    };
+    op.hlc
+        .check_range()
+        .map_err(|e| stamp("invalid_stamp", e))?;
+    op.hlc
+        .check_not_after(now_ms, MAX_FUTURE_SKEW_MS)
+        .map_err(|e| stamp("future_stamp", e))?;
     let hlc_wall_ms = i64::try_from(op.hlc.wall_ms)
         .map_err(|_| invalid(format!("hlc.wall_ms {} is out of range", op.hlc.wall_ms)))?;
     let role = match (&op.payload, numbers::number_value(&op)) {
         (Payload::TicketCreate(_), _) => Role::Create,
         (_, Some(n)) => Role::Number(
-            i64::try_from(n).map_err(|_| invalid(format!("number {n} is out of range")))?,
+            i64::try_from(n)
+                .ok()
+                .filter(|n| (1..=numbers::MAX_NUMBER).contains(n))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "number {n} is out of range (1 to {})",
+                        numbers::MAX_NUMBER
+                    ))
+                })?,
         ),
         _ => Role::Other,
     };
@@ -408,13 +528,14 @@ async fn body(req: Request) -> Result<Bytes, PushError> {
 }
 
 pub async fn push(State(db): State<Db>, caller: Authed, req: Request) -> Response {
-    match push_batch(&db, &caller.workspace, req).await {
+    match push_batch(&db, &caller, req).await {
         Ok(pushed) => Json(pushed).into_response(),
         Err(e) => e.into_response(),
     }
 }
 
-async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, PushError> {
+async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, PushError> {
+    let workspace = caller.workspace.as_str();
     let body = body(req).await?;
     let text = std::str::from_utf8(&body)
         .map_err(|_| PushError::Batch("body is not UTF-8".to_string()))?;
@@ -432,8 +553,10 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
     let mut unique: Vec<Parsed> = Vec::with_capacity(batch.ops.len());
     let mut first_at: HashMap<String, usize> = HashMap::with_capacity(batch.ops.len());
     let mut position: Vec<usize> = Vec::with_capacity(batch.ops.len());
+    // One wall-clock reading bounds every stamp in the batch.
+    let now_ms = numbers::now_ms();
     for (index, raw) in batch.ops.iter().enumerate() {
-        let parsed = parse_op(index, raw)?;
+        let parsed = parse_op(index, raw, now_ms)?;
         let at = *first_at
             .entry(parsed.op_id.clone())
             .or_insert_with(|| unique.len());
@@ -482,6 +605,11 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
         } else {
             check_seeded_numbers(&tx, workspace, &fresh, &first_at).await?
         };
+        // Only fresh ops are stored, so only they must be the caller's
+        // to author (AGT-1450).
+        for p in &fresh {
+            check_actor(caller, allocator.seeded, p, first_at[&p.op_id])?;
+        }
 
         // Fold the batch into the views in order; once seeded, that is
         // where a claim is decided. A refused claim is answered, not
@@ -577,6 +705,33 @@ async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, Pu
     Ok(Pushed { ops, numbers })
 }
 
+/// Whether `caller` may store `p` as its actor (see the module doc).
+fn check_actor(
+    caller: &Authed,
+    seeded: bool,
+    p: &Parsed<'_>,
+    index: usize,
+) -> Result<(), PushError> {
+    if p.actor == numbers::HUB_ACTOR && (seeded || !caller.actors.unrestricted()) {
+        return Err(PushError::ReservedActor {
+            index,
+            op_id: p.op_id.clone(),
+        });
+    }
+    if !caller.actors.permits(&p.actor) {
+        let allowed = caller.actors.describe();
+        return Err(PushError::ActorNotAllowed {
+            index,
+            op_id: p.op_id.clone(),
+            reason: format!(
+                "token {} ({}) may not author ops as {:?}; it may act as: {allowed}",
+                caller.token_id, caller.token_label, p.actor
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// The 400 for an op the views cannot fold.
 fn fold_error(index: usize, op_id: &str, e: FoldError) -> PushError {
     let reason = e.to_string();
@@ -651,9 +806,11 @@ async fn check_seeded_numbers(
 mod tests {
     use super::*;
 
+    const NOW: u64 = 1_790_000_000_000;
+
     fn err_of(index: usize, raw: &str) -> (Option<String>, String) {
         let raw: &RawValue = serde_json::from_str(raw).unwrap();
-        match parse_op(index, raw) {
+        match parse_op(index, raw, NOW) {
             Err(PushError::Op { op_id, reason, .. }) => (op_id, reason),
             Err(_) => panic!("not an op error"),
             Ok(_) => panic!("parsed {raw}"),
@@ -665,7 +822,7 @@ mod tests {
         let raw = r#"{ "op_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "hlc": {"wall_ms": 5, "counter": 2},
             "actor":"matt", "entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW", "kind":"hold.clear", "version":1 }"#;
         let value: &RawValue = serde_json::from_str(raw).unwrap();
-        let parsed = parse_op(0, value).unwrap();
+        let parsed = parse_op(0, value, NOW).unwrap();
         assert_eq!(parsed.op_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
         assert_eq!((parsed.hlc_wall_ms, parsed.hlc_counter), (5, 2));
         assert_eq!(parsed.actor, "matt");
@@ -697,5 +854,132 @@ mod tests {
                 "actor":"a","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"tombstone","version":2}"#,
         );
         assert!(reason.starts_with("op version 2 is newer"), "{reason}");
+    }
+
+    fn stamp_err(raw: &str) -> (&'static str, Option<String>, String) {
+        let raw: &RawValue = serde_json::from_str(raw).unwrap();
+        match parse_op(2, raw, NOW) {
+            Err(PushError::Stamp {
+                error,
+                index,
+                op_id,
+                reason,
+            }) => {
+                assert_eq!(index, 2);
+                (error, op_id, reason)
+            }
+            Err(e) => panic!("not a stamp error: {e:?}"),
+            Ok(_) => panic!("parsed {raw}"),
+        }
+    }
+
+    fn with_hlc(wall_ms: u64, counter: u32) -> String {
+        format!(
+            r#"{{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{{"wall_ms":{wall_ms},"counter":{counter}}},
+                "actor":"a","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"tombstone","version":1}}"#
+        )
+    }
+
+    #[test]
+    fn refuses_out_of_range_and_far_future_stamps() {
+        let (error, op_id, reason) = stamp_err(&with_hlc(u64::MAX, 0));
+        assert_eq!(error, "invalid_stamp");
+        assert_eq!(op_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(reason.contains("wall_ms"), "{reason}");
+        let (error, _, _) = stamp_err(&with_hlc(i64::MAX as u64 + 1, 0));
+        assert_eq!(error, "invalid_stamp");
+        let (error, _, reason) = stamp_err(&with_hlc(5, u32::MAX));
+        assert_eq!(error, "invalid_stamp");
+        assert!(reason.contains("counter"), "{reason}");
+        let (error, _, _) = stamp_err(&with_hlc(NOW + MAX_FUTURE_SKEW_MS + 1, 0));
+        assert_eq!(error, "future_stamp");
+
+        // A day ahead is tolerated; history of any age is accepted.
+        for (wall_ms, counter) in [(NOW + MAX_FUTURE_SKEW_MS, 3), (0, 0), (1, u32::MAX - 1)] {
+            let raw = with_hlc(wall_ms, counter);
+            let raw: &RawValue = serde_json::from_str(&raw).unwrap();
+            assert!(parse_op(0, raw, NOW).is_ok(), "{wall_ms}.{counter}");
+        }
+    }
+
+    #[test]
+    fn refuses_numbers_outside_the_allocator_range() {
+        let number = |n: u64| {
+            format!(
+                r#"{{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{{"wall_ms":1,"counter":0}},
+                    "actor":"a","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"field.set",
+                    "payload":{{"field":"number","value":{n}}},"version":1}}"#
+            )
+        };
+        for bad in [0, numbers::MAX_NUMBER as u64 + 1, i64::MAX as u64, u64::MAX] {
+            let (_, reason) = err_of(0, &number(bad));
+            assert!(reason.contains("out of range"), "{bad}: {reason}");
+        }
+        let raw = number(numbers::MAX_NUMBER as u64);
+        let raw: &RawValue = serde_json::from_str(&raw).unwrap();
+        let parsed = parse_op(0, raw, NOW).unwrap();
+        assert_eq!(parsed.role, Role::Number(numbers::MAX_NUMBER));
+    }
+
+    use crate::auth::ActorBinding;
+
+    fn authed(actors: ActorBinding) -> Authed {
+        Authed {
+            workspace: "saltline".into(),
+            token_id: 7,
+            token_label: "laptop".into(),
+            actors,
+        }
+    }
+
+    fn parsed_as(actor: &str) -> String {
+        format!(
+            r#"{{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{{"wall_ms":1,"counter":0}},
+                "actor":"{actor}","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"tombstone","version":1}}"#
+        )
+    }
+
+    #[test]
+    fn actors_are_checked_against_the_token_binding() {
+        let bound = authed(ActorBinding::Patterns(vec![
+            "matt".into(),
+            "claude:*".into(),
+        ]));
+        let legacy = authed(ActorBinding::Legacy);
+        let any = authed(ActorBinding::Patterns(vec!["*".into()]));
+        let check = |who: &Authed, actor: &str, seeded: bool| {
+            let raw = parsed_as(actor);
+            let raw: &RawValue = serde_json::from_str(&raw).unwrap();
+            let p = parse_op(0, raw, NOW).unwrap();
+            check_actor(who, seeded, &p, 4)
+        };
+        for seeded in [false, true] {
+            assert!(check(&bound, "matt", seeded).is_ok());
+            assert!(check(&bound, "claude:pm-build", seeded).is_ok());
+            match check(&bound, "alice", seeded) {
+                Err(PushError::ActorNotAllowed { index, reason, .. }) => {
+                    assert_eq!(index, 4);
+                    assert!(reason.contains("token 7 (laptop)"), "{reason}");
+                    assert!(reason.contains("matt,claude:*"), "{reason}");
+                }
+                other => panic!("{other:?}"),
+            }
+            // Legacy and `*` tokens: any actor, as before bindings.
+            assert!(check(&legacy, "alice", seeded).is_ok());
+            assert!(check(&any, "alice", seeded).is_ok());
+            // The hub's actor: never from a bound token.
+            assert!(matches!(
+                check(&bound, "hub", seeded),
+                Err(PushError::ReservedActor { index: 4, .. })
+            ));
+        }
+        // Once seeded, not from anyone; while seeding, an unrestricted
+        // token may reseed the hub's history.
+        assert!(matches!(
+            check(&legacy, "hub", true),
+            Err(PushError::ReservedActor { .. })
+        ));
+        assert!(check(&legacy, "hub", false).is_ok());
+        assert!(check(&any, "hub", false).is_ok());
     }
 }

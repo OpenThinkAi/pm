@@ -467,6 +467,73 @@ fn a_non_dependency_failure_fails_fast() {
     assert!(store.ticket(b).unwrap().is_none());
 }
 
+/// oaudit 2026-09-30: a pulled stamp that does not fit the store, has a
+/// spent counter, or sits years in the future is a typed error naming
+/// the op — never a panic — and nothing in the batch lands.
+#[test]
+fn a_pulled_op_with_an_inadmissible_stamp_is_a_typed_error() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let year_ahead = now + pm_store::PULL_MAX_FUTURE_SKEW_MS + 60_000;
+    let cases: Vec<(&str, Hlc)> = vec![
+        ("wall_ms above i64::MAX", Hlc::new(u64::MAX, 0)),
+        (
+            "wall_ms just above i64::MAX",
+            Hlc::new(i64::MAX as u64 + 1, 0),
+        ),
+        ("spent counter", Hlc::new(now, u32::MAX)),
+        ("far future", Hlc::new(year_ahead, 0)),
+    ];
+    for (case, hlc) in cases {
+        let (_dir, mut store) = store();
+        let before = store.ops_since(0).unwrap().len();
+        let latest = store.latest_hlc().unwrap();
+        let b = Ulid::new();
+        let mut bad = create(b, 0);
+        bad.hlc = hlc;
+        let batch = vec![create(Ulid::new(), 5), bad.clone()];
+        let err = store.apply_pulled(&batch).unwrap_err();
+        let StoreError::Pull { op_id, source, .. } = &err else {
+            panic!("{case}: {err:?}");
+        };
+        assert_eq!(*op_id, bad.op_id, "{case}");
+        assert!(
+            matches!(**source, StoreError::InvalidStamp(_)),
+            "{case}: {err:?}"
+        );
+        assert_eq!(store.ops_since(0).unwrap().len(), before, "{case}");
+        assert_eq!(
+            store.latest_hlc().unwrap(),
+            latest,
+            "{case}: clock untouched"
+        );
+        assert!(store.ticket(b).unwrap().is_none(), "{case}");
+    }
+
+    // A stamp a day or two ahead (a replica whose clock runs behind) and
+    // one from long ago (a seeded history) still apply.
+    let (_dir, mut store) = store();
+    let mut ahead = create(Ulid::new(), 0);
+    ahead.hlc = Hlc::new(now + 2 * pm_core::MAX_FUTURE_SKEW_MS, 0);
+    let old = create(Ulid::new(), 1);
+    let pulled = store.apply_pulled(&[ahead, old]).unwrap();
+    assert_eq!(pulled.applied, 2);
+}
+
+/// The store's own codec: a stamp that does not fit an SQLite integer is
+/// refused with a typed error on any commit path, not a panic.
+#[test]
+fn committing_an_unstorable_stamp_is_a_typed_error() {
+    let (_dir, mut store) = store();
+    let mut bad = create(Ulid::new(), 0);
+    bad.hlc = Hlc::new(u64::MAX, 0);
+    let err = store.commit(&bad).unwrap_err();
+    assert!(matches!(err, StoreError::InvalidStamp(_)), "{err:?}");
+    assert!(store.ticket(bad.entity).unwrap().is_none());
+}
+
 #[test]
 fn a_local_op_echoed_back_by_the_hub_leaves_the_outbox() {
     let (_dir, mut store) = store();

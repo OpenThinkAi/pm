@@ -51,7 +51,9 @@ pub use domain::{
     Actor, ActorId, ActorKind, Comment, DocsOwner, Hold, NotBefore, Parked, Priority, Project,
     ProjectStatus, Relation, RelationKind, Source, State, StateCategory, Ticket, Waiver, Workspace,
 };
-pub use hlc::{Clock, Hlc, Stamp};
+pub use hlc::{
+    Clock, ClockError, Hlc, MAX_COUNTER, MAX_FUTURE_SKEW_MS, MAX_WALL_MS, Stamp, StampError,
+};
 pub use op::{OP_VERSION, Op, Payload};
 pub use view::{ApplyError, BodyState, ClaimRejected, TicketView, apply, apply_persisted};
 
