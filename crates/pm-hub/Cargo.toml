@@ -6,6 +6,7 @@ publish = false
 description = "pm-hub — the sync hub: Postgres-backed op log, sequence and auth (README §Sync & hub)"
 license.workspace = true
 repository.workspace = true
+publish = false
 
 # The hub links `pm-core` so merge and claim rules stay identical to the
 # CLI's (README §Sync & hub). Postgres goes through `tokio-postgres` with
@@ -41,3 +42,7 @@ pm-store = { path = "../pm-store" }
 tempfile = "3.27"
 # `writer`'s unit tests time out a lock wait.
 tokio = { version = "1", features = ["time"] }
+
+# pm-hub is deployed to Railway (scripts/deploy-hub.sh), never released via dist/npm.
+[package.metadata.dist]
+dist = false
