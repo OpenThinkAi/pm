@@ -45,6 +45,27 @@ pub struct Env {
     /// and *before* the last of them is marked pushed — the worst place a
     /// crash can land, which the next sync must recover from.
     pub sync_test_crash_after_batches: Option<usize>,
+    /// `PATH` (AGT-1402): where `pm edit`/`pm app` look for the ui-leaf
+    /// runtime when config.toml names none.
+    pub path: Option<OsString>,
+    /// `XDG_CACHE_HOME`: the bundled ui-leaf views are unpacked under
+    /// `$XDG_CACHE_HOME/pm/views`, else `~/.cache/pm/views`.
+    pub xdg_cache_home: Option<PathBuf>,
+    /// `PM_VIEWS_DIR`: mount the views from this directory instead of the
+    /// copy built into the binary (view development, AGT-1403..1405).
+    pub pm_views_dir: Option<PathBuf>,
+    /// `DISPLAY` / `WAYLAND_DISPLAY`: whether a Linux/BSD session has a
+    /// display the ui-leaf window can open on.
+    pub display: Option<String>,
+    pub wayland_display: Option<String>,
+    /// `SSH_CONNECTION` / `SSH_TTY`: a remote session, where a window
+    /// would open on a desktop nobody at this terminal is looking at.
+    pub ssh_connection: Option<String>,
+    pub ssh_tty: Option<String>,
+    /// `UI_LEAF_NO_OPEN`, ui-leaf's own switch: truthy means never open a
+    /// window (so pm uses `$EDITOR`); `0`/`false`/`no` forces one even
+    /// under SSH.
+    pub ui_leaf_no_open: Option<String>,
 }
 
 impl Env {
@@ -78,6 +99,14 @@ impl Env {
             sync_test_batch_ops: text("PM_SYNC_TEST_BATCH_OPS").and_then(|v| v.parse().ok()),
             sync_test_crash_after_batches: text("PM_SYNC_TEST_CRASH_AFTER_BATCHES")
                 .and_then(|v| v.parse().ok()),
+            path: std::env::var_os("PATH").filter(|v| !v.is_empty()),
+            xdg_cache_home: xdg("XDG_CACHE_HOME"),
+            pm_views_dir: path("PM_VIEWS_DIR"),
+            display: text("DISPLAY"),
+            wayland_display: text("WAYLAND_DISPLAY"),
+            ssh_connection: text("SSH_CONNECTION"),
+            ssh_tty: text("SSH_TTY"),
+            ui_leaf_no_open: text("UI_LEAF_NO_OPEN"),
         }
     }
 
@@ -109,6 +138,21 @@ impl Env {
         };
         Ok(base.join("pm").join(prefix.to_ascii_lowercase()))
     }
+
+    /// `$XDG_CACHE_HOME/pm`, else `~/.cache/pm`: rebuildable files only
+    /// (the unpacked ui-leaf views).
+    pub fn cache_dir(&self) -> Result<PathBuf> {
+        let base = match (&self.xdg_cache_home, &self.home) {
+            (Some(xdg), _) => xdg.clone(),
+            (None, Some(home)) => home.join(".cache"),
+            (None, None) => {
+                return Err(CliError::error(
+                    "cannot locate ~/.cache/pm: HOME is not set (or set PM_VIEWS_DIR)",
+                ));
+            }
+        };
+        Ok(base.join("pm"))
+    }
 }
 
 /// `~/.config/pm/config.toml`. Unknown keys are ignored so later tickets
@@ -132,6 +176,19 @@ pub struct Config {
     /// setting it makes `pm claim` refuse rather than claim unconfirmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub: Option<String>,
+    /// `[ui_leaf]` (AGT-1402): the ui-leaf runtime `pm edit`/`pm app` use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_leaf: Option<UiLeafConfig>,
+}
+
+/// `[ui_leaf]` in config.toml.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct UiLeafConfig {
+    /// `ui_leaf.path`: the ui-leaf binary to run, instead of the first
+    /// `ui-leaf` on `PATH`. A relative path is relative to the directory
+    /// holding config.toml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 /// `[edit]` in config.toml.
@@ -180,6 +237,12 @@ impl Config {
             && repo.is_relative()
         {
             backup.repo = Some(dir.join(repo));
+        }
+        if let (Some(ui_leaf), Some(dir)) = (&mut config.ui_leaf, path.parent())
+            && let Some(bin) = &ui_leaf.path
+            && bin.is_relative()
+        {
+            ui_leaf.path = Some(dir.join(bin));
         }
         Ok(Some(config))
     }

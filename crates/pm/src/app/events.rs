@@ -122,6 +122,7 @@ struct ViewerGuard(Arc<AppState>);
 impl ViewerGuard {
     fn new(state: Arc<AppState>) -> Self {
         state.viewers.fetch_add(1, Ordering::SeqCst);
+        state.connected_once.store(true, Ordering::SeqCst);
         state.viewers_changed.notify_one();
         ViewerGuard(state)
     }
@@ -134,10 +135,10 @@ impl Drop for ViewerGuard {
     }
 }
 
-/// Resolves once no event stream has been open for `grace`, measured
-/// from start and from every last disconnect. Never resolves when
-/// `grace` is zero (`--idle 0`).
-pub(crate) async fn idle(state: Arc<AppState>, grace: Duration) {
+/// Resolves once no event stream has been open for `grace` since the
+/// last one closed — or for `startup` from start, before any has opened.
+/// Never resolves when `grace` is zero (`--idle 0`).
+pub(crate) async fn idle(state: Arc<AppState>, startup: Duration, grace: Duration) {
     if grace.is_zero() {
         std::future::pending::<()>().await;
     }
@@ -146,8 +147,13 @@ pub(crate) async fn idle(state: Arc<AppState>, grace: Duration) {
             state.viewers_changed.notified().await;
             continue;
         }
+        let wait = if state.connected_once.load(Ordering::SeqCst) {
+            grace
+        } else {
+            startup
+        };
         tokio::select! {
-            _ = tokio::time::sleep(grace) => {
+            _ = tokio::time::sleep(wait) => {
                 if state.viewers.load(Ordering::SeqCst) == 0 {
                     return;
                 }

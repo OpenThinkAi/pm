@@ -285,6 +285,7 @@ pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>, join: Option<Ul
             backup: None,
             edit: None,
             hub: None,
+            ui_leaf: None,
         }
         .write(&config_path)?;
     }

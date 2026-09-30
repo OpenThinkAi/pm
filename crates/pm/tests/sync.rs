@@ -158,7 +158,7 @@ impl Replica {
     fn edit_description(&self, id: &str, line: &str) {
         let editor = self.appending_editor(line);
         let out = self
-            .command(&["edit", id])
+            .command(&["edit", id, "--view=editor"])
             .env("EDITOR", &editor)
             .output()
             .unwrap();

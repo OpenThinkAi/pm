@@ -36,10 +36,13 @@ ulid = { version = "1.2", features = ["serde"] }
 # and tokio are the versions `crates/pm-hub` already locks; `getrandom`
 # mints the one-shot token from the OS CSPRNG as pm-hub mints its tokens;
 # `futures-util` (already in the tree under axum) builds the SSE stream.
+# `process` + `io-util` (AGT-1402): pm drives the ui-leaf child over its
+# line-delimited stdio protocol alongside the server (adds only tokio's
+# own `signal-hook-registry`).
 axum = "0.8"
 futures-util = { version = "0.3", default-features = false }
 getrandom = "0.3"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 # Tests corrupt a materialized row directly to prove `pm doctor` catches it.

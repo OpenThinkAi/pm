@@ -194,20 +194,20 @@ enum Cmd {
         /// Ticket id (e.g. PM-12) or ULID
         id: String,
     },
-    /// Serve the localhost API the ui-leaf views use (127.0.0.1, random port, one-shot token); prints the URL and token, exits when the last view disconnects
+    /// Open the board in ui-leaf, served by a localhost API (127.0.0.1, random port, one-shot token); with --json, serve the API headless and print its URL and token
     App {
-        /// Seconds without a connected view before exiting (0 = never)
-        #[arg(long, value_name = "SECS", default_value_t = 30)]
-        idle: u64,
+        /// Seconds without a connected view before exiting (0 = never). Default: 30 headless, 5 when pm opened the board
+        #[arg(long, value_name = "SECS")]
+        idle: Option<u64>,
         /// A browser origin allowed to call the API (e.g. the view's http://127.0.0.1:5173); repeat for several. Default: none
         #[arg(long = "allow-origin", value_name = "ORIGIN")]
         allow_origin: Vec<String>,
     },
-    /// Edit a ticket in $EDITOR (frontmatter + markdown); the save becomes ops
+    /// Edit a ticket: the ui-leaf ticket view, or $EDITOR (frontmatter + markdown) without a display or ui-leaf; every change becomes ops
     Edit {
         /// Ticket id (e.g. PM-12) or ULID
         id: String,
-        /// editor ($EDITOR) or ui-leaf; default: config `edit.view`, else editor
+        /// ui-leaf or editor ($EDITOR); default: config `edit.view`, else ui-leaf (falling back to $EDITOR)
         #[arg(long, value_parser = edit::parse_view)]
         view: Option<edit::View>,
     },

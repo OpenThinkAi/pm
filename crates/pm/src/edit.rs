@@ -37,10 +37,13 @@
 //! version-vector entry per edit session, which for ticket bodies (a handful
 //! of edits each) is a few bytes.
 //!
-//! `--view=ui-leaf` (or `edit.view = "ui-leaf"` in config.toml) is the
-//! phase 4 editor and exits 1 until it exists; with neither set, the ui-leaf
-//! view would be the default where a display is available, and until then
-//! `$EDITOR` always is.
+//! **Which editor** (AGT-1402, decision 6): `--view`, then `edit.view` in
+//! config.toml, else ui-leaf. ui-leaf opens the ticket view through
+//! `pm app`'s launcher ([`crate::app::launch`]) and `pm edit` returns when
+//! its window closes — every change it made is already an op. Without a
+//! display, without a pinned ui-leaf, or with `editor` chosen, it is the
+//! `$EDITOR` flow below, unchanged; a missing ui-leaf (or asking for ui-leaf
+//! on a headless session) says so in one line on stderr first.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -55,6 +58,10 @@ use serde_json::Value;
 use serde_yaml_ng::{Mapping, Value as Yaml};
 use ulid::Ulid;
 
+use crate::app::{
+    self,
+    launch::{self, Choice, Ended},
+};
 use crate::batch;
 use crate::exit::{CliError, Result};
 use crate::verbs::{Ctx, Stamper, display_id, find, print_json, ticket_json};
@@ -93,7 +100,7 @@ const KNOWN_KEYS: &[&str] = &[
 pub enum View {
     /// `$EDITOR` on a frontmatter + markdown temp file.
     Editor,
-    /// The ui-leaf ticket editor (phase 4).
+    /// The ui-leaf ticket view (AGT-1402).
     UiLeaf,
 }
 
@@ -106,12 +113,6 @@ pub fn parse_view(s: &str) -> std::result::Result<View, String> {
             "unknown view '{other}': expected editor or ui-leaf"
         )),
     }
-}
-
-/// Whether the ui-leaf editor can be launched here. Always false until
-/// phase 4 ships it; it will then also require a display.
-fn ui_leaf_available() -> bool {
-    false
 }
 
 /// `edit.view` from config.toml, if set; a value other than `editor` or
@@ -129,20 +130,53 @@ fn configured_view(env: &Env) -> Result<Option<View>> {
         .map_err(|e| CliError::usage(format!("{}: edit.view: {e}", path.display())))
 }
 
-/// `--view`, then config's `edit.view`, then ui-leaf where available, else
-/// `$EDITOR`.
-fn resolve_view(flag: Option<View>, env: &Env) -> Result<View> {
+/// `--view`, then config's `edit.view`, else ui-leaf — and whether the
+/// choice was explicit (a flag or config), which decides whether a
+/// headless fallback is worth a note.
+fn resolve_view(flag: Option<View>, env: &Env) -> Result<(View, bool)> {
     if let Some(view) = flag {
-        return Ok(view);
+        return Ok((view, true));
     }
     if let Some(view) = configured_view(env)? {
-        return Ok(view);
+        return Ok((view, true));
     }
-    Ok(if ui_leaf_available() {
-        View::UiLeaf
+    Ok((View::UiLeaf, false))
+}
+
+/// The ui-leaf path of `pm edit`: `Ok(true)` when the view opened and has
+/// closed (the command is done), `Ok(false)` to continue with `$EDITOR`.
+fn edit_in_ui_leaf(ctx: &Ctx<'_>, reference: &str, explicit: bool) -> Result<bool> {
+    let runtime = match launch::choose(ctx.env, explicit)? {
+        Choice::Launch(runtime) => runtime,
+        Choice::Fallback(note) => {
+            if let Some(note) = note {
+                eprintln!("pm: {note}; using $EDITOR (set edit.view = \"editor\" to skip ui-leaf)");
+            }
+            return Ok(false);
+        }
+    };
+    // Resolve the ticket first: a bad id is exit 3 before any window.
+    let (store, ws) = ctx.open()?;
+    let ticket = find(&store, &ws, reference)?;
+    let shown = display_id(&ws, &ticket);
+    drop(store);
+    match app::edit_ticket(ctx, runtime, &shown)? {
+        Ended::Closed => {}
+        Ended::Failed(why) => {
+            eprintln!("pm: ui-leaf could not open {shown} ({why}); using $EDITOR");
+            return Ok(false);
+        }
+    }
+    let (store, ws) = ctx.open()?;
+    let ticket = store
+        .ticket(ticket.id)?
+        .ok_or_else(|| CliError::not_found(format!("no ticket {shown}")))?;
+    if ctx.json {
+        print_json(&ticket_json(&ws, &store, &ticket)?);
     } else {
-        View::Editor
-    })
+        println!("{shown}");
+    }
+    Ok(true)
 }
 
 // --------------------------------------------------------------- the file
@@ -514,10 +548,9 @@ impl Drop for TempFile {
 
 /// `pm edit <id> [--view=editor|ui-leaf]`.
 pub fn edit(ctx: &Ctx<'_>, reference: &str, view_flag: Option<View>) -> Result<()> {
-    if resolve_view(view_flag, ctx.env)? == View::UiLeaf {
-        return Err(CliError::error(
-            "the ui-leaf editor is not yet available (phase 4); use --view=editor",
-        ));
+    let (view, explicit) = resolve_view(view_flag, ctx.env)?;
+    if view == View::UiLeaf && edit_in_ui_leaf(ctx, reference, explicit)? {
+        return Ok(());
     }
     let actor = ctx.actor()?;
     let (mut store, ws) = ctx.open()?;

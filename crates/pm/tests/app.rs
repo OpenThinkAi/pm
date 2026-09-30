@@ -102,7 +102,10 @@ impl Sandbox {
             .env("HOME", self.home.path())
             .env("USER", "tester")
             .env("TMPDIR", self.home.path())
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            // Never a real ui-leaf: a non-`--json` `pm app` here must not
+            // open a browser (tests/launch.rs drives a fake one).
+            .env("PATH", "/usr/bin:/bin")
+            .env("UI_LEAF_NO_OPEN", "1")
             .stdin(Stdio::null());
         for (k, v) in extra {
             cmd.env(k, v);

@@ -871,7 +871,7 @@ fn every_verbs_json_output_matches_its_fixture() {
     // ---- pm edit (no-op save; same shape as `pm show --json`) ----
     {
         let out = sb.run(
-            &["edit", "AGT-2", "--json"],
+            &["edit", "AGT-2", "--view=editor", "--json"],
             &[("EDITOR", editor.to_str().unwrap())],
         );
         if out.status.code() != Some(0) {

@@ -131,7 +131,9 @@ apparent exception, `pm edit` / `pm project edit`, launches `$EDITOR` (or
 `$VISUAL`, or `vi`) as a **child process** through `sh -c`; that child
 inherits whatever stdio `pm` itself was given, so a non-interactive editor
 invocation (no TTY) fails fast rather than hanging, and `pm edit` reports
-that as an aborted edit (exit `1`), never a hang.
+that as an aborted edit (exit `1`), never a hang. `pm edit`'s default
+ui-leaf view (and `pm app` without `--json`) instead waits on a window
+until it closes; agents pass `--view=editor` or use the other verbs.
 
 ### Ticket ids
 
@@ -471,25 +473,43 @@ note, and leaves the state untouched.
 
 ### `pm edit <ID>`
 
-Flags: `--view <VIEW>` (`editor` or `ui-leaf`; default: `edit.view` in
-config.toml, else `editor`). `ui-leaf` is phase 4 and exits `1` until it
-exists.
+Flags: `--view <VIEW>` (`ui-leaf` or `editor`; default: `edit.view` in
+config.toml, else `ui-leaf`).
 
-Opens the ticket as frontmatter + markdown in `$EDITOR` (`$VISUAL` first,
-`vi` last resort). A parse/validation error on save re-opens the editor
-with the error in a `#`-comment header; the editor exiting non-zero, or
-the save coming back byte-identical to what was shown, aborts (exit `1`,
-zero ops committed) rather than reopening.
+**`ui-leaf`** (AGT-1402, README decision 6) opens the ticket's view in
+ui-leaf, backed by the same localhost API `pm app` serves
+(`docs/app-api.md` §Launching a view), and returns when the window closes
+(a few seconds after its event stream drops). Every change the view makes
+is already an op by then. The ticket is resolved first: an unknown id is
+exit `3` before any window opens. It falls back to the `editor` flow below
+when:
+
+- there is **no display** — `UI_LEAF_NO_OPEN` set truthy, an SSH session
+  (`SSH_CONNECTION`/`SSH_TTY`), or on Linux/BSD neither `DISPLAY` nor
+  `WAYLAND_DISPLAY`; `UI_LEAF_NO_OPEN=0` forces a window. Silent unless
+  `ui-leaf` was asked for by flag or config, then one stderr line;
+- there is **no pinned ui-leaf** — `ui_leaf.path` in config.toml (else the
+  first `ui-leaf` on `PATH`) is missing, does not run, or reports a version
+  outside `>=1.6.0, <2.0.0`. Always one stderr line saying which;
+- ui-leaf **exits before its view is ready**. One stderr line.
+
+**`editor`** opens the ticket as frontmatter + markdown in `$EDITOR`
+(`$VISUAL` first, `vi` last resort), unchanged by the above. A
+parse/validation error on save re-opens the editor with the error in a
+`#`-comment header; the editor exiting non-zero, or the save coming back
+byte-identical to what was shown, aborts (exit `1`, zero ops committed)
+rather than reopening.
 
 - `--json`: **Ticket**, as it reads after the save's ops commit (or
-  unchanged, if the save was a no-op).
+  unchanged, if the save was a no-op) — or, from the ui-leaf view, as it
+  reads when the window closed.
 
 ### `pm app`
 
 Flags: `--idle <SECS>` (exit after this long with no view connected;
-default `30`, `0` never), `--allow-origin <ORIGIN>` (a browser origin the
-API answers, e.g. the view's `http://127.0.0.1:5173`; repeatable; default
-none).
+`0` never; default `30` headless, `5` when pm opened the board),
+`--allow-origin <ORIGIN>` (a browser origin the API answers, e.g. an
+external view's `http://127.0.0.1:5173`; repeatable; default none).
 
 Serves the localhost HTTP API the ui-leaf views use (AGT-1401; README
 §Surfaces, decision A6) — the shapes above (**Ticket**, **Project**,
@@ -501,18 +521,29 @@ refuses any other `Host` or a non-allow-listed `Origin`; exits when the
 last connected view has been gone for `--idle` seconds. Claims are not
 served (they need the hub, AGT-1397).
 
-- Exit `1`: the workspace cannot be opened; the port cannot be bound.
+**Without `--json`** (AGT-1402) it opens the **board** in ui-leaf — the
+runtime, display and pin rules are `pm edit`'s above — and prints nothing
+on stdout: the API's URL and token go to the view only. It exits `0` when
+the board's window has been closed for `--idle` seconds, or when ui-leaf
+exits. With no display or no pinned ui-leaf it says why on stderr and
+serves headless instead, printing `url:` and `token:` lines.
+
+**With `--json`** it never launches anything: the headless server for
+tooling and tests.
+
+- Exit `1`: the workspace cannot be opened; the port cannot be bound;
+  ui-leaf exited before the board was ready.
 - Exit `2`: an `--allow-origin` value that is not `scheme://host[:port]`.
 - `--json`: **one compact line**, printed and flushed before the server
-  starts answering, so a launcher (AGT-1402) can read it while the
-  process runs on:
+  starts answering, so a launcher can read it while the process runs on:
   ```jsonc
   {"schema": 1, "url": "http://127.0.0.1:<port>", "token": "pma_<64 hex>", "pid": 0,
    "workspace": "<dir>", "actor": "string", "idle_secs": 30, "allowed_origins": ["string", ...]}
   ```
   Not a `json_contract.rs` fixture: the port and token differ every run
   and the process does not end; `tests/app.rs` asserts the shape and
-  drives the API.
+  drives the API. The launcher itself is `tests/launch.rs`, against a
+  fake ui-leaf.
 
 ### `pm claim [ID]`
 

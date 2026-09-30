@@ -90,7 +90,7 @@ pub(crate) async fn guard(
         .and_then(|o| o.to_str().ok())
         .map(|o| o.trim().to_ascii_lowercase());
     if let Some(origin) = &origin
-        && !state.allowed_origins.iter().any(|a| a == origin)
+        && !state.origin_allowed(origin)
     {
         return error_response(
             StatusCode::FORBIDDEN,
