@@ -20,7 +20,7 @@
 //! All of it is bookkeeping written directly, like `backup_target`: not
 //! derived from the op log, untouched by `pm doctor --rebuild`.
 
-use pm_core::Op;
+use pm_core::{Op, Payload};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use ulid::Ulid;
@@ -233,12 +233,47 @@ fn outbox_len(conn: &Connection) -> Result<u64> {
 /// Routes a foreign op to the commit path for the entity it targets. The
 /// op log shares one entity namespace between tickets and project
 /// documents; a `body.edit` whose entity is a known document goes to the
-/// document path, everything else to the ticket path.
+/// document path, every other ticket kind to the ticket path.
+///
+/// Config kinds (AGT-1384: `workspace.set`, `state.upsert`,
+/// `actor.upsert`, `project.create`, `project.set`) are **rejected** with
+/// [`StoreError::UnsupportedPulledOp`], failing the whole batch: the store
+/// cannot fold them yet (AGT-1385 rewires config writes onto them), and
+/// recording one in the log without folding it would leave the log and
+/// the tables disagreeing — `pm doctor`'s replay would then fail on it.
+/// A rejected batch leaves the cursor where it was, so the same pull
+/// succeeds once this build learns to fold config. The match lists every
+/// kind so a new one has to be routed here deliberately.
 fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
-    if op.kind() == "body.edit" && is_known_doc(tx, op.entity)? {
-        commit_doc_edit_in(tx, op.entity, op)?;
-    } else {
-        commit_foreign_in(tx, op)?;
+    match &op.payload {
+        Payload::WorkspaceSet(_)
+        | Payload::StateUpsert(_)
+        | Payload::ActorUpsert(_)
+        | Payload::ProjectCreate(_)
+        | Payload::ProjectSet(_) => {
+            return Err(StoreError::UnsupportedPulledOp {
+                op_id: op.op_id,
+                kind: op.kind(),
+            });
+        }
+        Payload::BodyEdit(_) if is_known_doc(tx, op.entity)? => {
+            commit_doc_edit_in(tx, op.entity, op)?;
+        }
+        Payload::TicketCreate(_)
+        | Payload::FieldSet(_)
+        | Payload::LabelAdd(_)
+        | Payload::LabelRemove(_)
+        | Payload::RelationAdd(_)
+        | Payload::RelationRemove(_)
+        | Payload::CommentAdd(_)
+        | Payload::StateTransition(_)
+        | Payload::Claim(_)
+        | Payload::HoldSet(_)
+        | Payload::HoldClear
+        | Payload::BodyEdit(_)
+        | Payload::Tombstone => {
+            commit_foreign_in(tx, op)?;
+        }
     }
     Ok(())
 }

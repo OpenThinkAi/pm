@@ -649,8 +649,9 @@ report what changed, then run the same report).
     }
   }
   ```
-- Text output adds a `sync` line: `outbox N op(s), pushed through #S,
-  cursor C, P ticket(s) awaiting a hub number`.
+- Text output adds a `sync` line: `outbox N op(s), pushed through seq S,
+  cursor C, P ticket(s) awaiting a hub number`, where `S` is a local op-log
+  `seq` (not a ticket number) and a zero cursor reads `0 (never pulled)`.
 
 ### `pm archive [ID]`
 

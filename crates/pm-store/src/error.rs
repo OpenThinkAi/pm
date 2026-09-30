@@ -68,6 +68,13 @@ pub enum StoreError {
         #[source]
         source: Box<StoreError>,
     },
+    /// A pulled op of a kind this build's store cannot fold yet — the
+    /// AGT-1384 config kinds, until AGT-1385 wires their writers and
+    /// folds. Raised by [`crate::Store::apply_pulled`] (inside
+    /// [`StoreError::Pull`]) so the batch rolls back rather than logging
+    /// an op the tables never reflect.
+    #[error("op {op_id}: pulled '{kind}' ops cannot be applied by this build yet")]
+    UnsupportedPulledOp { op_id: Ulid, kind: &'static str },
     /// [`crate::Store::apply_pulled`] could not commit a foreign op; the
     /// whole pulled batch was rolled back. A dependency error (an unknown
     /// ticket, relation target, document, project or state) here means

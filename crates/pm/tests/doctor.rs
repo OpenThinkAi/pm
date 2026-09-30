@@ -183,8 +183,8 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     // AGT-1393: nothing has been pushed, so the whole log is the outbox.
     assert!(
         text.contains(
-            "sync            outbox 9 op(s), pushed through #0, cursor 0, \
-             0 ticket(s) awaiting a hub number\n"
+            "sync            outbox 9 op(s), pushed through seq 0, \
+             cursor 0 (never pulled), 0 ticket(s) awaiting a hub number\n"
         ),
         "{text}"
     );

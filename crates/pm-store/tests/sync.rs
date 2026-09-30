@@ -538,3 +538,28 @@ fn the_pending_marker_survives_a_rebuild() {
     store.rebuild().unwrap();
     assert_eq!(store.pending_numbers().unwrap(), vec![a]);
 }
+
+// ---- config kinds (AGT-1384) ----
+
+#[test]
+fn a_pulled_config_op_is_rejected_and_rolls_the_batch_back() {
+    let (_dir, mut store) = store();
+    let (a, _b, mut ops) = foreign_batch();
+    let config = op(
+        Ulid::new(),
+        30,
+        "laptop",
+        Payload::WorkspaceSet(pm_core::op::WorkspaceSet::StaleDays(7)),
+    );
+    ops.push(config.clone());
+    let err = store.apply_pulled(&ops).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Pull { op_id, source, .. }
+            if *op_id == config.op_id
+                && matches!(**source, StoreError::UnsupportedPulledOp { kind: "workspace.set", .. })),
+        "{err:?}"
+    );
+    assert!(store.ops_since(0).unwrap().is_empty());
+    assert!(store.ticket(a).unwrap().is_none());
+    assert_eq!(store.workspace().unwrap().unwrap().stale_days, 30);
+}
