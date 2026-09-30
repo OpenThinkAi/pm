@@ -1,13 +1,16 @@
 //! End-to-end `POST /w/<workspace>/ops` (AGT-1389): seqs, idempotency,
 //! all-or-nothing batches, structured 400s, size limits, auth, and
-//! commit-ordered seqs under concurrent pushes. See `common` for where
+//! commit-ordered seqs under concurrent pushes, and one workspace's
+//! pushes never stalling another's (AGT-1463). See `common` for where
 //! Postgres comes from.
 
 mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use common::*;
 use pm_core::op::{CommentAdd, LabelAdd};
@@ -81,7 +84,10 @@ fn count_ops(url: &str) -> i64 {
 }
 
 fn create_token(url: &str, name: &str, workspace: &str) -> String {
-    let (ok, stdout, stderr) = admin(url, &["token", "create", name, "--workspace", workspace]);
+    let (ok, stdout, stderr) = admin(
+        url,
+        &["token", "create", name, "--workspace", workspace, "--any"],
+    );
     assert!(ok, "token create failed: {stderr}");
     stdout.trim().to_string()
 }
@@ -390,4 +396,141 @@ fn concurrent_pushes_get_commit_ordered_contiguous_seqs() {
         .collect();
     acked.sort_unstable();
     assert_eq!(stored, acked.into_iter().map(|a| a.1).collect::<Vec<_>>());
+}
+
+/// Holds `workspace`'s row lock in its own transaction — what a long push
+/// looks like to every other writer — until the returned sender fires.
+fn hold_workspace_lock(url: &str, workspace: &str) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let (release_tx, release) = mpsc::channel::<()>();
+    let (locked_tx, locked) = mpsc::channel::<()>();
+    let (url, workspace) = (url.to_string(), workspace.to_string());
+    let done = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                .await
+                .unwrap();
+            tokio::spawn(connection);
+            let tx = client.transaction().await.unwrap();
+            tx.execute(
+                "SELECT id FROM workspaces WHERE id = $1 FOR NO KEY UPDATE",
+                &[&workspace],
+            )
+            .await
+            .unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release.recv();
+            tx.commit().await.unwrap();
+        });
+    });
+    locked.recv().unwrap();
+    (release_tx, done)
+}
+
+fn lock_waiters(url: &str) -> i64 {
+    query_rows(url, "SELECT count(*) FROM pg_locks WHERE NOT granted").unwrap()[0][0]
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn a_stalled_workspace_never_blocks_another() {
+    let Some((_container, url)) = postgres_for("a_stalled_workspace_never_blocks_another") else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    wait_for_health(&mut hub, port);
+    let busy = create_token(&url, "studio", "saltline");
+    let other = create_token(&url, "elsewhere", "other");
+
+    // saltline's writer is stuck behind its row lock, with more pushes
+    // queued behind it than the hub has write connections.
+    const QUEUED: usize = 10;
+    let (release, holder) = hold_workspace_lock(&url, "saltline");
+    let queued: Vec<_> = (0..QUEUED)
+        .map(|_| {
+            let token = busy.clone();
+            let batch: Vec<Value> = (0..5)
+                .map(|_| serde_json::to_value(label("q")).unwrap())
+                .collect();
+            thread::spawn(move || {
+                let (status, body) = push(port, &token, &batch);
+                assert_eq!(status, 200, "{body}");
+                acks(&body)
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while lock_waiters(&url) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no saltline push queued on the lock"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Only one of them holds a connection: the rest wait in the hub, not
+    // in Postgres.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(lock_waiters(&url), 1, "queued pushes hold no connection");
+    assert!(queued.iter().all(|h| !h.is_finished()));
+
+    // Another workspace pushes (and ends its seed) straight through.
+    let started = Instant::now();
+    for _ in 0..3 {
+        let (status, body) = push_to(
+            port,
+            "other",
+            &other,
+            &[serde_json::to_value(label("x")).unwrap()],
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+    let resp = request_body(
+        port,
+        "POST",
+        "/w/other/seeded",
+        &[&format!("Authorization: Bearer {other}")],
+        br#"{"number_floor": 0}"#,
+    );
+    assert_eq!(resp.status, 200, "{resp:?}");
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(5), "other waited {took:?}");
+    assert!(
+        queued.iter().all(|h| !h.is_finished()),
+        "saltline still stalled"
+    );
+
+    // Released, saltline's pushes land one after another with contiguous,
+    // non-interleaved runs of seqs.
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    let mut runs: Vec<(i64, i64)> = queued
+        .into_iter()
+        .map(|h| {
+            let acks = h.join().unwrap();
+            for (i, ack) in acks.iter().enumerate() {
+                assert_eq!(ack.1, acks[0].1 + i as i64, "{acks:?}");
+            }
+            (acks[0].1, acks[acks.len() - 1].1)
+        })
+        .collect();
+    runs.sort_unstable();
+    for pair in runs.windows(2) {
+        assert!(pair[0].1 < pair[1].0, "{runs:?}");
+    }
+    let saltline: Vec<i64> = query_rows(
+        &url,
+        "SELECT seq FROM ops WHERE workspace_id = 'saltline' ORDER BY seq",
+    )
+    .unwrap()
+    .into_iter()
+    .map(|r| r[0].as_deref().unwrap().parse().unwrap())
+    .collect();
+    assert_eq!(saltline.len(), QUEUED * 5);
 }

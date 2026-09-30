@@ -16,8 +16,13 @@
 //! views (see `views`, AGT-1392). `pm-hub token create|list|bind|revoke` manage
 //! bearer tokens and the actors each may author ops as (see `admin`). The HTTP contract is `docs/hub-api.md`.
 //!
-//! Environment: `DATABASE_URL` (required; a Postgres URL) and `PORT`
-//! (default 8080; Railway sets it).
+//! Environment: `DATABASE_URL` (required; a Postgres URL), `PORT`
+//! (default 8080; Railway sets it) and `MIGRATION_DATABASE_URL`
+//! (optional): when set, the start-up migration (DDL) runs on a
+//! connection to it and the server itself only ever uses `DATABASE_URL`,
+//! so the serving role needs no DDL rights (`docs/hub-api.md`
+//! §Deployment). `pm-hub healthcheck` probes the local `/health` for the
+//! image's `HEALTHCHECK`.
 
 mod admin;
 mod auth;
@@ -27,6 +32,7 @@ mod numbers;
 mod ops;
 mod pull;
 mod views;
+mod writer;
 
 use std::env;
 use std::error::Error;
@@ -39,9 +45,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use serde::Serialize;
-use tokio::sync::Mutex;
 use tokio_postgres::Client;
 
 const DEFAULT_PORT: u16 = 8080;
@@ -59,11 +64,15 @@ enum Cmd {
     /// Manage bearer tokens (run where DATABASE_URL reaches the hub's Postgres)
     #[command(subcommand)]
     Token(TokenCmd),
+    /// Exit 0 if the hub on this machine answers GET /health with 200
+    /// (the image's HEALTHCHECK; uses PORT like the server)
+    Healthcheck,
 }
 
 #[derive(Subcommand, Debug)]
 enum TokenCmd {
     /// Mint a token for a machine or agent; prints it once on stdout (creates the workspace if new)
+    #[command(group = ArgGroup::new("binding").required(true).multiple(false))]
     Create {
         /// What holds the token, e.g. `studio` or `claude:pm-build`
         name: String,
@@ -72,9 +81,13 @@ enum TokenCmd {
         workspace: String,
         /// Actors the token may author ops as: an actor (`matt`), a prefix
         /// ending in `*` (`claude:*`) or `*`; repeat or comma-separate.
-        /// Without it the token may act as any actor
-        #[arg(long = "actor", value_name = "PATTERN")]
+        /// Required unless --any
+        #[arg(long = "actor", value_name = "PATTERN", group = "binding")]
         actors: Vec<String>,
+        /// Let the token author ops as any actor and end the workspace's
+        /// seed (same as `--actor '*'`); for the machine that seeds
+        #[arg(long, group = "binding")]
+        any: bool,
     },
     /// Restrict (or re-bind) the actors a token may author ops as, by the id `token list` shows
     Bind {
@@ -93,14 +106,14 @@ enum TokenCmd {
     Revoke { id: i64 },
 }
 
-/// The server's two database connections. `reader` answers auth, health
+/// The server's database connections. `reader` answers auth, health
 /// and pulls concurrently (tokio-postgres pipelines them); `writer` is
-/// the one connection pushes run their transactions on, one at a time
-/// (`ops`). Cloned into every handler.
+/// the pool pushes and seed-ends run their transactions on, one at a time
+/// per workspace (`writer`, AGT-1463). Cloned into every handler.
 #[derive(Clone)]
 struct Db {
     reader: Arc<Client>,
-    writer: Arc<Mutex<Client>>,
+    writer: Arc<writer::Writers>,
 }
 
 impl FromRef<Db> for Arc<Client> {
@@ -115,6 +128,7 @@ async fn main() -> ExitCode {
     let result = match cli.cmd {
         None => run().await,
         Some(Cmd::Token(cmd)) => token(cmd).await,
+        Some(Cmd::Healthcheck) => healthcheck(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -141,7 +155,8 @@ async fn token(cmd: TokenCmd) -> Result<(), Box<dyn Error>> {
             name,
             workspace,
             actors,
-        } => admin::token_create(&mut client, &name, &workspace, &actors).await,
+            any,
+        } => admin::token_create(&mut client, &name, &workspace, &actors, any).await,
         TokenCmd::Bind { id, actors } => admin::token_bind(&client, id, &actors).await,
         TokenCmd::List { workspace } => admin::token_list(&client, workspace.as_deref()).await,
         TokenCmd::Revoke { id } => admin::token_revoke(&client, id).await,
@@ -163,23 +178,51 @@ async fn connect(database_url: &str) -> Result<Client, Box<dyn Error>> {
     Ok(client)
 }
 
-async fn run() -> Result<(), Box<dyn Error>> {
-    let database_url = database_url()?;
-    let port = match env::var("PORT") {
+fn port() -> Result<u16, Box<dyn Error>> {
+    Ok(match env::var("PORT") {
         Ok(port) => port
             .parse::<u16>()
             .map_err(|_| format!("PORT must be a port number, got {port:?}"))?,
         Err(_) => DEFAULT_PORT,
-    };
+    })
+}
+
+/// Runs the start-up migration: on a connection to
+/// `MIGRATION_DATABASE_URL` when it is set (a role that may run DDL,
+/// closed again once the schema is current), else on `serving`.
+async fn migrate_schema(serving: &mut Client) -> Result<i32, Box<dyn Error>> {
+    match env::var("MIGRATION_DATABASE_URL") {
+        Ok(url) if !url.trim().is_empty() => {
+            let (mut client, connection) = db::connect(&url)
+                .await
+                .map_err(|e| format!("MIGRATION_DATABASE_URL: {e}"))?;
+            let driver = tokio::spawn(connection.drive());
+            let version = migrate::migrate(&mut client).await;
+            drop(client);
+            let _ = driver.await;
+            let version = version?;
+            eprintln!("pm-hub: migrated with MIGRATION_DATABASE_URL");
+            Ok(version)
+        }
+        _ => Ok(migrate::migrate(serving).await?),
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
+    let database_url = database_url()?;
+    let port = port()?;
 
     let mut reader = connect(&database_url).await?;
-    let version = migrate::migrate(&mut reader).await?;
+    let version = migrate_schema(&mut reader).await?;
     eprintln!("pm-hub: schema version {version}");
-    let writer = connect(&database_url).await?;
+    let mut writers = Vec::with_capacity(writer::WRITER_CONNECTIONS);
+    for _ in 0..writer::WRITER_CONNECTIONS {
+        writers.push(connect(&database_url).await?);
+    }
 
     let app = app(Db {
         reader: Arc::new(reader),
-        writer: Arc::new(Mutex::new(writer)),
+        writer: Arc::new(writer::Writers::new(writers)),
     });
     // `::` is dual-stack on Linux, so this serves both Railway's public
     // (IPv4) proxy and its private (IPv6) network.
@@ -187,6 +230,48 @@ async fn run() -> Result<(), Box<dyn Error>> {
     eprintln!("pm-hub: listening on port {port}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// `pm-hub healthcheck`: GET /health on this machine's `PORT` (IPv4
+/// loopback, then IPv6), exit 0 on a 200. The runtime image has no curl;
+/// this is what its `HEALTHCHECK` runs. Railway ignores `HEALTHCHECK` and
+/// probes `/health` itself (`railway.toml` `healthcheckPath`).
+fn healthcheck() -> Result<(), Box<dyn Error>> {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let port = port()?;
+    let timeout = Duration::from_secs(5);
+    let addrs: [SocketAddr; 2] = [
+        (Ipv4Addr::LOCALHOST, port).into(),
+        (Ipv6Addr::LOCALHOST, port).into(),
+    ];
+    let mut stream = addrs
+        .iter()
+        .find_map(|a| TcpStream::connect_timeout(a, timeout).ok())
+        .ok_or_else(|| format!("nothing listening on port {port}"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    let mut head = [0u8; 64];
+    let mut len = 0;
+    while len < head.len() {
+        match stream.read(&mut head[len..])? {
+            0 => break,
+            n => len += n,
+        }
+        if head[..len].windows(2).any(|w| w == b"\r\n") {
+            break;
+        }
+    }
+    let line = String::from_utf8_lossy(&head[..len]);
+    let status = line.split_whitespace().nth(1).unwrap_or("none");
+    if status == "200" {
+        Ok(())
+    } else {
+        Err(format!("/health answered {status}").into())
+    }
 }
 
 /// The HTTP surface. Routes added above `route_layer` require a bearer

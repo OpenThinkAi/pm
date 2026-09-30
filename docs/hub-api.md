@@ -9,7 +9,8 @@ JSON in, JSON out.
 
 Every route except `GET /health` is under `/w/{workspace}/` and needs
 `Authorization: Bearer <token>` with a token minted for that workspace
-(`pm-hub token create <name> --workspace <id>`, AGT-1388). Any auth
+(`pm-hub token create <name> --workspace <id> --actor <pattern>|--any`,
+AGT-1388). Any auth
 failure — no header, a malformed one, an unknown or revoked token, a
 token for another workspace, a workspace that does not exist — is the
 same bare `404` an unknown route gets, so a caller without a grant learns
@@ -50,9 +51,12 @@ author ops as (`tokens.actors`, schema version 4):
 | `*` | any actor |
 
 - `pm-hub token create <name> --workspace <id> --actor <pattern> …`
-  (repeat `--actor` or comma-separate) mints a bound token. Without
-  `--actor` the token is recorded as `*` and `create` prints a note —
-  binding is opt-in.
+  (repeat `--actor` or comma-separate) mints a bound token;
+  `pm-hub token create <name> --workspace <id> --any` mints an
+  unrestricted one (recorded as `*`, with a note). One of the two is
+  **required** (AGT-1463): a plain `create` is a usage error rather than
+  a silent any-actor token. Give `--any` only to the machine that seeds
+  the workspace (see below). Tokens minted earlier are not touched.
 - `pm-hub token bind <id> --actor <pattern> …` replaces a live token's
   patterns (effective on its next request, no restart). `--actor '*'`
   makes it explicitly unrestricted.
@@ -71,9 +75,40 @@ unrestricted token (legacy or `*`) may — a hub-to-hub reseed carries the
 old hub's number ops. **Seeding** is otherwise ordinary pushing: a
 seed's historical ops keep their original actors, so seed with a token
 whose patterns cover every actor in the log (an unrestricted one, or
-e.g. `matt,pm-sync,claude:*`).
+e.g. `matt,pm-sync,claude:*`) — including every actor the log's
+payloads name (below).
 
-**Rollout.** Deploying this hub runs migration 4 (`ALTER TABLE tokens
+**Actors named in payloads (AGT-1463).** The same two rules apply to
+every payload field of a fresh op that names an actor:
+
+| Kind | Field |
+|---|---|
+| `claim` | `assignee` |
+| `hold.set` | `hold.by` |
+| `field.set` (`field: assignee`) | `value`, when not `null` |
+| `actor.upsert` | `id` |
+
+A bound token therefore cannot claim, hold or assign a ticket in
+another actor's name, nor register an actor it could not act as (`400
+actor_not_allowed`, `reason` naming the kind and field; `400
+reserved_actor` for `hub`). Two cases pass from any token: unassigning
+(`field.set assignee null` names nobody), and a `field.set assignee`
+whose value is the ticket's **current** assignee at the hub at that
+point in the batch — it changes nothing, and it is what a client logs
+to reconcile after the hub refused its claim (`field.set assignee` to
+`rejected.taken_by`, see [Claims](#claims-agt-1392)). An assignment to a
+third actor made on a bound token's machine is refused whole with the
+rest of its batch, so bind a machine's token to every actor it assigns
+work to (or use `--any`).
+
+**Ending the seed (AGT-1463).** `POST /w/{workspace}/seeded` is one-way
+and sets the number floor, so only an unrestricted token (legacy, `--any`
+or bound to `*`) may call it; a bound token gets `400 seed_not_allowed`
+while the workspace is seeding (and the usual `409 already_seeded` once
+it is not). A structured 400 rather than the auth 404: the token is valid
+for the workspace, and `pm sync` reports a 400's `reason`.
+
+**Rollout (AGT-1450).** Deploying this hub runs migration 4 (`ALTER TABLE tokens
 ADD COLUMN IF NOT EXISTS actors text[]`), which only adds a nullable
 column: every existing token, including the Studio's `studio` token,
 keeps authenticating and keeps pushing as any actor exactly as before.
@@ -83,6 +118,59 @@ actors in use, then `pm-hub token bind <id> --actor matt --actor pm-sync
 subcommands refuse to run against a schema other than the one they were
 built for, so upgrade (start) the hub before using a newer `pm-hub token
 …` locally.
+
+## Deployment
+
+Environment:
+
+- `DATABASE_URL` (required): the Postgres URL the server serves with —
+  auth, pulls, pushes — and the admin subcommands (`pm-hub token …`) use.
+- `PORT` (default 8080; Railway sets it).
+- `MIGRATION_DATABASE_URL` (optional, AGT-1463): when set, the start-up
+  migration (DDL, plus migration 3's view backfill) runs on a connection
+  to this URL, which is closed once the schema is current; the server
+  itself never uses it. Unset, the migration runs over `DATABASE_URL`, as
+  before — the default deployment is unchanged. Same `sslmode` rules as
+  `DATABASE_URL`.
+
+**Least privilege.** With `MIGRATION_DATABASE_URL` set to a role that
+owns the schema, `DATABASE_URL` can be a role that reads and writes rows
+but cannot change or drop tables. The hub never deletes rows outside a
+migration. One-time setup, run as the owner role (here the Railway
+default `postgres`; `pm_hub_app` is an example name):
+
+```sql
+CREATE ROLE pm_hub_app LOGIN PASSWORD '<secret>';
+GRANT CONNECT ON DATABASE railway TO pm_hub_app;
+GRANT USAGE ON SCHEMA public TO pm_hub_app;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+-- Tables and sequences migrations create later:
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE ON TABLES TO pm_hub_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO pm_hub_app;
+-- Tables that already exist (an upgraded hub):
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO pm_hub_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO pm_hub_app;
+```
+
+Then set `MIGRATION_DATABASE_URL` to the owner's URL and `DATABASE_URL`
+to `pm_hub_app`'s (`crates/pm-hub/tests/health.rs`
+`a_separate_migration_role_leaves_the_server_dml_only` runs exactly
+this). The default privileges are tied to the role that runs the
+migrations: if that role changes, re-run the grants for it.
+
+**Health checks.** Railway gates traffic on its own probe of `/health`
+(`railway.toml` `healthcheckPath`) and ignores a Dockerfile
+`HEALTHCHECK`. The image also declares `HEALTHCHECK CMD ["pm-hub",
+"healthcheck"]` for `docker run` and other runtimes: that subcommand
+GETs `http://localhost:$PORT/health` (IPv4, then IPv6 loopback) and
+exits 0 only on a 200 — the image has no curl.
+
+**Image.** Base images and the test Postgres
+(`crates/pm-hub/tests/common/mod.rs`) are pinned by digest (AGT-1452,
+AGT-1463). The build stage copies only `Cargo.toml`, `Cargo.lock`,
+`crates/` and `.build-sha` from the context.
 
 ## `GET /health` (open)
 
@@ -203,8 +291,8 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 | `400` | `invalid_stamp` | `index`, `op_id` | the op's `hlc.wall_ms` exceeds `i64::MAX` or its `hlc.counter` is `u32::MAX` (see Stamps above) |
 | `400` | `future_stamp` | `index`, `op_id` | the op's `hlc.wall_ms` is more than one day ahead of the hub's clock |
 | `400` | `invalid_id` | `index`, `op_id` | a `workspace.set prefix`, `project.create` (id or parent) or `project.set parent` whose value is not a safe file-path component (`pm_core::ids::is_safe_component`: ASCII letters, digits, `-`, `_`, `.`, at most 64 bytes, not starting with `.`) — clients use these in export/backup paths (AGT-1453); a replica refuses the same on pull (`StoreError::InvalidId`) |
-| `400` | `actor_not_allowed` | `index`, `op_id` | a fresh op's `actor` matches none of the token's actor patterns; `reason` names the token and its patterns (see [Token actor bindings](#token-actor-bindings-agt-1450)) |
-| `400` | `reserved_actor` | `index`, `op_id` | a fresh op authored as `hub` — from any token once the workspace is seeded, from a bound token while seeding |
+| `400` | `actor_not_allowed` | `index`, `op_id` | a fresh op's `actor`, or an actor its payload names (`claim.assignee`, `hold.by`, `field.set assignee`, `actor.upsert id`), matches none of the token's actor patterns; `reason` names the token, its patterns and the field (see [Token actor bindings](#token-actor-bindings-agt-1450)) |
+| `400` | `reserved_actor` | `index`, `op_id` | a fresh op authored as `hub`, or naming `hub` in one of those payload fields — from any token once the workspace is seeded, from a bound token while seeding |
 | `400` | `foreign_workspace` | `index`, `op_id` | a config op (`workspace.set`, `state.upsert`, `actor.upsert`) for a workspace Ulid other than the one this hub workspace's config already belongs to |
 | `400` | `invalid_batch` | — | the body is not UTF-8 / not JSON / not `{"ops": [...]}`, or the batch has more than 1000 ops |
 | `400` | `number_not_allowed` | `index`, `op_id` | a `field.set number` pushed to a seeded workspace (only the hub numbers tickets then, whatever the op's `actor`) |
@@ -276,9 +364,20 @@ first, and a puller that saw 6 would skip 5 forever. Each push runs in
 one transaction that first locks the workspace's row (`SELECT … FROM
 workspaces … FOR NO KEY UPDATE`, held to commit) and only then inserts,
 so a workspace's pushes take sequence values and commit one after
-another. Pushes share one dedicated database connection behind a mutex
-(a transaction needs a connection to itself); reads, auth and pulls use
-another connection and never wait for a push.
+another. That row lock is the ordering guarantee, and it holds across
+hub processes and anything else writing to the database.
+
+Write transactions (pushes, seed-ends) run on a small pool of
+connections (`pm_hub::writer::WRITER_CONNECTIONS`, 4) behind a
+**per-workspace** in-process lock (AGT-1463; before, one connection and
+one mutex served every workspace). A push first takes its workspace's
+lock (FIFO), then a pooled connection: pushes to one workspace queue in
+the hub holding no connection, so one workspace's run of large pushes
+never parks every connection on its row lock, and pushes to different
+workspaces run side by side (`crates/pm-hub/tests/ops.rs`
+`a_stalled_workspace_never_blocks_another`). Reads, auth and pulls use
+another connection and never wait for a push. Request bodies are still
+buffered before the lock (up to 64 MiB each).
 
 ## Ticket numbers (AGT-1391)
 
@@ -466,10 +565,11 @@ so neither can wrap the allocator or leave the workspace stuck in seed
 mode.
 
 Errors: `400 invalid_body` (not `{"number_floor": <n>}`, or a floor
-above the cap), `409
+above the cap), `400 seed_not_allowed` (the token is bound to actor
+patterns; only an unrestricted token may end a seed, AGT-1463), `409
 already_seeded` (the seed already ended; the hub is the authority — a
-client retrying a lost response treats this as done). Auth failures are
-the usual bare `404`.
+client retrying a lost response treats this as done, whatever its
+token). Auth failures are the usual bare `404`.
 
 ### How `pm sync` seeds (AGT-1396)
 
