@@ -179,6 +179,11 @@ pub enum ApplyError {
         #[source]
         source: BodyError,
     },
+    /// A config kind (AGT-1384) targets a workspace or project, never a
+    /// ticket; only [`crate::config`] folds it. A caller bug, as
+    /// [`crate::doc::DocApplyError::WrongKind`] is.
+    #[error("op {op_id}: a ticket does not accept the config op '{kind}'")]
+    WrongKind { op_id: Ulid, kind: &'static str },
 }
 
 /// Why the authority refused a `claim`.
@@ -406,6 +411,16 @@ pub fn apply(view: &mut TicketView, op: &Op) -> Result<(), ApplyError> {
             if view.deleted_at.as_ref().is_none_or(|s| stamp < *s) {
                 view.deleted_at = Some(stamp.clone());
             }
+        }
+        Payload::WorkspaceSet(_)
+        | Payload::StateUpsert(_)
+        | Payload::ActorUpsert(_)
+        | Payload::ProjectCreate(_)
+        | Payload::ProjectSet(_) => {
+            return Err(ApplyError::WrongKind {
+                op_id: op.op_id,
+                kind: op.kind(),
+            });
         }
     }
     if view.updated.as_ref().is_none_or(|s| stamp > *s) {
@@ -947,6 +962,31 @@ mod tests {
             TicketView::new(ticket),
             "rejected ops leave the view untouched"
         );
+    }
+
+    /// AGT-1384: a config op addressed to a ticket's id is a caller bug,
+    /// not a silent no-op — and the view stays as it was.
+    #[test]
+    fn config_ops_are_rejected_by_a_ticket_view() {
+        use crate::op::WorkspaceSet;
+        let ticket = Ulid::new();
+        let mut view = TicketView::new(ticket);
+        apply(&mut view, &create(ticket, 1)).unwrap();
+        let before = view.clone();
+        let bad = op(
+            ticket,
+            2,
+            "matt",
+            Payload::WorkspaceSet(WorkspaceSet::Prefix("AGT".into())),
+        );
+        assert_eq!(
+            apply(&mut view, &bad),
+            Err(ApplyError::WrongKind {
+                op_id: bad.op_id,
+                kind: "workspace.set"
+            })
+        );
+        assert_eq!(view, before);
     }
 
     #[test]
