@@ -36,10 +36,58 @@ nothing (think-hub precedent). A wrong method on a real route is that
 
 `503` with an empty body means the hub could not reach Postgres; retry.
 
+### Token actor bindings (AGT-1450)
+
+A token authenticates a *machine*, and one machine pushes for several
+actors (README decision A7: the owner, `pm-sync`, its `claude:*`
+agents). Each token therefore carries a set of **actor patterns** it may
+author ops as (`tokens.actors`, schema version 4):
+
+| Pattern | Matches |
+|---|---|
+| `matt` | exactly the actor `matt` |
+| `claude:*` | any actor starting `claude:` (a trailing `*` is a prefix match; `*` may appear only at the end) |
+| `*` | any actor |
+
+- `pm-hub token create <name> --workspace <id> --actor <pattern> …`
+  (repeat `--actor` or comma-separate) mints a bound token. Without
+  `--actor` the token is recorded as `*` and `create` prints a note —
+  binding is opt-in.
+- `pm-hub token bind <id> --actor <pattern> …` replaces a live token's
+  patterns (effective on its next request, no restart). `--actor '*'`
+  makes it explicitly unrestricted.
+- A token minted before bindings existed has `actors = NULL`: it stays
+  **unrestricted** ("legacy") and `pm-hub token list` shows it as `any
+  (legacy, unbound)` until `token bind` restricts it. `token list` has
+  an `ACTORS` column: `ID WORKSPACE NAME ACTORS CREATED REVOKED`.
+
+On push, every **fresh** op's `actor` must match one of the token's
+patterns (`400 actor_not_allowed` otherwise, batch refused whole). An op
+the workspace already has is acknowledged whoever authored it — nothing
+is stored for it. The actor `hub` is reserved for the hub's own ops:
+once the workspace is seeded no client may push it (`400
+reserved_actor`, whatever the token); while seeding, only an
+unrestricted token (legacy or `*`) may — a hub-to-hub reseed carries the
+old hub's number ops. **Seeding** is otherwise ordinary pushing: a
+seed's historical ops keep their original actors, so seed with a token
+whose patterns cover every actor in the log (an unrestricted one, or
+e.g. `matt,pm-sync,claude:*`).
+
+**Rollout.** Deploying this hub runs migration 4 (`ALTER TABLE tokens
+ADD COLUMN IF NOT EXISTS actors text[]`), which only adds a nullable
+column: every existing token, including the Studio's `studio` token,
+keeps authenticating and keeps pushing as any actor exactly as before.
+To restrict it afterwards, run `pm-hub token list` to confirm the
+actors in use, then `pm-hub token bind <id> --actor matt --actor pm-sync
+--actor 'claude:*'` (adjusting to that machine's actors). The admin
+subcommands refuse to run against a schema other than the one they were
+built for, so upgrade (start) the hub before using a newer `pm-hub token
+…` locally.
+
 ## `GET /health` (open)
 
 ```json
-{"status": "ok", "schema_version": 3, "op_version": 1, "build": "<git sha>"}
+{"status": "ok", "schema_version": 4, "op_version": 1, "build": "<git sha>"}
 ```
 
 `schema_version` is read live from the database; `op_version` is the
@@ -83,6 +131,27 @@ malformed one and to fill its indexed columns (`op_id`, `hlc`, `actor`,
 `entity`, `kind`), and stores the op's JSON text exactly as received — a
 pull serves the same bytes back. An op's `version` may not be newer than
 the hub's `op_version`.
+
+**Stamps (oaudit 2026-09-30).** Every op's `hlc` is checked before
+anything is stored or folded, so a forged stamp can neither crash a
+replica nor win every last-writer-wins register forever:
+
+- `wall_ms` must be at most `i64::MAX` (both stores keep it in a signed
+  64-bit column) and `counter` at most `u32::MAX - 1` (so a clock that
+  receives it can still advance) — else `400 invalid_stamp`;
+- `wall_ms` may be at most **one day** (`pm_core::MAX_FUTURE_SKEW_MS`,
+  86 400 000 ms) ahead of the hub's own wall clock at the time of the
+  push — else `400 future_stamp`. A client whose clock runs more than a
+  day fast must fix it before it can push.
+
+There is no lower bound: stamps from the past are always accepted, so a
+seed's historical ops (years old, or `wall_ms` near 0 from an import)
+land as before. A replica applies the same range checks to every op it
+pulls (`pm_store::Store::apply_pulled` → `StoreError::InvalidStamp`,
+never a panic), with a far looser future bound of 365 days
+(`pm_store::PULL_MAX_FUTURE_SKEW_MS`) so a replica whose own clock runs
+behind still pulls honest ops. `pm_core::Clock` never overflows its
+counter: a spent counter rolls into the next millisecond.
 
 Response `200`, one entry per op **in batch order**, plus the number of
 every ticket a `ticket.create` in the batch made (see [Ticket
@@ -130,7 +199,12 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 
 | Status | `error` | Extra fields | When |
 |---|---|---|---|
-| `400` | `invalid_op` | `index` (position in the batch), `op_id` (if the JSON had one) | an op does not parse as `pm_core::Op`, its `actor` is empty, its `version` is newer than the hub's, or it does not fold into its ticket with `pm_core::apply` (a relation that does not touch the ticket) |
+| `400` | `invalid_op` | `index` (position in the batch), `op_id` (if the JSON had one) | an op does not parse as `pm_core::Op`, its `actor` is empty, its `version` is newer than the hub's, a `field.set number` carries a number outside `1..=2^53-1`, or it does not fold into its ticket with `pm_core::apply` (a relation that does not touch the ticket) |
+| `400` | `invalid_stamp` | `index`, `op_id` | the op's `hlc.wall_ms` exceeds `i64::MAX` or its `hlc.counter` is `u32::MAX` (see Stamps above) |
+| `400` | `future_stamp` | `index`, `op_id` | the op's `hlc.wall_ms` is more than one day ahead of the hub's clock |
+| `400` | `invalid_id` | `index`, `op_id` | a `workspace.set prefix`, `project.create` (id or parent) or `project.set parent` whose value is not a safe file-path component (`pm_core::ids::is_safe_component`: ASCII letters, digits, `-`, `_`, `.`, at most 64 bytes, not starting with `.`) — clients use these in export/backup paths (AGT-1453); a replica refuses the same on pull (`StoreError::InvalidId`) |
+| `400` | `actor_not_allowed` | `index`, `op_id` | a fresh op's `actor` matches none of the token's actor patterns; `reason` names the token and its patterns (see [Token actor bindings](#token-actor-bindings-agt-1450)) |
+| `400` | `reserved_actor` | `index`, `op_id` | a fresh op authored as `hub` — from any token once the workspace is seeded, from a bound token while seeding |
 | `400` | `foreign_workspace` | `index`, `op_id` | a config op (`workspace.set`, `state.upsert`, `actor.upsert`) for a workspace Ulid other than the one this hub workspace's config already belongs to |
 | `400` | `invalid_batch` | — | the body is not UTF-8 / not JSON / not `{"ops": [...]}`, or the batch has more than 1000 ops |
 | `400` | `number_not_allowed` | `index`, `op_id` | a `field.set number` pushed to a seeded workspace (only the hub numbers tickets then, whatever the op's `actor`) |
@@ -385,7 +459,14 @@ op); and marks the workspace seeded (`whoami` now says `seeded: true`
 and the hub arbitrates claims — see [Claims](#claims-agt-1392)). An empty seed — a workspace with no log to bring —
 ends the same way with `{"number_floor": 0}`: allocation then starts at 1.
 
-Errors: `400 invalid_body` (not `{"number_floor": <n>}`), `409
+`number_floor` may be at most 2^53 − 1 (`pm_hub::numbers::MAX_NUMBER`,
+the largest integer the views' JavaScript represents exactly), the same
+cap a seeded `field.set number` has; all number arithmetic is checked,
+so neither can wrap the allocator or leave the workspace stuck in seed
+mode.
+
+Errors: `400 invalid_body` (not `{"number_floor": <n>}`, or a floor
+above the cap), `409
 already_seeded` (the seed already ended; the hub is the authority — a
 client retrying a lost response treats this as done). Auth failures are
 the usual bare `404`.

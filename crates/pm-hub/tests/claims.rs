@@ -364,8 +364,9 @@ fn hub_views_equal_a_client_rebuild_and_the_migration_backfills_them() {
     assert_eq!(hub_view(&url, c).snapshot().number, Some(3));
     assert_eq!(hub_states(&url), store.workspace().unwrap().unwrap().states);
 
-    // Backfill: drop the views and their migration, restart, and the hub
-    // rebuilds them from the log to the same state.
+    // Backfill: drop the views and their migration (and every later
+    // one, so version 3 is pending again), restart, and the hub rebuilds
+    // them from the log to the same state.
     let before: Vec<_> = hub_views(&url)
         .iter()
         .map(|(e, v)| (e.clone(), essentials(v)))
@@ -375,12 +376,12 @@ fn hub_views_equal_a_client_rebuild_and_the_migration_backfills_them() {
     query_rows(
         &url,
         "DROP TABLE ticket_views; DROP TABLE workspace_views;
-         DELETE FROM schema_version WHERE version = 3",
+         DELETE FROM schema_version WHERE version >= 3",
     )
     .unwrap();
     let mut hub = spawn_hub(&url, port);
     let (_, health) = wait_for_health(&mut hub, port);
-    assert_eq!(health["schema_version"], 3);
+    assert_eq!(health["schema_version"], expected_schema_version());
     let after: Vec<_> = hub_views(&url)
         .iter()
         .map(|(e, v)| (e.clone(), essentials(v)))

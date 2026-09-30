@@ -11,8 +11,14 @@ use crate::error::{Result, StoreError};
 
 /// `wall_ms` as stored. HLC wall time is a `u64`; SQLite integers are
 /// `i64`, which still covers every millisecond until the year 292 million.
-pub(crate) fn wall_ms(hlc: Hlc) -> i64 {
-    i64::try_from(hlc.wall_ms).expect("wall_ms fits an SQLite integer")
+/// A stamp beyond that (only a foreign writer makes one) is a typed
+/// [`StoreError::InvalidStamp`], never a panic (oaudit 2026-09-30).
+pub(crate) fn wall_ms(hlc: Hlc) -> Result<i64> {
+    i64::try_from(hlc.wall_ms).map_err(|_| {
+        StoreError::InvalidStamp(pm_core::StampError::WallOutOfRange {
+            wall_ms: hlc.wall_ms,
+        })
+    })
 }
 
 pub(crate) fn hlc(row: &Row<'_>, wall_col: &str, counter_col: &str) -> rusqlite::Result<Hlc> {

@@ -68,7 +68,7 @@ pub use doctor::{
 pub use error::{Result, StoreError};
 pub use query::TicketFilter;
 pub use ready::ReadyQuery;
-pub use sync::{Pulled, SyncStatus};
+pub use sync::{PULL_MAX_FUTURE_SKEW_MS, Pulled, SyncStatus};
 
 /// Embedded migrations, in order. Each runs once, inside its own
 /// transaction, and is recorded in `schema_version`.

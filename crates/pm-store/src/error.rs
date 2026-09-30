@@ -83,6 +83,15 @@ pub enum StoreError {
     /// Same rule, for a child project's `parent` reference.
     #[error("project '{project}' has child projects; reparent or delete them first")]
     ProjectHasChildren { project: String },
+    /// A stamp that is not admissible: out of the storable range, or (on
+    /// a pull) too far ahead of this machine's clock (oaudit 2026-09-30,
+    /// see [`crate::Store::apply_pulled`]).
+    #[error("invalid stamp: {0}")]
+    InvalidStamp(#[from] pm_core::StampError),
+    /// A foreign op carrying a workspace prefix or project id that is not
+    /// safe in a file path (`pm_core::ids`, AGT-1450).
+    #[error(transparent)]
+    InvalidId(#[from] pm_core::ids::IdError),
     /// A stored column no longer decodes (a JSON blob or a ULID). Only a
     /// foreign writer or a schema bug can produce this.
     #[error("stored {what} is corrupt: {detail}")]

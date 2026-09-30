@@ -58,6 +58,29 @@ use crate::ops::{ErrorBody, OpRow, insert_ops};
 /// The actor every hub-authored op carries.
 pub const HUB_ACTOR: &str = "hub";
 
+/// The largest ticket number the hub records or issues, and the largest
+/// `number_floor` it adopts (oaudit 2026-09-30): 2^53 - 1, the largest
+/// integer the views' JavaScript represents exactly. Far below `i64::MAX`,
+/// so `floor + 1` and every later allocation stay in range; a seeded
+/// number or floor above it is a 400, rather than a stuck seed.
+pub const MAX_NUMBER: i64 = (1 << 53) - 1;
+
+/// Why allocation failed.
+#[derive(Debug)]
+pub enum AllocError {
+    Db(tokio_postgres::Error),
+    /// The allocator or the hub's clock ran out of range — unreachable
+    /// while [`MAX_NUMBER`] and the push's stamp checks hold, and never
+    /// wrapped: nothing is written.
+    Exhausted(String),
+}
+
+impl From<tokio_postgres::Error> for AllocError {
+    fn from(e: tokio_postgres::Error) -> Self {
+        AllocError::Db(e)
+    }
+}
+
 /// A ticket's number as the push and seed-end responses report it.
 #[derive(Serialize)]
 pub struct Numbered {
@@ -120,17 +143,30 @@ impl Allocator {
     /// The hub's `field.set number` op for `create`, stamped after the
     /// create and after the hub's previous op. The number is the next
     /// one; the allocator advances.
-    fn allocate(&mut self, create: &Create, now_ms: u64) -> Op {
+    fn allocate(&mut self, create: &Create, now_ms: u64) -> Result<Op, AllocError> {
         let number = self.next_number;
-        self.next_number += 1;
-        let hlc = self.clock.receive(create.hlc, now_ms);
-        Op::new(
+        let (Some(next), Ok(value)) = (
+            number
+                .checked_add(1)
+                .filter(|n| *n <= MAX_NUMBER.saturating_add(1)),
+            u64::try_from(number),
+        ) else {
+            return Err(AllocError::Exhausted(format!(
+                "ticket number {number} is out of range"
+            )));
+        };
+        let hlc = self
+            .clock
+            .try_receive(create.hlc, now_ms)
+            .map_err(|e| AllocError::Exhausted(e.to_string()))?;
+        self.next_number = next;
+        Ok(Op::new(
             Ulid::new(),
             hlc,
             ActorId::new(HUB_ACTOR),
             create.entity,
-            Payload::FieldSet(FieldSet::Number(number as u64)),
-        )
+            Payload::FieldSet(FieldSet::Number(value)),
+        ))
     }
 
     /// Numbers every `create` (in order) that is not yet in `numbers`:
@@ -141,7 +177,7 @@ impl Allocator {
         tx: &Transaction<'_>,
         workspace: &str,
         creates: &[Create],
-    ) -> Result<Vec<Numbered>, tokio_postgres::Error> {
+    ) -> Result<Vec<Numbered>, AllocError> {
         let entities: Vec<String> = creates.iter().map(|c| c.entity.to_string()).collect();
         let known = numbered(tx, workspace, &entities).await?;
         // One wall-clock reading for the whole batch: within it the
@@ -154,7 +190,7 @@ impl Allocator {
             {
                 continue;
             }
-            ops.push(self.allocate(create, now_ms));
+            ops.push(self.allocate(create, now_ms)?);
         }
         if ops.is_empty() {
             return Ok(Vec::new());
@@ -168,7 +204,8 @@ impl Allocator {
             .zip(&jsons)
             .map(|(op, json)| OpRow {
                 op_id: op.op_id.to_string(),
-                hlc_wall_ms: op.hlc.wall_ms as i64,
+                // `try_receive` only issues storable stamps.
+                hlc_wall_ms: i64::try_from(op.hlc.wall_ms).unwrap_or(i64::MAX),
                 hlc_counter: i64::from(op.hlc.counter),
                 actor: HUB_ACTOR,
                 entity: op.entity.to_string(),
@@ -182,7 +219,7 @@ impl Allocator {
             let Payload::FieldSet(FieldSet::Number(number)) = &op.payload else {
                 unreachable!("allocate builds number ops")
             };
-            let number = *number as i64;
+            let number = i64::try_from(*number).unwrap_or(i64::MAX);
             record(tx, workspace, &op.entity.to_string(), number, seq).await?;
             out.push(Numbered {
                 entity: op.entity.to_string(),
@@ -196,12 +233,11 @@ impl Allocator {
     }
 
     /// Writes `next_number` and the clock back to the locked row.
-    pub async fn save(
-        &self,
-        tx: &Transaction<'_>,
-        workspace: &str,
-    ) -> Result<(), tokio_postgres::Error> {
+    pub async fn save(&self, tx: &Transaction<'_>, workspace: &str) -> Result<(), AllocError> {
         let latest = self.clock.latest();
+        let wall_ms = i64::try_from(latest.wall_ms).map_err(|_| {
+            AllocError::Exhausted(format!("the hub's clock ({latest}) is out of range"))
+        })?;
         tx.execute(
             "UPDATE workspaces
              SET next_number = $2, clock_wall_ms = $3, clock_counter = $4
@@ -209,7 +245,7 @@ impl Allocator {
             &[
                 &workspace,
                 &self.next_number,
-                &(latest.wall_ms as i64),
+                &wall_ms,
                 &i64::from(latest.counter),
             ],
         )
@@ -348,6 +384,16 @@ enum SeedError {
     AlreadySeeded,
     NoWorkspace,
     Db(tokio_postgres::Error),
+    Internal(String),
+}
+
+impl From<AllocError> for SeedError {
+    fn from(e: AllocError) -> Self {
+        match e {
+            AllocError::Db(e) => SeedError::Db(e),
+            AllocError::Exhausted(why) => SeedError::Internal(why),
+        }
+    }
 }
 
 impl From<tokio_postgres::Error> for SeedError {
@@ -378,6 +424,10 @@ impl IntoResponse for SeedError {
                 eprintln!("pm-hub: seeded: {e}");
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             }
+            SeedError::Internal(why) => {
+                eprintln!("pm-hub: seeded: {why}");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
         }
     }
 }
@@ -398,7 +448,13 @@ async fn finish(db: &Db, workspace: &str, body: &str) -> Result<Seeded, SeedErro
     let SeedEnd { number_floor } =
         serde_json::from_str(body).map_err(|e| SeedError::Body(format!("body: {e}")))?;
     let number_floor = i64::try_from(number_floor)
-        .map_err(|_| SeedError::Body(format!("number_floor {number_floor} is out of range")))?;
+        .ok()
+        .filter(|n| *n <= MAX_NUMBER)
+        .ok_or_else(|| {
+            SeedError::Body(format!(
+                "number_floor {number_floor} is out of range (at most {MAX_NUMBER})"
+            ))
+        })?;
 
     let mut writer = db.writer.lock().await;
     let tx = writer.transaction().await?;
@@ -416,7 +472,11 @@ async fn finish(db: &Db, workspace: &str, body: &str) -> Result<Seeded, SeedErro
         .await?
         .get(0);
     let floor = number_floor.max(seeded_max);
-    allocator.next_number = floor + 1;
+    // Seeded numbers and the floor are both capped at MAX_NUMBER, so this
+    // cannot overflow; checked all the same, never wrapped.
+    allocator.next_number = floor
+        .checked_add(1)
+        .ok_or_else(|| SeedError::Internal(format!("number floor {floor} is out of range")))?;
 
     // The hub's clock has seen the whole seed.
     let latest = tx
@@ -512,20 +572,22 @@ mod tests {
         };
         // The create is ahead of both the hub's clock and its wall clock:
         // the hub op still lands strictly after it.
-        let first = a.allocate(&create, 60);
+        let first = a.allocate(&create, 60).unwrap();
         assert!(first.hlc > create.hlc, "{} vs {}", first.hlc, create.hlc);
         assert_eq!(first.hlc, Hlc::new(1_800_000_000_000, 4));
         assert_eq!(first.actor.as_str(), HUB_ACTOR);
         assert_eq!(first.entity, create.entity);
         assert_eq!(first.version, pm_core::OP_VERSION);
         assert_eq!(number_value(&first), Some(1377));
-        let second = a.allocate(
-            &Create {
-                entity: Ulid::new(),
-                hlc: Hlc::new(10, 0),
-            },
-            60,
-        );
+        let second = a
+            .allocate(
+                &Create {
+                    entity: Ulid::new(),
+                    hlc: Hlc::new(10, 0),
+                },
+                60,
+            )
+            .unwrap();
         assert!(second.hlc > first.hlc);
         assert_eq!(number_value(&second), Some(1378));
         assert_eq!(a.next_number, 1379);
@@ -539,6 +601,49 @@ mod tests {
     }
 
     #[test]
+    fn allocation_never_wraps_the_number_or_the_clock() {
+        // oaudit 2026-09-30: `next_number += 1` / `floor + 1` could wrap.
+        let create = Create {
+            entity: Ulid::new(),
+            hlc: Hlc::new(5, 0),
+        };
+        let mut a = Allocator {
+            seeded: true,
+            next_number: MAX_NUMBER,
+            clock: Clock::new(),
+        };
+        let last = a.allocate(&create, 5).unwrap();
+        assert_eq!(number_value(&last), Some(MAX_NUMBER as u64));
+        assert!(matches!(
+            a.allocate(&create, 5),
+            Err(AllocError::Exhausted(_))
+        ));
+        let mut a = Allocator {
+            seeded: true,
+            next_number: i64::MAX,
+            clock: Clock::new(),
+        };
+        assert!(matches!(
+            a.allocate(&create, 5),
+            Err(AllocError::Exhausted(_))
+        ));
+        assert_eq!(a.next_number, i64::MAX, "left as it was");
+
+        // A clock with no storable stamp left refuses rather than wraps.
+        let spent = Hlc::new(pm_core::MAX_WALL_MS, u32::MAX);
+        let mut a = Allocator {
+            seeded: true,
+            next_number: 1,
+            clock: Clock::from_latest(spent),
+        };
+        assert!(matches!(
+            a.allocate(&create, 5),
+            Err(AllocError::Exhausted(_))
+        ));
+        assert_eq!((a.next_number, a.clock.latest()), (1, spent));
+    }
+
+    #[test]
     fn the_hub_op_is_a_plain_field_set_number_on_the_wire() {
         let mut a = Allocator {
             seeded: true,
@@ -546,13 +651,15 @@ mod tests {
             clock: Clock::new(),
         };
         let entity = Ulid::new();
-        let op = a.allocate(
-            &Create {
-                entity,
-                hlc: Hlc::new(5, 0),
-            },
-            5,
-        );
+        let op = a
+            .allocate(
+                &Create {
+                    entity,
+                    hlc: Hlc::new(5, 0),
+                },
+                5,
+            )
+            .unwrap();
         let json = serde_json::to_value(&op).unwrap();
         assert_eq!(json["kind"], "field.set");
         assert_eq!(

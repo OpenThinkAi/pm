@@ -37,7 +37,7 @@ use ulid::Ulid;
 
 use crate::Store;
 use crate::codec::ulid;
-use crate::commit::commit_foreign_in;
+use crate::commit::{commit_foreign_in, now_ms};
 use crate::config::CONFIG_KINDS;
 use crate::error::{Result, StoreError};
 use crate::project::{commit_doc_edit_in, is_known_doc};
@@ -268,6 +268,14 @@ impl Store {
     /// and a ticket that now has a number leaves the pending-number set.
     /// Any failure — including a dependency nothing in the batch
     /// supplies — rolls the whole batch back ([`StoreError::Pull`]).
+    ///
+    /// Every op's stamp is checked first (oaudit 2026-09-30): one out of
+    /// the storable range, with a spent counter, or more than
+    /// [`PULL_MAX_FUTURE_SKEW_MS`] ahead of this machine's clock fails the
+    /// batch as [`StoreError::InvalidStamp`] (inside [`StoreError::Pull`])
+    /// rather than panicking or poisoning the local clock. An op carrying
+    /// a workspace prefix or project id unsafe in a file path fails it as
+    /// [`StoreError::InvalidId`].
     pub fn apply_pulled(&mut self, ops: &[Op]) -> Result<Pulled> {
         let tx = self
             .conn
@@ -404,6 +412,7 @@ fn outbox_len(conn: &Connection) -> Result<u64> {
 /// the binding lands; one whose binding lost to an earlier one, or whose
 /// project was deleted, is still a document edit and lands in the log.
 fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
+    check_foreign_stamp(op, now_ms())?;
     match &op.payload {
         Payload::BodyEdit(_) if is_known_doc(tx, op.entity)? => {
             commit_doc_edit_in(tx, op.entity, op)?;
@@ -431,6 +440,27 @@ fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
             commit_foreign_in(tx, op)?;
         }
     }
+    Ok(())
+}
+
+/// How far ahead of this machine's clock a pulled op's stamp may be. Far
+/// more lenient than the hub's push bound ([`pm_core::MAX_FUTURE_SKEW_MS`],
+/// one day): the hub already refuses far-future pushes, and a replica
+/// whose own clock runs behind must still pull honest ops. This only
+/// stops an op the hub stored before it checked (or a hostile hub) from
+/// dragging this replica's clock years ahead.
+pub const PULL_MAX_FUTURE_SKEW_MS: u64 = 365 * pm_core::MAX_FUTURE_SKEW_MS;
+
+/// The trust-boundary check on a foreign op's stamp (oaudit 2026-09-30):
+/// storable, its counter not spent, and not absurdly far in the future.
+/// Refused as [`StoreError::InvalidStamp`] before the op reaches the log,
+/// a view or a clock; the pull rolls back and names the op.
+fn check_foreign_stamp(op: &Op, now_ms: u64) -> Result<()> {
+    op.hlc.check_range()?;
+    op.hlc.check_not_after(now_ms, PULL_MAX_FUTURE_SKEW_MS)?;
+    // A prefix or project id this replica would later put in a file path
+    // (AGT-1453) is refused here too (AGT-1450).
+    pm_core::ids::check_op_ids(op)?;
     Ok(())
 }
 

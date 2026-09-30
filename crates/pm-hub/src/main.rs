@@ -13,8 +13,8 @@
 //!   seed and make the hub its number authority (see `numbers`).
 //!
 //! Claims are arbitrated inside the push, against the hub's materialized
-//! views (see `views`, AGT-1392). `pm-hub token create|list|revoke` manage
-//! bearer tokens (see `admin`). The HTTP contract is `docs/hub-api.md`.
+//! views (see `views`, AGT-1392). `pm-hub token create|list|bind|revoke` manage
+//! bearer tokens and the actors each may author ops as (see `admin`). The HTTP contract is `docs/hub-api.md`.
 //!
 //! Environment: `DATABASE_URL` (required; a Postgres URL) and `PORT`
 //! (default 8080; Railway sets it).
@@ -70,6 +70,18 @@ enum TokenCmd {
         /// Workspace the token grants access to
         #[arg(long, value_name = "ID")]
         workspace: String,
+        /// Actors the token may author ops as: an actor (`matt`), a prefix
+        /// ending in `*` (`claude:*`) or `*`; repeat or comma-separate.
+        /// Without it the token may act as any actor
+        #[arg(long = "actor", value_name = "PATTERN")]
+        actors: Vec<String>,
+    },
+    /// Restrict (or re-bind) the actors a token may author ops as, by the id `token list` shows
+    Bind {
+        id: i64,
+        /// Actor patterns, as for `create --actor` (`*` = any actor)
+        #[arg(long = "actor", value_name = "PATTERN", required = true)]
+        actors: Vec<String>,
     },
     /// List tokens (never their secrets)
     List {
@@ -125,9 +137,12 @@ async fn token(cmd: TokenCmd) -> Result<(), Box<dyn Error>> {
         }
     });
     match cmd {
-        TokenCmd::Create { name, workspace } => {
-            admin::token_create(&mut client, &name, &workspace).await
-        }
+        TokenCmd::Create {
+            name,
+            workspace,
+            actors,
+        } => admin::token_create(&mut client, &name, &workspace, &actors).await,
+        TokenCmd::Bind { id, actors } => admin::token_bind(&client, id, &actors).await,
         TokenCmd::List { workspace } => admin::token_list(&client, workspace.as_deref()).await,
         TokenCmd::Revoke { id } => admin::token_revoke(&client, id).await,
     }

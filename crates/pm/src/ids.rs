@@ -14,7 +14,7 @@ use crate::exit::{CliError, Result};
 /// Longest workspace prefix.
 pub const PREFIX_MAX: usize = 16;
 /// Longest project id, and the longest path component we accept.
-pub const ID_MAX: usize = 64;
+pub const ID_MAX: usize = pm_core::ids::ID_MAX;
 
 /// A workspace prefix: 1-16 uppercase letters or digits, starting with a
 /// letter. Exit 2 otherwise.
@@ -61,13 +61,8 @@ pub fn validate_project_id(id: &str) -> Result<()> {
 /// starting with `.` (so never `.` or `..`). No separators, NUL or other
 /// control characters. Exit 2 otherwise.
 pub fn safe_component<'a>(value: &'a str, what: &str) -> Result<&'a str> {
-    let ok = !value.is_empty()
-        && value.len() <= ID_MAX
-        && !value.starts_with('.')
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    if ok {
+    // One rule with the trust-boundary check (`pm_core::ids`, AGT-1450).
+    if pm_core::ids::is_safe_component(value) {
         Ok(value)
     } else {
         Err(CliError::usage(format!(

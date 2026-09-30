@@ -86,6 +86,106 @@ pub struct Authed {
     pub workspace: String,
     pub token_id: i64,
     pub token_label: String,
+    /// Which actors this token may author ops as (AGT-1450).
+    pub actors: ActorBinding,
+}
+
+/// Most patterns one token may be bound to.
+pub const MAX_ACTOR_PATTERNS: usize = 32;
+/// Longest actor pattern, in characters (actor ids are short handles).
+pub const MAX_ACTOR_PATTERN: usize = 128;
+
+/// The actors a token may author ops as (AGT-1450, oaudit 2026-09-30),
+/// from `tokens.actors`. README decision A7 mints one token per machine,
+/// and one machine pushes for several actors (the owner, `pm-sync`, its
+/// `claude:*` agents), so a binding is a set of patterns, not one actor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActorBinding {
+    /// `tokens.actors IS NULL`: minted before bindings existed. Any actor,
+    /// exactly as before, until `pm-hub token bind` restricts it.
+    Legacy,
+    /// Actor patterns: `matt` (exactly that actor), `claude:*` (any actor
+    /// starting `claude:`), or `*` (any actor).
+    Patterns(Vec<String>),
+}
+
+impl ActorBinding {
+    pub fn from_column(actors: Option<Vec<String>>) -> Self {
+        match actors {
+            None => ActorBinding::Legacy,
+            Some(patterns) => ActorBinding::Patterns(patterns),
+        }
+    }
+
+    /// Whether any actor at all is allowed (a legacy token, or `*`).
+    pub fn unrestricted(&self) -> bool {
+        match self {
+            ActorBinding::Legacy => true,
+            ActorBinding::Patterns(p) => p.iter().any(|p| p == "*"),
+        }
+    }
+
+    /// Whether this binding lets the token author an op as `actor`.
+    pub fn permits(&self, actor: &str) -> bool {
+        match self {
+            ActorBinding::Legacy => true,
+            ActorBinding::Patterns(patterns) => {
+                patterns.iter().any(|p| match p.strip_suffix('*') {
+                    Some(prefix) => actor.starts_with(prefix),
+                    None => actor == p,
+                })
+            }
+        }
+    }
+
+    /// How `token list` and error messages show it.
+    pub fn describe(&self) -> String {
+        match self {
+            ActorBinding::Legacy => "any (legacy, unbound)".to_string(),
+            ActorBinding::Patterns(p) => p.join(","),
+        }
+    }
+}
+
+/// Checks and normalises `--actor` patterns for `token create` / `token
+/// bind`: each is `*`, an actor id, or an actor-id prefix followed by one
+/// trailing `*`; no whitespace or control characters. Comma-separated
+/// values are split, and duplicates dropped (first occurrence kept).
+pub fn parse_actor_patterns(values: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for pattern in values.iter().flat_map(|v| v.split(',')).map(str::trim) {
+        if pattern.is_empty() {
+            return Err("an actor pattern is empty".to_string());
+        }
+        if pattern.chars().count() > MAX_ACTOR_PATTERN {
+            return Err(format!(
+                "actor pattern {pattern:?} is longer than {MAX_ACTOR_PATTERN} characters"
+            ));
+        }
+        if pattern.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(format!(
+                "actor pattern {pattern:?} contains whitespace or a control character"
+            ));
+        }
+        if pattern.trim_end_matches('*').contains('*') || pattern.ends_with("**") {
+            return Err(format!(
+                "actor pattern {pattern:?}: '*' may only end a pattern (e.g. claude:*), or be the whole pattern"
+            ));
+        }
+        if !out.iter().any(|p| p == pattern) {
+            out.push(pattern.to_string());
+        }
+    }
+    if out.is_empty() {
+        return Err("give at least one --actor pattern".to_string());
+    }
+    if out.len() > MAX_ACTOR_PATTERNS {
+        return Err(format!(
+            "{} actor patterns; the limit is {MAX_ACTOR_PATTERNS}",
+            out.len()
+        ));
+    }
+    Ok(out)
 }
 
 /// Extractable from any state that lends the reader connection (the
@@ -124,7 +224,7 @@ where
         // "wrong workspace for this token" are the same miss.
         let row = Arc::<Client>::from_ref(state)
             .query_opt(
-                "SELECT id, label FROM tokens
+                "SELECT id, label, actors FROM tokens
                  WHERE token_hash = $1 AND workspace_id = $2 AND revoked_at IS NULL",
                 &[&hash_token(token), workspace],
             )
@@ -134,6 +234,7 @@ where
                 workspace: workspace.clone(),
                 token_id: row.get(0),
                 token_label: row.get(1),
+                actors: ActorBinding::from_column(row.get(2)),
             }),
             Ok(None) => Err(not_found().await),
             Err(e) => {
@@ -176,6 +277,59 @@ mod tests {
                 0xf2, 0x00, 0x15, 0xad
             ]
         );
+    }
+
+    fn patterns(p: &[&str]) -> ActorBinding {
+        ActorBinding::Patterns(p.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn bindings_match_exact_actors_prefixes_and_everything() {
+        let legacy = ActorBinding::Legacy;
+        assert!(legacy.unrestricted());
+        assert!(legacy.permits("matt") && legacy.permits("hub"));
+        assert_eq!(legacy.describe(), "any (legacy, unbound)");
+
+        let studio = patterns(&["matt", "pm-sync", "claude:*"]);
+        assert!(!studio.unrestricted());
+        for ok in ["matt", "pm-sync", "claude:pm-build", "claude:"] {
+            assert!(studio.permits(ok), "{ok}");
+        }
+        for no in ["mat", "matt2", "pm-sync:x", "claude", "Claude:x", "hub", ""] {
+            assert!(!studio.permits(no), "{no}");
+        }
+        assert_eq!(studio.describe(), "matt,pm-sync,claude:*");
+
+        let any = patterns(&["*"]);
+        assert!(any.unrestricted());
+        assert!(any.permits("anyone"));
+        assert!(!patterns(&[]).permits("matt"));
+    }
+
+    #[test]
+    fn actor_patterns_are_checked_and_normalised() {
+        let ok =
+            |v: &[&str]| parse_actor_patterns(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            ok(&["matt,claude:*", " pm-sync ", "matt"]).unwrap(),
+            ["matt", "claude:*", "pm-sync"]
+        );
+        assert_eq!(ok(&["*"]).unwrap(), ["*"]);
+        for bad in [
+            &[][..],
+            &[""],
+            &["a,,b"],
+            &["cl*ude"],
+            &["*x"],
+            &["x**"],
+            &["a b"],
+            &["a\tb"],
+        ] {
+            assert!(ok(bad).is_err(), "{bad:?}");
+        }
+        assert!(ok(&[&"x".repeat(MAX_ACTOR_PATTERN + 1)]).is_err());
+        let many: Vec<String> = (0..=MAX_ACTOR_PATTERNS).map(|i| format!("a{i}")).collect();
+        assert!(parse_actor_patterns(&many).is_err());
     }
 
     #[test]
