@@ -103,6 +103,33 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A moment for human-readable (text) output: the UTC date-time
+/// `YYYY-MM-DD HH:MM UTC` of an HLC's wall clock (AGT-1449). UTC, to match
+/// every date pm already prints (`pm show` comment dates, hold dates, `pm
+/// export md`) — pm never reads the local timezone. The counter is dropped;
+/// `--json` carries the exact `{wall_ms, counter}`.
+pub(crate) fn when(hlc: &pm_core::Hlc) -> String {
+    let (date, hh, mm, _) = utc_parts(hlc.wall_ms);
+    format!("{date} {hh:02}:{mm:02} UTC")
+}
+
+/// Like [`when`] with seconds (`YYYY-MM-DD HH:MM:SS UTC`), for `pm log`
+/// rows, where neighbouring ops are seconds apart.
+pub(crate) fn when_secs(hlc: &pm_core::Hlc) -> String {
+    let (date, hh, mm, ss) = utc_parts(hlc.wall_ms);
+    format!("{date} {hh:02}:{mm:02}:{ss:02} UTC")
+}
+
+fn utc_parts(ms: u64) -> (String, u64, u64, u64) {
+    let secs = ms / 1000 % 86_400;
+    (
+        pm_core::markers::date_from_ms(ms),
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60,
+    )
+}
+
 /// Clap value parser for `--priority` and `priority=`.
 pub fn parse_priority(s: &str) -> std::result::Result<Priority, String> {
     serde_json::from_value(Value::String(s.to_string()))
@@ -1342,4 +1369,23 @@ pub fn set(ctx: &Ctx<'_>, reference: &str, assignments: &[String]) -> Result<()>
         println!("{}", display_id(&ws, &ticket));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod when_tests {
+    use super::*;
+    use pm_core::Hlc;
+
+    #[test]
+    fn renders_utc_date_time_without_the_counter() {
+        // 2026-09-30 12:04:10.142 UTC
+        let hlc = Hlc::new(1_790_769_850_142, 7);
+        assert_eq!(when(&hlc), "2026-09-30 12:04 UTC");
+        assert_eq!(when_secs(&hlc), "2026-09-30 12:04:10 UTC");
+        assert_eq!(when(&Hlc::new(0, 0)), "1970-01-01 00:00 UTC");
+        assert_eq!(
+            when_secs(&Hlc::new(86_399_999, 0)),
+            "1970-01-01 23:59:59 UTC"
+        );
+    }
 }

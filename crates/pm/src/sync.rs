@@ -438,7 +438,10 @@ impl std::fmt::Display for RejectedClaim {
             f,
             "the hub refused claim {} on ticket {}: {holder} since {} ({}); \
              reconciled locally to the hub's answer",
-            self.op_id, self.ticket, self.rejected.at, self.rejected.reason
+            self.op_id,
+            self.ticket,
+            crate::verbs::when(&self.rejected.at),
+            self.rejected.reason
         )
     }
 }

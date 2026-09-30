@@ -155,6 +155,16 @@ that ticket again: **Ticket**'s `blocked_by`, `pm new --batch`'s `refs`,
 `AGT-12` once numbered and the **ULID** while the number is pending,
 never `AGT-?`. Human output of those same verbs uses the same refs.
 
+**Timestamps in text output** (AGT-1449). `--json` carries HLCs as
+structured `{wall_ms, counter}` (`at`, `hlc`) and is unchanged. Text output
+never prints a raw `<wall_ms>.<counter>` HLC: a moment renders as a **UTC**
+date-time, `YYYY-MM-DD HH:MM UTC` (`pm claim`'s exit-75 `since …` and the
+hub-refused-claim line of `pm sync`), or `YYYY-MM-DD HH:MM:SS UTC` in `pm
+log` rows. UTC, never local time, to match every date pm already prints
+(comment dates in `pm show`, hold dates in `pm show`/`pm holds`, `pm export
+md`); pm reads no timezone. The HLC counter is dropped; for the precise
+stamp use `--json`.
+
 ## Shared `--json` shapes
 
 Several verbs print exactly this ticket shape (`verbs::ticket_json`) —
@@ -582,7 +592,8 @@ ticket instead), `--project <PROJECT>` (only meaningful with `--ready`),
 - Exit `3`: `--ready` with no ready ticket anywhere in scope; the named
   ticket is deleted.
 - Exit `75`: the ticket was not `unstarted`-and-unassigned at claim time
-  (someone else has it, or it already left `unstarted`).
+  (someone else has it, or it already left `unstarted`). The stderr
+  message reads `AGT-3 is taken by alice (since 2026-09-30 12:04 UTC): …`.
 - **Authority** (AGT-1397, README §Authority). With no `hub` in
   config.toml the local database decides, inside the commit transaction.
   With a `hub` configured (`pm hub login`) the verb asks the hub
@@ -634,6 +645,11 @@ across flags; `--held` (only tickets with a hold set); `--search <TEXT>`
   does).
 
 ### `pm log [<ID>]`
+
+Text output (AGT-1449): one row per op, `<time>  <actor>  <kind>
+<summary>`, where `<time>` is the op's wall clock as a **UTC** date-time,
+`YYYY-MM-DD HH:MM:SS UTC`. The exact HLC (`<wall_ms>.<counter>`) is not
+printed in text; it is `hlc` in `--json`, which is unchanged.
 
 No flags beyond the globals. With an `<ID>`, that ticket's ops. With none
 (AGT-1386), the workspace's **config ops** instead — every
