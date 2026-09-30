@@ -19,7 +19,7 @@ set +x
 readonly SERVICE=hub
 readonly HEALTH_URL=https://hub-production-8a91.up.railway.app/health
 readonly KEYCHAIN_ITEM=pm-hub.railway-project-token
-readonly HEALTH_WAIT_SECS=180
+readonly HEALTH_WAIT_SECS=600
 
 die() {
   echo "deploy-hub: $*" >&2
@@ -47,7 +47,10 @@ token="$(security find-generic-password -s "$KEYCHAIN_ITEM" -w)" ||
 [[ -n "$token" ]] || die "keychain item $KEYCHAIN_ITEM is empty"
 
 # Scoped to this one command: nothing else in the script sees the token.
-RAILWAY_TOKEN="$token" railway up --service "$SERVICE" --environment production --ci
+# --detach, not --ci: streaming build logs fails with a project token
+# ("Failed to retrieve build log") and aborted the script mid-build.
+# The /health poll below (which covers the build time) is the success check.
+RAILWAY_TOKEN="$token" railway up --service "$SERVICE" --environment production --detach
 unset token
 
 echo "deploy-hub: waiting for $HEALTH_URL"
