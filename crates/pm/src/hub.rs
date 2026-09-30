@@ -56,7 +56,7 @@ pub(crate) fn hub_workspace_id(ws: &Workspace) -> String {
 pub enum HubCmd {
     /// Store the hub URL in config.toml and read the token (stdin, or PM_HUB_TOKEN) into the keychain
     Login {
-        /// The hub's base URL, e.g. https://hub.example (http:// or https://, no credentials)
+        /// The hub's base URL, e.g. https://hub.example (https://; http:// only for localhost/loopback; no credentials)
         url: String,
     },
     /// Show the hub URL, workspace, token presence (never the value) and hub reachability; exit 1 if the hub is unreachable or rejects the token
@@ -306,6 +306,7 @@ impl HubClient {
                 ws.prefix, ws.id
             )));
         };
+        check_configured(&url)?;
         Ok(HubClient {
             url,
             workspace: hub_workspace_id(ws),
@@ -406,8 +407,53 @@ fn check_token(token: &str) -> Result<()> {
     }
 }
 
+/// Whether a normalized hub URL's host is this machine: `localhost`,
+/// `127.0.0.0/8` or `::1`. Only such hosts may use cleartext `http://`.
+fn is_loopback_host(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let authority = rest.split(['/']).next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// The transport policy (AGT-1451): the bearer token rides every request,
+/// so a non-loopback hub must be reached over `https://`. `Err` carries the
+/// reason; callers wrap it in the exit code that fits (login: usage, 2;
+/// a hub already configured: error, 1).
+fn check_transport(url: &str) -> std::result::Result<(), String> {
+    if url.starts_with("http://") && !is_loopback_host(url) {
+        return Err(format!(
+            "refusing cleartext hub URL {url}: the bearer token would cross the network \
+             unencrypted; use an https:// URL (http:// is only allowed for localhost, \
+             127.0.0.0/8 and ::1)"
+        ));
+    }
+    Ok(())
+}
+
+/// [`check_transport`] for a URL read back from config.toml.
+fn check_configured(url: &str) -> Result<()> {
+    check_transport(url).map_err(|e| {
+        CliError::error(format!(
+            "{e}; re-run `pm hub login https://...` with an https URL (config.toml still holds the http one)"
+        ))
+    })
+}
+
 fn login(ctx: &Ctx<'_>, url: &str) -> Result<()> {
     let url = normalize_url(url)?;
+    check_transport(&url).map_err(CliError::usage)?;
     let (_store, ws) = ctx.open()?;
     let service = service_name(ctx.env, &ws);
 
@@ -537,6 +583,7 @@ fn status(ctx: &Ctx<'_>) -> Result<()> {
     let mut error: Option<String> = None;
 
     if let Some(hub) = &hub {
+        check_configured(hub)?;
         match get(&format!("{hub}/health"), None) {
             Ok((200, body)) => {
                 reachable = Some(true);
@@ -631,6 +678,32 @@ fn status(ctx: &Ctx<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_policy() {
+        for ok in [
+            "https://hub-production-8a91.up.railway.app",
+            "https://10.0.0.5",
+            "http://127.0.0.1:8080",
+            "http://127.9.9.9",
+            "http://localhost:3000/x",
+            "http://LOCALHOST",
+            "http://[::1]:8080",
+        ] {
+            assert!(check_transport(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://hub.example",
+            "http://10.0.0.5:8080",
+            "http://[2001:db8::1]",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example",
+            "http://0.0.0.0:8080",
+        ] {
+            let e = check_transport(bad).unwrap_err();
+            assert!(e.contains("https://"), "{bad}: {e}");
+        }
+    }
 
     #[test]
     fn urls() {

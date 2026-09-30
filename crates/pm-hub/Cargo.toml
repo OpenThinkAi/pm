@@ -10,14 +10,16 @@ repository.workspace = true
 # The hub links `pm-core` so merge and claim rules stay identical to the
 # CLI's (README §Sync & hub). Postgres goes through `tokio-postgres` with
 # runtime (not compile-time-checked) queries, so building never needs a
-# live database. No TLS: the hub reaches Postgres over Railway's private
-# network (`postgres.railway.internal`), which has no public TCP proxy.
+# live database. TLS to Postgres is opt-in per DATABASE_URL (`sslmode=`, see
+# `db.rs`); a URL without it stays plaintext, which is right for Railway's
+# private network (`postgres.railway.internal`) and loopback.
 [dependencies]
 axum = "0.8"
 base64 = "0.22"
 clap = { version = "4.6.7", features = ["derive"] }
 getrandom = "0.3"
 pm-core = { path = "../pm-core" }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
 # `raw_value` keeps each pushed op's JSON text as received, so the hub
 # stores and serves the exact bytes (README §Sync & hub: opaque storage).
@@ -27,8 +29,10 @@ sha2 = "0.11"
 thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
 tokio-postgres = "0.7"
+tokio-postgres-rustls = { version = "0.14.0", default-features = false }
 # Fresh `op_id`s for the ops the hub authors itself (`numbers`).
 ulid = "1.2"
+webpki-roots = { version = "1.0.9", default-features = false }
 
 [dev-dependencies]
 # The claims tests build a client log with pm-store and compare the hub's

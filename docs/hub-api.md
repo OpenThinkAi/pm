@@ -16,6 +16,24 @@ same bare `404` an unknown route gets, so a caller without a grant learns
 nothing (think-hub precedent). A wrong method on a real route is that
 404 too.
 
+### Transport security
+
+- **Client to hub.** The bearer token rides every request, so `pm hub
+  login` refuses an `http://` URL unless the host is loopback (`localhost`,
+  `127.0.0.0/8`, `::1`) and exits 2. A non-loopback `http://` URL already in
+  config.toml is refused by `pm hub status` and every sync/claim call with
+  a message to re-login over `https://`.
+- **Hub to Postgres.** `DATABASE_URL`'s `sslmode` picks the transport
+  (AGT-1451): absent, `disable` or `prefer` is plaintext — correct for
+  Railway's private network (`postgres.railway.internal`) and loopback, and
+  what production uses. `require`, `verify-ca` and `verify-full` all use TLS
+  via rustls with the bundled Mozilla roots (`webpki-roots`) and always
+  verify the certificate chain and host name; there is no
+  accept-any-certificate mode, so a private-CA or self-signed server is
+  refused. Use TLS for any `pm-hub token ...` run from outside the private
+  network or any deployment reaching Postgres over a public address. The
+  same applies to the admin CLI, which shares the connect path.
+
 `503` with an empty body means the hub could not reach Postgres; retry.
 
 ## `GET /health` (open)
