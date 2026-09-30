@@ -90,15 +90,28 @@ pub fn list(ctx: &Ctx<'_>, args: ListArgs) -> Result<()> {
 
 // ----------------------------------------------------------------- pm log
 
-/// `pm log <id>` (AC3): the ticket's ops, oldest first (`Store::ops`
-/// already returns them in append order).
-pub fn log(ctx: &Ctx<'_>, reference: &str) -> Result<()> {
+/// `pm log [<id>]` (AC3): the ticket's ops, oldest first (`Store::ops`
+/// already returns them in append order). With no `<id>`, the workspace's
+/// config ops instead (AGT-1386): every `workspace.set`, `state.upsert`,
+/// `actor.upsert`, `project.create`, `project.set` and `project.delete`.
+pub fn log(ctx: &Ctx<'_>, reference: Option<&str>) -> Result<()> {
     let (store, ws) = ctx.open()?;
-    let ticket = find(&store, &ws, reference)?;
-    let ops = store.ops(ticket.id)?;
+    let ops = match reference {
+        Some(reference) => store.ops(find(&store, &ws, reference)?.id)?,
+        None => store.config_ops()?,
+    };
+    // A project's slug is on its `project.create`; that names the
+    // `project.set`s and the `project.delete` that follow.
+    let slugs: BTreeMap<Ulid, String> = ops
+        .iter()
+        .filter_map(|op| match &op.payload {
+            Payload::ProjectCreate(c) => Some((op.entity, c.id.clone())),
+            _ => None,
+        })
+        .collect();
 
     if ctx.json {
-        let out: Vec<Value> = ops.iter().map(op_json).collect();
+        let out: Vec<Value> = ops.iter().map(|op| op_json(op, &slugs)).collect();
         print_json(&Value::Array(out));
         return Ok(());
     }
@@ -112,28 +125,34 @@ pub fn log(ctx: &Ctx<'_>, reference: &str) -> Result<()> {
             op.hlc,
             op.actor.as_str(),
             op.kind(),
-            op_summary(op)
+            op_summary_in(op, &slugs)
         );
     }
     Ok(())
 }
 
-fn op_json(op: &Op) -> Value {
+fn op_json(op: &Op, slugs: &BTreeMap<Ulid, String>) -> Value {
     json!({
         "schema": SCHEMA,
         "op_id": op.op_id.to_string(),
         "hlc": { "wall_ms": op.hlc.wall_ms, "counter": op.hlc.counter },
         "actor": op.actor.as_str(),
         "kind": op.kind(),
-        "summary": op_summary(op),
+        "summary": op_summary_in(op, slugs),
     })
 }
 
 /// A short, human-readable description of what an op did. Relation
 /// endpoints print as raw ULIDs (not display ids): resolving them to
 /// `AGT-N` would mean a store lookup per op, and `pm log` is meant to read
-/// straight off the log, not to re-derive ticket state.
-fn op_summary(op: &Op) -> String {
+/// straight off the log, not to re-derive ticket state. `slugs` maps a
+/// project Ulid to its slug, so a config op that targets a project
+/// (`project.set`, `project.delete`) names it.
+fn op_summary_in(op: &Op, slugs: &BTreeMap<Ulid, String>) -> String {
+    let project = || match slugs.get(&op.entity) {
+        Some(slug) => format!("'{slug}'"),
+        None => format!("{}", op.entity),
+    };
     match &op.payload {
         Payload::TicketCreate(c) => format!("created \"{}\"", c.title),
         Payload::FieldSet(f) => field_summary(f),
@@ -158,37 +177,68 @@ fn op_summary(op: &Op) -> String {
         Payload::HoldClear => "cleared hold".to_string(),
         Payload::BodyEdit(_) => "edited description".to_string(),
         Payload::Tombstone => "deleted".to_string(),
-        // Config kinds (AGT-1384) target a workspace or project, so `pm log
-        // <ticket>` never lists one; the summaries exist so the match stays
-        // exhaustive and a misrouted op still reads.
-        Payload::WorkspaceSet(w) => format!("set workspace {}", workspace_field(w)),
-        Payload::StateUpsert(s) => format!("upserted state '{}'", s.name),
-        Payload::ActorUpsert(a) => format!("upserted actor '{}'", a.id),
-        Payload::ProjectCreate(p) => format!("created project '{}'", p.id),
-        Payload::ProjectSet(p) => format!("set project {}", project_field(p)),
+        // Config kinds (AGT-1384/1386): the workspace-wide `pm log` (no
+        // ticket) lists these.
+        Payload::WorkspaceSet(w) => workspace_summary(w),
+        Payload::StateUpsert(s) => format!(
+            "set state '{}' ({}, position {})",
+            s.name,
+            word(&s.category),
+            s.position
+        ),
+        Payload::ActorUpsert(a) => format!("registered {} actor '{}'", word(&a.kind), a.id),
+        Payload::ProjectCreate(p) => format!(
+            "created project '{}' \"{}\" ({}{})",
+            p.id,
+            p.title,
+            word(&p.status),
+            p.parent
+                .as_ref()
+                .map(|parent| format!(", under '{parent}'"))
+                .unwrap_or_default()
+        ),
+        Payload::ProjectSet(p) => project_summary(&project(), p),
+        Payload::ProjectDelete => format!("deleted project {}", project()),
     }
 }
 
-fn workspace_field(w: &pm_core::op::WorkspaceSet) -> &'static str {
+/// The serde spelling of a unit-variant enum (`in-progress`, `agent`).
+fn word<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn workspace_summary(w: &pm_core::op::WorkspaceSet) -> String {
     use pm_core::op::WorkspaceSet;
     match w {
-        WorkspaceSet::Prefix(_) => "prefix",
-        WorkspaceSet::GateLabelAdd(_) => "gate label (add)",
-        WorkspaceSet::GateLabelRemove { .. } => "gate label (remove)",
-        WorkspaceSet::ModelLabel { .. } => "model label",
-        WorkspaceSet::TemplateSections(_) => "template sections",
-        WorkspaceSet::StaleDays(_) => "stale days",
+        WorkspaceSet::Prefix(v) => format!("set workspace prefix to '{v}'"),
+        WorkspaceSet::GateLabelAdd(l) => format!("added gate label '{l}'"),
+        WorkspaceSet::GateLabelRemove { label, .. } => format!("removed gate label '{label}'"),
+        WorkspaceSet::ModelLabel {
+            label,
+            model: Some(m),
+        } => format!("mapped model label '{label}' to '{m}'"),
+        WorkspaceSet::ModelLabel { label, model: None } => {
+            format!("unmapped model label '{label}'")
+        }
+        WorkspaceSet::TemplateSections(v) => {
+            format!("set template sections to [{}]", v.join(", "))
+        }
+        WorkspaceSet::StaleDays(d) => format!("set stale days to {d}"),
     }
 }
 
-fn project_field(p: &pm_core::op::ProjectSet) -> &'static str {
+fn project_summary(name: &str, p: &pm_core::op::ProjectSet) -> String {
     use pm_core::op::ProjectSet;
     match p {
-        ProjectSet::Title(_) => "title",
-        ProjectSet::Status(_) => "status",
-        ProjectSet::Parent(_) => "parent",
-        ProjectSet::RepoAdd(_) => "repo (add)",
-        ProjectSet::RepoRemove { .. } => "repo (remove)",
+        ProjectSet::Title(v) => format!("set project {name} title to \"{v}\""),
+        ProjectSet::Status(v) => format!("set project {name} status to {}", word(v)),
+        ProjectSet::Parent(Some(v)) => format!("set project {name} parent to '{v}'"),
+        ProjectSet::Parent(None) => format!("cleared project {name} parent"),
+        ProjectSet::RepoAdd(r) => format!("added repo '{r}' to project {name}"),
+        ProjectSet::RepoRemove { repo, .. } => format!("removed repo '{repo}' from project {name}"),
     }
 }
 

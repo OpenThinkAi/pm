@@ -401,16 +401,64 @@ fn every_config_kind_commits_and_rebuilds_byte_for_byte() {
     ));
 }
 
-/// A deleted project stays deleted through a rebuild: its ops remain in
-/// the log, and the rebuild neither resurrects the row nor fails on them.
+/// `pm project delete` is a `project.delete` op: the row goes, the log
+/// keeps every op, a rebuild reproduces the deletion from the tombstone
+/// (not from a remembered absence), and a hub peer learns it.
 #[test]
-fn a_rebuild_does_not_resurrect_a_deleted_project() {
+fn a_deleted_project_is_a_tombstone_op_that_a_rebuild_honours() {
     let (_dir, mut store) = populated();
-    store.put_project(&project("gone", None), &matt()).unwrap();
-    store.delete_project("gone").unwrap();
-    assert!(store.project("gone").unwrap().is_none());
-    assert!(store.rebuild().unwrap().is_empty());
+    let ulid = store.put_project(&project("gone", None), &matt()).unwrap();
+    store.delete_project("gone", &matt()).unwrap();
     assert!(store.project("gone").unwrap().is_none());
     assert!(store.project_view("gone").unwrap().is_none());
+    let tomb: Vec<_> = store
+        .config_ops()
+        .unwrap()
+        .into_iter()
+        .filter(|op| op.kind() == "project.delete")
+        .collect();
+    assert_eq!(tomb.len(), 1);
+    assert_eq!(tomb[0].entity, ulid);
+    assert!(store.rebuild().unwrap().is_empty());
+    assert!(store.project("gone").unwrap().is_none());
     assert!(store.doctor().unwrap().is_healthy());
+
+    // Gone is gone: deleting it again names it unknown.
+    assert!(matches!(
+        store.delete_project("gone", &matt()).unwrap_err(),
+        StoreError::UnknownProject { .. }
+    ));
+    let old_ops: Vec<Op> = store
+        .config_ops()
+        .unwrap()
+        .into_iter()
+        .filter(|op| op.entity == ulid)
+        .collect();
+    assert_eq!(old_ops.last().unwrap().kind(), "project.delete");
+
+    // The slug is free again, under a new identity.
+    let again = store.put_project(&project("gone", None), &matt()).unwrap();
+    assert_ne!(again, ulid);
+    assert!(store.project("gone").unwrap().is_some());
+    assert!(store.rebuild().unwrap().is_empty());
+    assert!(store.project("gone").unwrap().is_some());
+
+    // A peer applying the old identity's ops (create ... tombstone) ends
+    // without the project, and a `project.set` arriving after the delete
+    // does not bring it back.
+    let late = Op::new(
+        Ulid::new(),
+        Hlc::new(u64::MAX / 4, 0),
+        matt(),
+        ulid,
+        Payload::ProjectSet(pm_core::op::ProjectSet::Title("late".into())),
+    );
+    let (_peer_dir, mut peer) = populated();
+    let mut batch = old_ops;
+    batch.push(late);
+    peer.apply_pulled(&batch).unwrap();
+    assert!(peer.project("gone").unwrap().is_none());
+    assert!(peer.rebuild().unwrap().is_empty());
+    assert!(peer.project("gone").unwrap().is_none());
+    assert!(peer.doctor().unwrap().is_healthy());
 }

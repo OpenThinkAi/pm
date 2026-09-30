@@ -206,6 +206,17 @@ impl Store {
             .map(|ops| ops.into_iter().map(|(_, op)| op).collect())
     }
 
+    /// Every config op (workspace, states, actors, project metadata and
+    /// tombstones), in the order this replica appended them.
+    pub fn config_ops(&self) -> Result<Vec<Op>> {
+        read_ops(
+            &self.conn,
+            &format!("WHERE kind IN ({})", crate::config::CONFIG_KINDS),
+            [],
+        )
+        .map(|ops| ops.into_iter().map(|(_, op)| op).collect())
+    }
+
     /// Tickets matching `tail_sql` — everything after `FROM ticket t`, so
     /// a `WHERE …`, optionally preceded by JOINs against the `t` alias —
     /// in the order [`Store::tickets`] documents.

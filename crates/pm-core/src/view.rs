@@ -416,7 +416,8 @@ pub fn apply(view: &mut TicketView, op: &Op) -> Result<(), ApplyError> {
         | Payload::StateUpsert(_)
         | Payload::ActorUpsert(_)
         | Payload::ProjectCreate(_)
-        | Payload::ProjectSet(_) => {
+        | Payload::ProjectSet(_)
+        | Payload::ProjectDelete => {
             return Err(ApplyError::WrongKind {
                 op_id: op.op_id,
                 kind: op.kind(),

@@ -5,7 +5,7 @@
 //! Until AGT-1385 these were direct table writes, which push/pull could not
 //! carry. Now they have the shape the ticket tables have: a config op
 //! (`workspace.set`, `state.upsert`, `actor.upsert`, `project.create`,
-//! `project.set`; AGT-1384) is appended to the log and the rows it affects
+//! `project.set`, `project.delete`; AGT-1384, AGT-1386) is appended to the log and the rows it affects
 //! are rewritten in the same transaction ([`commit_config_in`], reached
 //! through [`Store::commit`]); the merge state lives in `workspace_view` /
 //! `project_view` (a [`WorkspaceView`] / [`ProjectView`] as JSON, the
@@ -28,12 +28,21 @@
 //! - `project.doc_id`, `project_doc` rows and their `doc_id`s — document
 //!   identity; a document's body is op-derived under that id (AGT-1344,
 //!   `project.rs`), the id itself is assigned once by the row's creator.
-//! - A project row's *existence*: `pm project delete` removes the row
-//!   directly and its ops stay in the log (never pruned); a rebuild never
-//!   resurrects a row that is gone ([`Mode::Rebuild`]), since there is no
-//!   project tombstone kind. A foreign writer deleting a project row is
-//!   therefore not something `pm doctor` can tell from a `pm project
-//!   delete`.
+//! - A project row's *document* columns and rows (see above): a
+//!   `project.delete` removes the row together with its documents, and the
+//!   ops stay in the log (never pruned).
+//!
+//! A project's existence *is* op-derived (AGT-1386): `project.delete`
+//! tombstones its [`ProjectView`] (`deleted_at`, permanent), and
+//! materializing a tombstoned view removes the project row, its named
+//! documents and their cached merge state while keeping the view itself —
+//! so a `project.set` that syncs in later folds without resurrecting a
+//! row, and a rebuild reproduces the deletion instead of needing to
+//! remember it. A *live* commit (not a rebuild) refuses the deletes
+//! `pm project delete` refuses: a ticket still in the project, or a child
+//! project naming it as `parent` (R2). A database that deleted a project
+//! before this kind existed has no tombstone for it; a rebuild re-creates
+//! that row (without documents) from its `project.create`.
 //! - `actor` rows are never deleted (`ops.actor` references them) and an
 //!   actor's first appearance is [`crate::commit::ensure_actor`]'s
 //!   `INSERT OR IGNORE` from the op that names it — the kind an
@@ -59,8 +68,7 @@ use crate::query::read_ops;
 
 /// The five config kinds, as `ops.kind` spells them — what
 /// [`replay_config`] selects and what `apply_pulled` routes here.
-pub(crate) const CONFIG_KINDS: &str =
-    "'workspace.set', 'state.upsert', 'actor.upsert', 'project.create', 'project.set'";
+pub(crate) const CONFIG_KINDS: &str = "'workspace.set', 'state.upsert', 'actor.upsert', 'project.create', 'project.set', 'project.delete'";
 
 impl Store {
     /// Brings the workspace and its states to `ws` by committing config
@@ -187,6 +195,26 @@ impl Store {
         Ok(())
     }
 
+    /// `pm project delete` (AC4): commits a `project.delete` op under
+    /// `actor`, whose materialization removes the project, its documents
+    /// and their cached merge state (see [`remove_project_rows`]). Refused
+    /// while a ticket still references the project or a child project
+    /// still names it as `parent`, and for an unknown project; deleting
+    /// one already deleted is refused the same way (its row is gone). The
+    /// op log itself is never pruned — a `body.edit` for a deleted
+    /// document's `doc_id` simply has nothing left to materialize into.
+    pub fn delete_project(&mut self, id: &str, actor: &ActorId) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ulid = project_ulid(&tx, id)?.ok_or_else(|| StoreError::UnknownProject {
+            project: id.to_string(),
+        })?;
+        commit_payloads(&tx, ulid, actor, vec![Payload::ProjectDelete])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Every project, by id.
     pub fn projects(&self) -> Result<Vec<Project>> {
         load_projects(&self.conn, "", [])
@@ -221,9 +249,10 @@ impl Store {
 
 // ------------------------------------------------------------ commit path
 
-/// Whether a materialization may create a project row. A commit does; a
-/// rebuild only rewrites rows that exist, so a project deleted with `pm
-/// project delete` (its ops stay in the log) is not resurrected.
+/// Whether a materialization is a live commit (which enforces R2 on a
+/// `project.delete`) or a replay of ops already in the log (a rebuild
+/// empties the ticket tables first and must reproduce whatever the log
+/// says).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     Commit,
@@ -247,7 +276,7 @@ pub(crate) fn commit_config_in(
     between: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     ensure_actor(tx, &op.actor)?;
-    let view = next_view(tx, op, Mode::Commit)?.expect("a commit never skips an op");
+    let view = next_view(tx, op)?;
     append_op(tx, op)?;
     between()?;
     materialize(tx, &view, Mode::Commit)
@@ -255,16 +284,10 @@ pub(crate) fn commit_config_in(
 
 /// Re-applies a config op already in the log — load → apply →
 /// materialize without the append — the way `commit::replay_in` does for
-/// a ticket op. `Ok(false)` when the op was skipped: a project whose row
-/// is gone ([`Mode::Rebuild`]).
-fn replay_config_in(tx: &Transaction<'_>, op: &Op) -> Result<bool> {
-    match next_view(tx, op, Mode::Rebuild)? {
-        Some(view) => {
-            materialize(tx, &view, Mode::Rebuild)?;
-            Ok(true)
-        }
-        None => Ok(false),
-    }
+/// a ticket op.
+fn replay_config_in(tx: &Transaction<'_>, op: &Op) -> Result<()> {
+    let view = next_view(tx, op)?;
+    materialize(tx, &view, Mode::Rebuild)
 }
 
 /// The config replay `pm doctor` / `--rebuild` run first (before the
@@ -280,27 +303,49 @@ pub(crate) fn replay_config(tx: &Transaction<'_>) -> Result<()> {
             source: Box::new(source),
         })?;
     }
+    check_replayed_projects(tx)
+}
+
+/// After a config replay, every live (not tombstoned) project view must
+/// have its row: the one that does not lost its slug to another identity
+/// ([`StoreError::DuplicateProject`], deferred from
+/// [`materialize_project`]'s rebuild path).
+fn check_replayed_projects(tx: &Transaction<'_>) -> Result<()> {
+    let mut stmt = tx.prepare("SELECT project, view FROM project_view")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (_, text) = row?;
+        let view: ProjectView = from_json("project_view.view", &text)?;
+        if view.deleted_at.is_none() && view.created.is_some() && !project_row_exists(tx, view.id)?
+        {
+            return Err(StoreError::DuplicateProject {
+                id: view.slug.value,
+            });
+        }
+    }
     Ok(())
 }
 
-/// The entity's view with `op` folded in. `None` only in
-/// [`Mode::Rebuild`], for a project op whose row no longer exists.
-fn next_view(tx: &Transaction<'_>, op: &Op, mode: Mode) -> Result<Option<ConfigView>> {
+/// The entity's view with `op` folded in.
+fn next_view(tx: &Transaction<'_>, op: &Op) -> Result<ConfigView> {
     match &op.payload {
         Payload::WorkspaceSet(_) | Payload::StateUpsert(_) | Payload::ActorUpsert(_) => {
             check_workspace_id(tx, op.entity)?;
             let mut view = load_workspace_view(tx, op.entity)?
                 .unwrap_or_else(|| WorkspaceView::new(op.entity));
             apply_workspace(&mut view, op)?;
-            Ok(Some(ConfigView::Workspace(view)))
+            Ok(ConfigView::Workspace(view))
         }
-        Payload::ProjectCreate(_) | Payload::ProjectSet(_) => {
+        Payload::ProjectCreate(_) | Payload::ProjectSet(_) | Payload::ProjectDelete => {
             let mut view = match load_project_view(tx, op.entity)? {
                 Some(view) => view,
-                None if mode == Mode::Rebuild && !project_row_exists(tx, op.entity)? => {
-                    return Ok(None);
-                }
-                None if matches!(op.payload, Payload::ProjectCreate(_)) => {
+                // A delete needs no slug, so it may fold ahead of its
+                // create (the tombstone then holds when the create lands).
+                None if matches!(
+                    op.payload,
+                    Payload::ProjectCreate(_) | Payload::ProjectDelete
+                ) =>
+                {
                     ProjectView::new(op.entity)
                 }
                 // A `project.set` ahead of its `project.create`: the view
@@ -312,7 +357,7 @@ fn next_view(tx: &Transaction<'_>, op: &Op, mode: Mode) -> Result<Option<ConfigV
                 }
             };
             apply_project(&mut view, op)?;
-            Ok(Some(ConfigView::Project(view)))
+            Ok(ConfigView::Project(view))
         }
         other => Err(StoreError::NotAConfigOp {
             op_id: op.op_id,
@@ -383,6 +428,10 @@ fn materialize_workspace(tx: &Transaction<'_>, view: &WorkspaceView) -> Result<(
 fn materialize_project(tx: &Transaction<'_>, view: &ProjectView, mode: Mode) -> Result<()> {
     let p = view.snapshot(String::new(), BTreeMap::new());
     let ulid = view.id.to_string();
+    if view.deleted_at.is_some() {
+        remove_project_rows(tx, view.id, mode)?;
+        return save_project_view(tx, view);
+    }
     if let Some(parent) = &p.parent
         && !project_exists(tx, parent)?
     {
@@ -404,10 +453,16 @@ fn materialize_project(tx: &Transaction<'_>, view: &ProjectView, mode: Mode) -> 
             ],
         )?;
     } else {
-        if mode == Mode::Rebuild {
-            return Ok(());
-        }
         if project_exists(tx, &p.id)? {
+            if mode == Mode::Rebuild {
+                // Rows outlive a rebuild while the log replays in order:
+                // a slug freed by a `project.delete` and re-created under
+                // a new Ulid is, at the old identity's create, still held
+                // by the new identity's row. That row is rewritten when
+                // its own create replays; only the view is kept here.
+                // [`check_replayed_projects`] catches a genuine clash.
+                return save_project_view(tx, view);
+            }
             return Err(StoreError::DuplicateProject { id: p.id });
         }
         tx.execute(
@@ -423,11 +478,52 @@ fn materialize_project(tx: &Transaction<'_>, view: &ProjectView, mode: Mode) -> 
             ],
         )?;
     }
+    save_project_view(tx, view)
+}
+
+fn save_project_view(tx: &Transaction<'_>, view: &ProjectView) -> Result<()> {
     tx.execute(
         "INSERT INTO project_view (project, view) VALUES (?1, ?2)
          ON CONFLICT(project) DO UPDATE SET view = excluded.view",
-        params![ulid, json(view)],
+        params![view.id.to_string(), json(view)],
     )?;
+    Ok(())
+}
+
+/// Removes a tombstoned project's row, its named documents and the cached
+/// merge state of every document it owned (the `project_view` row stays:
+/// it carries the tombstone). A live commit refuses while a ticket is in
+/// the project or a child project names it as `parent`; a replay does not
+/// (the ticket tables are empty then, and the log already passed this
+/// check when the op was first committed).
+fn remove_project_rows(tx: &Transaction<'_>, id: Ulid, mode: Mode) -> Result<()> {
+    let ulid = id.to_string();
+    let slug: Option<String> = tx
+        .query_row(
+            "SELECT id FROM project WHERE ulid = ?1",
+            params![ulid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(slug) = slug else {
+        return Ok(());
+    };
+    if mode == Mode::Commit {
+        if exists(tx, "SELECT 1 FROM ticket WHERE project = ?1", &slug)? {
+            return Err(StoreError::ProjectHasTickets { project: slug });
+        }
+        if exists(tx, "SELECT 1 FROM project WHERE parent = ?1", &slug)? {
+            return Err(StoreError::ProjectHasChildren { project: slug });
+        }
+    }
+    tx.execute(
+        "DELETE FROM project_doc_view WHERE doc_id IN
+            (SELECT doc_id FROM project_doc WHERE project = ?1 AND doc_id IS NOT NULL
+             UNION SELECT doc_id FROM project WHERE id = ?1 AND doc_id IS NOT NULL)",
+        params![slug],
+    )?;
+    tx.execute("DELETE FROM project_doc WHERE project = ?1", params![slug])?;
+    tx.execute("DELETE FROM project WHERE id = ?1", params![slug])?;
     Ok(())
 }
 

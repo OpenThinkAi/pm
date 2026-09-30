@@ -118,6 +118,13 @@ pub enum Payload {
     ProjectCreate(ProjectCreate),
     #[serde(rename = "project.set")]
     ProjectSet(ProjectSet),
+    /// Tombstones the project (`pm project delete`, AGT-1386): permanent,
+    /// like a ticket's [`Payload::Tombstone`]; a later `project.set` or
+    /// `project.create` for the same entity folds into the view but never
+    /// brings the project back. Re-using the slug takes a fresh
+    /// `project.create` under a new project Ulid.
+    #[serde(rename = "project.delete")]
+    ProjectDelete,
 }
 
 impl Payload {
@@ -141,6 +148,7 @@ impl Payload {
             Payload::ActorUpsert(_) => "actor.upsert",
             Payload::ProjectCreate(_) => "project.create",
             Payload::ProjectSet(_) => "project.set",
+            Payload::ProjectDelete => "project.delete",
         }
     }
 
@@ -156,6 +164,7 @@ impl Payload {
                 | Payload::ActorUpsert(_)
                 | Payload::ProjectCreate(_)
                 | Payload::ProjectSet(_)
+                | Payload::ProjectDelete
         )
     }
 }

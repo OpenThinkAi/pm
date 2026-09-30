@@ -190,54 +190,6 @@ impl Store {
         Ok(text)
     }
 
-    /// `pm project delete` (AC4): refused while a ticket still references
-    /// the project (R-style FK) or a child project still names it as
-    /// `parent`; otherwise removes the project, its documents, and their
-    /// cached merge state (`project_view` too). The op log itself is never
-    /// pruned — a `body.edit` for a deleted document's `doc_id` simply has
-    /// nothing left to materialize into, and the project's own config ops
-    /// are skipped by a rebuild (`config.rs`, `Mode::Rebuild`).
-    pub fn delete_project(&mut self, id: &str) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let has_tickets: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ticket WHERE project = ?1)",
-            params![id],
-            |r| r.get(0),
-        )?;
-        if has_tickets {
-            return Err(StoreError::ProjectHasTickets {
-                project: id.to_string(),
-            });
-        }
-        let has_children: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM project WHERE parent = ?1)",
-            params![id],
-            |r| r.get(0),
-        )?;
-        if has_children {
-            return Err(StoreError::ProjectHasChildren {
-                project: id.to_string(),
-            });
-        }
-        tx.execute(
-            "DELETE FROM project_doc_view WHERE doc_id IN
-                (SELECT doc_id FROM project_doc WHERE project = ?1 AND doc_id IS NOT NULL
-                 UNION SELECT doc_id FROM project WHERE id = ?1 AND doc_id IS NOT NULL)",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM project_doc WHERE project = ?1", params![id])?;
-        tx.execute(
-            "DELETE FROM project_view WHERE project IN
-                (SELECT ulid FROM project WHERE id = ?1 AND ulid IS NOT NULL)",
-            params![id],
-        )?;
-        tx.execute("DELETE FROM project WHERE id = ?1", params![id])?;
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Whether `doc_id` belongs to some project's design doc or a named
     /// document. The op log shares one `entity` namespace between tickets
     /// and documents (both are Ulids); this is how `pm backup --restore`

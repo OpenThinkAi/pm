@@ -209,6 +209,15 @@ Creates a workspace database. Presets are data, not flavors of code path —
 starting with a letter — else exit `2`) always overrides that preset's
 default prefix when given.
 
+Every config write in the CLI is an op (AGT-1385/1386): `pm init` commits
+`workspace.set` / `state.upsert` ops, `pm project new` a `project.create`
+(+ `project.set repo_add`), `pm workspace gate-label` a `workspace.set`,
+`pm archive --auto`'s project retire a `project.set status`, and
+`pm project delete` a `project.delete`; `pm log` (no id) lists them. The
+only direct config-table writes left are the allocator floor
+(`workspace.number_floor`) and document identity (`project.doc_id`,
+`project_doc.doc_id`).
+
 - `--preset default` (the default when `--preset` is omitted): a neutral
   workspace for outside users. Prefix `PM`. States `backlog` (category
   `backlog`), `todo` (`unstarted`), `in-progress` (`started`), `done`
@@ -442,9 +451,14 @@ across flags; `--held` (only tickets with a hold set); `--search <TEXT>`
   top-level `schema` key; each array element does, as Ticket always
   does).
 
-### `pm log <ID>`
+### `pm log [<ID>]`
 
-No flags beyond the globals.
+No flags beyond the globals. With an `<ID>`, that ticket's ops. With none
+(AGT-1386), the workspace's **config ops** instead — every
+`workspace.set`, `state.upsert`, `actor.upsert`, `project.create`,
+`project.set` and `project.delete`, oldest first, in the same shape; a
+`project.set` / `project.delete` summary names the project by its slug
+(from its `project.create` in the same listing).
 
 - `--json`: a bare JSON array, oldest op first:
   ```jsonc
@@ -457,7 +471,10 @@ No flags beyond the globals.
       "kind": "ticket.create" | "field.set" | "label.add" | "label.remove"
             | "relation.add" | "relation.remove" | "comment.add"
             | "state.transition" | "claim" | "hold.set" | "hold.clear"
-            | "body.edit" | "tombstone",
+            | "body.edit" | "tombstone"
+            // `pm log` with no <ID> (config ops, AGT-1386):
+            | "workspace.set" | "state.upsert" | "actor.upsert"
+            | "project.create" | "project.set" | "project.delete",
       "summary": "string"   // one-line human description; relation endpoints are raw ULIDs, not display ids
     },
     ...
@@ -848,6 +865,11 @@ a named document.
 
 No flags beyond the globals.
 
+Commits a `project.delete` tombstone op (AGT-1386): permanent, syncs like
+any op, and removes the project row with its documents (the log keeps every
+op; the slug can later be re-created as a new project). `pm doctor
+--rebuild` reproduces the deletion from the tombstone.
+
 - Exit `1`: the project still has tickets or child projects (a foreign
   key refusal, not a cascade).
 - Exit `3`: unknown project.
@@ -863,8 +885,9 @@ Flags: `--from-file <PATH>` (required).
 ### `pm workspace gate-label add|remove|list <LABEL>`
 
 No flags beyond the globals (`list` takes no `<LABEL>`). Direct writes to
-`Workspace::gate_labels` (AGT-1380), not op-logged — the same kind of write
-`pm project`'s metadata fields are (`crates/pm/src/project.rs` module doc).
+`Workspace::gate_labels` (AGT-1380): each add or remove commits a
+`workspace.set gate_label_add` / `gate_label_remove` config op (AGT-1385; a
+remove cites the add-tags it observed, so a concurrent re-add survives).
 A workspace always starts with whatever its `--preset` seeded (`manual` for
 `--preset saltline`, nothing for `--preset default`); this is how a project
 adds its own, e.g. `matt-gated`, without hand-editing the database. `pm
