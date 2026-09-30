@@ -1,0 +1,23 @@
+[package]
+name = "pm-hub"
+version.workspace = true
+edition.workspace = true
+description = "pm-hub — the sync hub: Postgres-backed op log, sequence and auth (README §Sync & hub)"
+license.workspace = true
+repository.workspace = true
+
+# The hub links `pm-core` so merge and claim rules stay identical to the
+# CLI's (README §Sync & hub). Postgres goes through `tokio-postgres` with
+# runtime (not compile-time-checked) queries, so building never needs a
+# live database. No TLS: the hub reaches Postgres over Railway's private
+# network (`postgres.railway.internal`), which has no public TCP proxy.
+[dependencies]
+axum = "0.8"
+pm-core = { path = "../pm-core" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio-postgres = "0.7"
+
+[dev-dependencies]
+serde_json = "1.0"

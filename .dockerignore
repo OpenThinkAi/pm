@@ -1,0 +1,3 @@
+# Keep the build context to sources (crates/pm-hub/Dockerfile).
+/target
+/.git

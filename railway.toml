@@ -1,0 +1,12 @@
+# Railway config-as-code for the `hub` service in project `pm-hub`
+# (AGT-1387). Deployed by scripts/deploy-hub.sh.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "crates/pm-hub/Dockerfile"
+
+[deploy]
+# Railway only routes traffic to a new deployment once /health is 200,
+# which needs a live database and a migrated schema.
+healthcheckPath = "/health"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
