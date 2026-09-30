@@ -92,8 +92,11 @@ booleans `held` and `archived` (`true`/`false`).
 
 ### `GET /tickets/{id}`
 
-**Ticket**. `{id}` is a display id (`AGT-12`) or a ULID, as every CLI
-`<ID>` is; `AGT-?` is `400` (see cli-contract §Ticket ids).
+`pm show --json`: **Ticket** plus its `comments`
+(`[{"author", "at", "body"}, ...]`, AGT-1430). `{id}` is a display id
+(`AGT-12`) or a ULID, as every CLI `<ID>` is; `AGT-?` is `400` (see
+cli-contract §Ticket ids). The list and ready shapes above carry no
+`comments`, exactly as `pm list`/`pm ready` do not.
 
 ### `GET /tickets/{id}/body`
 
@@ -125,9 +128,9 @@ The description as a CRDT document, for an editor that binds a
 
 ## Writes
 
-Every write is a JSON `POST` on a ticket, answers with the **Ticket** as
-it now reads (as `pm set`/`label`/`move`/`edit --json` do), and commits
-its ops in one batch. A write that changes nothing commits nothing.
+Every write is a JSON `POST` on a ticket, answers with the ticket as it
+now reads in the `GET /tickets/{id}` shape (**Ticket** plus `comments`,
+as `pm show --json` prints it), and commits its ops in one batch. A write that changes nothing commits nothing.
 
 ### `POST /tickets/{id}/fields`
 

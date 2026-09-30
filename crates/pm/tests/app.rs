@@ -535,6 +535,9 @@ fn a_foreign_host_or_origin_is_refused() {
 fn reads_are_the_clis_json_shapes() {
     let sb = Sandbox::new();
     assert_ok(&sb.run(&["hold", "AGT-2", "waiting"], &[]));
+    // A comment: `pm show --json` carries `comments` (AGT-1430), `pm list`
+    // does not, and the API follows each.
+    assert_ok(&sb.run(&["comment", "AGT-1", "a note"], &[]));
     let app = App::start(&sb, &["--idle", "0"]);
 
     for (path, cli) in [
@@ -573,6 +576,10 @@ fn reads_are_the_clis_json_shapes() {
             cli.join(" ")
         );
     }
+    let (_, one) = app.get("/tickets/AGT-1");
+    assert_eq!(one["comments"][0]["body"], "a note", "{one}");
+    let (_, listed) = app.get("/tickets");
+    assert!(listed[0].get("comments").is_none(), "{listed}");
     // The ULID works as the id, as it does on the command line.
     let ulid = sb.json(&["show", "AGT-1"])["ulid"]
         .as_str()

@@ -23,6 +23,7 @@ use super::{AppState, auth, events};
 use crate::exit::{self, CliError, Result};
 use crate::verbs::{
     SCHEMA, Stamper, display_id, find, parse_assignment, require_project, ticket_json,
+    ticket_json_with_comments,
 };
 use crate::{mutate, project, ready, workspace};
 
@@ -123,13 +124,14 @@ fn csv(value: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The ticket as it now reads: the **Ticket** shape every mutation
-/// answers with, same as the CLI.
+/// The ticket as it now reads: the **Ticket** shape with its `comments`,
+/// exactly `pm show --json` (AGT-1430), so a view can replace what it
+/// shows with the answer to its own write.
 fn current(store: &Store, ws: &Workspace, id: Ulid) -> Result<Value> {
     let ticket = store
         .ticket(id)?
         .ok_or_else(|| CliError::error(format!("ticket {id} vanished after mutation")))?;
-    ticket_json(ws, store, &ticket)
+    ticket_json_with_comments(ws, store, &ticket)
 }
 
 /// Commits `ops` on `ticket` as one batch and answers with the ticket.
@@ -208,11 +210,11 @@ async fn list(State(state): State<Arc<AppState>>, Query(q): Query<ListQuery>) ->
     .await
 }
 
-/// `GET /tickets/{id}`
+/// `GET /tickets/{id}`: `pm show --json`, comments included (AGT-1430).
 async fn ticket(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult {
     with_store(&state, move |store, ws| {
         let t = find(store, ws, &id)?;
-        Ok(Json(ticket_json(ws, store, &t)?))
+        Ok(Json(ticket_json_with_comments(ws, store, &t)?))
     })
     .await
 }
