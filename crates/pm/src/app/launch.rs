@@ -16,8 +16,18 @@
 //! `package.json` at the package root (`<pkg>/bin/ui-leaf` → `<pkg>`) must
 //! be named `@openthink/ui-leaf` ([`verify_npm_package`]). Anything else is
 //! [`Missing::Untrusted`] — pm says so and uses `$EDITOR` — until the
-//! operator names it in `ui_leaf.path`. This is provenance, not integrity:
-//! a compromised npm release still passes.
+//! operator names it in `ui_leaf.path`.
+//!
+//! **Integrity (AGT-1482).** Provenance alone is not integrity: a
+//! compromised npm release, or a local write to the npm prefix, passes the
+//! package check. So the binary a `PATH` hit resolves to (the native
+//! `ui-leaf-bin` the postinstall downloaded, or the shim itself when there
+//! is none) must also hash to one of [`PINNED_BUILDS`] — the SHA-256 of
+//! every published build of the supported releases, per platform. An
+//! unknown digest is [`Missing::Unverified`]: pm says so and uses
+//! `$EDITOR`. `ui_leaf.path` stays the operator's explicit opt-in: a
+//! configured binary is trusted as given, digest unchecked (a locally
+//! built ui-leaf, or a release pm has not pinned yet).
 //!
 //! **Pinned** means: `<runtime> --version` reports a version in
 //! [`PIN_MIN`]`..<`[`PIN_BELOW`] — exactly the verified minor (AGT-1468).
@@ -75,6 +85,62 @@ pub(crate) const PIN_MIN: (u64, u64, u64) = (1, 6, 0);
 /// The first ui-leaf version pm does not launch: the next minor.
 pub(crate) const PIN_BELOW: (u64, u64, u64) = (1, 7, 0);
 
+/// One published ui-leaf build pm launches from `PATH` (AGT-1482).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PinnedBuild {
+    pub version: &'static str,
+    /// npm's `<platform>-<arch>`, as ui-leaf's postinstall names it.
+    pub platform: &'static str,
+    /// Lowercase hex SHA-256 of the native binary.
+    pub sha256: &'static str,
+}
+
+/// The SHA-256 of every ui-leaf build inside the pin ([`PIN_MIN`]..
+/// [`PIN_BELOW`]) that pm launches from `PATH`: each platform's native
+/// binary, exactly as the release publishes it and ui-leaf's postinstall
+/// installs it (`bin/ui-leaf-bin`, byte for byte). 1.6.0 is the only
+/// 1.6.x release (npm, 2026-09-30).
+///
+/// Where the digests come from (2026-09-30): the npm tarball ships only a
+/// stub — the postinstall downloads the binary from the GitHub release
+/// `v<version>` and checks it against that release's `checksums.txt` —
+/// so the npm tarball holds no binary to hash. Each digest below is the
+/// release asset's SHA-256 as GitHub reports it, and it matches the
+/// release's `checksums.txt`; darwin-arm64 was also hashed from an
+/// installed copy. **Bumping** (a new 1.6.x, or with [`PIN_MIN`] /
+/// [`PIN_BELOW`] a new minor) is docs/app-api.md §Bumping the ui-leaf pin:
+/// add one entry per platform from that release, read-only
+/// (`gh release view v<version> --repo OpenThinkAi/ui-leaf --json assets`
+/// and `gh release download v<version> --pattern checksums.txt`), and
+/// check at least one against a real install.
+pub(crate) const PINNED_BUILDS: &[PinnedBuild] = &[
+    PinnedBuild {
+        version: "1.6.0",
+        platform: "darwin-arm64",
+        sha256: "4c4e27358b4db17511721cc287fe61d1381c08f19247ebef352f5e09d23f1cf4",
+    },
+    PinnedBuild {
+        version: "1.6.0",
+        platform: "darwin-x64",
+        sha256: "5d822c04636ad0f7bf933fa12d72c13489c391b5199147c4a38c666bc19d6474",
+    },
+    PinnedBuild {
+        version: "1.6.0",
+        platform: "linux-arm64",
+        sha256: "f0ce0beeec8c72200afabb73746ae6ecbfb3cd23826dcb32d51b2f98b71c293b",
+    },
+    PinnedBuild {
+        version: "1.6.0",
+        platform: "linux-x64",
+        sha256: "e98d2c6c9af7768640d6d9ef83935d329445bca0323930c1c5c3b5ab790a6293",
+    },
+    PinnedBuild {
+        version: "1.6.0",
+        platform: "win32-x64",
+        sha256: "4702a23265e81d36773b68c722fc60a057ca0e481f76eeccadf52e92dc9d800b",
+    },
+];
+
 /// How long `ui-leaf --version` may take (the npm shim starts Node).
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long ui-leaf gets to close after pm asks before it is killed.
@@ -102,6 +168,10 @@ pub(crate) enum Missing {
     /// Found on `PATH`, but it is not the npm-installed
     /// `@openthink/ui-leaf` package (AGT-1465).
     Untrusted { path: PathBuf, why: String },
+    /// Found on `PATH` in the npm package, but its binary is not one of
+    /// [`PINNED_BUILDS`] (AGT-1482): `why` gives its digest, or why it
+    /// could not be hashed.
+    Unverified { path: PathBuf, why: String },
     /// `--version` failed or printed something that is not a version.
     Unrunnable { path: PathBuf, why: String },
     /// A version outside the pin.
@@ -123,6 +193,12 @@ impl fmt::Display for Missing {
                 f,
                 "ui-leaf on PATH at {} is not the npm @openthink/ui-leaf package ({why}); \
                  not launched. Set ui_leaf.path in config.toml to use it anyway",
+                path.display()
+            ),
+            Missing::Unverified { path, why } => write!(
+                f,
+                "ui-leaf at {} is not a build pm has pinned ({why}); not launched. \
+                 Set ui_leaf.path in config.toml to trust it anyway",
                 path.display()
             ),
             Missing::Unrunnable { path, why } => {
@@ -263,6 +339,72 @@ fn locate(
     Ok(native_binary(&found))
 }
 
+/// Lowercase hex SHA-256 of the file at `path`, streamed.
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().iter().fold(String::new(), |mut hex, b| {
+        let _ = write!(hex, "{b:02x}");
+        hex
+    }))
+}
+
+/// Checks that `path` hashes to one of `trusted` (AGT-1482).
+fn verify_digest(path: &Path, trusted: &[&str]) -> std::result::Result<(), Missing> {
+    let unverified = |why: String| Missing::Unverified {
+        path: path.to_path_buf(),
+        why,
+    };
+    let digest = sha256_file(path).map_err(|e| unverified(format!("cannot hash it: {e}")))?;
+    if trusted.iter().any(|t| t.eq_ignore_ascii_case(&digest)) {
+        Ok(())
+    } else {
+        Err(unverified(format!(
+            "sha256 {digest} is not a pinned {}.{}.x build",
+            PIN_MIN.0, PIN_MIN.1
+        )))
+    }
+}
+
+/// The digests a `PATH` hit may have: [`PINNED_BUILDS`] — plus, in a
+/// debug build only, `PM_UI_LEAF_TEST_SHA256`, so the test suite's fake
+/// runtime can stand in for a real one. A release build ignores it.
+fn trusted_digests(env: &Env) -> Vec<&str> {
+    let mut trusted: Vec<&str> = PINNED_BUILDS.iter().map(|b| b.sha256).collect();
+    if cfg!(debug_assertions)
+        && let Some(test) = env.ui_leaf_test_sha256.as_deref()
+    {
+        trusted.push(test);
+    }
+    trusted
+}
+
+/// [`locate`], then — for a `PATH` hit, never for `ui_leaf.path` — the
+/// digest check.
+fn resolve(
+    configured: Option<PathBuf>,
+    path_var: Option<&OsStr>,
+    trusted: &[&str],
+) -> std::result::Result<PathBuf, Missing> {
+    let explicit = configured.is_some();
+    let path = locate(configured, path_var)?;
+    if !explicit {
+        verify_digest(&path, trusted)?;
+    }
+    Ok(path)
+}
+
 /// `<path> --version`'s stdout, bounded by [`VERSION_TIMEOUT`].
 fn run_version(path: &Path) -> std::result::Result<String, String> {
     let mut child = Command::new(path)
@@ -322,7 +464,8 @@ pub(crate) fn find(env: &Env) -> Result<std::result::Result<Runtime, Missing>> {
     let configured = Config::load(&env.config_path()?)?
         .and_then(|c| c.ui_leaf)
         .and_then(|u| u.path);
-    Ok(locate(configured, env.path.as_deref()).and_then(probe))
+    let trusted = trusted_digests(env);
+    Ok(resolve(configured, env.path.as_deref(), &trusted).and_then(probe))
 }
 
 // -------------------------------------------------------------- display
@@ -698,6 +841,104 @@ mod tests {
             locate(None, Some(empty.as_os_str())),
             Err(Missing::NotFound)
         );
+    }
+
+    /// AGT-1482: a `PATH` hit launches only when its binary hashes to a
+    /// trusted digest; `ui_leaf.path` is the explicit opt-in and is never
+    /// hashed.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_hit_must_hash_to_a_pinned_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let link = npm_install(tmp.path(), "ok", NPM_PACKAGE, &bin);
+        let path_var = bin.as_os_str().to_owned();
+        let shim = std::fs::canonicalize(&link).unwrap();
+        let digest = sha256_file(&shim).unwrap();
+        assert_eq!(digest.len(), 64);
+
+        // The real pins do not include a shell script.
+        let env = Env::default();
+        let pinned = trusted_digests(&env);
+        let err = resolve(None, Some(&path_var), &pinned).unwrap_err();
+        assert!(
+            matches!(&err, Missing::Unverified { why, .. } if why.contains(&digest)),
+            "{err:?}"
+        );
+        let note = err.to_string();
+        assert!(note.contains("not a build pm has pinned"), "{note}");
+        assert!(note.contains("ui_leaf.path"), "{note}");
+
+        // Trusted by digest (either case): launched.
+        assert_eq!(resolve(None, Some(&path_var), &[&digest]), Ok(link.clone()));
+        let upper = digest.to_uppercase();
+        assert_eq!(resolve(None, Some(&path_var), &[&upper]), Ok(link));
+
+        // With a native sibling, the sibling is what is hashed: the shim's
+        // digest no longer vouches for it.
+        let native = script(shim.parent().unwrap(), "ui-leaf-bin", "echo native 1.6.0");
+        let native = std::fs::canonicalize(native).unwrap();
+        assert!(matches!(
+            resolve(None, Some(&path_var), &[&digest]),
+            Err(Missing::Unverified { .. })
+        ));
+        let native_digest = sha256_file(&native).unwrap();
+        assert_eq!(
+            resolve(None, Some(&path_var), &[&native_digest]),
+            Ok(native)
+        );
+
+        // ui_leaf.path: trusted as given, whatever it hashes to.
+        let mine = script(tmp.path(), "mine", "echo 1.6.0");
+        assert_eq!(resolve(Some(mine.clone()), None, &[]), Ok(mine));
+    }
+
+    #[test]
+    fn pinned_builds_are_well_formed_and_inside_the_pin() {
+        let mut seen = std::collections::HashSet::new();
+        for b in PINNED_BUILDS {
+            assert_eq!(b.sha256.len(), 64, "{b:?}");
+            assert!(
+                b.sha256
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{b:?}"
+            );
+            assert!(seen.insert(b.sha256), "duplicate {b:?}");
+            let version = parse_version(b.version).expect("a version");
+            assert!(pinned(version), "{b:?} is outside the pin");
+        }
+        // Every platform ui-leaf's postinstall supports, for the pin's
+        // first release.
+        for platform in [
+            "darwin-arm64",
+            "darwin-x64",
+            "linux-arm64",
+            "linux-x64",
+            "win32-x64",
+        ] {
+            assert!(
+                PINNED_BUILDS
+                    .iter()
+                    .any(|b| b.platform == platform && b.version == "1.6.0"),
+                "{platform}"
+            );
+        }
+    }
+
+    /// The test hook is honoured in a debug build only.
+    #[test]
+    fn the_test_digest_is_a_debug_build_hook() {
+        let env = Env {
+            ui_leaf_test_sha256: Some("ab".repeat(32)),
+            ..Env::default()
+        };
+        let trusted = trusted_digests(&env);
+        assert_eq!(
+            trusted.contains(&"ab".repeat(32).as_str()),
+            cfg!(debug_assertions)
+        );
+        assert_eq!(trusted_digests(&Env::default()).len(), PINNED_BUILDS.len());
     }
 
     #[cfg(unix)]

@@ -109,6 +109,23 @@ third actor made on a bound token's machine is refused whole with the
 rest of its batch, so bind a machine's token to every actor it assigns
 work to (or use `--any`).
 
+**Assignments are arbitrated like claims (AGT-1482).** Once the
+workspace is seeded, a bound token's `field.set assignee` naming an
+actor goes through the same admissibility as a `claim`
+(`TicketView::claim_admissible`, see [Claims](#claims-agt-1392)): it is
+admitted only on a ticket that is unstarted and unassigned, and otherwise
+refused exactly like a losing claim — `seq: null, stored: false,
+rejected: {…}` in a `200`, nothing stored, the rest of the batch landing.
+Without it a bound token could skip the `claim` and write itself in as
+the assignee of a ticket another actor had won. Exempt: restating the
+ticket's current assignee (the reconcile write above, which changes
+nothing), unassigning (`null`), seed mode (history, as for claims), and
+unrestricted tokens (legacy, `--any`, `*` — the operator, who may author
+as anyone and reassigns work deliberately). `pm sync` treats such a
+refusal as it treats a refused claim: acknowledged, reconciled to
+`rejected.state` / `rejected.taken_by`, and reported with the op's
+`kind`.
+
 **Why document identity relies on this (AGT-1467).** A project's
 design doc and named documents go to the *earliest* binding
 (`project.doc_add` / the create's `doc_id`), and a binding stamped before
@@ -128,6 +145,14 @@ or bound to `*`) may call it; a bound token gets `400 seed_not_allowed`
 while the workspace is seeding (and the usual `409 already_seeded` once
 it is not). A structured 400 rather than the auth 404: the token is valid
 for the workspace, and `pm sync` reports a 400's `reason`.
+
+**Seeded numbers (AGT-1482).** For the same reason only an unrestricted
+token may push the seed's `field.set number` ops: the largest seeded
+number becomes the floor the seed's end adopts (one at `2^53-1` would
+leave the allocator nothing to issue), and a number taken now is refused
+to the real seed as `duplicate_number`. A bound token's number op while
+seeding is `400 number_not_allowed` (its `reason` names the token), and
+the batch is refused whole.
 
 **Rollout (AGT-1450).** Deploying this hub runs migration 4 (`ALTER TABLE tokens
 ADD COLUMN IF NOT EXISTS actors text[]`), which only adds a nullable
@@ -259,8 +284,20 @@ land as before. A replica applies the same range checks to every op it
 pulls (`pm_store::Store::apply_pulled` → `StoreError::InvalidStamp`,
 never a panic), with a far looser future bound of 365 days
 (`pm_store::PULL_MAX_FUTURE_SKEW_MS`) so a replica whose own clock runs
-behind still pulls honest ops. `pm_core::Clock` never overflows its
-counter: a spent counter rolls into the next millisecond.
+behind still pulls honest ops; a local commit and `pm backup --restore`
+use seven days (`pm_store::LOCAL_MAX_FUTURE_SKEW_MS`, AGT-1482: a local
+stamp is only ahead of the wall clock when something dragged the log
+ahead or the clock is slow, and a restored backup is history).
+`pm_core::Clock` never overflows its counter: a spent counter rolls into
+the next millisecond.
+
+**Stamps in payloads (AGT-1482).** A `field.set archived_at` value and a
+`hold.set`'s `hold.at` are stamps too, copied into the ticket and stored
+as integers. They get the same two checks (`pm_core::Op::check_payload_stamps`):
+out of range is `400 invalid_stamp`, more than a day ahead of the hub's
+clock `400 future_stamp` (the `reason` starts `payload <field>`). They are
+not bounded by the op's own stamp: `pm import vault` writes a ticket's
+archive month, which can postdate the op carrying it.
 
 Response `200`, one entry per op **in batch order**, plus the number of
 every ticket a `ticket.create` in the batch made (see [Ticket
@@ -309,21 +346,23 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 | Status | `error` | Extra fields | When |
 |---|---|---|---|
 | `400` | `invalid_op` | `index` (position in the batch), `op_id` (if the JSON had one) | an op does not parse as `pm_core::Op`, its `actor` is empty, its `version` is newer than the hub's, a `field.set number` carries a number outside `1..=2^53-1`, or it does not fold into its ticket with `pm_core::apply` (a relation that does not touch the ticket), or it fails an admission rule (AGT-1464): a `project.create` for a project the log already has one for (`already has a project.create` — a backdated second create would move the stamp document identity is anchored to), or a `ticket.create` whose entity is already bound as a project document (`already a project document`); a replica refuses the same on every commit path, a pull included (`StoreError::DuplicateProjectCreate` / `EntityInUse`) |
-| `400` | `invalid_stamp` | `index`, `op_id` | the op's `hlc.wall_ms` exceeds `i64::MAX` or its `hlc.counter` is `u32::MAX` (see Stamps above) |
-| `400` | `future_stamp` | `index`, `op_id` | the op's `hlc.wall_ms` is more than one day ahead of the hub's clock |
-| `400` | `op_too_large` | `index`, `op_id` | a `body.edit` whose decoded update is over 32 MiB (`pm_core::MAX_BODY_EDIT_BYTES`, AGT-1467) — every replica would import, snapshot and re-serve it; a replica refuses the same on pull, local commit and restore (`StoreError::OpTooLarge`) |
-| `400` | `invalid_id` | `index`, `op_id` | a `workspace.set prefix`, `project.create` (id or parent), `project.set parent`, or a ticket's project (`ticket.create`, `field.set project`) whose value is not a safe file-path component (`pm_core::ids::is_safe_component`: ASCII letters, digits, `-`, `_`, `.`, at most 64 bytes, not starting with `.`, not a Windows device name); a state name (`state.upsert`, `ticket.create`, `state.transition`) that is not `pm_core::ids::is_safe_segment` (1–255 bytes, not starting with `.`, no `/`, `\`, `:` or control characters, not a Windows device name — `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`9`, `LPT1`–`9`, `CONIN$`, `CONOUT$`, any case, any extension; AGT-1467); or a `project.doc_add` name that is not `pm_core::ids::is_safe_doc_name` (`/`-separated safe segments, so no `.`/`..`, leading or trailing `/`; at most 255 bytes) — clients use these in export/backup paths (AGT-1453, AGT-1464); a replica refuses the same on pull, local commit and restore (`StoreError::InvalidId`) |
+| `400` | `invalid_stamp` | `index`, `op_id` | the op's `hlc.wall_ms` exceeds `i64::MAX` or its `hlc.counter` is `u32::MAX`, or so does a stamp in its payload (`archived_at`, `hold.at`; AGT-1482) (see Stamps above) |
+| `400` | `future_stamp` | `index`, `op_id` | the op's `hlc.wall_ms`, or a payload stamp's (AGT-1482), is more than one day ahead of the hub's clock |
+| `400` | `op_too_large` | `index`, `op_id` | a `body.edit` whose decoded update is over 32 MiB (`pm_core::MAX_BODY_EDIT_BYTES`, AGT-1467) — every replica would import, snapshot and re-serve it — or an op of any other kind whose payload JSON is over 1 MiB (`pm_core::MAX_OP_PAYLOAD_BYTES`, AGT-1482; the largest honest one on record is a 14 KB comment); a replica refuses the same on pull, local commit and restore (`StoreError::OpTooLarge`) |
+| `400` | `invalid_id` | `index`, `op_id` | a `workspace.set prefix`, `project.create` (id or parent), `project.set parent`, or a ticket's project (`ticket.create`, `field.set project`) whose value is not a safe file-path component (`pm_core::ids::is_safe_component`: ASCII letters, digits, `-`, `_`, `.`, at most 64 bytes, not starting with `.`, not a Windows device name); a state name (`state.upsert`, `ticket.create`, `state.transition`, and — AGT-1482 — `claim`, which writes its state into the ticket like a transition) that is not `pm_core::ids::is_safe_segment` (1–255 bytes, not starting with `.`, no `/`, `\`, `:` or control characters, not a Windows device name — `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`9`, `LPT1`–`9`, `CONIN$`, `CONOUT$`, any case, any extension; AGT-1467); or a `project.doc_add` name that is not `pm_core::ids::is_safe_doc_name` (`/`-separated safe segments, so no `.`/`..`, leading or trailing `/`; at most 255 bytes) — clients use these in export/backup paths (AGT-1453, AGT-1464); a replica refuses the same on pull, local commit and restore (`StoreError::InvalidId`) |
 | `400` | `actor_not_allowed` | `index`, `op_id` | a fresh op's `actor`, or an actor its payload names (`claim.assignee`, `hold.by`, `field.set assignee`, `actor.upsert id`), matches none of the token's actor patterns; `reason` names the token, its patterns and the field (see [Token actor bindings](#token-actor-bindings-agt-1450)) |
 | `400` | `reserved_actor` | `index`, `op_id` | a fresh op authored as `hub`, or naming `hub` in one of those payload fields — from any token once the workspace is seeded, from a bound token while seeding |
 | `400` | `foreign_workspace` | `index`, `op_id` | a config op (`workspace.set`, `state.upsert`, `actor.upsert`) for a workspace Ulid other than the one this hub workspace's config already belongs to |
 | `400` | `invalid_batch` | — | the body is not UTF-8 / not JSON / not `{"ops": [...]}`, or the batch has more than 1000 ops |
-| `400` | `number_not_allowed` | `index`, `op_id` | a `field.set number` pushed to a seeded workspace (only the hub numbers tickets then, whatever the op's `actor`) |
+| `400` | `number_not_allowed` | `index`, `op_id` | a `field.set number` pushed to a seeded workspace (only the hub numbers tickets then, whatever the op's `actor`), or pushed while seeding by an actor-bound token (only an unrestricted token seeds numbers, AGT-1482) |
 | `400` | `duplicate_number` | `index`, `op_id` | in seed mode, a `field.set number` whose number another ticket already holds, or whose ticket is already numbered |
 | `413` | `too_large` | — | the body exceeds 64 MiB (by `Content-Length`, answered before reading; or discovered while reading) |
 
 Limits: **1000 ops per batch, 64 MiB per request body**
-(`pm_hub::ops::{MAX_BATCH_OPS, MAX_BODY_BYTES}`), and **32 MiB per
-`body.edit` update** (decoded; `pm_core::MAX_BODY_EDIT_BYTES`, AGT-1467).
+(`pm_hub::ops::{MAX_BATCH_OPS, MAX_BODY_BYTES}`), **32 MiB per
+`body.edit` update** (decoded; `pm_core::MAX_BODY_EDIT_BYTES`, AGT-1467),
+and **1 MiB per payload of any other kind** (its JSON;
+`pm_core::MAX_OP_PAYLOAD_BYTES`, AGT-1482).
 The byte limit leaves room for a single large op — the Studio's seed log
 holds one 23 MB `body.edit` (about 17 MiB decoded) — plus a batch around
 it; a client should size batches by both count and bytes.
@@ -533,6 +572,13 @@ been freed. The hub admits; pm-core's rules then decide what the admitted
 claim's write does, so a client stamps a claim with its current clock: a
 claim stamped before the unclaim it follows would be admitted, stored,
 and lose the LWW register everywhere.
+
+**Assignments from bound tokens (AGT-1482).** Once seeded, a `field.set
+assignee` naming an actor, pushed by an actor-bound token, is judged by
+the same `claim_admissible` and refused with the same ack — unless it
+restates the ticket's current assignee (see [Token actor
+bindings](#token-actor-bindings-agt-1450)). Unrestricted tokens, and
+unassigning, are not arbitrated.
 
 **Seeding workspace.** Every claim in a seeding push is stored and folded
 as a plain write, never arbitrated. The seed is history: each claim in it

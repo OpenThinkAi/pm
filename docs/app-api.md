@@ -335,10 +335,18 @@ package (AGT-1465): pm resolves the shim's symlink and requires the
 `package.json` one directory above it (`<pkg>/bin/ui-leaf` → `<pkg>`) to be
 named `@openthink/ui-leaf`; anything else — a stray executable, another
 package's shim — is not launched, pm says so on stderr, and the editor flow
-runs until the binary is named in `ui_leaf.path`. (Provenance, not
-integrity: pm hands the runtime its API token, so install ui-leaf from a
-trusted source.) When that is the npm package's Node shim, pm runs the native
-`ui-leaf-bin` beside it. It must report (`--version`) a version in
+runs until the binary is named in `ui_leaf.path`. When that is the npm
+package's Node shim, pm runs the native `ui-leaf-bin` beside it. **Integrity
+(AGT-1482):** that binary (or the shim, when there is no native sibling)
+must also hash to one of `PINNED_BUILDS` in `crates/pm/src/app/launch.rs` —
+the SHA-256 of every published build of the supported releases, per
+platform (1.6.0 on darwin-arm64, darwin-x64, linux-arm64, linux-x64 and
+win32-x64). A package that passes the name check but carries any other
+binary — a tampered npm release or GitHub asset, a write to the npm prefix,
+an unpinned 1.6.x patch — is not launched; pm says so (with the digest it
+saw) and the editor flow runs. `ui_leaf.path` is the explicit opt-in: a
+configured binary is trusted as given and never hashed (a local build, or a
+release pm has not pinned yet). It must report (`--version`) a version in
 `>=1.6.0, <1.7.0` — exactly the minor the views were built and verified
 against (AGT-1468; see [Bumping the ui-leaf pin](#bumping-the-ui-leaf-pin)),
 so a newer minor is never launched by a routine `npm i -g`. Otherwise pm
@@ -515,8 +523,32 @@ instead, for developing a view without rebuilding pm.
 The runtime is handed pm's API token, so pm launches only the ui-leaf minor
 someone has verified: `PIN_MIN` (`>=`) and `PIN_BELOW` (`<`) in
 `crates/pm/src/app/launch.rs`. **Verified version: ui-leaf 1.6.0**
-(`ui-leaf --version`; range `>=1.6.0, <1.7.0`). Patch releases inside the
-minor are accepted; a new minor or major is not until the pin moves:
+(`ui-leaf --version`; range `>=1.6.0, <1.7.0`). A `PATH` runtime must also
+be one of the exact builds in `PINNED_BUILDS` beside the pin (AGT-1482), so
+even a patch release inside the minor is not launched until its digests
+are added.
+
+**Adding a release's digests** (a new 1.6.x; step 3 below for a new minor).
+The npm tarball ships only a stub — ui-leaf's postinstall downloads the
+platform binary from the GitHub release `v<version>` and checks it against
+that release's `checksums.txt` — so the digests come from the release, read
+only:
+
+```sh
+gh release view v<version> --repo OpenThinkAi/ui-leaf --json assets \
+  --jq '.assets[] | "\(.name) \(.digest)"'
+gh release download v<version> --repo OpenThinkAi/ui-leaf --pattern checksums.txt
+```
+
+Add one `PinnedBuild` per platform asset (`ui-leaf-darwin-arm64` →
+`darwin-arm64`, …, `ui-leaf-windows-x64.exe` → `win32-x64`) whose GitHub
+digest and `checksums.txt` line agree, and check at least one against a
+real install (`shasum -a 256 $(npm root -g)/@openthink/ui-leaf/bin/ui-leaf-bin`).
+The 1.6.0 digests were taken this way on 2026-09-30 (darwin-arm64 matched
+the installed binary). A digest that cannot be verified is left out: that
+platform then needs `ui_leaf.path` until it is.
+
+A new minor or major also needs the pin moved:
 
 1. Install the candidate from the npm registry and read its changelog and
    the diff against the verified version (`npm diff`); note any change to
@@ -525,8 +557,12 @@ minor are accepted; a new minor or major is not until the pin moves:
 2. Run the pm suite (`cargo test --workspace`, including `tests/launch.rs`
    against the fake runtime) and one real `pm edit --view=ui-leaf` and
    `pm app` session by hand against the candidate.
-3. Raise `PIN_MIN` to the candidate and `PIN_BELOW` to the next minor; update
-   the two `>=…, <…` ranges in this file and `docs/cli-contract.md`, the
-   `the_pin_is_exactly_the_verified_minor` and `an_unpinned_ui_leaf_is_not_launched`
-   tests, and the "Verified version" line above.
+3. Raise `PIN_MIN` to the candidate and `PIN_BELOW` to the next minor,
+   replace `PINNED_BUILDS` with the candidate's digests (above; drop the
+   old minor's — `pinned_builds_are_well_formed_and_inside_the_pin` fails
+   on any entry outside the pin, and names every platform it expects);
+   update the two `>=…, <…` ranges in this file and `docs/cli-contract.md`,
+   the `the_pin_is_exactly_the_verified_minor` and
+   `an_unpinned_ui_leaf_is_not_launched` tests, and the "Verified version"
+   line above.
 4. Land it through the normal stamp flow.

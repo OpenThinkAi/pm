@@ -351,7 +351,11 @@ pub(crate) fn commit_config_in(
     mode: Mode,
     between: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    crate::commit::check_ingest(op)?;
+    let origin = match mode {
+        Mode::Foreign => crate::commit::Origin::Pulled,
+        Mode::Commit | Mode::Rebuild => crate::commit::Origin::Local,
+    };
+    crate::commit::check_ingest(op, origin)?;
     check_config_admission(tx, op)?;
     ensure_actor(tx, &op.actor)?;
     let view = next_view(tx, op)?;

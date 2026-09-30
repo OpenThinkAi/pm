@@ -548,3 +548,51 @@ fn comments_keep_their_own_dates_before_created_and_after_updated() {
         "{parity}"
     );
 }
+
+// ------------------------------------------------------ AGT-1482 perms
+
+/// Every directory the export creates is 0700 and every file 0600, a
+/// re-export over a world-readable file narrows it too, and an export
+/// root that already existed keeps its mode.
+#[cfg(unix)]
+#[test]
+fn export_files_and_directories_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let sb = Sandbox::initialized();
+    sb.import(Path::new(FIXTURE));
+
+    let dir = sb.path("fresh/out");
+    let report = sb.export(&dir, false);
+    assert_eq!(report["files"], 13);
+    let (mut files, mut dirs) = (0, 0);
+    let mut stack = vec![sb.path("fresh")];
+    while let Some(d) = stack.pop() {
+        assert_eq!(mode(&d), 0o700, "{}", d.display());
+        dirs += 1;
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                assert_eq!(mode(&path), 0o600, "{}", path.display());
+                files += 1;
+            }
+        }
+    }
+    assert_eq!(files, 13);
+    assert!(dirs > 3, "{dirs}");
+
+    // An existing root is the operator's: its mode stays. A file left
+    // world-readable by an older export is narrowed on the next one.
+    let root = sb.path("existing");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    sb.export(&root, false);
+    assert_eq!(mode(&root), 0o755);
+    let file = root.join("tickets/done/AGT-15-approve-the-e2-copy.md");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    sb.export(&root, false);
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(mode(&root.join("tickets")), 0o700);
+}

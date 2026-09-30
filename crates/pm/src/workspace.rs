@@ -66,6 +66,10 @@ pub struct Env {
     /// window (so pm uses `$EDITOR`); `0`/`false`/`no` forces one even
     /// under SSH.
     pub ui_leaf_no_open: Option<String>,
+    /// `PM_UI_LEAF_TEST_SHA256` (AGT-1482, a test hook honoured by debug
+    /// builds only): one more digest a `PATH` ui-leaf may hash to, so the
+    /// test suite's fake runtime launches without `ui_leaf.path`.
+    pub ui_leaf_test_sha256: Option<String>,
 }
 
 impl Env {
@@ -107,6 +111,7 @@ impl Env {
             ssh_connection: text("SSH_CONNECTION"),
             ssh_tty: text("SSH_TTY"),
             ui_leaf_no_open: text("UI_LEAF_NO_OPEN"),
+            ui_leaf_test_sha256: text("PM_UI_LEAF_TEST_SHA256"),
         }
     }
 

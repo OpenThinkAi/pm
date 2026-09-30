@@ -23,7 +23,8 @@ previous value stays in the history.
 | Loro body history (same database) | Ticket bodies and project docs are Loro documents. Text you removed from a body is still in the document's causal history and in every replica's copy of it. |
 | The hub (Postgres `ops` table) | The same ops, for every workspace synced to it. Hub-side admin deletes of tokens or workspaces are separate from op content. |
 | Git backups (`pm backup`) | Op shards (`ops/<prefix>/*.jsonl`) committed to the backup repo, so git history keeps every version of every shard, for as long as that repo and its clones exist. |
-| Exports (`pm export md`) | Plain files of current, non-deleted state. Already-written export files and any git history of them keep old content until you remove them yourself. |
+| Exports (`pm export md`) | Plain files of current, non-deleted state, owner-only (`0600` files in `0700` directories, AGT-1482). Already-written export files and any git history of them keep old content until you remove them yourself. |
+| Sync quarantine (same database) | Pulled ops a replica refused (AGT-1467). A refused op's content is dropped 30 days after its refusal, or at once with `pm doctor --prune-quarantine` (AGT-1482); its op id, hub seq, kind, entity and reason stay. Parked ops keep theirs until they land or are refused. |
 
 Each replica (every machine that ran `pm sync`) has its own full copy.
 Removing data from one place does not remove it from the others.

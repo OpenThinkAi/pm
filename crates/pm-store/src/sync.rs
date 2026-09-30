@@ -37,7 +37,7 @@ use ulid::Ulid;
 
 use crate::Store;
 use crate::codec::ulid;
-use crate::commit::{commit_foreign_in, now_ms};
+use crate::commit::{Origin, commit_foreign_in, now_ms};
 use crate::config::CONFIG_KINDS;
 use crate::error::{Result, StoreError};
 use crate::project::{commit_doc_edit_in, is_known_doc};
@@ -77,9 +77,26 @@ pub struct Quarantined {
     pub attempts: u32,
     /// Why it was parked (what it waits on) or refused.
     pub reason: String,
-    /// When this replica recorded it (Unix ms).
+    /// When this replica recorded it (Unix ms); for a refused op, when it
+    /// was refused.
     pub recorded_ms: u64,
+    /// The op's content has been dropped (AGT-1482): a refused op older
+    /// than [`QUARANTINE_RETENTION_MS`], or any refused op after `pm
+    /// doctor --prune-quarantine`. Its id, seq, kind, entity and reason
+    /// stay.
+    pub pruned: bool,
 }
+
+/// How long a refused op's content stays in `sync_quarantine` (AGT-1482):
+/// 30 days from its refusal. A refused op is never retried, so its body
+/// only serves someone reading `pm doctor` about a recent sync; after that
+/// it is another replica's text (comments, titles, description updates)
+/// kept outside the op log for no one. Each pull drops what has aged out
+/// ([`Store::apply_pulled_page`]); `pm doctor --prune-quarantine` drops
+/// all of it now ([`Store::prune_quarantine`]). The row itself — op id,
+/// hub seq, kind, entity, reason — stays: it is what keeps a re-served op
+/// refused rather than applied.
+pub const QUARANTINE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Where a quarantined op stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -437,8 +454,24 @@ impl Store {
             params![next],
         )?;
         finish_pull(&tx)?;
+        prune_quarantine(&tx, now_ms().saturating_sub(QUARANTINE_RETENTION_MS))?;
         tx.commit()?;
         Ok(pulled)
+    }
+
+    /// Drops the content of every refused op in `sync_quarantine` now
+    /// (`pm doctor --prune-quarantine`, AGT-1482), keeping each row's op
+    /// id, hub seq, kind, entity and reason. Parked ops keep theirs: they
+    /// are still retried. Returns how many rows it pruned. Changes nothing
+    /// a pull decides: a refused op is never retried, and a re-served one
+    /// is recognised by its `op_id` alone.
+    pub fn prune_quarantine(&mut self) -> Result<u64> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pruned = prune_quarantine(&tx, u64::MAX)?;
+        tx.commit()?;
+        Ok(pruned)
     }
 
     /// Every pulled op this replica has parked or refused
@@ -515,25 +548,40 @@ pub(crate) fn sync_status(conn: &Connection) -> Result<SyncStatus> {
     })
 }
 
+/// Drops the content (`op`, set to `''`) of every refused op recorded at
+/// or before `cutoff_ms` (AGT-1482); returns how many rows changed.
+fn prune_quarantine(conn: &Connection, cutoff_ms: u64) -> Result<u64> {
+    let cutoff = i64::try_from(cutoff_ms).unwrap_or(i64::MAX);
+    let pruned = conn.execute(
+        "UPDATE sync_quarantine SET op = ''
+         WHERE status = 'refused' AND op <> '' AND recorded_ms <= ?1",
+        params![cutoff],
+    )?;
+    Ok(pruned as u64)
+}
+
 pub(crate) fn quarantine(conn: &Connection) -> Result<Vec<Quarantined>> {
     let mut stmt = conn.prepare(
-        "SELECT op_id, hub_seq, kind, entity, status, attempts, reason, recorded_ms
+        "SELECT op_id, hub_seq, kind, entity, status, attempts, reason, recorded_ms, op = ''
          FROM sync_quarantine ORDER BY hub_seq, op_id",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
+            (
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ),
             r.get::<_, u32>(5)?,
             r.get::<_, String>(6)?,
             r.get::<_, i64>(7)?,
+            r.get::<_, bool>(8)?,
         ))
     })?;
     rows.map(|row| {
-        let (op_id, hub_seq, kind, entity, status, attempts, reason, recorded_ms) = row?;
+        let ((op_id, hub_seq, kind, entity, status), attempts, reason, recorded_ms, pruned) = row?;
         Ok(Quarantined {
             op_id: ulid("sync_quarantine.op_id", &op_id)?,
             hub_seq,
@@ -546,6 +594,7 @@ pub(crate) fn quarantine(conn: &Connection) -> Result<Vec<Quarantined>> {
             attempts,
             reason,
             recorded_ms: recorded_ms.max(0) as u64,
+            pruned,
         })
     })
     .collect()
@@ -582,7 +631,7 @@ fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
     check_foreign_stamp(op, now_ms())?;
     match &op.payload {
         Payload::BodyEdit(_) if is_known_doc(tx, op.entity)? => {
-            commit_doc_edit_in(tx, op.entity, op)?;
+            commit_doc_edit_in(tx, op.entity, op, Origin::Pulled)?;
         }
         Payload::WorkspaceSet(_)
         | Payload::StateUpsert(_)
@@ -627,7 +676,7 @@ pub const PULL_MAX_FUTURE_SKEW_MS: u64 = 365 * pm_core::MAX_FUTURE_SKEW_MS;
 /// local commit and `pm backup --restore` runs
 /// ([`crate::commit::check_ingest`]).
 fn check_foreign_stamp(op: &Op, now_ms: u64) -> Result<()> {
-    crate::commit::check_ingest_at(op, now_ms)
+    crate::commit::check_ingest_at(op, now_ms, Origin::Pulled)
 }
 
 /// What a pull does with an op that failed to apply (AGT-1467).
@@ -686,7 +735,9 @@ fn disposition(e: &StoreError, op: &Op) -> Disposition {
         | E::UnknownState { .. } => Disposition::Park(Wake::Config),
         // How far ahead is too far depends on this machine's clock, not on
         // the op: quarantining would make two replicas decide differently.
-        E::InvalidStamp(pm_core::StampError::FarFuture { .. }) => Disposition::Fail,
+        E::InvalidStamp(
+            pm_core::StampError::FarFuture { .. } | pm_core::StampError::PayloadFarFuture { .. },
+        ) => Disposition::Fail,
         E::InvalidStamp(_)
         | E::InvalidId(_)
         | E::OpTooLarge(_)
@@ -987,6 +1038,7 @@ impl<'a, 'c> Engine<'a, 'c> {
             attempts,
             reason,
             recorded_ms,
+            pruned: false,
         });
         Ok(())
     }

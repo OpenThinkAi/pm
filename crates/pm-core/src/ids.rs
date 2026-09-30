@@ -134,8 +134,9 @@ pub fn check_component(what: &'static str, value: &str) -> Result<(), IdError> {
 /// path: a `workspace.set prefix`; a `project.create`'s id and parent and
 /// a `project.set parent`; a ticket's project (`ticket.create`,
 /// `field.set project`); a workflow state's name (`state.upsert`,
-/// `ticket.create`, `state.transition`); and a `project.doc_add` document
-/// name (AGT-1464).
+/// `ticket.create`, `state.transition`, and — AGT-1482 — `claim`, which
+/// writes its state into the ticket's `state` register exactly as a
+/// transition does); and a `project.doc_add` document name (AGT-1464).
 pub fn check_op_ids(op: &Op) -> Result<(), IdError> {
     let check = |what: &'static str, value: &str, ok: fn(&str) -> bool, rule: &'static str| {
         if ok(value) {
@@ -174,6 +175,7 @@ pub fn check_op_ids(op: &Op) -> Result<(), IdError> {
         Payload::FieldSet(FieldSet::Project(Some(project))) => id("ticket project", project),
         Payload::StateUpsert(s) => state(&s.name),
         Payload::StateTransition(t) => state(&t.state),
+        Payload::Claim(c) => state(&c.state),
         _ => Ok(()),
     }
 }
@@ -183,7 +185,9 @@ mod tests {
     use super::*;
     use crate::domain::{ActorId, Priority, ProjectStatus, StateCategory};
     use crate::hlc::Hlc;
-    use crate::op::{ProjectCreate, ProjectDocAdd, StateTransition, StateUpsert, TicketCreate};
+    use crate::op::{
+        Claim, ProjectCreate, ProjectDocAdd, StateTransition, StateUpsert, TicketCreate,
+    };
     use ulid::Ulid;
 
     fn op(payload: Payload) -> Op {
@@ -436,6 +440,28 @@ mod tests {
                 state: bad.into(),
             }));
             assert_eq!(check_op_ids(&to).unwrap_err().what, "state name");
+        }
+    }
+
+    /// AGT-1482 (oaudit r4, high): a `claim` carries a state name the
+    /// fold writes into the ticket's `state` register, so it is held to
+    /// the same rule as every other state-bearing op.
+    #[test]
+    fn claim_state_names_are_checked() {
+        let claim = |state: &str| {
+            op(Payload::Claim(Claim {
+                state: state.into(),
+                assignee: ActorId::new("claude:a"),
+            }))
+        };
+        assert_eq!(check_op_ids(&claim("in-progress")), Ok(()));
+        assert_eq!(check_op_ids(&claim("in review")), Ok(()));
+        for bad in [
+            "", ".", "..", "../../x", "a/b", "a\\b", ".x", "a\0b", "a\nb", "C:x", "NUL", "com1.md",
+        ] {
+            let e = check_op_ids(&claim(bad)).unwrap_err();
+            assert_eq!(e.what, "state name", "{bad:?}");
+            assert_eq!(e.value, bad);
         }
     }
 }

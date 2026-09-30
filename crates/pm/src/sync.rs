@@ -36,6 +36,10 @@
 //!   database admitted while it was the authority (a seed, or a log joined
 //!   after another machine's seed): `pm claim` itself goes to the hub
 //!   (`crate::claim`, AGT-1397) and never leaves a refused claim behind.
+//!   Since AGT-1482 the hub judges an actor-bound token's `field.set
+//!   assignee` the same way (it may not take a ticket a claim could not);
+//!   a refused one is acknowledged, reconciled and reported alike, with
+//!   its `kind` in `--json`.
 //! - **Pull.** Pages of `GET /ops?since=<cursor>&limit=` are applied one
 //!   page per transaction ([`Store::apply_pulled_page`]: foreign ops land
 //!   through the normal commit path, ops already present by `op_id` — this
@@ -313,6 +317,7 @@ pub(crate) fn push_all(
             reconcile(ctx, store, op, rejected)?;
             let claim = RejectedClaim {
                 op_id: op.op_id,
+                kind: op.kind(),
                 ticket: op.entity,
                 rejected: rejected.clone(),
             };
@@ -405,7 +410,8 @@ pub(crate) struct Ack {
     /// one) — or refused it, in which case `rejected` says why.
     #[serde(default)]
     pub stored: bool,
-    /// Present only on a refused `claim`.
+    /// Present only on a refused `claim` (or, AGT-1482, an actor-bound
+    /// token's `field.set assignee`).
     #[serde(default)]
     pub rejected: Option<Rejected>,
 }
@@ -440,6 +446,9 @@ pub(crate) struct Rejected {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct RejectedClaim {
     pub op_id: Ulid,
+    /// `claim`, or (AGT-1482) `field.set`: an assignee write from an
+    /// actor-bound token, which the hub judges like a claim.
+    pub kind: &'static str,
     pub ticket: Ulid,
     #[serde(flatten)]
     pub rejected: Rejected,
@@ -453,8 +462,13 @@ impl std::fmt::Display for RejectedClaim {
         };
         write!(
             f,
-            "the hub refused claim {} on ticket {}: {holder} since {} ({}); \
+            "the hub refused {} {} on ticket {}: {holder} since {} ({}); \
              reconciled locally to the hub's answer",
+            if self.kind == "claim" {
+                "claim"
+            } else {
+                "assignee write"
+            },
             self.op_id,
             self.ticket,
             crate::verbs::when(&self.rejected.at),
@@ -755,6 +769,7 @@ mod tests {
         for taken_by in [Some(ActorId::new(evil)), None] {
             let claim = RejectedClaim {
                 op_id: Ulid::new(),
+                kind: "claim",
                 ticket: Ulid::new(),
                 rejected: Rejected {
                     taken_by,
@@ -897,11 +912,13 @@ mod tests {
         // The report flattens the verdict next to the op and ticket ids.
         let report = serde_json::to_value(RejectedClaim {
             op_id: outbox[0].1.op_id,
+            kind: "claim",
             ticket: outbox[0].1.entity,
             rejected: rejected.clone(),
         })
         .unwrap();
         assert_eq!(report["op_id"], outbox[0].1.op_id.to_string());
+        assert_eq!(report["kind"], "claim");
         assert_eq!(report["ticket"], outbox[0].1.entity.to_string());
         assert_eq!(report["taken_by"], "claude:pm-build");
         assert_eq!(report["code"], "not_unstarted");

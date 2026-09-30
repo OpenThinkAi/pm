@@ -336,6 +336,10 @@ enum Cmd {
         /// Regenerate the derived tables from the op log first and print what changed
         #[arg(long)]
         rebuild: bool,
+        /// Drop the content of every refused op in the sync quarantine now, keeping its id,
+        /// hub seq and reason (refused content is otherwise dropped after 30 days)
+        #[arg(long)]
+        prune_quarantine: bool,
     },
     /// Archive a ticket (`pm archive PM-N`), or sweep for eligible tickets/projects (`--auto`)
     Archive {
@@ -633,7 +637,10 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
         Cmd::Holds { project, ids } => markers::holds(ctx, markers::HoldsArgs { project, ids }),
         Cmd::Waive { id, rule, reason } => markers::waive(ctx, &id, &rule, &reason),
         Cmd::Check { project } => check::check(ctx, project.as_deref()),
-        Cmd::Doctor { rebuild } => doctor::doctor(ctx, rebuild),
+        Cmd::Doctor {
+            rebuild,
+            prune_quarantine,
+        } => doctor::doctor(ctx, rebuild, prune_quarantine),
         Cmd::Archive { id, auto, dry_run } => archive::archive(ctx, id, auto, dry_run),
         Cmd::Unarchive { id } => archive::unarchive(ctx, &id),
         Cmd::Import {

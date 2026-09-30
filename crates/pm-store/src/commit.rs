@@ -208,7 +208,7 @@ fn commit_in(
         commit_config_in(tx, op, Mode::Commit, between)?;
         return Ok(None);
     }
-    check_ingest(op)?;
+    check_ingest(op, Origin::Local)?;
     check_ticket_entity(tx, op)?;
     ensure_actor(tx, &op.actor)?;
     let view = next_view(tx, op, Fold::Local)?;
@@ -247,23 +247,66 @@ pub(crate) fn commit_foreign_in(tx: &Transaction<'_>, op: &Op) -> Result<Option<
 /// commits), a pull ([`Store::apply_pulled`]) or `pm backup --restore`
 /// ([`Store::commit_any`]) (oaudit 2026-09-30, AGT-1450; every ingest path
 /// since AGT-1464): the stamp is storable and not more than
-/// [`crate::PULL_MAX_FUTURE_SKEW_MS`] ahead of this machine's clock, and
-/// every identifier or name it carries that becomes a file path is safe
-/// ([`pm_core::ids::check_op_ids`]), and a `body.edit` is within
-/// [`pm_core::MAX_BODY_EDIT_BYTES`] (AGT-1467). A replay of the log (`pm doctor
-/// --rebuild`) does not re-check: what is in the log already passed.
-pub(crate) fn check_ingest(op: &Op) -> Result<()> {
-    check_ingest_at(op, now_ms())
+/// [`Origin::max_future_skew_ms`] ahead of this machine's clock, and
+/// so is every stamp its payload carries (AGT-1482,
+/// [`Op::check_payload_stamps`]); every identifier or name it carries that
+/// becomes a file path is safe ([`pm_core::ids::check_op_ids`]); and its
+/// payload is within its size bound ([`Op::check_size`]: a `body.edit`
+/// within [`pm_core::MAX_BODY_EDIT_BYTES`], AGT-1467, any other kind
+/// within [`pm_core::MAX_OP_PAYLOAD_BYTES`], AGT-1482). A replay of the log
+/// (`pm doctor --rebuild`) does not re-check: what is in the log already
+/// passed.
+pub(crate) fn check_ingest(op: &Op, origin: Origin) -> Result<()> {
+    check_ingest_at(op, now_ms(), origin)
 }
 
-pub(crate) fn check_ingest_at(op: &Op, now_ms: u64) -> Result<()> {
+pub(crate) fn check_ingest_at(op: &Op, now_ms: u64, origin: Origin) -> Result<()> {
     op.hlc.check_range()?;
     op.hlc
-        .check_not_after(now_ms, crate::sync::PULL_MAX_FUTURE_SKEW_MS)?;
+        .check_not_after(now_ms, origin.max_future_skew_ms())?;
+    op.check_payload_stamps(now_ms, origin.max_future_skew_ms())?;
     pm_core::ids::check_op_ids(op)?;
     op.check_size()?;
     Ok(())
 }
+
+/// Where an op being ingested comes from, which decides how far ahead of
+/// this machine's clock its stamp may be (AGT-1482).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// Stamped here (a local verb) or read back from a backup (`pm backup
+    /// --restore`): at most [`crate::LOCAL_MAX_FUTURE_SKEW_MS`] ahead.
+    Local,
+    /// Pulled from the hub: at most [`crate::PULL_MAX_FUTURE_SKEW_MS`]
+    /// ahead, so a replica whose clock runs behind still pulls.
+    Pulled,
+}
+
+impl Origin {
+    pub(crate) fn max_future_skew_ms(self) -> u64 {
+        match self {
+            Origin::Local => LOCAL_MAX_FUTURE_SKEW_MS,
+            Origin::Pulled => crate::sync::PULL_MAX_FUTURE_SKEW_MS,
+        }
+    }
+}
+
+/// How far ahead of this machine's clock a locally committed or restored
+/// op's stamp may be (AGT-1482): seven days, where it was the pull's year.
+///
+/// A local op is stamped by this replica's clock — the later of the wall
+/// clock and the newest stamp in the log — so it is only ever ahead of the
+/// wall clock when an admitted op dragged the log ahead, or when the wall
+/// clock itself is behind. A restored backup holds history, never the
+/// future. The bound tolerates a clock up to six days slow (writes then
+/// still carry stamps the hub accepts, since the hub's own clock is right
+/// and its push bound is [`pm_core::MAX_FUTURE_SKEW_MS`], one day), while
+/// refusing the op that would otherwise win every LWW register it touches
+/// for up to a year and carry every later local stamp with it. The pull
+/// keeps its year ([`crate::PULL_MAX_FUTURE_SKEW_MS`]): refusing a pulled
+/// op for this machine's clock would stop a slow replica from reading at
+/// all.
+pub const LOCAL_MAX_FUTURE_SKEW_MS: u64 = 7 * pm_core::MAX_FUTURE_SKEW_MS;
 
 /// AGT-1464: a `ticket.create` may not take an entity that is already a
 /// project document (bound by any project, winner or not) or a project —

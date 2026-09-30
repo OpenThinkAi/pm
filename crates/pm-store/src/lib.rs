@@ -61,6 +61,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 pub use backfill::MIGRATE_ACTOR;
 pub use backup::BackupStatus;
+pub use commit::LOCAL_MAX_FUTURE_SKEW_MS;
 pub use config::{DocIds, project_diff, workspace_diff};
 pub use doctor::{
     CONFIG_TABLES, ColumnChange, Diff, ForeignKeyViolation, PROJECT_DOC_TABLES, Report, Row,
@@ -70,7 +71,8 @@ pub use error::{Result, StoreError};
 pub use query::TicketFilter;
 pub use ready::ReadyQuery;
 pub use sync::{
-    MAX_PARK_RETRIES, PULL_MAX_FUTURE_SKEW_MS, Pulled, QuarantineStatus, Quarantined, SyncStatus,
+    MAX_PARK_RETRIES, PULL_MAX_FUTURE_SKEW_MS, Pulled, QUARANTINE_RETENTION_MS, QuarantineStatus,
+    Quarantined, SyncStatus,
 };
 
 /// Embedded migrations, in order. Each runs once, inside its own

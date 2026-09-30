@@ -864,7 +864,11 @@ tickets).
 ### `pm doctor`
 
 Flags: `--rebuild` (regenerate the ticket tables from the op log first,
-report what changed, then run the same report).
+report what changed, then run the same report); `--prune-quarantine`
+(AGT-1482: drop the content of every *refused* op in the sync quarantine
+now, keeping its op id, hub seq, kind, entity and reason, then report;
+parked ops keep theirs, since they are still retried. Without it a refused
+op's content is dropped 30 days after its refusal, on the next pull).
 
 - Exit `1`: the database is unhealthy (without `--rebuild`), or still
   unhealthy after one.
@@ -874,6 +878,7 @@ report what changed, then run the same report).
     "schema": 1,
     "healthy": true,
     "rebuilt": {"tables": [...]} | null,   // a Diff, only present with --rebuild
+    "pruned_quarantine": 2,                 // only with --prune-quarantine: refused ops whose content it dropped (AGT-1482)
     "schema_version": 12,                   // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state); 9 since AGT-1396 (seeded flag); 12 since AGT-1467 (sync quarantine)
     "op_count": 30,
     "tables": {"ticket": 5, "comment": 2, ...},
@@ -899,7 +904,8 @@ report what changed, then run the same report).
         "status": "parked" | "refused",
         "attempts": 0,                      // retries while parked
         "reason": "string",                 // what it waits on, or why it can never apply
-        "recorded_ms": 1790000000000        // when this replica recorded it
+        "recorded_ms": 1790000000000,       // when this replica recorded it (refused: when it was refused)
+        "pruned": false                     // its content was dropped (AGT-1482: 30 days after refusal, or --prune-quarantine)
       }
     ]
   }
@@ -910,8 +916,10 @@ report what changed, then run the same report).
   and a `seeded` line: `yes (the hub is this workspace's authority)` or
   `no (…)`, and a `quarantine` line: `none`, or `P parked, R refused
   (pulled ops kept out of the log)` followed by one indented line per op
-  (`<status> <op_id> <kind> (hub seq N, entity E): <reason>`; see `pm sync`
-  §Quarantine).
+  (`<status> <op_id> <kind> (hub seq N, entity E)[ [content pruned]]:
+  <reason>`; see `pm sync` §Quarantine). With `--prune-quarantine` the
+  report is preceded by `pruned the content of N refused op(s) in the sync
+  quarantine`.
 
 ### `pm archive [ID]`
 
@@ -1055,6 +1063,9 @@ each named document as `<name>.md` beside it. Flags: `--legacy-markers`
 default `waived:`/`hold:`/`parked:` frontmatter keys; `pm import vault`
 reads both forms back to the same fields).
 
+- Permissions (AGT-1482): every directory the export creates is `0700`
+  and every file it writes `0600` (a file left by an earlier export is
+  narrowed too); a `DIR` that already existed keeps its mode.
 - Exit `1`: `DIR` or a file under it cannot be written; a ticket's state,
   a project id or a document name would not make a plain path segment
   under `DIR` (contains `..`, is absolute or empty) — every path the
@@ -1489,6 +1500,11 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
   listed under `rejected` in `--json`. This happens only to a claim the
   local database admitted while it was the authority (before the seed
   ended); `pm claim` itself goes to the hub and never leaves one behind.
+  Since AGT-1482 the hub judges a `field.set assignee` from an
+  actor-bound token the same way (`pm set <ID> assignee=<me>` on a ticket
+  someone else won): refused, it is reconciled and reported alike
+  (`pm: the hub refused assignee write <op_id> on ticket <ulid>: …`), with
+  `kind: "field.set"` in `--json`.
 - **Pull.** `GET …/ops?since=<cursor>&limit=1000`, page by page until
   `next >= head` (the hub also cuts a page at 16 MiB of ops,
   `docs/hub-api.md`). Each page is applied in one transaction (foreign ops
@@ -1506,12 +1522,17 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
     that could supply it lands, and lands itself once that works (counted
     in `unparked`). One still waiting after 32 retries is refused.
   - **refused** — it can never apply here: an id or name unsafe in a file
-    path, a stamp out of range, a `body.edit` over 32 MiB, a second
+    path (a `claim`'s state included, AGT-1482), a stamp out of range (the
+    op's, or one in its payload: `archived_at`, `hold.at`), a `body.edit`
+    over 32 MiB or any other payload over 1 MiB (AGT-1482), a second
     `project.create`, a document binding or ticket id already in use, a
     number already taken, an update that does not decode. Each is
     reported on stderr (`pm: refused pulled op <op_id> (<kind>, hub seq
     N): <reason>; kept out of the log (see `pm doctor`)`) and listed under
-    `refused` in `--json`; it is never retried.
+    `refused` in `--json`; it is never retried. Its content is dropped 30
+    days after the refusal (on the next pull), or at once with `pm doctor
+    --prune-quarantine`; the op id, hub seq, kind, entity and reason stay
+    (AGT-1482).
 
   Every replica quarantines the same ops however the log was paged (the
   rules depend only on the hub's log, and the parked set carries over
@@ -1519,8 +1540,10 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
   quarantined and still exit `1`, leaving the cursor where it was: an op
   this build cannot parse (a newer build's kind — skipping it for good
   would leave this replica diverged after an upgrade; upgrade `pm`), and a
-  pulled stamp more than 365 days ahead of this machine's clock (whether
-  it is depends on the clock; fix the clock). The hub refuses every
+  pulled stamp — the op's, or one in its payload — more than 365 days
+  ahead of this machine's clock (whether it is depends on the clock; fix
+  the clock). A local commit or `pm backup --restore` allows seven days
+  (`pm_store::LOCAL_MAX_FUTURE_SKEW_MS`, AGT-1482). The hub refuses every
   quarantinable op at push today, so a quarantine only ever holds ops the
   hub stored before it checked them (or a hostile hub's). `pm doctor`
   lists the quarantine; nothing in it is pushed, backed up or replayed.
@@ -1578,9 +1601,10 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
     "head": 42,                 // the hub's largest seq as of the last page
     "outbox": 0,                // ops still unacknowledged after the round
     "pending_numbers": 0,       // tickets still awaiting a hub-issued number
-    "rejected": [               // outbox claims the hub refused this round, reconciled locally
+    "rejected": [               // outbox claims (and bound-token assignee writes, AGT-1482) the hub refused this round, reconciled locally
       {
-        "op_id": "<ULID>",        // the refused claim op
+        "op_id": "<ULID>",        // the refused op
+        "kind": "claim" | "field.set",  // AGT-1482
         "ticket": "<ULID>",       // its ticket
         "taken_by": "string" | null,
         "at": {"wall_ms": 0, "counter": 0},

@@ -71,10 +71,19 @@ overrides and isolates, line/paragraph separators — via `crates/pm/src/text.rs
 
 ### ui-leaf runtime
 
-pm hands the ui-leaf runtime its API token. `ui_leaf.path` is used as given;
-a `ui-leaf` found on `PATH` is launched only when it is the npm-installed
-`@openthink/ui-leaf` package (see `docs/app-api.md`). This is provenance, not
-a content hash.
+pm hands the ui-leaf runtime its API token. `ui_leaf.path` is used as given
+(the explicit opt-in); a `ui-leaf` found on `PATH` is launched only when it is
+the npm-installed `@openthink/ui-leaf` package **and** its native binary
+hashes to one of the pinned SHA-256 digests of the supported release's
+published builds (AGT-1482; `PINNED_BUILDS` in `crates/pm/src/app/launch.rs`,
+bump procedure in `docs/app-api.md` §Bumping the ui-leaf pin). Anything else
+falls back to `$EDITOR` with a note naming the digest it saw.
+
+### Exports
+
+`pm export md` writes every ticket, comment and author name: each
+directory it creates is `0700` and each file `0600` (AGT-1482), like the
+editor's temp files; an existing export root keeps its own mode.
 
 ### View CSP
 
@@ -89,9 +98,10 @@ Ops arrive from other machines through the hub, so both ends check them
 (`docs/hub-api.md` §push lists the hub's refusals; a replica applies the
 same checks on pull, local commit and `pm backup --restore`).
 
-- **Bounded input (AGT-1467).** A `body.edit` update is at most 32 MiB
-  decoded (`pm_core::MAX_BODY_EDIT_BYTES`), refused at the hub's push and
-  on every client ingest path. A pull page is at most 16 MiB of ops
+- **Bounded input (AGT-1467, AGT-1482).** A `body.edit` update is at most
+  32 MiB decoded (`pm_core::MAX_BODY_EDIT_BYTES`), and every other op's
+  payload at most 1 MiB of JSON (`pm_core::MAX_OP_PAYLOAD_BYTES`), refused
+  at the hub's push and on every client ingest path. A pull page is at most 16 MiB of ops
   (always at least one op), cut in the database, so neither the hub nor a
   client buffers an unbounded page. A replica's pull loop tries each op
   at most 33 times however adversarially the page is ordered.
@@ -99,7 +109,16 @@ same checks on pull, local commit and `pm backup --restore`).
   is parked or refused into a local quarantine (`pm doctor` lists it)
   instead of failing every later `pm sync`; the decision depends only on
   the hub's log, so every replica quarantines the same ops and they still
-  converge (`pm_store::Store::apply_pulled_page` has the argument).
+  converge (`pm_store::Store::apply_pulled_page` has the argument). A
+  refused op's content (its JSON) is dropped 30 days after its refusal
+  (`pm_store::QUARANTINE_RETENTION_MS`), or at once with `pm doctor
+  --prune-quarantine`; its op id, hub seq, kind, entity and reason stay,
+  which is all that keeps it refused (AGT-1482).
+- **Stamps (oaudit 2026-09-30, AGT-1482).** Every op's HLC is range-checked
+  and bounded in the future: one day at the hub's push, seven days on a
+  local commit or `pm backup --restore` (`pm_store::LOCAL_MAX_FUTURE_SKEW_MS`),
+  a year on pull (so a replica with a slow clock still reads). Stamps
+  carried in payloads (`archived_at`, `hold.at`) get the same checks.
 - **Paths (AGT-1450, AGT-1464, AGT-1467).** Workspace prefixes, project
   ids, state names and document names become file paths (`pm export md`,
   backups, editor files). Besides separators, dot-segments and control
@@ -109,7 +128,10 @@ same checks on pull, local commit and `pm backup --restore`).
   workspace prefix `pm init --join` stores is held to the same rule.
 - **Who an op says it is (AGT-1450, AGT-1467).** `op.actor` is written by
   the op's author; the hub stores a fresh op only if the pushing token's
-  actor binding permits it. Document identity trusts it (a binding
+  actor binding permits it. An actor-bound token may not push a seed's
+  ticket numbers, and its `field.set assignee` is arbitrated like a
+  `claim` once seeded, so it cannot take a ticket another actor won
+  (AGT-1482). Document identity trusts it (a binding
   stamped before its project's create counts only under the creator's
   actor), so an unrestricted token (legacy or `--any`) is as trusted as
   any actor; bind every other token to its machine's actors.

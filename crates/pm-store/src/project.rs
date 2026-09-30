@@ -198,7 +198,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let text = commit_doc_edit_in(&tx, doc_id, op)?;
+        let text = commit_doc_edit_in(&tx, doc_id, op, crate::commit::Origin::Local)?;
         tx.commit()?;
         Ok(text)
     }
@@ -279,7 +279,7 @@ pub(crate) fn set_doc_text_in(
             update: update.into_bytes(),
         }),
     );
-    commit_doc_edit_in(tx, doc_id, &op)?;
+    commit_doc_edit_in(tx, doc_id, &op, crate::commit::Origin::Local)?;
     Ok(())
 }
 
@@ -294,7 +294,12 @@ pub(crate) fn load_doc_view(conn: &rusqlite::Connection, doc_id: Ulid) -> Result
     crate::codec::opt_from_json("project_doc_view.view", text)
 }
 
-pub(crate) fn commit_doc_edit_in(tx: &Transaction<'_>, doc_id: Ulid, op: &Op) -> Result<String> {
+pub(crate) fn commit_doc_edit_in(
+    tx: &Transaction<'_>,
+    doc_id: Ulid,
+    op: &Op,
+    origin: crate::commit::Origin,
+) -> Result<String> {
     // AGT-1467: the op is folded into `doc_id`'s view but logged under
     // `op.entity`, and `commit_any` routes any op whose entity is a bound
     // document here — so both must say the same document, and only a
@@ -314,7 +319,7 @@ pub(crate) fn commit_doc_edit_in(tx: &Transaction<'_>, doc_id: Ulid, op: &Op) ->
     )? {
         return Err(StoreError::DuplicateOp { op_id: op.op_id });
     }
-    crate::commit::check_ingest(op)?;
+    crate::commit::check_ingest(op, origin)?;
     ensure_actor(tx, &op.actor)?;
     if !doc_has_row(tx, doc_id)? {
         if !is_known_doc(tx, doc_id)? {
