@@ -3,10 +3,20 @@
 //!
 //! The URL's `sslmode` picks the transport:
 //!
-//! - absent, `disable` or `prefer`: plaintext. This is right for Railway's
-//!   private network (`postgres.railway.internal`) and loopback, and it is
-//!   what production uses today. `prefer` is opportunistic in libpq; here it
-//!   is treated as plaintext rather than guessing.
+//! - absent or `disable`: plaintext. This is right for Railway's private
+//!   network (`postgres.railway.internal`) and loopback, and it is what
+//!   production uses today. An *absent* `sslmode` logs a one-line notice
+//!   the first time a connection is made (AGT-1467), so a deployment that
+//!   moves the database off the private network without adding one does
+//!   not silently send credentials and ops in the clear; `disable` is an
+//!   explicit choice and logs nothing.
+//! - `prefer`: TLS first, then plaintext, as libpq does (AGT-1467). The
+//!   first attempt negotiates TLS (and falls back inside `tokio-postgres`
+//!   if the server offers none); if that attempt fails — a certificate the
+//!   bundled roots do not verify, a failed handshake — the connection is
+//!   retried in plaintext and the failure logged. Like libpq's `prefer`,
+//!   this protects only against a passive listener; use `require` or
+//!   stronger when the network is not trusted.
 //! - `require`, `verify-ca` or `verify-full`: TLS through rustls (ring
 //!   provider, pure Rust, no system OpenSSL). The server certificate is
 //!   always verified against the bundled Mozilla roots (`webpki-roots`) and
@@ -28,7 +38,13 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Transport {
+    /// `sslmode=disable`.
     Plain,
+    /// No `sslmode` at all: plaintext, with a notice (module docs).
+    PlainByDefault,
+    /// `sslmode=prefer`: TLS, falling back to plaintext.
+    Prefer,
+    /// `require`, `verify-ca`, `verify-full`.
     Tls,
 }
 
@@ -58,10 +74,51 @@ pub fn plan(database_url: &str) -> Result<(Transport, String), String> {
             .join(" ")
     };
     let transport = match mode.as_deref() {
-        None | Some("disable") | Some("prefer") => Transport::Plain,
+        None => Transport::PlainByDefault,
+        Some("disable") => Transport::Plain,
+        Some("prefer") => Transport::Prefer,
         Some(_) => Transport::Tls,
     };
     Ok((transport, rewritten))
+}
+
+/// `url` (a `plan` output with `sslmode=prefer`) with `sslmode=disable`
+/// instead: the plaintext retry of a `prefer` connection.
+fn without_tls(url: &str) -> String {
+    let param = |p: &str| {
+        if p == "sslmode=prefer" {
+            "sslmode=disable".to_string()
+        } else {
+            p.to_string()
+        }
+    };
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        match url.split_once('?') {
+            None => url.to_string(),
+            Some((base, query)) => {
+                let params: Vec<String> = query.split('&').map(param).collect();
+                format!("{base}?{}", params.join("&"))
+            }
+        }
+    } else {
+        url.split_whitespace()
+            .map(param)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// The one-line notice for a URL with no `sslmode` (module docs), at most
+/// once per process: a hub opens several connections at start-up.
+fn plaintext_notice() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "pm-hub: notice: the database URL sets no sslmode, so Postgres is reached in \
+             plaintext (right on a private network or loopback; add sslmode=require, or \
+             sslmode=disable to silence this)"
+        );
+    });
 }
 
 fn rewrite_param(param: &str, sep: char, mode: &mut Option<String>) -> Result<String, String> {
@@ -119,10 +176,23 @@ impl Conn {
 pub async fn connect(database_url: &str) -> Result<(Client, Conn), Box<dyn std::error::Error>> {
     let (transport, url) = plan(database_url)?;
     Ok(match transport {
-        Transport::Plain => {
+        Transport::Plain | Transport::PlainByDefault => {
+            if transport == Transport::PlainByDefault {
+                plaintext_notice();
+            }
             let (client, conn) = tokio_postgres::connect(&url, NoTls).await?;
             (client, Conn::Plain(Box::new(conn)))
         }
+        Transport::Prefer => match tokio_postgres::connect(&url, tls_connector()).await {
+            Ok((client, conn)) => (client, Conn::Tls(Box::new(conn))),
+            Err(e) => {
+                eprintln!(
+                    "pm-hub: sslmode=prefer: the TLS attempt failed ({e}); retrying in plaintext"
+                );
+                let (client, conn) = tokio_postgres::connect(&without_tls(&url), NoTls).await?;
+                (client, Conn::Plain(Box::new(conn)))
+            }
+        },
         Transport::Tls => {
             let (client, conn) = tokio_postgres::connect(&url, tls_connector()).await?;
             (client, Conn::Tls(Box::new(conn)))
@@ -139,22 +209,43 @@ mod tests {
     }
 
     #[test]
-    fn no_sslmode_is_plaintext() {
+    fn no_sslmode_is_plaintext_with_a_notice() {
         assert_eq!(
             t("postgres://u:p@postgres.railway.internal:5432/railway"),
-            Transport::Plain
+            Transport::PlainByDefault
         );
         assert_eq!(
             t("postgresql://u@localhost/db?application_name=x"),
-            Transport::Plain
+            Transport::PlainByDefault
         );
-        assert_eq!(t("host=localhost user=u"), Transport::Plain);
+        assert_eq!(t("host=localhost user=u"), Transport::PlainByDefault);
     }
 
     #[test]
-    fn disable_and_prefer_are_plaintext() {
+    fn disable_is_plaintext_and_prefer_tries_tls_first() {
         assert_eq!(t("postgres://u@h/db?sslmode=disable"), Transport::Plain);
-        assert_eq!(t("postgres://u@h/db?sslmode=prefer"), Transport::Plain);
+        assert_eq!(t("host=h sslmode=disable"), Transport::Plain);
+        assert_eq!(t("postgres://u@h/db?sslmode=prefer"), Transport::Prefer);
+        assert_eq!(t("host=h sslmode=prefer user=u"), Transport::Prefer);
+        // The plaintext retry parses and says so.
+        for (url, retry) in [
+            (
+                "postgres://u:p@h/db?application_name=x&sslmode=prefer&connect_timeout=5",
+                "postgres://u:p@h/db?application_name=x&sslmode=disable&connect_timeout=5",
+            ),
+            (
+                "host=h sslmode=prefer user=u",
+                "host=h sslmode=disable user=u",
+            ),
+        ] {
+            let (_, planned) = plan(url).unwrap();
+            assert_eq!(without_tls(&planned), retry);
+            let config: tokio_postgres::Config = retry.parse().unwrap();
+            assert_eq!(
+                config.get_ssl_mode(),
+                tokio_postgres::config::SslMode::Disable
+            );
+        }
     }
 
     #[test]

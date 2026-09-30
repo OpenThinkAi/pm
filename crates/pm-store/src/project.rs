@@ -191,7 +191,9 @@ impl Store {
     /// Appends a `body.edit` op and re-materializes the document it
     /// targets, in one transaction — the document analogue of
     /// [`crate::Store::commit`]. Returns the document's text as it now
-    /// reads.
+    /// reads. Refuses, writing nothing, an op that is not a `body.edit`
+    /// whose `entity` is `doc_id` ([`StoreError::NotADocumentEdit`],
+    /// AGT-1467).
     pub fn commit_doc_edit(&mut self, doc_id: Ulid, op: &Op) -> Result<String> {
         let tx = self
             .conn
@@ -293,6 +295,18 @@ pub(crate) fn load_doc_view(conn: &rusqlite::Connection, doc_id: Ulid) -> Result
 }
 
 pub(crate) fn commit_doc_edit_in(tx: &Transaction<'_>, doc_id: Ulid, op: &Op) -> Result<String> {
+    // AGT-1467: the op is folded into `doc_id`'s view but logged under
+    // `op.entity`, and `commit_any` routes any op whose entity is a bound
+    // document here — so both must say the same document, and only a
+    // `body.edit` belongs in one.
+    if op.entity != doc_id || !matches!(op.payload, Payload::BodyEdit(_)) {
+        return Err(StoreError::NotADocumentEdit {
+            op_id: op.op_id,
+            kind: op.kind(),
+            entity: op.entity,
+            doc_id,
+        });
+    }
     if exists(
         tx,
         "SELECT 1 FROM ops WHERE op_id = ?1",
@@ -310,7 +324,10 @@ pub(crate) fn commit_doc_edit_in(tx: &Transaction<'_>, doc_id: Ulid, op: &Op) ->
         // an earlier one, or a deleted project's document (AGT-1413): the
         // edit joins the log, and nothing is materialized for it (the
         // replay rebuilds rows' documents only), so there is no view to
-        // fold it into either.
+        // fold it into either. Its update must still decode (AGT-1467):
+        // it is folded into a scratch view first, so bytes no replica
+        // could import never reach the log (or the hub, on the next push).
+        apply_doc(&mut DocView::new(doc_id), op)?;
         append_op(tx, op)?;
         return Ok(String::new());
     }

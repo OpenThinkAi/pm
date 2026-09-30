@@ -861,7 +861,7 @@ report what changed, then run the same report).
     "schema": 1,
     "healthy": true,
     "rebuilt": {"tables": [...]} | null,   // a Diff, only present with --rebuild
-    "schema_version": 9,                    // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state); 9 since AGT-1396 (seeded flag)
+    "schema_version": 12,                   // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state); 9 since AGT-1396 (seeded flag); 12 since AGT-1467 (sync quarantine)
     "op_count": 30,
     "tables": {"ticket": 5, "comment": 2, ...},
     "integrity": [],                        // SQLite integrity_check messages, if any
@@ -873,15 +873,32 @@ report what changed, then run the same report).
       "pushed_through": 0,                  // every op with seq <= this is known to the hub
       "cursor": 0,                          // hub seq the last pull got through; 0 = never pulled
       "pending_numbers": 0,                 // tickets created with a hub configured, still awaiting a number
-      "seeded": false                       // the hub is this workspace's authority: its seed ended (AGT-1396)
-    }
+      "seeded": false,                      // the hub is this workspace's authority: its seed ended (AGT-1396)
+      "parked": 0,                          // pulled ops parked, waiting on an op not pulled yet (AGT-1467)
+      "refused": 0                          // pulled ops refused as inadmissible (AGT-1467)
+    },
+    "quarantine": [                         // pulled ops `pm sync` kept out of the log (AGT-1467), hub seq order;
+      {                                     //   informational, never affects "healthy"
+        "op_id": "<ULID>",
+        "hub_seq": 1234,                    // the op's seq in the hub's log
+        "kind": "ticket.create",
+        "entity": "<ULID>",
+        "status": "parked" | "refused",
+        "attempts": 0,                      // retries while parked
+        "reason": "string",                 // what it waits on, or why it can never apply
+        "recorded_ms": 1790000000000        // when this replica recorded it
+      }
+    ]
   }
   ```
 - Text output adds a `sync` line: `outbox N op(s), pushed through seq S,
   cursor C, P ticket(s) awaiting a hub number`, where `S` is a local op-log
   `seq` (not a ticket number) and a zero cursor reads `0 (never pulled)`,
   and a `seeded` line: `yes (the hub is this workspace's authority)` or
-  `no (…)`.
+  `no (…)`, and a `quarantine` line: `none`, or `P parked, R refused
+  (pulled ops kept out of the log)` followed by one indented line per op
+  (`<status> <op_id> <kind> (hub seq N, entity E): <reason>`; see `pm sync`
+  §Quarantine).
 
 ### `pm archive [ID]`
 
@@ -1428,10 +1445,40 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
   local database admitted while it was the authority (before the seed
   ended); `pm claim` itself goes to the hub and never leaves one behind.
 - **Pull.** `GET …/ops?since=<cursor>&limit=1000`, page by page until
-  `next >= head`. Each page is applied in one transaction (foreign ops go
-  through the normal commit path; an op already present by `op_id` — this
-  replica's own, echoed back — is skipped and counts as pushed), and the
-  cursor moves to the page's `next` only after that transaction commits.
+  `next >= head` (the hub also cuts a page at 16 MiB of ops,
+  `docs/hub-api.md`). Each page is applied in one transaction (foreign ops
+  go through the normal commit path; an op already present by `op_id` —
+  this replica's own, echoed back — is skipped and counts as pushed), and
+  the cursor moves to the page's `next` in that same transaction
+  (AGT-1467), so a page is never applied twice.
+- **Quarantine** (AGT-1467). A pulled op this replica cannot apply no
+  longer fails the sync — which, since the hub serves it again from the
+  same cursor, used to fail every later sync too. Instead it is kept out
+  of the log, recorded in the database, and the rest of the page lands:
+  - **parked** — it waits on something not pulled yet (its ticket, a
+    relation target, a project, state or document binding, or the edits
+    a `body.edit` builds on). It is retried, in hub order, whenever an op
+    that could supply it lands, and lands itself once that works (counted
+    in `unparked`). One still waiting after 32 retries is refused.
+  - **refused** — it can never apply here: an id or name unsafe in a file
+    path, a stamp out of range, a `body.edit` over 32 MiB, a second
+    `project.create`, a document binding or ticket id already in use, a
+    number already taken, an update that does not decode. Each is
+    reported on stderr (`pm: refused pulled op <op_id> (<kind>, hub seq
+    N): <reason>; kept out of the log (see `pm doctor`)`) and listed under
+    `refused` in `--json`; it is never retried.
+
+  Every replica quarantines the same ops however the log was paged (the
+  rules depend only on the hub's log, and the parked set carries over
+  between pages), so replicas still converge. Two failures are *not*
+  quarantined and still exit `1`, leaving the cursor where it was: an op
+  this build cannot parse (a newer build's kind — skipping it for good
+  would leave this replica diverged after an upgrade; upgrade `pm`), and a
+  pulled stamp more than 365 days ahead of this machine's clock (whether
+  it is depends on the clock; fix the clock). The hub refuses every
+  quarantinable op at push today, so a quarantine only ever holds ops the
+  hub stored before it checked them (or a hostile hub's). `pm doctor`
+  lists the quarantine; nothing in it is pushed, backed up or replayed.
   A hub-authored `field.set number` (AGT-1391) arrives like any other op
   and clears the ticket's pending-number flag: a ticket `pm new` filed as
   `AGT-?` (AGT-1398) reads `AGT-N` from this sync on. (The push response
@@ -1444,7 +1491,8 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
   answer for a rejected token or an unknown workspace; the message says to
   run `pm hub status`); the hub refuses a batch or query with a structured
   `400`/`413` (`error` and `reason` are quoted, with the op's index and id
-  when given); `503`; or the store refuses a pulled op. Local state stays
+  when given); `503`; a pulled op this build cannot parse, or one stamped
+  far in the future (see Quarantine); or the local database fails. Local state stays
   exactly as it was apart from what had already been committed — every
   batch the hub acknowledged is marked, every page applied has advanced
   the cursor.
@@ -1474,7 +1522,13 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
     "pushed": 3,                // outbox ops the hub acknowledged this round (the seed's included)
     "pulled": 5,                // ops received from the hub this round
     "applied": 4,               // of those, foreign ops committed into the log
-    "skipped": 1,               // of those, already present (this replica's own, echoed back)
+    "skipped": 1,               // of those, already present (this replica's own, echoed back) or already quarantined
+    "unparked": 0,              // ops parked by an earlier round that landed in this one (AGT-1467)
+    "parked": 0,                // ops pulled this round and parked, waiting on an op not pulled yet
+    "refused": [],              // ops refused this round, kept out of the log (AGT-1467):
+                                //   {"op_id", "hub_seq", "kind", "entity", "status": "refused",
+                                //    "attempts", "reason", "recorded_ms"}
+    "quarantine": {"parked": 0, "refused": 0},  // what the quarantine holds after the round (= pm doctor)
     "cursor": 42,               // hub seq the pull got through (= pm doctor's sync.cursor)
     "head": 42,                 // the hub's largest seq as of the last page
     "outbox": 0,                // ops still unacknowledged after the round
@@ -1493,8 +1547,10 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
   }
   ```
 - Text output is one line: `pushed 3 op(s); pulled 5 op(s): 4 applied,
-  1 skipped; cursor 42 (hub head 42)`, with `; N op(s) still in the outbox`
-  and `; N ticket(s) still awaiting a hub number` appended when non-zero,
+  1 skipped; cursor 42 (hub head 42)`, with `; N op(s) still in the outbox`,
+  `; N ticket(s) still awaiting a hub number`, `; N parked op(s) applied`,
+  `; N pulled op(s) refused and kept out of the log` and `; quarantine: P
+  parked, R refused (`pm doctor` lists them)` appended when non-zero,
   and — on the round that seeded — prefixed with `seeded hub workspace
   <id> ([resumed; ]N op(s), number floor F, K ticket(s) numbered by the
   hub); `.

@@ -25,9 +25,17 @@ nothing (think-hub precedent). A wrong method on a real route is that
   config.toml is refused by `pm hub status` and every sync/claim call with
   a message to re-login over `https://`.
 - **Hub to Postgres.** `DATABASE_URL`'s `sslmode` picks the transport
-  (AGT-1451): absent, `disable` or `prefer` is plaintext — correct for
-  Railway's private network (`postgres.railway.internal`) and loopback, and
-  what production uses. `require`, `verify-ca` and `verify-full` all use TLS
+  (AGT-1451): absent or `disable` is plaintext — correct for Railway's
+  private network (`postgres.railway.internal`) and loopback, and what
+  production uses. An *absent* `sslmode` prints one notice line on stderr
+  when the first connection is made (`pm-hub: notice: the database URL
+  sets no sslmode, …`; AGT-1467), so a database moved off the private
+  network without one is not silently plaintext; `sslmode=disable` states
+  the choice and prints nothing. `prefer` tries TLS first and falls back to
+  plaintext as libpq does (AGT-1467): plaintext when the server offers no
+  TLS, and — logged on stderr — when the TLS attempt fails (e.g. a
+  certificate the bundled roots do not verify). Like libpq's `prefer`, it
+  stops only a passive listener. `require`, `verify-ca` and `verify-full` all use TLS
   via rustls with the bundled Mozilla roots (`webpki-roots`) and always
   verify the certificate chain and host name; there is no
   accept-any-certificate mode, so a private-CA or self-signed server is
@@ -100,6 +108,19 @@ to reconcile after the hub refused its claim (`field.set assignee` to
 third actor made on a bound token's machine is refused whole with the
 rest of its batch, so bind a machine's token to every actor it assigns
 work to (or use `--any`).
+
+**Why document identity relies on this (AGT-1467).** A project's
+design doc and named documents go to the *earliest* binding
+(`project.doc_add` / the create's `doc_id`), and a binding stamped before
+the project's `project.create` counts only when its `actor` is the
+creator's (`pm_core::DocClaims`, AGT-1464). That `actor` is a field the
+op's writer fills in; what stops a peer from backdating a
+`project.doc_add` to `hlc 0` under the creator's actor (or `migrate`,
+migration 0007's creator) is this binding: the push is `400
+actor_not_allowed` unless the token is bound to that actor or
+unrestricted — a token that could author as the creator anyway. Legacy
+and `--any` tokens are therefore as trusted as the creator; bind every
+other machine's token to its own actors.
 
 **Ending the seed (AGT-1463).** `POST /w/{workspace}/seeded` is one-way
 and sets the number floor, so only an unrestricted token (legacy, `--any`
@@ -290,7 +311,8 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 | `400` | `invalid_op` | `index` (position in the batch), `op_id` (if the JSON had one) | an op does not parse as `pm_core::Op`, its `actor` is empty, its `version` is newer than the hub's, a `field.set number` carries a number outside `1..=2^53-1`, or it does not fold into its ticket with `pm_core::apply` (a relation that does not touch the ticket), or it fails an admission rule (AGT-1464): a `project.create` for a project the log already has one for (`already has a project.create` — a backdated second create would move the stamp document identity is anchored to), or a `ticket.create` whose entity is already bound as a project document (`already a project document`); a replica refuses the same on every commit path, a pull included (`StoreError::DuplicateProjectCreate` / `EntityInUse`) |
 | `400` | `invalid_stamp` | `index`, `op_id` | the op's `hlc.wall_ms` exceeds `i64::MAX` or its `hlc.counter` is `u32::MAX` (see Stamps above) |
 | `400` | `future_stamp` | `index`, `op_id` | the op's `hlc.wall_ms` is more than one day ahead of the hub's clock |
-| `400` | `invalid_id` | `index`, `op_id` | a `workspace.set prefix`, `project.create` (id or parent), `project.set parent`, or a ticket's project (`ticket.create`, `field.set project`) whose value is not a safe file-path component (`pm_core::ids::is_safe_component`: ASCII letters, digits, `-`, `_`, `.`, at most 64 bytes, not starting with `.`); a state name (`state.upsert`, `ticket.create`, `state.transition`) that is not `pm_core::ids::is_safe_segment` (1–255 bytes, not starting with `.`, no `/`, `\` or control characters); or a `project.doc_add` name that is not `pm_core::ids::is_safe_doc_name` (`/`-separated safe segments, so no `.`/`..`, leading or trailing `/`; at most 255 bytes) — clients use these in export/backup paths (AGT-1453, AGT-1464); a replica refuses the same on pull, local commit and restore (`StoreError::InvalidId`) |
+| `400` | `op_too_large` | `index`, `op_id` | a `body.edit` whose decoded update is over 32 MiB (`pm_core::MAX_BODY_EDIT_BYTES`, AGT-1467) — every replica would import, snapshot and re-serve it; a replica refuses the same on pull, local commit and restore (`StoreError::OpTooLarge`) |
+| `400` | `invalid_id` | `index`, `op_id` | a `workspace.set prefix`, `project.create` (id or parent), `project.set parent`, or a ticket's project (`ticket.create`, `field.set project`) whose value is not a safe file-path component (`pm_core::ids::is_safe_component`: ASCII letters, digits, `-`, `_`, `.`, at most 64 bytes, not starting with `.`, not a Windows device name); a state name (`state.upsert`, `ticket.create`, `state.transition`) that is not `pm_core::ids::is_safe_segment` (1–255 bytes, not starting with `.`, no `/`, `\`, `:` or control characters, not a Windows device name — `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`9`, `LPT1`–`9`, `CONIN$`, `CONOUT$`, any case, any extension; AGT-1467); or a `project.doc_add` name that is not `pm_core::ids::is_safe_doc_name` (`/`-separated safe segments, so no `.`/`..`, leading or trailing `/`; at most 255 bytes) — clients use these in export/backup paths (AGT-1453, AGT-1464); a replica refuses the same on pull, local commit and restore (`StoreError::InvalidId`) |
 | `400` | `actor_not_allowed` | `index`, `op_id` | a fresh op's `actor`, or an actor its payload names (`claim.assignee`, `hold.by`, `field.set assignee`, `actor.upsert id`), matches none of the token's actor patterns; `reason` names the token, its patterns and the field (see [Token actor bindings](#token-actor-bindings-agt-1450)) |
 | `400` | `reserved_actor` | `index`, `op_id` | a fresh op authored as `hub`, or naming `hub` in one of those payload fields — from any token once the workspace is seeded, from a bound token while seeding |
 | `400` | `foreign_workspace` | `index`, `op_id` | a config op (`workspace.set`, `state.upsert`, `actor.upsert`) for a workspace Ulid other than the one this hub workspace's config already belongs to |
@@ -300,10 +322,11 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 | `413` | `too_large` | — | the body exceeds 64 MiB (by `Content-Length`, answered before reading; or discovered while reading) |
 
 Limits: **1000 ops per batch, 64 MiB per request body**
-(`pm_hub::ops::{MAX_BATCH_OPS, MAX_BODY_BYTES}`). The byte limit leaves
-room for a single large op — the Studio's seed log holds one 23 MB
-`body.edit` — plus a batch around it; a client should size batches by
-both count and bytes.
+(`pm_hub::ops::{MAX_BATCH_OPS, MAX_BODY_BYTES}`), and **32 MiB per
+`body.edit` update** (decoded; `pm_core::MAX_BODY_EDIT_BYTES`, AGT-1467).
+The byte limit leaves room for a single large op — the Studio's seed log
+holds one 23 MB `body.edit` (about 17 MiB decoded) — plus a batch around
+it; a client should size batches by both count and bytes.
 
 ## `GET /w/{workspace}/ops?since=<seq>&limit=<n>` — pull (AGT-1390)
 
@@ -312,6 +335,16 @@ them. Both parameters are optional: `since` defaults to `0` (the whole
 log), `limit` to **500** and is clamped to **1000**
 (`pm_hub::pull::{DEFAULT_PAGE_OPS, MAX_PAGE_OPS}`, the push batch cap).
 Any other parameter is a `400`.
+
+**Byte cap (AGT-1467).** Whatever `limit` says, a page stops before
+**16 MiB** of op text (`pm_hub::pull::MAX_PAGE_BYTES`): it is the longest
+run of ops from `since` whose stored JSON totals at most that, cut in the
+database so the hub never buffers more. A page past `since` always holds
+at least one op, so an op bigger than the cap (up to a push's 64 MiB) is
+served alone and the cursor still moves. A byte-capped page is an
+ordinary short page — `next` is its last seq and `next < head` — so every
+client that pages until `next >= head` (all of them, old and new) needs
+nothing else.
 
 Response `200`:
 
@@ -332,8 +365,9 @@ Response `200`:
   `seq` in `ops`, or the request's own `since` when `ops` is empty.
 - `head` is the workspace's largest seq (`0` for an empty log), read in
   the same snapshot as the page. `next < head` means more ops were
-  already waiting; `next >= head` means the client had everything as of
-  that snapshot. A client pages `since = next` until `next >= head`.
+  already waiting (the page hit `limit` or the byte cap); `next >= head`
+  means the client had everything as of that snapshot. A client pages
+  `since = next` until `next >= head`.
 - The cursor is gap-safe: seqs are handed out and committed in order
   per workspace (see "How the order is kept"), so every seq at or below
   `head` is committed when `head` is read, and no op with a seq at or

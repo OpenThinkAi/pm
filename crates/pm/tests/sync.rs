@@ -1394,3 +1394,162 @@ fn seed_refusals_exit_1_and_change_nothing() {
     assert_eq!(x.sync_state(), x_state);
     assert!(x.pm(&["doctor"]).status.success());
 }
+
+// ================================================== quarantine (AGT-1467)
+
+/// Stores `op` in the hub's log behind its back — an op the hub took
+/// before it checked what it checks today — and returns its seq.
+fn legacy_op(db: &str, hub_ws: &str, op: &Op) -> i64 {
+    let text = serde_json::to_string(op).unwrap();
+    assert!(!text.contains('\''));
+    let rows = hub::query_rows(
+        db,
+        &format!(
+            "INSERT INTO ops (workspace_id, op_id, hlc_wall_ms, hlc_counter, actor, entity, kind, op)
+             VALUES ('{hub_ws}', '{}', {}, {}, '{}', '{}', '{}', '{text}'::json)
+             RETURNING seq",
+            op.op_id,
+            op.hlc.wall_ms,
+            op.hlc.counter,
+            op.actor.as_str(),
+            op.entity,
+            op.kind()
+        ),
+    )
+    .unwrap();
+    rows[0][0].as_deref().unwrap().parse().unwrap()
+}
+
+/// AC1 end to end: a legacy op in the hub's log that no replica can apply
+/// no longer fails every `pm sync`. It is refused (reported on stderr and
+/// under `refused`), one that waits on an op never pushed is parked, the
+/// rest of the log flows around both, the cursor passes them, and
+/// `pm doctor` lists them — on the replica that was there and on a
+/// replica joined afterwards alike.
+#[test]
+fn a_pulled_op_that_cannot_apply_is_quarantined_not_fatal() {
+    let Some((_container, db)) =
+        postgres_for("a_pulled_op_that_cannot_apply_is_quarantined_not_fatal")
+    else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&db, port);
+    wait_for_health(&mut hub, port);
+    let hub_url = format!("http://127.0.0.1:{port}");
+
+    let mut alice = Replica::init("alice");
+    let hub_ws = alice.workspace_id().to_ascii_lowercase();
+    let token = create_token(&db, "alice", &hub_ws);
+    alice.ok(&["new", "--title", "before"]);
+    alice.configure(&hub_url, &token);
+    alice.sync();
+
+    // A ticket in a state named like a Windows device (refused), and a
+    // comment on a ticket that was never pushed (parked).
+    let bad = Op::new(
+        Ulid::new(),
+        pm_core::Hlc::new(1_000, 0),
+        ActorId::new("mallory"),
+        Ulid::new(),
+        Payload::TicketCreate(TicketCreate {
+            title: "bad".into(),
+            state: "NUL".into(),
+            priority: Priority::Medium,
+            project: None,
+            repo: None,
+            source: None,
+            ext: Default::default(),
+        }),
+    );
+    let orphan = Op::new(
+        Ulid::new(),
+        pm_core::Hlc::new(1_001, 0),
+        ActorId::new("mallory"),
+        Ulid::new(),
+        Payload::CommentAdd(CommentAdd {
+            body: "on nothing".into(),
+        }),
+    );
+    let bad_seq = legacy_op(&db, &hub_ws, &bad);
+    legacy_op(&db, &hub_ws, &orphan);
+    let mut bob = Replica::join(&alice.workspace_id(), "bob");
+    bob.configure(&hub_url, &token);
+    // An honest op after both.
+    let bob_first = bob.pm(&["sync", "--json"]);
+    assert!(bob_first.status.success(), "{}", err(&bob_first));
+    bob.ok(&["new", "--title", "after"]);
+    bob.sync();
+
+    for r in [&alice, &bob] {
+        let out = r.pm(&["sync", "--json"]);
+        assert!(out.status.success(), "{}: {}", r.actor, err(&out));
+        let round: Value = serde_json::from_slice(&out.stdout).unwrap();
+        // Bob already pulled both in his first round; Alice now.
+        if r.actor == "alice" {
+            let refused = round["refused"].as_array().unwrap();
+            assert_eq!(refused.len(), 1, "{round}");
+            assert_eq!(refused[0]["op_id"], bad.op_id.to_string());
+            assert_eq!(refused[0]["hub_seq"], bad_seq);
+            assert_eq!(refused[0]["status"], "refused");
+            assert_eq!(round["parked"], 1, "{round}");
+            assert!(
+                err(&out).contains(&format!("refused pulled op {}", bad.op_id)),
+                "{}",
+                err(&out)
+            );
+        }
+        assert_eq!(
+            round["quarantine"],
+            json!({"parked": 1, "refused": 1}),
+            "{round}"
+        );
+        assert_eq!(round["cursor"], round["head"], "{round}");
+        // Both tickets arrived around the quarantined ops.
+        let (code, list) = r.json(&["list"]);
+        assert_eq!(code, 0);
+        let titles: BTreeSet<String> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            titles,
+            BTreeSet::from(["before".to_string(), "after".to_string()]),
+            "{}",
+            r.actor
+        );
+        let (code, doctor) = r.json(&["doctor"]);
+        assert_eq!(code, 0, "quarantine never affects health: {doctor}");
+        let q = doctor["quarantine"].as_array().unwrap();
+        let listed: Vec<(&str, &str)> = q
+            .iter()
+            .map(|e| (e["op_id"].as_str().unwrap(), e["status"].as_str().unwrap()))
+            .collect();
+        let (bad_id, orphan_id) = (bad.op_id.to_string(), orphan.op_id.to_string());
+        assert_eq!(
+            listed,
+            [(bad_id.as_str(), "refused"), (orphan_id.as_str(), "parked")],
+            "{}",
+            r.actor
+        );
+        assert_eq!(
+            (
+                doctor["sync"]["parked"].as_u64(),
+                doctor["sync"]["refused"].as_u64()
+            ),
+            (Some(1), Some(1))
+        );
+        let text = r.ok(&["doctor"]);
+        assert!(
+            out_s(&text).contains("quarantine      1 parked, 1 refused"),
+            "{}",
+            out_s(&text)
+        );
+        // A further round is quiet.
+        let again = r.sync();
+        assert_eq!(counts(&again), (0, 0, 0, 0), "{again}");
+        assert_eq!(again["refused"], json!([]));
+    }
+}

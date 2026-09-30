@@ -27,6 +27,25 @@ use crate::hlc::{Hlc, Stamp};
 /// kinds of AGT-1384 landed this way).
 pub const OP_VERSION: u16 = 1;
 
+/// Largest `body.edit` update, in decoded bytes (32 MiB; AGT-1467). A
+/// remote update is imported into a Loro document, snapshotted into every
+/// view and re-served to every replica, so an unbounded one is a
+/// memory and storage denial of service. The bound sits well above the
+/// largest honest update on record (the Studio seed's ~17 MiB document
+/// edit, 23 MB as base64 JSON) and, as base64 inside a push, under the
+/// hub's 64 MiB request limit. Checked at the hub's push and on every
+/// client ingest path ([`Op::check_size`]).
+pub const MAX_BODY_EDIT_BYTES: usize = 32 * 1024 * 1024;
+
+/// An op whose payload is over its size bound ([`Op::check_size`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{kind} update is {bytes} bytes, over the {max}-byte limit")]
+pub struct OpTooLarge {
+    pub kind: &'static str,
+    pub bytes: usize,
+    pub max: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Op {
     pub op_id: Ulid,
@@ -73,6 +92,19 @@ impl Op {
     /// The `(hlc, actor)` key every merge rule orders by.
     pub fn stamp(&self) -> Stamp {
         Stamp::new(self.hlc, self.actor.clone())
+    }
+
+    /// Refuses a `body.edit` whose update is over [`MAX_BODY_EDIT_BYTES`].
+    /// Every other kind is bounded only by the hub's request limit.
+    pub fn check_size(&self) -> Result<(), OpTooLarge> {
+        match &self.payload {
+            Payload::BodyEdit(edit) if edit.update.len() > MAX_BODY_EDIT_BYTES => Err(OpTooLarge {
+                kind: self.kind(),
+                bytes: edit.update.len(),
+                max: MAX_BODY_EDIT_BYTES,
+            }),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -399,6 +431,33 @@ mod tests {
             Ulid::new(),
             payload,
         )
+    }
+
+    /// AGT-1467: a `body.edit` over the bound is refused; at the bound,
+    /// and every other kind, passes.
+    #[test]
+    fn body_edits_are_size_bounded() {
+        let edit = |len: usize| {
+            op(Payload::BodyEdit(BodyEdit {
+                update: vec![0; len],
+            }))
+        };
+        assert_eq!(edit(MAX_BODY_EDIT_BYTES).check_size(), Ok(()));
+        assert_eq!(edit(0).check_size(), Ok(()));
+        let e = edit(MAX_BODY_EDIT_BYTES + 1).check_size().unwrap_err();
+        assert_eq!(
+            e,
+            OpTooLarge {
+                kind: "body.edit",
+                bytes: MAX_BODY_EDIT_BYTES + 1,
+                max: MAX_BODY_EDIT_BYTES
+            }
+        );
+        for other in all_kinds() {
+            if !matches!(other.payload, Payload::BodyEdit(_)) {
+                assert_eq!(other.check_size(), Ok(()), "{}", other.kind());
+            }
+        }
     }
 
     fn all_kinds() -> Vec<Op> {

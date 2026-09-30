@@ -291,7 +291,8 @@ fn apply_pulled_commits_foreign_ops_that_never_enter_the_outbox() {
         pulled,
         Pulled {
             applied: ops.len(),
-            skipped: 0
+            skipped: 0,
+            ..Pulled::default()
         }
     );
     let t = store.ticket(a).unwrap().unwrap();
@@ -332,7 +333,8 @@ fn apply_pulled_is_idempotent() {
         store.apply_pulled(&ops).unwrap(),
         Pulled {
             applied: 0,
-            skipped: ops.len()
+            skipped: ops.len(),
+            ..Pulled::default()
         }
     );
     let mut twice = ops.clone();
@@ -341,7 +343,8 @@ fn apply_pulled_is_idempotent() {
         store.apply_pulled(&twice).unwrap(),
         Pulled {
             applied: 0,
-            skipped: twice.len()
+            skipped: twice.len(),
+            ..Pulled::default()
         }
     );
 
@@ -368,7 +371,8 @@ fn a_duplicate_inside_one_batch_applies_once() {
         store.apply_pulled(&doubled).unwrap(),
         Pulled {
             applied: ops.len(),
-            skipped: 1
+            skipped: 1,
+            ..Pulled::default()
         }
     );
 }
@@ -583,7 +587,8 @@ fn a_local_op_echoed_back_by_the_hub_leaves_the_outbox() {
         store.apply_pulled(std::slice::from_ref(&mine)).unwrap(),
         Pulled {
             applied: 0,
-            skipped: 1
+            skipped: 1,
+            ..Pulled::default()
         }
     );
     assert_eq!(store.outbox_len().unwrap(), 0);
@@ -814,7 +819,8 @@ fn a_pulled_config_batch_folds_in_any_order_and_is_not_outbox() {
         pulled,
         Pulled {
             applied: 5,
-            skipped: 0
+            skipped: 0,
+            ..Pulled::default()
         }
     );
 

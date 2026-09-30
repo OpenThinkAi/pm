@@ -112,6 +112,22 @@ pub enum StoreError {
     /// AGT-1450, AGT-1464) — refused on every ingest path.
     #[error(transparent)]
     InvalidId(#[from] pm_core::ids::IdError),
+    /// A `body.edit` whose update is over [`pm_core::MAX_BODY_EDIT_BYTES`]
+    /// (AGT-1467) — refused on every ingest path, like the hub's push.
+    #[error(transparent)]
+    OpTooLarge(#[from] pm_core::OpTooLarge),
+    /// The document commit path was handed an op that is not a
+    /// `body.edit` of that document (AGT-1467): another kind, or an
+    /// `entity` other than the `doc_id` it is folded into. Only a crafted
+    /// op (a tampered backup restored through [`crate::Store::commit_any`])
+    /// or a caller bug produces it; nothing is written.
+    #[error("op {op_id} ({kind}, entity {entity}) is not a body.edit of document {doc_id}")]
+    NotADocumentEdit {
+        op_id: Ulid,
+        kind: &'static str,
+        entity: Ulid,
+        doc_id: Ulid,
+    },
     /// A stored column no longer decodes (a JSON blob or a ULID). Only a
     /// foreign writer or a schema bug can produce this.
     #[error("stored {what} is corrupt: {detail}")]

@@ -35,7 +35,8 @@
 //!   ops, the pending-number marker for tickets awaiting a hub number, and
 //!   (AGT-1396) the seeded flag plus the seed's helpers — which of a set of
 //!   op ids the log lacks, and [`Store::join_workspace`], the empty replica
-//!   a second machine starts from
+//!   a second machine starts from; and (AGT-1467) the quarantine of pulled
+//!   ops that cannot apply ([`Store::apply_pulled_page`])
 //! - [`StoreError`] — typed failures (R2/R4/R5 violations, claim rejection, …)
 
 mod backfill;
@@ -68,7 +69,9 @@ pub use doctor::{
 pub use error::{Result, StoreError};
 pub use query::TicketFilter;
 pub use ready::ReadyQuery;
-pub use sync::{PULL_MAX_FUTURE_SKEW_MS, Pulled, SyncStatus};
+pub use sync::{
+    MAX_PARK_RETRIES, PULL_MAX_FUTURE_SKEW_MS, Pulled, QuarantineStatus, Quarantined, SyncStatus,
+};
 
 /// Embedded migrations, in order. Each runs once, inside its own
 /// transaction, and is recorded in `schema_version`.
@@ -84,10 +87,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (9, include_str!("../migrations/0009_sync_seeded.sql")),
     (10, include_str!("../migrations/0010_docs_owned_by.sql")),
     (11, include_str!("../migrations/0011_reserialize_views.sql")),
+    (12, include_str!("../migrations/0012_sync_quarantine.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// The migration whose work is Rust, not SQL: after its (comment-only)
 /// SQL file runs, [`reencode::run`] rewrites every stored byte payload in

@@ -249,7 +249,8 @@ pub(crate) fn commit_foreign_in(tx: &Transaction<'_>, op: &Op) -> Result<Option<
 /// since AGT-1464): the stamp is storable and not more than
 /// [`crate::PULL_MAX_FUTURE_SKEW_MS`] ahead of this machine's clock, and
 /// every identifier or name it carries that becomes a file path is safe
-/// ([`pm_core::ids::check_op_ids`]). A replay of the log (`pm doctor
+/// ([`pm_core::ids::check_op_ids`]), and a `body.edit` is within
+/// [`pm_core::MAX_BODY_EDIT_BYTES`] (AGT-1467). A replay of the log (`pm doctor
 /// --rebuild`) does not re-check: what is in the log already passed.
 pub(crate) fn check_ingest(op: &Op) -> Result<()> {
     check_ingest_at(op, now_ms())
@@ -260,6 +261,7 @@ pub(crate) fn check_ingest_at(op: &Op, now_ms: u64) -> Result<()> {
     op.hlc
         .check_not_after(now_ms, crate::sync::PULL_MAX_FUTURE_SKEW_MS)?;
     pm_core::ids::check_op_ids(op)?;
+    op.check_size()?;
     Ok(())
 }
 

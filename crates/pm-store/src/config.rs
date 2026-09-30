@@ -484,9 +484,9 @@ fn next_view(tx: &Transaction<'_>, op: &Op) -> Result<ConfigView> {
                 }
                 // A `project.set` or `project.doc_add` ahead of its
                 // `project.create`: the view could fold it (pm-core allows
-                // it), but a row needs the slug the create carries — defer
-                // it (`apply_pulled` retries once the rest of the batch
-                // has landed).
+                // it), but a row needs the slug the create carries — a
+                // pull parks it and retries it once a config op lands
+                // (`sync::disposition`).
                 None => {
                     return Err(StoreError::UnknownProjectEntity { project: op.entity });
                 }

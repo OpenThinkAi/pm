@@ -215,3 +215,48 @@ fn a_separate_migration_role_leaves_the_server_dml_only() {
         "{err}"
     );
 }
+
+/// AGT-1467: `sslmode=prefer` tries TLS first and, against a server that
+/// offers none (the test Postgres), connects in plaintext as libpq does;
+/// an absent `sslmode` connects in plaintext and says so once on stderr;
+/// an explicit `disable` says nothing; `require` still refuses a server
+/// without TLS.
+#[test]
+fn sslmode_prefer_falls_back_and_an_absent_sslmode_is_announced() {
+    let Some((_container, url)) =
+        postgres_for("sslmode_prefer_falls_back_and_an_absent_sslmode_is_announced")
+    else {
+        return;
+    };
+    // Migrate once, through the server.
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    assert_eq!(wait_for_health(&mut hub, port).0, 200);
+    drop(hub);
+
+    let with = |mode: &str| {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}sslmode={mode}")
+    };
+    let notice = "sets no sslmode";
+    let list = ["token", "list"];
+
+    let (ok, _, stderr) = admin(&url, &list);
+    assert!(ok, "{stderr}");
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+    assert!(
+        !stderr.contains("pm-hub-test"),
+        "the password leaked: {stderr}"
+    );
+
+    let (ok, _, stderr) = admin(&with("prefer"), &list);
+    assert!(ok, "prefer must fall back to plaintext: {stderr}");
+    assert!(!stderr.contains(notice), "{stderr}");
+
+    let (ok, _, stderr) = admin(&with("disable"), &list);
+    assert!(ok, "{stderr}");
+    assert!(!stderr.contains(notice), "{stderr}");
+
+    let (ok, _, stderr) = admin(&with("require"), &list);
+    assert!(!ok, "require must not fall back: {stderr}");
+}

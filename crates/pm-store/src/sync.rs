@@ -28,7 +28,7 @@
 //! All of it is bookkeeping written directly, like `backup_target`: not
 //! derived from the op log, untouched by `pm doctor --rebuild`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use pm_core::{ApplyError, DocApplyError, Op, Payload};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -43,15 +43,59 @@ use crate::error::{Result, StoreError};
 use crate::project::{commit_doc_edit_in, is_known_doc};
 use crate::query::read_ops;
 
-/// What [`Store::apply_pulled`] did with a batch.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// What [`Store::apply_pulled`] / [`Store::apply_pulled_page`] did with a
+/// batch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Pulled {
-    /// Foreign ops committed into the log.
+    /// Foreign ops committed into the log — this batch's, and any parked
+    /// by an earlier page that landed in this one.
     pub applied: usize,
     /// Ops already present by `op_id` (this replica's own ops echoed back,
-    /// a re-pulled batch, or a duplicate within the batch) — left alone.
+    /// a re-pulled batch, or a duplicate within the batch), already
+    /// quarantined, or at or below the cursor — left alone.
     pub skipped: usize,
+    /// Of `applied`, ops an earlier page had parked (AGT-1467).
+    pub unparked: usize,
+    /// This batch's ops still parked when it was committed, waiting on an
+    /// op not pulled yet (AGT-1467; [`Store::apply_pulled_page`] only).
+    pub parked: usize,
+    /// Ops refused by this batch — this batch's, or parked ones given up
+    /// on (AGT-1467; [`Store::apply_pulled_page`] only).
+    pub refused: Vec<Quarantined>,
 }
+
+/// A pulled op kept out of the log (AGT-1467, [`Store::apply_pulled_page`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Quarantined {
+    pub op_id: Ulid,
+    /// The op's seq in the hub log.
+    pub hub_seq: i64,
+    pub kind: String,
+    pub entity: Ulid,
+    pub status: QuarantineStatus,
+    /// Retries it has had while parked.
+    pub attempts: u32,
+    /// Why it was parked (what it waits on) or refused.
+    pub reason: String,
+    /// When this replica recorded it (Unix ms).
+    pub recorded_ms: u64,
+}
+
+/// Where a quarantined op stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuarantineStatus {
+    /// Waiting on an op not pulled yet; retried when one that could
+    /// supply it lands.
+    Parked,
+    /// Can never apply here; kept for the record, never retried.
+    Refused,
+}
+
+/// Most retries a parked op gets before it is refused (AGT-1467). Honest
+/// logs park nothing — the hub serves every op after what it depends on —
+/// so this only bounds the work an adversarial or corrupt log can cause.
+pub const MAX_PARK_RETRIES: u32 = 32;
 
 /// The sync state `pm doctor` reports.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -68,6 +112,10 @@ pub struct SyncStatus {
     /// (AGT-1396). `false` until the first `pm sync` seeds it, or joins
     /// a hub whose seed already ended.
     pub seeded: bool,
+    /// Pulled ops parked, waiting on an op not pulled yet (AGT-1467).
+    pub parked: u64,
+    /// Pulled ops refused as inadmissible (AGT-1467).
+    pub refused: u64,
 }
 
 impl Store {
@@ -141,8 +189,13 @@ impl Store {
     /// the workspace opens but has no states to file a ticket into.
     /// Refuses a database that already has a workspace
     /// ([`StoreError::ForeignWorkspace`] when the ids differ,
-    /// [`StoreError::AlreadyJoined`] when they match) or any op.
+    /// [`StoreError::AlreadyJoined`] when they match) or any op, and a
+    /// `prefix` that is not safe in a file path
+    /// ([`StoreError::InvalidId`], AGT-1467 — the same rule every
+    /// `workspace.set prefix` op is held to, since path-building verbs
+    /// read the row before the first pull rewrites it).
     pub fn join_workspace(&mut self, id: Ulid, prefix: &str) -> Result<()> {
+        pm_core::ids::check_component("workspace prefix", prefix)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -248,26 +301,32 @@ impl Store {
         Ok(())
     }
 
-    /// Commits foreign ops pulled from the hub through the normal apply
-    /// path — the same merge, materialization and hygiene checks as
-    /// [`Store::commit`] / [`Store::commit_doc_edit`] — in **one**
-    /// transaction. An op already present by `op_id` is skipped, so
-    /// re-applying a batch (or receiving this replica's own ops back) is
-    /// a no-op. Claims are not re-checked: the hub admitted them.
+    /// Commits foreign ops through the normal apply path — the same
+    /// merge, materialization and hygiene checks as [`Store::commit`] /
+    /// [`Store::commit_doc_edit`] — in **one** transaction, all or
+    /// nothing. The strict form, for ops the caller already knows the hub
+    /// admitted (`pm claim`'s own claim, the seed end's number ops) and for
+    /// tests; `pm sync`'s pull uses [`Store::apply_pulled_page`], which
+    /// quarantines instead of failing. An op already present by `op_id`
+    /// is skipped, so re-applying a batch (or receiving this replica's own
+    /// ops back) is a no-op. Claims are not re-checked: the hub admitted
+    /// them.
     ///
     /// Order-independent within the batch: an op whose ticket, relation
     /// target, document, project, project entity or state is not there
     /// yet — or a document or ticket-description edit whose predecessor
-    /// edits are not — is deferred and retried once the rest of the batch has landed, so a batch
-    /// applies to the same state in any order (pm-core's merge is
+    /// edits are not — is parked and retried when an op that could
+    /// supply it lands (the rules are [`Store::apply_pulled_page`]'s), so
+    /// a batch applies to the same state in any order (pm-core's merge is
     /// order-independent; this makes the existence checks so too). Ops
     /// are appended to the local log in the order they actually landed,
     /// so `pm doctor`'s replay in `seq` order reproduces the tables.
     ///
     /// Every applied op counts as already pushed (it came from the hub),
     /// and a ticket that now has a number leaves the pending-number set.
-    /// Any failure — including a dependency nothing in the batch
-    /// supplies — rolls the whole batch back ([`StoreError::Pull`]).
+    /// Any failure — an op [`Store::apply_pulled_page`] would refuse, or
+    /// a dependency nothing in the batch supplies — rolls the whole batch
+    /// back ([`StoreError::Pull`], naming the op).
     ///
     /// Every op's stamp is checked first (oaudit 2026-09-30): one out of
     /// the storable range, with a spent counter, or more than
@@ -280,49 +339,112 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut pulled = Pulled::default();
-        let mut pending: Vec<&Op> = ops.iter().collect();
-        while !pending.is_empty() {
-            let mut deferred: Vec<&Op> = Vec::new();
-            let mut first_blocker: Option<StoreError> = None;
-            let attempted = pending.len();
-            for op in pending {
-                if let Some(seq) = seq_of(&tx, op.op_id)? {
-                    mark_seq_pushed(&tx, seq)?;
-                    pulled.skipped += 1;
-                    continue;
-                }
-                tx.execute_batch("SAVEPOINT pulled_op")?;
-                match apply_foreign(&tx, op) {
-                    Ok(()) => {
-                        tx.execute_batch("RELEASE pulled_op")?;
-                        let seq = seq_of(&tx, op.op_id)?.expect("the op was just appended");
-                        mark_seq_pushed(&tx, seq)?;
-                        pulled.applied += 1;
-                    }
-                    Err(e) if is_dependency(&e) => {
-                        tx.execute_batch("ROLLBACK TO pulled_op; RELEASE pulled_op")?;
-                        deferred.push(op);
-                        first_blocker.get_or_insert(pull_error(op, e));
-                    }
-                    Err(e) => return Err(pull_error(op, e)),
-                }
-            }
-            if deferred.len() == attempted {
-                // A full pass landed nothing: what the rest waits on is
-                // not coming from this batch.
-                return Err(first_blocker.expect("a deferred op recorded its error"));
-            }
-            pending = deferred;
+        let mut engine = Engine::new(&tx, Mode::Strict)?;
+        for (index, op) in ops.iter().enumerate() {
+            engine.process(index as i64, op)?;
         }
-        tx.execute(
-            "DELETE FROM pending_number
-             WHERE ticket IN (SELECT id FROM ticket WHERE number IS NOT NULL)",
-            [],
-        )?;
-        fold_pushed(&tx)?;
+        let pulled = engine.finish()?;
+        finish_pull(&tx)?;
         tx.commit()?;
         Ok(pulled)
+    }
+
+    /// Applies one page of the hub's log — `ops` as `(hub seq, op)` —
+    /// and moves the pull cursor to `next`, in **one** transaction, so a
+    /// page is never applied twice (AGT-1467). This is `pm sync`'s pull.
+    ///
+    /// Unlike [`Store::apply_pulled`], one op that cannot apply does not
+    /// fail the page — which, since the hub serves the page again from the
+    /// same cursor, would fail every later pull too. Each op, in hub seq
+    /// order, ends up:
+    ///
+    /// - **applied** — committed into the log, as by `apply_pulled`;
+    /// - **skipped** — already in the log (this replica's own op echoed
+    ///   back), already quarantined, or at or below the cursor;
+    /// - **parked** — it waits on something not here yet (a
+    ///   [dependency](Store::apply_pulled)). It is kept out of the log in
+    ///   `sync_quarantine` and retried, in hub seq order, whenever an op
+    ///   that could supply it lands: any config op wakes every parked op,
+    ///   and any other op wakes those waiting on its entity (a missing
+    ///   ticket or relation target, the edits a `body.edit` builds on) or
+    ///   targeting it. A parked op still blocked after
+    ///   [`MAX_PARK_RETRIES`] retries is refused;
+    /// - **refused** — it can never apply: an unsafe id, a stamp out of
+    ///   range, an oversized `body.edit`, a duplicate `project.create`, a
+    ///   document or ticket id already in use, a number already taken, an
+    ///   update that does not decode. Recorded with its reason in
+    ///   `sync_quarantine` for `pm doctor`, and never retried.
+    ///
+    /// **Convergence.** Every replica must end in the same state whatever
+    /// it quarantines. That holds because what happens to an op is a pure
+    /// function of the hub's log up to it: ops are processed one at a time
+    /// in hub seq order whatever the page boundaries (the parked set, with
+    /// each op's wake key and retry count, is persisted between pages, and
+    /// the cursor moves in the same transaction); applying an op, and each
+    /// retry it gets, is decided by the store's state, which is itself
+    /// the result of that same processing; and an op this replica already
+    /// holds (its own, echoed back) still wakes parked ops at its hub
+    /// position, exactly as landing it does on every other replica. So
+    /// two replicas that pulled the same log hold the same ops, parked
+    /// the same ops and refused the same ops, and pm-core's
+    /// order-independent merge gives them the same tables. Two inputs are
+    /// deliberately *not* quarantined, because they are not functions of
+    /// the log: a stamp more than [`PULL_MAX_FUTURE_SKEW_MS`] ahead of
+    /// this machine's clock (whether it is depends on the clock; the pull
+    /// fails, as before, and succeeds once the clock is right), and
+    /// anything the store cannot write at all (a busy or corrupt
+    /// database) — both fail the page and leave the cursor where it was.
+    /// This replica's own ops are the one local input, and an honest log
+    /// never lets them matter: an op naming an entity follows that
+    /// entity's creation in the hub log (nobody else can know a fresh id
+    /// before the hub serves it), so nothing is parked on an op this
+    /// replica already holds. Only a log that names an entity before its
+    /// creation reached the hub — a hostile one — can have ops parked on
+    /// it here; retries against the local copy then decide them sooner
+    /// than elsewhere, which changes retry counts and, in a contrived log
+    /// that also holds a conflicting op, which of the two is refused.
+    ///
+    /// Bounded work (AGT-1467): each op is tried once on arrival and at
+    /// most [`MAX_PARK_RETRIES`] times after, so a page costs at most
+    /// `1 + MAX_PARK_RETRIES` attempts per op whatever order it arrives
+    /// in (the old pass-until-nothing-lands loop was quadratic).
+    ///
+    /// `ops` may come in any order; it is sorted by hub seq. `next` is
+    /// the page's `next`: the cursor becomes the greater of it and the
+    /// current cursor.
+    pub fn apply_pulled_page(&mut self, ops: &[(i64, Op)], next: i64) -> Result<Pulled> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cursor: i64 = tx.query_row("SELECT pulled_seq FROM sync_state", [], |r| r.get(0))?;
+        let mut page: Vec<&(i64, Op)> = ops.iter().collect();
+        page.sort_by_key(|(seq, _)| *seq);
+        let mut engine = Engine::new(&tx, Mode::Quarantine)?;
+        let mut last = cursor;
+        for (seq, op) in page {
+            if *seq <= last {
+                // At or below the cursor (processed by an earlier page), or
+                // a repeat within this one.
+                engine.pulled.skipped += 1;
+                continue;
+            }
+            last = *seq;
+            engine.process(*seq, op)?;
+        }
+        let pulled = engine.finish()?;
+        tx.execute(
+            "UPDATE sync_state SET pulled_seq = MAX(pulled_seq, ?1)",
+            params![next],
+        )?;
+        finish_pull(&tx)?;
+        tx.commit()?;
+        Ok(pulled)
+    }
+
+    /// Every pulled op this replica has parked or refused
+    /// ([`Store::apply_pulled_page`]), in hub seq order — for `pm doctor`.
+    pub fn quarantine(&self) -> Result<Vec<Quarantined>> {
+        quarantine(&self.conn)
     }
 
     /// Flags `ticket` as awaiting a hub-issued number (created while a hub
@@ -375,13 +497,58 @@ pub(crate) fn sync_status(conn: &Connection) -> Result<SyncStatus> {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     let pending: i64 = conn.query_row("SELECT COUNT(*) FROM pending_number", [], |r| r.get(0))?;
+    let (parked, refused): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*) FILTER (WHERE status = 'parked'),
+                COUNT(*) FILTER (WHERE status = 'refused')
+         FROM sync_quarantine",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     Ok(SyncStatus {
         pushed_through,
         outbox: outbox_len(conn)?,
         cursor,
         pending_numbers: pending as u64,
         seeded,
+        parked: parked as u64,
+        refused: refused as u64,
     })
+}
+
+pub(crate) fn quarantine(conn: &Connection) -> Result<Vec<Quarantined>> {
+    let mut stmt = conn.prepare(
+        "SELECT op_id, hub_seq, kind, entity, status, attempts, reason, recorded_ms
+         FROM sync_quarantine ORDER BY hub_seq, op_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, u32>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, i64>(7)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (op_id, hub_seq, kind, entity, status, attempts, reason, recorded_ms) = row?;
+        Ok(Quarantined {
+            op_id: ulid("sync_quarantine.op_id", &op_id)?,
+            hub_seq,
+            kind,
+            entity: ulid("sync_quarantine.entity", &entity)?,
+            status: match status.as_str() {
+                "parked" => QuarantineStatus::Parked,
+                _ => QuarantineStatus::Refused,
+            },
+            attempts,
+            reason,
+            recorded_ms: recorded_ms.max(0) as u64,
+        })
+    })
+    .collect()
 }
 
 fn outbox_len(conn: &Connection) -> Result<u64> {
@@ -463,24 +630,492 @@ fn check_foreign_stamp(op: &Op, now_ms: u64) -> Result<()> {
     crate::commit::check_ingest_at(op, now_ms)
 }
 
-/// Failures another op in the same batch may yet resolve: a missing
-/// ticket, relation target, document, project (by slug — a ticket's
-/// `project`, a project's `parent`), project entity (a `project.set` or
-/// `project.doc_add` ahead of its `project.create`) or state, or a
+/// What a pull does with an op that failed to apply (AGT-1467).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Disposition {
+    /// Something another op may yet supply is missing: park it, to be
+    /// woken as [`Wake`] says.
+    Park(Wake),
+    /// It can never apply: refuse it.
+    Refuse,
+    /// Not a property of the op: fail the whole page.
+    Fail,
+}
+
+/// What a parked op waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wake {
+    /// Any config op (a project, state, or document binding).
+    Config,
+    /// The next op landed on this entity (a ticket's creation, or the
+    /// edits a `body.edit` builds on).
+    Entity(Ulid),
+}
+
+impl Wake {
+    fn column(self) -> String {
+        match self {
+            Wake::Config => "*".to_string(),
+            Wake::Entity(entity) => entity.to_string(),
+        }
+    }
+}
+
+/// Classifies a failed op. Exhaustive on purpose: a new [`StoreError`]
+/// has to be placed deliberately, since parking or refusing an op that is
+/// really a local failure (or failing on one that is the op's fault)
+/// breaks either convergence or liveness. Dependencies wait on: a missing
+/// ticket or relation target (its `ticket.create` — also how a `body.edit`
+/// for a document not yet bound shows up, whose binding is a config op),
+/// a document, project, project entity or state (config ops), or a
 /// document (AGT-1413) or ticket-description (AGT-1415) edit ahead of the
-/// edits it builds on.
-fn is_dependency(e: &StoreError) -> bool {
-    matches!(
-        e,
-        StoreError::UnknownTicket { .. }
-            | StoreError::UnknownRelationTarget { .. }
-            | StoreError::UnknownDocument { .. }
-            | StoreError::UnknownProject { .. }
-            | StoreError::UnknownProjectEntity { .. }
-            | StoreError::UnknownState { .. }
-            | StoreError::DocApply(DocApplyError::MissingDependency { .. })
-            | StoreError::Apply(ApplyError::MissingDependency { .. })
-    )
+/// edits it builds on (the next edit of that entity).
+fn disposition(e: &StoreError, op: &Op) -> Disposition {
+    use StoreError as E;
+    match e {
+        E::UnknownTicket { ticket } | E::UnknownRelationTarget { ticket } => {
+            Disposition::Park(Wake::Entity(*ticket))
+        }
+        E::DocApply(DocApplyError::MissingDependency { .. })
+        | E::Apply(ApplyError::MissingDependency { .. }) => {
+            Disposition::Park(Wake::Entity(op.entity))
+        }
+        E::UnknownDocument { .. }
+        | E::UnknownProject { .. }
+        | E::UnknownProjectEntity { .. }
+        | E::UnknownState { .. } => Disposition::Park(Wake::Config),
+        // How far ahead is too far depends on this machine's clock, not on
+        // the op: quarantining would make two replicas decide differently.
+        E::InvalidStamp(pm_core::StampError::FarFuture { .. }) => Disposition::Fail,
+        E::InvalidStamp(_)
+        | E::InvalidId(_)
+        | E::OpTooLarge(_)
+        | E::NotADocumentEdit { .. }
+        | E::DuplicateNumber { .. }
+        | E::AlreadyNumbered { .. }
+        | E::ClaimRejected(_)
+        | E::Apply(_)
+        | E::DocApply(_)
+        | E::ConfigApply(_)
+        | E::ForeignWorkspace { .. }
+        | E::DuplicateProject { .. }
+        | E::DuplicateDocument { .. }
+        | E::DocIdInUse { .. }
+        | E::EntityInUse { .. }
+        | E::DuplicateProjectCreate { .. }
+        | E::Body(_)
+        | E::ProjectHasTickets { .. }
+        | E::ProjectHasChildren { .. } => Disposition::Refuse,
+        // A constraint the op's own content violates is as deterministic
+        // as a typed refusal; any other SQLite failure is the database's.
+        E::Sqlite(rusqlite::Error::SqliteFailure(f, _))
+            if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Disposition::Refuse
+        }
+        E::Sqlite(_)
+        | E::SchemaTooNew { .. }
+        | E::NoWorkspace
+        | E::DuplicateOp { .. }
+        | E::AlreadyJoined { .. }
+        | E::NotEmpty { .. }
+        | E::NotAConfigOp { .. }
+        | E::Corrupt { .. }
+        | E::Replay { .. }
+        | E::Pull { .. } => Disposition::Fail,
+    }
+}
+
+/// How a pull treats an op that cannot apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// [`Store::apply_pulled`]: fail the batch.
+    Strict,
+    /// [`Store::apply_pulled_page`]: park or refuse it in
+    /// `sync_quarantine` and carry on.
+    Quarantine,
+}
+
+/// One parked op, as the engine tracks it; its body is in `Engine::ops`
+/// or, parked by an earlier page, in `sync_quarantine`.
+struct Parked {
+    op_id: Ulid,
+    entity: Ulid,
+    wake: Wake,
+    attempts: u32,
+    /// Parked by an earlier page (loaded from `sync_quarantine`).
+    earlier: bool,
+}
+
+/// What one attempt at an op did.
+enum Attempt {
+    Landed,
+    Blocked(StoreError, Wake),
+    Refused(StoreError),
+}
+
+/// The pull's apply loop (AGT-1467): each op in order, parking what waits
+/// on a dependency and retrying it when something that could supply it
+/// lands. Orders are hub seqs ([`Mode::Quarantine`]) or batch positions
+/// ([`Mode::Strict`]).
+struct Engine<'a, 'c> {
+    tx: &'a Transaction<'c>,
+    mode: Mode,
+    /// The parked set, by order.
+    parked: BTreeMap<i64, Parked>,
+    /// Orders of the parked ops each entity may wake: their own entity,
+    /// and the one a [`Wake::Entity`] names.
+    by_entity: HashMap<Ulid, BTreeSet<i64>>,
+    /// The parked ops' ids.
+    parked_ids: HashSet<Ulid>,
+    /// Parked ops' bodies, for those parked in this call.
+    ops: HashMap<i64, Op>,
+    /// [`Mode::Strict`]: why each parked op is blocked, for the error.
+    blocked: HashMap<i64, StoreError>,
+    pulled: Pulled,
+}
+
+impl<'a, 'c> Engine<'a, 'c> {
+    fn new(tx: &'a Transaction<'c>, mode: Mode) -> Result<Self> {
+        let mut engine = Engine {
+            tx,
+            mode,
+            parked: BTreeMap::new(),
+            by_entity: HashMap::new(),
+            parked_ids: HashSet::new(),
+            ops: HashMap::new(),
+            blocked: HashMap::new(),
+            pulled: Pulled::default(),
+        };
+        if mode == Mode::Quarantine {
+            let mut stmt = tx.prepare(
+                "SELECT hub_seq, op_id, entity, wake, attempts FROM sync_quarantine
+                 WHERE status = 'parked'",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, u32>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (order, op_id, entity, wake, attempts) = row?;
+                let wake = match wake.as_deref() {
+                    None | Some("*") => Wake::Config,
+                    Some(entity) => Wake::Entity(ulid("sync_quarantine.wake", entity)?),
+                };
+                engine.index(
+                    order,
+                    Parked {
+                        op_id: ulid("sync_quarantine.op_id", &op_id)?,
+                        entity: ulid("sync_quarantine.entity", &entity)?,
+                        wake,
+                        attempts,
+                        earlier: true,
+                    },
+                );
+            }
+        }
+        Ok(engine)
+    }
+
+    fn index(&mut self, order: i64, parked: Parked) {
+        self.by_entity
+            .entry(parked.entity)
+            .or_default()
+            .insert(order);
+        if let Wake::Entity(entity) = parked.wake {
+            self.by_entity.entry(entity).or_default().insert(order);
+        }
+        self.parked_ids.insert(parked.op_id);
+        self.parked.insert(order, parked);
+    }
+
+    fn unindex(&mut self, order: i64) -> Option<Parked> {
+        let parked = self.parked.remove(&order)?;
+        self.parked_ids.remove(&parked.op_id);
+        let keys = match parked.wake {
+            Wake::Entity(entity) => vec![parked.entity, entity],
+            Wake::Config => vec![parked.entity],
+        };
+        for key in keys {
+            if let Some(orders) = self.by_entity.get_mut(&key) {
+                orders.remove(&order);
+                if orders.is_empty() {
+                    self.by_entity.remove(&key);
+                }
+            }
+        }
+        self.ops.remove(&order);
+        self.blocked.remove(&order);
+        Some(parked)
+    }
+
+    /// One incoming op at `order`.
+    fn process(&mut self, order: i64, op: &Op) -> Result<()> {
+        if let Some(seq) = seq_of(self.tx, op.op_id)? {
+            // Already in the log (this replica's own, echoed back): on
+            // every other replica it lands here, so it wakes here too.
+            mark_seq_pushed(self.tx, seq)?;
+            self.pulled.skipped += 1;
+            return self.cascade(op);
+        }
+        if self.is_quarantined(op.op_id)? {
+            self.pulled.skipped += 1;
+            return Ok(());
+        }
+        match self.attempt(op)? {
+            Attempt::Landed => {
+                self.pulled.applied += 1;
+                self.cascade(op)
+            }
+            Attempt::Blocked(e, wake) => self.park(order, op, wake, e),
+            Attempt::Refused(e) => self.refuse(order, op, 0, e.to_string(), e),
+        }
+    }
+
+    fn is_quarantined(&self, op_id: Ulid) -> Result<bool> {
+        if self.parked_ids.contains(&op_id) {
+            return Ok(true);
+        }
+        Ok(self.mode == Mode::Quarantine
+            && crate::commit::exists(
+                self.tx,
+                "SELECT 1 FROM sync_quarantine WHERE op_id = ?1",
+                &op_id.to_string(),
+            )?)
+    }
+
+    /// Tries `op` inside a savepoint: landed (and marked pushed), blocked
+    /// on a dependency, or refused — or the page's error.
+    fn attempt(&self, op: &Op) -> Result<Attempt> {
+        self.tx.execute_batch("SAVEPOINT pulled_op")?;
+        match apply_foreign(self.tx, op) {
+            Ok(()) => {
+                self.tx.execute_batch("RELEASE pulled_op")?;
+                let seq = seq_of(self.tx, op.op_id)?.expect("the op was just appended");
+                mark_seq_pushed(self.tx, seq)?;
+                Ok(Attempt::Landed)
+            }
+            Err(e) => {
+                self.tx
+                    .execute_batch("ROLLBACK TO pulled_op; RELEASE pulled_op")?;
+                match disposition(&e, op) {
+                    Disposition::Park(wake) => Ok(Attempt::Blocked(e, wake)),
+                    Disposition::Refuse => Ok(Attempt::Refused(e)),
+                    Disposition::Fail => Err(pull_error(op, e)),
+                }
+            }
+        }
+    }
+
+    fn park(&mut self, order: i64, op: &Op, wake: Wake, e: StoreError) -> Result<()> {
+        if self.mode == Mode::Quarantine {
+            self.tx.execute(
+                "INSERT INTO sync_quarantine
+                     (op_id, hub_seq, kind, entity, status, wake, attempts, reason, recorded_ms, op)
+                 VALUES (?1, ?2, ?3, ?4, 'parked', ?5, 0, ?6, ?7, ?8)",
+                params![
+                    op.op_id.to_string(),
+                    order,
+                    op.kind(),
+                    op.entity.to_string(),
+                    wake.column(),
+                    e.to_string(),
+                    now_ms() as i64,
+                    serde_json::to_string(op).expect("an op serializes"),
+                ],
+            )?;
+        } else {
+            self.blocked.insert(order, e);
+        }
+        self.ops.insert(order, op.clone());
+        self.index(
+            order,
+            Parked {
+                op_id: op.op_id,
+                entity: op.entity,
+                wake,
+                attempts: 0,
+                earlier: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Refuses `op` for good: fails the batch ([`Mode::Strict`]), or
+    /// records it ([`Mode::Quarantine`]).
+    fn refuse(
+        &mut self,
+        order: i64,
+        op: &Op,
+        attempts: u32,
+        reason: String,
+        e: StoreError,
+    ) -> Result<()> {
+        if self.mode == Mode::Strict {
+            return Err(pull_error(op, e));
+        }
+        let recorded_ms = now_ms();
+        self.tx.execute(
+            "INSERT INTO sync_quarantine
+                 (op_id, hub_seq, kind, entity, status, wake, attempts, reason, recorded_ms, op)
+             VALUES (?1, ?2, ?3, ?4, 'refused', NULL, ?5, ?6, ?7, ?8)
+             ON CONFLICT(op_id) DO UPDATE SET
+                 status = 'refused', wake = NULL, attempts = excluded.attempts,
+                 reason = excluded.reason, recorded_ms = excluded.recorded_ms",
+            params![
+                op.op_id.to_string(),
+                order,
+                op.kind(),
+                op.entity.to_string(),
+                attempts,
+                reason,
+                recorded_ms as i64,
+                serde_json::to_string(op).expect("an op serializes"),
+            ],
+        )?;
+        self.pulled.refused.push(Quarantined {
+            op_id: op.op_id,
+            hub_seq: order,
+            kind: op.kind().to_string(),
+            entity: op.entity,
+            status: QuarantineStatus::Refused,
+            attempts,
+            reason,
+            recorded_ms,
+        });
+        Ok(())
+    }
+
+    /// The parked op at `order`'s body.
+    fn load(&self, order: i64, op_id: Ulid) -> Result<Op> {
+        if let Some(op) = self.ops.get(&order) {
+            return Ok(op.clone());
+        }
+        let text: String = self.tx.query_row(
+            "SELECT op FROM sync_quarantine WHERE op_id = ?1",
+            params![op_id.to_string()],
+            |r| r.get(0),
+        )?;
+        serde_json::from_str(&text).map_err(|e| StoreError::corrupt("sync_quarantine.op")(&e))
+    }
+
+    /// `landed` is now in the log: retry every parked op it may unblock,
+    /// in order, and whatever those unblock in turn.
+    fn cascade(&mut self, landed: &Op) -> Result<()> {
+        if self.parked.is_empty() {
+            return Ok(());
+        }
+        let mut queue: VecDeque<(bool, Ulid)> =
+            VecDeque::from([(landed.payload.is_config(), landed.entity)]);
+        while let Some((config, entity)) = queue.pop_front() {
+            let woken: Vec<i64> = if config {
+                self.parked.keys().copied().collect()
+            } else {
+                self.by_entity
+                    .get(&entity)
+                    .map(|orders| orders.iter().copied().collect())
+                    .unwrap_or_default()
+            };
+            for order in woken {
+                let Some(parked) = self.parked.get_mut(&order) else {
+                    continue; // landed or refused earlier in this cascade
+                };
+                parked.attempts += 1;
+                let (op_id, attempts, earlier) = (parked.op_id, parked.attempts, parked.earlier);
+                let op = self.load(order, op_id)?;
+                let outcome = match seq_of(self.tx, op_id)? {
+                    // Landed some other way meanwhile (`pm claim`'s strict
+                    // apply): it is in the log, so it is no longer parked.
+                    Some(seq) => {
+                        mark_seq_pushed(self.tx, seq)?;
+                        None
+                    }
+                    None => Some(self.attempt(&op)?),
+                };
+                match outcome {
+                    None | Some(Attempt::Landed) => {
+                        self.unindex(order);
+                        self.forget(op_id)?;
+                        if outcome.is_some() {
+                            self.pulled.applied += 1;
+                            if earlier {
+                                self.pulled.unparked += 1;
+                            }
+                        }
+                        queue.push_back((op.payload.is_config(), op.entity));
+                    }
+                    Some(Attempt::Blocked(e, _)) if attempts >= MAX_PARK_RETRIES => {
+                        self.unindex(order);
+                        let reason = format!("still waiting after {attempts} retries: {e}");
+                        self.refuse(order, &op, attempts, reason, e)?;
+                    }
+                    Some(Attempt::Blocked(e, wake)) => {
+                        let mut parked = self.unindex(order).expect("it was parked");
+                        parked.wake = wake;
+                        if self.mode == Mode::Quarantine {
+                            self.tx.execute(
+                                "UPDATE sync_quarantine SET wake = ?2, attempts = ?3, reason = ?4
+                                 WHERE op_id = ?1",
+                                params![op_id.to_string(), wake.column(), attempts, e.to_string()],
+                            )?;
+                        } else {
+                            self.blocked.insert(order, e);
+                        }
+                        self.ops.insert(order, op);
+                        self.index(order, parked);
+                    }
+                    Some(Attempt::Refused(e)) => {
+                        self.unindex(order);
+                        self.refuse(order, &op, attempts, e.to_string(), e)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn forget(&self, op_id: Ulid) -> Result<()> {
+        if self.mode == Mode::Quarantine {
+            self.tx.execute(
+                "DELETE FROM sync_quarantine WHERE op_id = ?1",
+                params![op_id.to_string()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// What the batch did. [`Mode::Strict`]: an op still parked is the
+    /// batch's error (the first, in batch order).
+    fn finish(mut self) -> Result<Pulled> {
+        if self.mode == Mode::Strict
+            && let Some((&order, _)) = self.parked.iter().next()
+        {
+            let op = self.ops.remove(&order).expect("a strict parked op is held");
+            let e = self
+                .blocked
+                .remove(&order)
+                .expect("a strict parked op records its blocker");
+            return Err(pull_error(&op, e));
+        }
+        self.pulled.parked = self.parked.values().filter(|p| !p.earlier).count();
+        Ok(self.pulled)
+    }
+}
+
+/// What every pull does once its ops are in: tickets that now have a
+/// number leave the pending set, and the pushed marker catches up.
+fn finish_pull(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "DELETE FROM pending_number
+         WHERE ticket IN (SELECT id FROM ticket WHERE number IS NOT NULL)",
+        [],
+    )?;
+    fold_pushed(tx)
 }
 
 fn pull_error(op: &Op, source: StoreError) -> StoreError {

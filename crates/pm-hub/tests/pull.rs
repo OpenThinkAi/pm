@@ -732,3 +732,99 @@ fn pulls_never_wait_for_a_push_and_never_skip_a_seq() {
         assert_eq!(*seen, want);
     }
 }
+
+/// AGT-1467: a page stops before 16 MiB of op text whatever `limit` says,
+/// always serving at least one op (a single larger op comes alone), and
+/// the cut page keeps the cursor contract — `next` is its last seq and
+/// `next < head` — so any client that pages until `next >= head` gets the
+/// whole log back, byte for byte.
+#[test]
+fn pages_are_capped_by_bytes_and_keep_the_cursor_contract() {
+    let Some((_container, url)) =
+        postgres_for("pages_are_capped_by_bytes_and_keep_the_cursor_contract")
+    else {
+        return;
+    };
+    const CAP: usize = 16 * 1024 * 1024;
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    wait_for_health(&mut hub, port);
+    let token = create_token(&url, "studio", "saltline");
+    let doc = Ulid::new();
+    let edit = |i: u64, len: usize| {
+        let op = at(
+            1_000 + i,
+            "matt",
+            doc,
+            Payload::BodyEdit(BodyEdit {
+                update: bytes(len, i),
+            }),
+        );
+        (op.op_id.to_string(), serde_json::to_string(&op).unwrap())
+    };
+    let small = |i: u64| {
+        let op = at(
+            2_000 + i,
+            "matt",
+            doc,
+            Payload::CommentAdd(CommentAdd {
+                body: format!("c{i}"),
+            }),
+        );
+        (op.op_id.to_string(), serde_json::to_string(&op).unwrap())
+    };
+    // Six ~6.7 MB edits (two per page fit), a ~26.7 MB one (over the cap
+    // on its own), and small ops around them.
+    let mut pushed = Vec::new();
+    for batch in [
+        vec![
+            small(0),
+            edit(1, 5 << 20),
+            edit(2, 5 << 20),
+            edit(3, 5 << 20),
+        ],
+        vec![
+            edit(4, 5 << 20),
+            edit(5, 5 << 20),
+            edit(6, 5 << 20),
+            small(1),
+        ],
+        vec![edit(7, 20 << 20)],
+        vec![small(2), small(3)],
+    ] {
+        pushed.extend(push_texts(port, &token, &batch));
+    }
+    let head = pushed.last().unwrap().1;
+
+    let mut since = 0;
+    let mut pages = Vec::new();
+    loop {
+        let (ops, next, page_head) = pull(port, &token, &format!("?since={since}&limit=1000"));
+        assert_eq!(page_head, head);
+        assert!(!ops.is_empty(), "a page past `since` is never empty");
+        assert_eq!(next, ops.last().unwrap().0);
+        let bytes: usize = ops.iter().map(|(_, text)| text.len()).sum();
+        assert!(
+            bytes <= CAP || ops.len() == 1,
+            "{} ops, {bytes} bytes",
+            ops.len()
+        );
+        pages.push(ops.len());
+        since = next;
+        if next >= head {
+            break;
+        }
+    }
+    // small+edit1+edit2 | edit3+edit4 | edit5+edit6+small | edit7 alone | small+small
+    assert_eq!(pages, [3, 2, 3, 1, 2], "page sizes");
+
+    let (all, _) = pull_all(port, &token, 0, 1000);
+    assert_eq!(all.len(), pushed.len());
+    for ((seq, text), (_, pushed_seq, pushed_text)) in all.iter().zip(&pushed) {
+        assert_eq!(seq, pushed_seq);
+        assert_eq!(text, pushed_text);
+    }
+    // A small `limit` still wins when it is the tighter bound.
+    let (ops, _, _) = pull(port, &token, "?since=0&limit=1");
+    assert_eq!(ops.len(), 1);
+}

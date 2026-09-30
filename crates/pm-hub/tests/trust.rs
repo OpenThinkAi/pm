@@ -808,3 +808,82 @@ fn pushed_project_identity_is_admission_checked() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(stored(&body), [false]);
 }
+
+/// AGT-1467: document-slot eligibility (`pm_core::DocClaims`) lets a
+/// binding stamped before its project's create win only when its `actor`
+/// is the creator's. That actor is self-asserted, so it is safe only
+/// because the hub binds it to the pushing token (AGT-1450): a backdated
+/// `project.doc_add` claiming the creator — or `migrate`, the backfill's
+/// creator — is refused from a token not bound to that actor, and
+/// accepted from one that is (or from an unrestricted token), which could
+/// author as the creator anyway.
+#[test]
+fn a_backdated_doc_add_as_the_creator_needs_a_token_for_the_creator() {
+    let Some((_container, url)) =
+        postgres_for("a_backdated_doc_add_as_the_creator_needs_a_token_for_the_creator")
+    else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    wait_for_health(&mut hub, port);
+    let (studio, _, _) = mint(&url, "studio", &["--any"]);
+    let (mallory, _, _) = mint(&url, "mallory", &["--actor", "mallory"]);
+    let (laptop, _, _) = mint(&url, "laptop", &["--actor", "matt"]);
+    let project = Ulid::new();
+    let create = Op::new(
+        Ulid::new(),
+        Hlc::new(recent(), 0),
+        ActorId::new("matt"),
+        project,
+        Payload::ProjectCreate(pm_core::op::ProjectCreate {
+            id: "pm".into(),
+            title: "pm".into(),
+            status: pm_core::ProjectStatus::InProgress,
+            parent: None,
+            doc_id: Some(Ulid::new()),
+        }),
+    );
+    let (status, body) = push(port, &studio, &[&create]);
+    assert_eq!(status, 200, "{body}");
+    // Backdated to hlc 0, before the create: eligible only as the creator.
+    let backdated = |actor: &str, name: Option<&str>| {
+        Op::new(
+            Ulid::new(),
+            Hlc::new(0, 0),
+            ActorId::new(actor),
+            project,
+            Payload::ProjectDocAdd(pm_core::op::ProjectDocAdd {
+                name: name.map(str::to_string),
+                doc_id: Ulid::new(),
+            }),
+        )
+    };
+    for claimed in ["matt", "migrate"] {
+        for name in [None, Some("notes")] {
+            let (status, err) = push(port, &mallory, &[&backdated(claimed, name)]);
+            assert_eq!(
+                (status, err["error"].as_str()),
+                (400, Some("actor_not_allowed")),
+                "{claimed} {name:?}: {err}"
+            );
+        }
+    }
+    assert_eq!(count_ops(&url), 1, "nothing stored");
+    // As itself it is stored — and, not being the creator, never wins
+    // the slot (pm-core's eligibility rule).
+    let (status, body) = push(port, &mallory, &[&backdated("mallory", None)]);
+    assert_eq!((status, stored(&body)), (200, vec![true]), "{body}");
+    // The creator's own token, and an unrestricted one, may.
+    let (status, body) = push(port, &laptop, &[&backdated("matt", None)]);
+    assert_eq!((status, stored(&body)), (200, vec![true]), "{body}");
+    let (status, err) = push(port, &laptop, &[&backdated("migrate", None)]);
+    assert_eq!(
+        (status, err["error"].as_str()),
+        (400, Some("actor_not_allowed")),
+        "{err}"
+    );
+    let (status, body) = push(port, &studio, &[&backdated("migrate", Some("notes"))]);
+    assert_eq!((status, stored(&body)), (200, vec![true]), "{body}");
+    assert_eq!(count_ops(&url), 4);
+}

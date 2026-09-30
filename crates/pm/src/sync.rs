@@ -37,15 +37,23 @@
 //!   after another machine's seed): `pm claim` itself goes to the hub
 //!   (`crate::claim`, AGT-1397) and never leaves a refused claim behind.
 //! - **Pull.** Pages of `GET /ops?since=<cursor>&limit=` are applied one
-//!   page per transaction ([`Store::apply_pulled`]: foreign ops land through
-//!   the normal commit path, ops already present by `op_id` — this replica's
-//!   own, echoed back — are skipped and counted as pushed), and the cursor
-//!   ([`Store::set_cursor`]) moves to the page's `next` only after that
-//!   transaction has committed. A crash between the two re-pulls the page,
-//!   which then applies as all-skipped. Paging stops at `next >= head`.
+//!   page per transaction ([`Store::apply_pulled_page`]: foreign ops land
+//!   through the normal commit path, ops already present by `op_id` — this
+//!   replica's own, echoed back — are skipped and counted as pushed), and
+//!   the cursor moves to the page's `next` in that same transaction, so a
+//!   page is applied exactly once. Paging stops at `next >= head`.
+//! - **Quarantine** (AGT-1467). A pulled op that cannot apply does not
+//!   fail the pull (which would fail every later one: the hub serves it
+//!   again from the same cursor). One waiting on an op not pulled yet is
+//!   *parked* and retried when something that could supply it lands; one
+//!   that can never apply is *refused*, reported on stderr and under
+//!   `refused` in `--json`. Both stay out of the log and are listed by
+//!   `pm doctor`; the rules, and why every replica quarantines the same
+//!   ops, are `Store::apply_pulled_page`'s.
 //! - **Failure.** A transport error, a `404` (the hub's one answer for a
-//!   bad token or unknown workspace), a structured `400`/`413`, or an op the
-//!   store refuses all exit `1` with the cause on stderr. Nothing local is
+//!   bad token or unknown workspace), a structured `400`/`413`, an op this
+//!   build cannot parse, a pulled stamp far ahead of this machine's clock,
+//!   or a local database failure all exit `1` with the cause on stderr. Nothing local is
 //!   touched beyond what was already committed: every batch the hub had
 //!   acknowledged is marked, every page applied has advanced the cursor, and
 //!   the rest of the outbox and the cursor are exactly as before.
@@ -133,6 +141,12 @@ pub(crate) struct Round {
     applied: usize,
     /// Of those, ops already present (this replica's own, echoed back).
     skipped: usize,
+    /// Ops parked by an earlier round that landed in this one (AGT-1467).
+    unparked: usize,
+    /// Ops pulled this round and parked, waiting on an op not pulled yet.
+    parked: usize,
+    /// Ops refused this round as inadmissible, kept out of the log.
+    refused: Vec<pm_store::Quarantined>,
     /// Where the cursor stands now.
     cursor: i64,
     /// The hub's head as of the last page.
@@ -556,26 +570,40 @@ fn pull_all(store: &mut Store, hub: &HubClient, round: &mut Round) -> Result<()>
     let mut since = store.cursor()?;
     loop {
         let page = pull_page(hub, since)?;
+        // An op this build cannot parse is not quarantined: it may be a
+        // newer build's kind, and skipping it for good would leave this
+        // replica diverged even after an upgrade. The pull fails instead.
         let ops = page
             .ops
             .into_iter()
             .map(|item| {
-                serde_json::from_value::<Op>(item.op).with_context(|| {
-                    format!("hub seq {}: not an op this build understands", item.seq)
-                })
+                serde_json::from_value::<Op>(item.op)
+                    .map(|op| (item.seq, op))
+                    .with_context(|| {
+                        format!("hub seq {}: not an op this build understands", item.seq)
+                    })
             })
-            .collect::<std::result::Result<Vec<Op>, _>>()?;
-        if !ops.is_empty() {
-            let pulled = store.apply_pulled(&ops)?;
-            round.pulled += ops.len();
-            round.applied += pulled.applied;
-            round.skipped += pulled.skipped;
+            .collect::<std::result::Result<Vec<(i64, Op)>, _>>()?;
+        // One transaction applies the page and moves the cursor to its
+        // `next` (AGT-1467): an op that cannot apply is parked or refused
+        // (`Store::apply_pulled_page`) instead of failing every later pull.
+        let pulled = store.apply_pulled_page(&ops, page.next)?;
+        round.pulled += ops.len();
+        round.applied += pulled.applied;
+        round.skipped += pulled.skipped;
+        round.unparked += pulled.unparked;
+        round.parked += pulled.parked;
+        for refused in pulled.refused {
+            eprintln!(
+                "pm: refused pulled op {} ({}, hub seq {}): {}; kept out of the log (see `pm doctor`)",
+                refused.op_id,
+                refused.kind,
+                refused.hub_seq,
+                crate::text::inline(&refused.reason)
+            );
+            round.refused.push(refused);
         }
-        // The page is committed; now, and only now, the cursor may pass it.
-        if page.next > since {
-            store.set_cursor(page.next)?;
-        }
-        round.cursor = page.next;
+        round.cursor = page.next.max(since);
         round.head = page.head;
         if page.next >= page.head || ops.is_empty() {
             return Ok(());
@@ -658,6 +686,10 @@ fn report(
             "outbox": state.outbox,
             "pending_numbers": state.pending_numbers,
             "rejected": round.rejected,
+            "unparked": round.unparked,
+            "parked": round.parked,
+            "refused": round.refused,
+            "quarantine": {"parked": state.parked, "refused": state.refused},
         });
         if compact {
             println!("{value}");
@@ -693,6 +725,21 @@ fn report(
             line.push_str(&format!(
                 "; {} claim(s) refused by the hub and reconciled",
                 round.rejected.len()
+            ));
+        }
+        if round.unparked > 0 {
+            line.push_str(&format!("; {} parked op(s) applied", round.unparked));
+        }
+        if !round.refused.is_empty() {
+            line.push_str(&format!(
+                "; {} pulled op(s) refused and kept out of the log",
+                round.refused.len()
+            ));
+        }
+        if state.parked > 0 || state.refused > 0 {
+            line.push_str(&format!(
+                "; quarantine: {} parked, {} refused (`pm doctor` lists them)",
+                state.parked, state.refused
             ));
         }
         println!("{line}");
