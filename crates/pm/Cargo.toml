@@ -5,6 +5,7 @@ edition.workspace = true
 description.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"
@@ -58,3 +59,9 @@ tempfile = "3.27"
 # included by path), which reaches Postgres with tokio-postgres (already in
 # the lockfile for pm-hub; tokio itself is a regular dependency above).
 tokio-postgres = "0.7"
+
+# Not published to crates.io (ships via dist: GitHub Release + npm). Needed so
+# cargo-deny's `wildcards = "deny"` accepts the unversioned path deps; `dist =
+# true` keeps dist releasing it despite `publish = false`.
+[package.metadata.dist]
+dist = true

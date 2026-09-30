@@ -13,6 +13,8 @@ all-features = true
 # Unmaintained advisories on any crate in the tree count, not only direct
 # dependencies.
 unmaintained = "all"
+# A yanked crate version in Cargo.lock fails the gate.
+yanked = "deny"
 ignore = [
     # The im-rs family (im, sized-chunks, bitmaps) is archived upstream and
     # reaches pm only as loro 1.16.2 -> loro-internal -> im 15.1.0. loro
@@ -64,9 +66,14 @@ allow = [
 ]
 
 [bans]
+# Duplicate versions stay a warning: they are transitive (e.g. via loro,
+# yrs and the HTTP/TLS stacks pulling different majors of the same crate),
+# not fixable from pm today, and not a vulnerability.
 multiple-versions = "warn"
-# `pm` carries unversioned path deps on its sibling crates.
-wildcards = "warn"
+# Wildcard version requirements ("*") fail the gate. Path dependencies on
+# pm's own sibling crates carry no version, so they are exempted.
+wildcards = "deny"
+allow-wildcard-paths = true
 highlight = "all"
 
 [sources]

@@ -187,7 +187,6 @@ jobs:
       # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container && matrix.container.image || null }}
     # HAND-EDIT: GH_TOKEN removed. This job runs crate build scripts; it
     # needs no GitHub API access (dist build only compiles and packages).
     env:
@@ -200,13 +199,12 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install Rust non-interactively if not already installed
-        if: ${{ matrix.container }}
-        run: |
-          if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          fi
+      # HAND-EDIT (AGT-1372 audit r3): dist emits a container-only step here
+      # that installs Rust with an unverified, unpinned `curl | sh` rustup,
+      # plus `container: ${{ matrix.container ... }}` on the job. No pm
+      # target uses a container (all native runners), so both are removed.
+      # If a container target is ever added, reinstate with a pinned,
+      # checksum-verified rustup-init.
       # HAND-EDIT (AGT-1372 audit): dist emits `${{ matrix.install_dist.run }}`
       # (an unverified curl | sh from the plan JSON). Use the pinned,
       # SHA-256-verified installer instead; see the plan job.
@@ -313,6 +311,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
+    # HAND-EDIT (AGT-1372 audit r3): the credentialed job (contents: write,
+    # id-token, attestations) runs behind the `release` GitHub environment
+    # so deployment-branch rules / reviewers apply. See RELEASING.md.
+    environment: release
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     # Matches what `dist generate` emits for github-attestations-phase = "host"

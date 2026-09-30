@@ -61,6 +61,13 @@ Listed so they can be checked or recreated.
   `npm-publish`** (exactly that name; npm then rejects tokens from runs that
   did not go through that environment). Trusted Publishing only works for a package that already exists; a
   brand-new package name needs one initial publish by an npm owner first.
+- **GitHub `release` environment.** `host` declares `environment: release`.
+  Create it under `OpenThinkAi/pm` → Settings → Environments → New
+  environment → `release`. Set deployment branches to `main` only
+  (selected branches) and optionally add required reviewers. The npm
+  Trusted Publisher is unaffected: it stays bound to `npm-publish`, because
+  only `publish-npm` talks to npm. Without the environment GitHub creates it
+  with no rules, so the protection is only real once you configure it.
 - **GitHub `npm-publish` environment.** `publish-npm` declares
   `environment: npm-publish`. Create it under `OpenThinkAi/pm` → Settings →
   Environments → New environment → `npm-publish`. Optionally add required
@@ -113,6 +120,14 @@ before bumping a version (needs network for the RustSec advisory DB):
 cargo install --locked cargo-deny --version 0.20.2   # once
 cargo deny check
 ```
+
+Policy: `yanked = "deny"`; `wildcards = "deny"` (with
+`allow-wildcard-paths = true` so pm's path deps pass); duplicate versions
+stay `warn` because they are transitive and not fixable from pm today.
+`wildcards = "deny"` flags pm's unversioned path deps on `pm-core`/`pm-store`
+unless the crate is non-publishable, so `crates/pm` sets `publish = false`
+(it ships via dist, not crates.io) with `[package.metadata.dist] dist = true`
+so dist still releases it.
 
 Dev-dependencies are deliberately included in every check (no
 `exclude-dev`). The only dev-only finding, `yrs` -> `smallstr`
@@ -175,9 +190,13 @@ marked with a `HAND-EDIT` or `PATCHED` comment in the file:
   in the script). dist's generated `curl | sh` installer, the
   `matrix.install_dist.run` step and the `cargo-dist-cache` upload/download
   (which carried one job's binary into the credentialed `host` job) are all
-  removed. Do not reintroduce the cache artifact. The container-only rustup
-  `curl | sh` step in build-local-artifacts never runs (all targets use
-  native runners); if a `container` target is ever added, pin that too.
+  removed. Do not reintroduce the cache artifact. 
+- container removal: dist's container-only rustup `curl | sh` step and the
+  `container:` key on build-local-artifacts are removed (no pm target uses
+  a container). If a `container` target is ever added, reinstate it with a
+  pinned, checksum-verified rustup-init;
+- `host`: `environment: release`, so the job holding `contents: write`,
+  `id-token` and attestations is gated by environment rules.
 
 `allow-dirty = ["ci"]` in `Cargo.toml` stops dist from failing CI on this
 drift. Everything else — attestations in the `host` job, SHA-pinned Actions
