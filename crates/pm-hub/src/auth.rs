@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{FromRequestParts, Path, Request};
+use axum::extract::{FromRef, FromRequestParts, Path, Request};
 use axum::http::StatusCode;
 use axum::http::header::{ALLOW, AUTHORIZATION};
 use axum::http::request::Parts;
@@ -88,20 +88,24 @@ pub struct Authed {
     pub token_label: String,
 }
 
-impl FromRequestParts<Arc<Client>> for Authed {
+/// Extractable from any state that lends the reader connection (the
+/// auth layer's `Arc<Client>` and the server's `Db`).
+impl<S> FromRequestParts<S> for Authed
+where
+    S: Send + Sync,
+    Arc<Client>: FromRef<S>,
+{
     type Rejection = Response;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        db: &Arc<Client>,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         // Already authenticated by `require_auth` on this request (every
         // routed handler). The lookup below runs for the layer itself, and
         // would also guard a handler wired outside the layer by mistake.
         if let Some(authed) = parts.extensions.get::<Authed>() {
             return Ok(authed.clone());
         }
-        let Ok(Path(params)) = Path::<HashMap<String, String>>::from_request_parts(parts, db).await
+        let Ok(Path(params)) =
+            Path::<HashMap<String, String>>::from_request_parts(parts, state).await
         else {
             return Err(not_found().await);
         };
@@ -118,7 +122,7 @@ impl FromRequestParts<Arc<Client>> for Authed {
         };
         // Workspace and token in one lookup, so "no such workspace" and
         // "wrong workspace for this token" are the same miss.
-        let row = db
+        let row = Arc::<Client>::from_ref(state)
             .query_opt(
                 "SELECT id, label FROM tokens
                  WHERE token_hash = $1 AND workspace_id = $2 AND revoked_at IS NULL",

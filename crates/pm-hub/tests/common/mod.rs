@@ -217,6 +217,17 @@ pub struct Response {
 
 /// One HTTP/1.1 request with extra header lines (`"Name: value"`).
 pub fn request(port: u16, method: &str, path: &str, headers: &[&str]) -> Response {
+    request_body(port, method, path, headers, b"")
+}
+
+/// [`request`] with a body (`Content-Length` set from it on non-GETs).
+pub fn request_body(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[&str],
+    body: &[u8],
+) -> Response {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connecting to pm-hub");
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
     for h in headers {
@@ -224,10 +235,11 @@ pub fn request(port: u16, method: &str, path: &str, headers: &[&str]) -> Respons
         req.push_str("\r\n");
     }
     if method != "GET" {
-        req.push_str("Content-Length: 0\r\n");
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     req.push_str("\r\n");
     stream.write_all(req.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
     let mut raw = String::new();
     stream.read_to_string(&mut raw).unwrap();
     let (head, body) = raw.split_once("\r\n\r\n").expect("HTTP response");

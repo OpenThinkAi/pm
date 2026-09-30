@@ -1,0 +1,397 @@
+//! `POST /w/{workspace}/ops`: a client pushes a batch of ops and gets back
+//! the hub sequence number of each (AGT-1389, README §Sync & hub).
+//!
+//! The body is `{"ops": [<op>, ...]}`, each op in the op log's wire format
+//! (`{op_id, hlc, actor, entity, kind, payload, version}` — the JSON `pm
+//! backup` writes one per line). Every op is parsed as a [`pm_core::Op`] to
+//! reject a malformed one and to fill the indexed columns, but what the
+//! `ops.op` column stores is the op's JSON text exactly as it arrived
+//! (`json`, not `jsonb`), so a pull serves back the bytes that were pushed.
+//!
+//! **Sequence.** `ops.seq` is the only transport order: a client pulls
+//! `since <seq>` and trusts that nothing with a smaller seq will appear
+//! later. A bigserial alone does not give that — two concurrent
+//! transactions take 5 and 6 and may commit 6 first, so a puller that saw
+//! 6 skips 5 forever. Every push therefore runs in one transaction that
+//! first locks the workspace's row (`SELECT ... FOR NO KEY UPDATE`, held to
+//! commit) and only then takes sequence values: per workspace, seqs are
+//! handed out and committed in the same order, with no gaps between a
+//! batch's ops. `NO KEY` leaves the row open to `FOR KEY SHARE`, which is
+//! what inserting a token for the workspace takes. Inside a batch, seq
+//! order is batch order. Pushes go through one dedicated connection behind
+//! a mutex (a transaction needs the connection to itself); reads and auth
+//! stay on the other connection and never wait for a push.
+//!
+//! **Idempotency.** `op_id` is an op's identity. An op the workspace
+//! already has (from an earlier batch, or earlier in this one) is answered
+//! with its existing seq and `stored: false`; its content is not compared
+//! and never overwritten. A batch is all-or-nothing: one bad op and nothing
+//! in it is stored.
+//!
+//! **Limits.** [`MAX_BATCH_OPS`] ops per batch, [`MAX_BODY_BYTES`] of body
+//! (the Studio's seed log holds one 23 MB `body.edit`, so the byte limit
+//! leaves room for a single large op plus a batch around it). A body over
+//! the limit is a 413 whether announced by `Content-Length` or discovered
+//! while reading.
+
+use std::collections::HashMap;
+
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, FailedToBufferBody};
+use axum::extract::{FromRequest, Request, State};
+use axum::http::StatusCode;
+use axum::http::header::CONTENT_LENGTH;
+use axum::response::{IntoResponse, Response};
+use pm_core::{OP_VERSION, Op};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+
+use crate::Db;
+use crate::auth::Authed;
+
+/// Most ops in one batch.
+pub const MAX_BATCH_OPS: usize = 1000;
+/// Largest request body, in bytes (64 MiB).
+pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct Batch<'a> {
+    #[serde(borrow)]
+    ops: Vec<&'a RawValue>,
+}
+
+#[derive(Serialize)]
+struct Pushed {
+    /// One entry per op in the batch, in batch order.
+    ops: Vec<Ack>,
+}
+
+#[derive(Serialize)]
+struct Ack {
+    op_id: String,
+    seq: i64,
+    /// `true` if this push stored the op; `false` if the workspace
+    /// already had it (its seq is the existing one).
+    stored: bool,
+}
+
+/// The structured error body of every 4xx this route returns.
+#[derive(Serialize)]
+struct ErrorBody {
+    error: &'static str,
+    reason: String,
+    /// The offending op's position in the batch (`invalid_op` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index: Option<usize>,
+    /// The offending op's `op_id`, when the JSON had one (`invalid_op` only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    op_id: Option<String>,
+}
+
+#[derive(Debug)]
+enum PushError {
+    TooLarge,
+    Batch(String),
+    Op {
+        index: usize,
+        op_id: Option<String>,
+        reason: String,
+    },
+    NoWorkspace,
+    Db(tokio_postgres::Error),
+}
+
+impl From<tokio_postgres::Error> for PushError {
+    fn from(e: tokio_postgres::Error) -> Self {
+        PushError::Db(e)
+    }
+}
+
+impl IntoResponse for PushError {
+    fn into_response(self) -> Response {
+        let (status, body) = match self {
+            PushError::TooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorBody {
+                    error: "too_large",
+                    reason: format!("request body exceeds {MAX_BODY_BYTES} bytes"),
+                    index: None,
+                    op_id: None,
+                },
+            ),
+            PushError::Batch(reason) => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "invalid_batch",
+                    reason,
+                    index: None,
+                    op_id: None,
+                },
+            ),
+            PushError::Op {
+                index,
+                op_id,
+                reason,
+            } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "invalid_op",
+                    reason,
+                    index: Some(index),
+                    op_id,
+                },
+            ),
+            // The token authenticated, so the workspace row was there a
+            // moment ago; answer as auth does when there is nothing there.
+            PushError::NoWorkspace => return StatusCode::NOT_FOUND.into_response(),
+            PushError::Db(e) => {
+                eprintln!("pm-hub: push: {e}");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        };
+        (status, Json(body)).into_response()
+    }
+}
+
+/// One op of a batch, parsed for its indexed columns; `raw` is what gets
+/// stored.
+struct Parsed<'a> {
+    op_id: String,
+    hlc_wall_ms: i64,
+    hlc_counter: i64,
+    actor: String,
+    entity: String,
+    kind: &'static str,
+    raw: &'a str,
+}
+
+/// `op_id` alone, for naming an op that failed to parse as a whole.
+#[derive(Deserialize)]
+struct OpIdOnly {
+    op_id: Option<String>,
+}
+
+fn parse_op(index: usize, raw: &RawValue) -> Result<Parsed<'_>, PushError> {
+    let invalid = |reason: String| PushError::Op {
+        index,
+        op_id: serde_json::from_str::<OpIdOnly>(raw.get())
+            .ok()
+            .and_then(|o| o.op_id),
+        reason,
+    };
+    let op: Op =
+        serde_json::from_str(raw.get()).map_err(|e| invalid(format!("not a pm op: {e}")))?;
+    if op.version > OP_VERSION {
+        return Err(invalid(format!(
+            "op version {} is newer than this hub understands ({OP_VERSION})",
+            op.version
+        )));
+    }
+    if op.actor.as_str().is_empty() {
+        return Err(invalid("actor is empty".to_string()));
+    }
+    let hlc_wall_ms = i64::try_from(op.hlc.wall_ms)
+        .map_err(|_| invalid(format!("hlc.wall_ms {} is out of range", op.hlc.wall_ms)))?;
+    Ok(Parsed {
+        op_id: op.op_id.to_string(),
+        hlc_wall_ms,
+        hlc_counter: i64::from(op.hlc.counter),
+        actor: op.actor.as_str().to_string(),
+        entity: op.entity.to_string(),
+        kind: op.kind(),
+        raw: raw.get(),
+    })
+}
+
+/// The body, or 413 when `Content-Length` announces more than the limit
+/// (without reading it) or the limit is hit while reading.
+async fn body(req: Request) -> Result<Bytes, PushError> {
+    let announced = req
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if announced.is_some_and(|n| n > MAX_BODY_BYTES) {
+        return Err(PushError::TooLarge);
+    }
+    Bytes::from_request(req, &()).await.map_err(|e| match e {
+        BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
+            PushError::TooLarge
+        }
+        e => PushError::Batch(e.body_text()),
+    })
+}
+
+pub async fn push(State(db): State<Db>, caller: Authed, req: Request) -> Response {
+    match push_batch(&db, &caller.workspace, req).await {
+        Ok(pushed) => Json(pushed).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn push_batch(db: &Db, workspace: &str, req: Request) -> Result<Pushed, PushError> {
+    let body = body(req).await?;
+    let text = std::str::from_utf8(&body)
+        .map_err(|_| PushError::Batch("body is not UTF-8".to_string()))?;
+    let batch: Batch =
+        serde_json::from_str(text).map_err(|e| PushError::Batch(format!("body: {e}")))?;
+    if batch.ops.len() > MAX_BATCH_OPS {
+        return Err(PushError::Batch(format!(
+            "{} ops in one batch; the limit is {MAX_BATCH_OPS}",
+            batch.ops.len()
+        )));
+    }
+
+    // Parse everything before touching the database, and collapse
+    // repeats of an op_id within the batch onto its first occurrence.
+    let mut unique: Vec<Parsed> = Vec::with_capacity(batch.ops.len());
+    let mut first_at: HashMap<String, usize> = HashMap::with_capacity(batch.ops.len());
+    let mut position: Vec<usize> = Vec::with_capacity(batch.ops.len());
+    for (index, raw) in batch.ops.iter().enumerate() {
+        let parsed = parse_op(index, raw)?;
+        let at = *first_at
+            .entry(parsed.op_id.clone())
+            .or_insert_with(|| unique.len());
+        if at == unique.len() {
+            unique.push(parsed);
+        }
+        position.push(at);
+    }
+
+    let mut seq_of: HashMap<String, (i64, bool)> = HashMap::with_capacity(unique.len());
+    {
+        let mut writer = db.writer.lock().await;
+        let tx = writer.transaction().await?;
+        // Held until commit: this is what orders seqs per workspace (see
+        // the module doc).
+        let locked = tx
+            .query_opt(
+                "SELECT id FROM workspaces WHERE id = $1 FOR NO KEY UPDATE",
+                &[&workspace],
+            )
+            .await?;
+        if locked.is_none() {
+            return Err(PushError::NoWorkspace);
+        }
+
+        let op_ids: Vec<&str> = unique.iter().map(|p| p.op_id.as_str()).collect();
+        let existing = tx
+            .query(
+                "SELECT op_id, seq FROM ops WHERE workspace_id = $1 AND op_id = ANY($2)",
+                &[&workspace, &op_ids],
+            )
+            .await?;
+        for row in existing {
+            seq_of.insert(row.get(0), (row.get(1), false));
+        }
+
+        let fresh: Vec<&Parsed> = unique
+            .iter()
+            .filter(|p| !seq_of.contains_key(&p.op_id))
+            .collect();
+        if !fresh.is_empty() {
+            let op_ids: Vec<&str> = fresh.iter().map(|p| p.op_id.as_str()).collect();
+            let wall_ms: Vec<i64> = fresh.iter().map(|p| p.hlc_wall_ms).collect();
+            let counters: Vec<i64> = fresh.iter().map(|p| p.hlc_counter).collect();
+            let actors: Vec<&str> = fresh.iter().map(|p| p.actor.as_str()).collect();
+            let entities: Vec<&str> = fresh.iter().map(|p| p.entity.as_str()).collect();
+            let kinds: Vec<&str> = fresh.iter().map(|p| p.kind).collect();
+            let raws: Vec<&str> = fresh.iter().map(|p| p.raw).collect();
+            // `ORDER BY ordinality` feeds rows to the insert in batch
+            // order, so `nextval` runs in that order too. `::json` from
+            // text keeps the text verbatim (a `json` value is its input).
+            let inserted = tx
+                .query(
+                    "INSERT INTO ops
+                         (workspace_id, op_id, hlc_wall_ms, hlc_counter, actor, entity, kind, op)
+                     SELECT $1, n.op_id, n.wall_ms, n.counter, n.actor, n.entity, n.kind, n.op::json
+                     FROM unnest($2::text[], $3::bigint[], $4::bigint[],
+                                 $5::text[], $6::text[], $7::text[], $8::text[])
+                          WITH ORDINALITY
+                          AS n (op_id, wall_ms, counter, actor, entity, kind, op, i)
+                     ORDER BY n.i
+                     RETURNING op_id, seq",
+                    &[
+                        &workspace, &op_ids, &wall_ms, &counters, &actors, &entities, &kinds, &raws,
+                    ],
+                )
+                .await?;
+            for row in inserted {
+                seq_of.insert(row.get(0), (row.get(1), true));
+            }
+        }
+        tx.commit().await?;
+    }
+
+    // A repeat within the batch is acknowledged like a repeat across
+    // batches: the first occurrence stored it, later ones did not.
+    let mut acked = vec![false; unique.len()];
+    let ops = position
+        .into_iter()
+        .map(|at| {
+            let op_id = &unique[at].op_id;
+            let (seq, stored) = seq_of[op_id];
+            let first = !std::mem::replace(&mut acked[at], true);
+            Ack {
+                op_id: op_id.clone(),
+                seq,
+                stored: stored && first,
+            }
+        })
+        .collect();
+    Ok(Pushed { ops })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err_of(index: usize, raw: &str) -> (Option<String>, String) {
+        let raw: &RawValue = serde_json::from_str(raw).unwrap();
+        match parse_op(index, raw) {
+            Err(PushError::Op { op_id, reason, .. }) => (op_id, reason),
+            Err(_) => panic!("not an op error"),
+            Ok(_) => panic!("parsed {raw}"),
+        }
+    }
+
+    #[test]
+    fn parses_indexed_columns_and_keeps_the_raw_text() {
+        let raw = r#"{ "op_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "hlc": {"wall_ms": 5, "counter": 2},
+            "actor":"matt", "entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW", "kind":"hold.clear", "version":1 }"#;
+        let value: &RawValue = serde_json::from_str(raw).unwrap();
+        let parsed = parse_op(0, value).unwrap();
+        assert_eq!(parsed.op_id, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!((parsed.hlc_wall_ms, parsed.hlc_counter), (5, 2));
+        assert_eq!(parsed.actor, "matt");
+        assert_eq!(parsed.entity, "01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        assert_eq!(parsed.kind, "hold.clear");
+        assert_eq!(parsed.raw, raw);
+    }
+
+    #[test]
+    fn names_the_bad_op_when_it_can() {
+        let (op_id, reason) = err_of(
+            3,
+            r#"{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{"wall_ms":1,"counter":0},
+                "actor":"a","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"nope","version":1}"#,
+        );
+        assert_eq!(op_id.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(reason.contains("nope"), "{reason}");
+        let (op_id, _) = err_of(0, "[1, 2]");
+        assert_eq!(op_id, None);
+        let (_, reason) = err_of(
+            0,
+            r#"{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{"wall_ms":1,"counter":0},
+                "actor":"","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"tombstone","version":1}"#,
+        );
+        assert_eq!(reason, "actor is empty");
+        let (_, reason) = err_of(
+            0,
+            r#"{"op_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hlc":{"wall_ms":1,"counter":0},
+                "actor":"a","entity":"01ARZ3NDEKTSV4RRFFQ69G5FAW","kind":"tombstone","version":2}"#,
+        );
+        assert!(reason.starts_with("op version 2 is newer"), "{reason}");
+    }
+}
