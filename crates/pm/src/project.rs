@@ -28,7 +28,8 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Subcommand;
 use pm_core::op::BodyEdit;
-use pm_core::{Body, Payload, Project, ProjectStatus};
+use pm_core::{ActorId, Body, Payload, Project, ProjectStatus};
+use pm_store::Store;
 use serde_json::{Map, Value, json};
 use ulid::Ulid;
 
@@ -70,6 +71,12 @@ pub enum ProjectCmd {
         /// ui-leaf or editor ($EDITOR); default: config `edit.view`, else ui-leaf at a terminal (falling back to $EDITOR)
         #[arg(long, value_parser = edit::parse_view)]
         view: Option<edit::View>,
+        /// Non-interactive: replace the document body with this file's text (`-` = stdin) instead of opening any editor; the BODY only, since a design doc has no frontmatter. Agents use this, never a scripted $EDITOR
+        #[arg(long = "from-file", value_name = "PATH|-", conflicts_with = "view")]
+        from_file: Option<String>,
+        /// With --from-file: write this named document instead of the design doc
+        #[arg(long, value_name = "NAME", requires = "from_file")]
+        doc: Option<String>,
     },
     /// Refuses while the project still has tickets or child projects (FK)
     Delete { id: String },
@@ -101,7 +108,13 @@ pub fn run(ctx: &Ctx<'_>, cmd: ProjectCmd) -> Result<()> {
         } => new(ctx, &id, &title, &repos, parent.as_deref()),
         ProjectCmd::Show { id, doc } => show(ctx, &id, doc.as_deref()),
         ProjectCmd::List { status } => list(ctx, status),
-        ProjectCmd::Edit { id, view } => edit(ctx, &id, view),
+        ProjectCmd::Edit {
+            id,
+            from_file: Some(src),
+            doc,
+            ..
+        } => edit_from_file(ctx, &id, doc.as_deref(), &src),
+        ProjectCmd::Edit { id, view, .. } => edit(ctx, &id, view),
         ProjectCmd::Delete { id } => delete(ctx, &id),
         ProjectCmd::Doc { cmd } => match cmd {
             ProjectDocCmd::Add {
@@ -263,6 +276,16 @@ fn edit_in_editor(ctx: &Ctx<'_>, id: &str) -> Result<()> {
         return print_project(ctx, &project);
     }
 
+    commit_doc_text(&mut store, actor, doc_id, &new_text)?;
+    let project = store
+        .project(id)?
+        .ok_or_else(|| CliError::error(format!("project '{id}' vanished after edit")))?;
+    print_project(ctx, &project)
+}
+
+/// Diffs `new_text` against a document's replica history and commits the
+/// `body.edit` (shared by the `$EDITOR` and `--from-file` paths).
+fn commit_doc_text(store: &mut Store, actor: ActorId, doc_id: Ulid, new_text: &str) -> Result<()> {
     // Continue this document's causal history rather than diffing from an
     // empty replica: import whatever this replica already knows (the
     // cached snapshot, if any body.edit has ever landed) before diffing to
@@ -282,10 +305,10 @@ fn edit_in_editor(ctx: &Ctx<'_>, id: &str) -> Result<()> {
             .map_err(|e| CliError::error(format!("restoring project doc history: {e}")))?;
     }
     let update = body
-        .diff_from_text(&new_text)
+        .diff_from_text(new_text)
         .map_err(|e| CliError::error(format!("diffing project doc: {e}")))?;
 
-    let mut stamper = Stamper::new(&store, actor)?;
+    let mut stamper = Stamper::new(store, actor)?;
     let op = stamper.op(
         doc_id,
         Payload::BodyEdit(BodyEdit {
@@ -293,6 +316,43 @@ fn edit_in_editor(ctx: &Ctx<'_>, id: &str) -> Result<()> {
         }),
     );
     store.commit_doc_edit(doc_id, &op)?;
+    Ok(())
+}
+
+/// `pm project edit <id> [--doc <name>] --from-file <path|->` (AGT-1480):
+/// the non-interactive write. The file is the document BODY (a design doc
+/// has no frontmatter), diffed line-faithfully through `Body::diff_from_text`
+/// like the editor flow, so a concurrent edit merges; unchanged text
+/// commits nothing.
+fn edit_from_file(ctx: &Ctx<'_>, id: &str, doc: Option<&str>, src: &str) -> Result<()> {
+    let actor = ctx.actor()?;
+    let (mut store, _ws) = ctx.open()?;
+    let project = store.project(id)?.ok_or_else(|| not_found(id))?;
+    let (doc_id, current) = match doc {
+        None => {
+            let doc_id = store.design_doc_id(id)?.ok_or_else(|| {
+                CliError::error(format!(
+                    "project '{id}' has no design doc bound yet (its binding has not synced here)"
+                ))
+            })?;
+            (doc_id, &project.doc)
+        }
+        Some(name) => {
+            let not_found = || {
+                CliError::not_found(format!(
+                    "project '{id}' has no document '{name}' (create it with `pm project doc add`)"
+                ))
+            };
+            let current = project.documents.get(name).ok_or_else(not_found)?;
+            let doc_id = store.named_doc_id(id, name)?.ok_or_else(not_found)?;
+            (doc_id, current)
+        }
+    };
+    let text = crate::fromfile::read_source(src)?;
+    if text == *current {
+        return print_project(ctx, &project);
+    }
+    commit_doc_text(&mut store, actor, doc_id, &text)?;
     let project = store
         .project(id)?
         .ok_or_else(|| CliError::error(format!("project '{id}' vanished after edit")))?;
@@ -323,7 +383,13 @@ fn doc_add(ctx: &Ctx<'_>, id: &str, name: &str, from_file: &std::path::Path) -> 
     let actor = ctx.actor()?;
 
     let (mut store, _ws) = ctx.open()?;
-    store.project(id)?.ok_or_else(|| not_found(id))?;
+    let project = store.project(id)?.ok_or_else(|| not_found(id))?;
+    if project.documents.contains_key(&name) {
+        return Err(CliError::error(format!(
+            "project '{id}' already has a document '{name}'; replace it with \
+             `pm project edit {id} --doc {name} --from-file <path|->`"
+        )));
+    }
     let doc_id = store.add_named_doc(id, &name, &actor)?;
 
     let mut body = Body::new();

@@ -501,3 +501,97 @@ fn offline_description_edits_merge_line_faithfully() {
     assert_ok(&sb.run(&["doctor"], None));
     assert_ok(&other.run(&["doctor"], None));
 }
+
+// ------------------------------------------------ AGT-1480: --from-file
+
+impl Sandbox {
+    /// A plain file with `contents` (unlike `fixture`, which is a `cp` step).
+    fn file(&self, name: &str, contents: &str) -> String {
+        let path = self.path(name);
+        std::fs::write(&path, contents).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn run_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pm"))
+            .args(args)
+            .env_clear()
+            .env("HOME", self.home.path())
+            .env("USER", "tester")
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+}
+
+#[test]
+fn from_file_replaces_only_the_description() {
+    let sb = Sandbox::new();
+    let f = sb.file("d.md", "new one\nline two\n\n## More\n");
+    let out = sb.run(&["edit", "AGT-1", "--from-file", &f, "--json"], None);
+    assert_ok(&out);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["description"], "new one\nline two\n\n## More\n");
+    let t = sb.show();
+    assert_eq!(t["title"], "Original title");
+    assert_eq!(t["labels"], serde_json::json!(["a", "b"]));
+    assert_eq!(sb.op_kinds().last(), Some(&"body.edit"));
+}
+
+#[test]
+fn from_file_unchanged_commits_nothing_and_stdin_works() {
+    let sb = Sandbox::new();
+    let before = sb.op_kinds().len();
+    let out = sb.run_stdin(&["edit", "AGT-1", "--from-file", "-"], "line one\nline two");
+    assert_ok(&out);
+    assert_eq!(sb.op_kinds().len(), before, "same text: no op");
+    assert_ok(&sb.run_stdin(&["edit", "AGT-1", "--from-file", "-"], "piped\n"));
+    assert_eq!(sb.show()["description"], "piped\n");
+}
+
+#[test]
+fn from_file_by_ulid_unknown_ticket_and_view_conflict() {
+    let sb = Sandbox::new();
+    let f = sb.file("d.md", "x\n");
+    let ulid = sb
+        .store()
+        .ticket_by_number(1)
+        .unwrap()
+        .unwrap()
+        .id
+        .to_string();
+    assert_ok(&sb.run(&["edit", &ulid, "--from-file", &f], None));
+    assert_eq!(sb.show()["description"], "x\n");
+    assert_code(&sb.run(&["edit", "AGT-99", "--from-file", &f], None), 3);
+    assert_code(
+        &sb.run(&["edit", "AGT-1", "--from-file", &f, "--view=editor"], None),
+        2,
+    );
+}
+
+#[test]
+fn from_file_merges_line_faithfully_with_a_concurrent_replica() {
+    let sb = Sandbox::new();
+    let other = sb.replica();
+    let l = sb.file("l.md", "line ONE\nline two");
+    let r = other.file("r.md", "line one\nline TWO");
+    assert_ok(&sb.run(&["edit", "AGT-1", "--from-file", &l], None));
+    assert_ok(&other.run(&["edit", "AGT-1", "--from-file", &r], None));
+    let (a, b) = (sb.ticket_ops(), other.ticket_ops());
+    sb.store().apply_pulled(&b).unwrap();
+    other.store().apply_pulled(&a).unwrap();
+    assert_eq!(sb.show()["description"], "line ONE\nline TWO");
+    assert_eq!(other.show()["description"], "line ONE\nline TWO");
+    assert_ok(&sb.run(&["doctor"], None));
+}

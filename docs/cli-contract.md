@@ -490,7 +490,19 @@ note, and leaves the state untouched.
 ### `pm edit <ID>`
 
 Flags: `--view <VIEW>` (`ui-leaf` or `editor`; default: `edit.view` in
-config.toml, else `ui-leaf` — for an interactive invocation only).
+config.toml, else `ui-leaf` — for an interactive invocation only);
+`--from-file <PATH|->` (AGT-1480; conflicts with `--view`).
+
+**`--from-file` is the non-interactive write for a ticket description.**
+Agents and scripts use it — never a scripted `$EDITOR`. It replaces the
+**description only**, with the file's text (`-` = stdin) taken verbatim;
+the frontmatter fields are not parsed and stay on `pm set`. The text is
+diffed through the same line-faithful `Body::diff_from_text` as the editor
+flow, so a concurrent edit merges; identical text commits nothing (a
+`no changes` note on stderr). Nothing is launched and nothing prompts.
+`<ID>` may be the ULID of a ticket still awaiting its hub number. Exit
+`2`: `--view` with `--from-file`, or non-UTF-8 input; `3`: unknown ticket;
+`1`: unreadable file. `--json`: **Ticket**.
 
 **Non-interactive `pm edit` never opens a window it was not asked for.**
 When the view is the default (no `--view`, no `edit.view`) and stdin or
@@ -1077,7 +1089,19 @@ Flags: `--status <STATUS>` (`in-progress`, `complete`, `abandoned`).
 ### `pm project edit <ID>`
 
 Flags: `--view <VIEW>` (`ui-leaf` or `editor`; default: `edit.view` in
-config.toml, else `ui-leaf` — for an interactive invocation only).
+config.toml, else `ui-leaf` — for an interactive invocation only);
+`--from-file <PATH|->` (conflicts with `--view`); `--doc <NAME>` (requires
+`--from-file`).
+
+**`--from-file`** (AGT-1480) is the non-interactive write: it replaces the
+design doc body — or, with `--doc <NAME>`, that named document's — with
+the file's text (`-` = stdin), launching nothing. The file is the document
+**body only**: a design doc has no frontmatter, so what you pass is what is
+stored. Diffed through the line-faithful `Body::diff_from_text` like the
+editor flow, so concurrent edits merge; unchanged text commits nothing.
+Agents use this, never a scripted `$EDITOR`. Exit `3`: unknown project or
+unknown `--doc` name (create it with `pm project doc add`). `--json`:
+**Project**. Without `--from-file` the paragraphs below apply.
 
 Chooses its view exactly as `pm edit` does (AGT-1405): `--view`, then
 `edit.view`, else ui-leaf only when stdin and stdout are both terminals —
@@ -1123,6 +1147,9 @@ op; the slug can later be re-created as a new project). `pm doctor
 ### `pm project doc add <ID> <NAME>`
 
 Flags: `--from-file <PATH>` (required).
+
+Creates only: a name that already exists is exit `1`, and the error points
+at `pm project edit <ID> --doc <NAME> --from-file <PATH|->`.
 
 - Exit `3`: unknown project.
 - `--json`: `{"schema": 1, "project": "id", "doc": "NAME"}`.

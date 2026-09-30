@@ -13,6 +13,7 @@ mod doctor;
 mod edit;
 mod exit;
 mod export;
+mod fromfile;
 mod hub;
 mod ids;
 mod import;
@@ -213,6 +214,9 @@ enum Cmd {
         /// ui-leaf or editor ($EDITOR); default: config `edit.view`, else ui-leaf (falling back to $EDITOR)
         #[arg(long, value_parser = edit::parse_view)]
         view: Option<edit::View>,
+        /// Non-interactive: replace the ticket's DESCRIPTION with this file's text (`-` = stdin); frontmatter fields stay on `pm set`. Agents use this, never a scripted $EDITOR
+        #[arg(long = "from-file", value_name = "PATH|-", conflicts_with = "view")]
+        from_file: Option<String>,
     },
     /// Take a ticket: unstarted and unassigned -> started, assigned to you (exit 75 if someone else has it)
     Claim {
@@ -559,7 +563,12 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             },
         ),
         Cmd::Unclaim { id } => mutate::unclaim(ctx, &id),
-        Cmd::Edit { id, view } => edit::edit(ctx, &id, view),
+        Cmd::Edit {
+            id,
+            from_file: Some(src),
+            ..
+        } => fromfile::ticket_description(ctx, &id, &src),
+        Cmd::Edit { id, view, .. } => edit::edit(ctx, &id, view),
         Cmd::App { idle, allow_origin } => app::app(ctx, app::AppArgs { idle, allow_origin }),
         Cmd::Claim {
             id,

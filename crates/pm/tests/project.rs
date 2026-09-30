@@ -468,3 +468,213 @@ fn init_rejects_path_shaped_prefixes_with_usage_exit() {
         assert!(!sb.ws.exists(), "{bad:?} created a workspace");
     }
 }
+
+// ------------------------------------------------ AGT-1480: --from-file
+
+impl Sandbox {
+    /// `pm` with `input` on stdin.
+    fn pm_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pm"));
+        cmd.args(args)
+            .env_clear()
+            .env("HOME", self.home.path())
+            .env("USER", "tester")
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn doc_of(&self, id: &str) -> String {
+        json(&self.pm(&["project", "show", id, "--json"]))["doc"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn replica(&self) -> Sandbox {
+        let home = tempfile::tempdir().unwrap();
+        let ws = home.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        for name in ["pm.sqlite", "pm.sqlite-wal", "pm.sqlite-shm"] {
+            let from = self.ws.join(name);
+            if from.is_file() {
+                std::fs::copy(&from, ws.join(name)).unwrap();
+            }
+        }
+        let config = |home: &std::path::Path| home.join(".config/pm/config.toml");
+        let text = std::fs::read_to_string(config(self.home.path())).unwrap();
+        let text = text.replace(self.ws.to_str().unwrap(), ws.to_str().unwrap());
+        std::fs::create_dir_all(config(home.path()).parent().unwrap()).unwrap();
+        std::fs::write(config(home.path()), text).unwrap();
+        Sandbox { home, ws }
+    }
+}
+
+#[test]
+fn from_file_replaces_the_design_doc_and_unchanged_is_a_no_op() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    let f = sb.fixture("spec.md", "# pm\n\nFirst.\n");
+    let v = json(&sb.pm(&[
+        "project",
+        "edit",
+        "pm",
+        "--from-file",
+        f.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(v["doc"], "# pm\n\nFirst.\n");
+    assert_eq!(sb.doc_of("pm"), "# pm\n\nFirst.\n");
+    let doc_id = sb.store().design_doc_id("pm").unwrap().unwrap();
+    assert_eq!(sb.store().ops(doc_id).unwrap().len(), 1);
+
+    assert_ok(&sb.pm(&["project", "edit", "pm", "--from-file", f.to_str().unwrap()]));
+    assert_eq!(sb.store().ops(doc_id).unwrap().len(), 1, "unchanged: no op");
+
+    let g = sb.fixture("spec2.md", "# pm\n\nSecond.\n");
+    assert_ok(&sb.pm(&["project", "edit", "pm", "--from-file", g.to_str().unwrap()]));
+    assert_eq!(sb.doc_of("pm"), "# pm\n\nSecond.\n");
+    assert_eq!(sb.store().ops(doc_id).unwrap().len(), 2);
+}
+
+#[test]
+fn from_file_reads_stdin_with_a_dash() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    assert_ok(&sb.pm_stdin(
+        &["project", "edit", "pm", "--from-file", "-"],
+        "piped body\n",
+    ));
+    assert_eq!(sb.doc_of("pm"), "piped body\n");
+}
+
+#[test]
+fn from_file_writes_a_named_doc_and_doc_add_points_there_on_a_duplicate() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    let f = sb.fixture("a.md", "one\n");
+    assert_ok(&sb.pm(&[
+        "project",
+        "doc",
+        "add",
+        "pm",
+        "notes",
+        "--from-file",
+        f.to_str().unwrap(),
+    ]));
+
+    let out = sb.pm(&[
+        "project",
+        "doc",
+        "add",
+        "pm",
+        "notes",
+        "--from-file",
+        f.to_str().unwrap(),
+    ]);
+    assert_code(&out, 1);
+    assert!(stderr(&out).contains("project edit pm --doc notes --from-file"));
+
+    assert_ok(&sb.pm_stdin(
+        &[
+            "project",
+            "edit",
+            "pm",
+            "--doc",
+            "notes",
+            "--from-file",
+            "-",
+        ],
+        "two\n",
+    ));
+    let v = json(&sb.pm(&["project", "show", "pm", "--doc", "notes", "--json"]));
+    assert_eq!(v["body"], "two\n");
+    assert_eq!(sb.doc_of("pm"), "", "the design doc is untouched");
+}
+
+#[test]
+fn from_file_unknown_project_or_doc_exits_3() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    let f = sb.fixture("a.md", "x\n");
+    let p = f.to_str().unwrap();
+    assert_code(&sb.pm(&["project", "edit", "nope", "--from-file", p]), 3);
+    assert_code(
+        &sb.pm(&["project", "edit", "pm", "--doc", "nope", "--from-file", p]),
+        3,
+    );
+}
+
+#[test]
+fn from_file_conflicts_with_view_and_doc_needs_from_file() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    let f = sb.fixture("a.md", "x\n");
+    let p = f.to_str().unwrap();
+    assert_code(
+        &sb.pm(&[
+            "project",
+            "edit",
+            "pm",
+            "--from-file",
+            p,
+            "--view",
+            "editor",
+        ]),
+        2,
+    );
+    assert_code(&sb.pm(&["project", "edit", "pm", "--doc", "n"]), 2);
+}
+
+#[test]
+fn from_file_edits_merge_with_a_concurrent_replica_edit() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    let base = sb.fixture("base.md", "line A\nline B\n");
+    assert_ok(&sb.pm(&[
+        "project",
+        "edit",
+        "pm",
+        "--from-file",
+        base.to_str().unwrap(),
+    ]));
+
+    let other = sb.replica();
+    let left = sb.fixture("l.md", "line A left\nline B\n");
+    let right = other.fixture("r.md", "line A\nline B right\n");
+    assert_ok(&sb.pm(&[
+        "project",
+        "edit",
+        "pm",
+        "--from-file",
+        left.to_str().unwrap(),
+    ]));
+    assert_ok(&other.pm(&[
+        "project",
+        "edit",
+        "pm",
+        "--from-file",
+        right.to_str().unwrap(),
+    ]));
+
+    let doc_id = sb.store().design_doc_id("pm").unwrap().unwrap();
+    let (a, b) = (
+        sb.store().ops(doc_id).unwrap(),
+        other.store().ops(doc_id).unwrap(),
+    );
+    sb.store().apply_pulled(&b).unwrap();
+    other.store().apply_pulled(&a).unwrap();
+    let merged = sb.doc_of("pm");
+    assert_eq!(merged, "line A left\nline B right\n");
+    assert_eq!(other.doc_of("pm"), merged);
+}
