@@ -29,18 +29,14 @@ use crate::verbs::{
 /// it (README §Conflict semantics: OR-set, add-wins). One `commit_batch` so
 /// a multi-token invocation (`+x -y +z`) can never land partially.
 pub fn label(ctx: &Ctx<'_>, reference: &str, changes: &[String]) -> Result<()> {
-    enum Change {
-        Add(String),
-        Remove(String),
-    }
-    let parsed: Vec<Change> = changes
+    let parsed: Vec<LabelChange> = changes
         .iter()
         .map(|c| {
             let c = c.trim();
             if let Some(rest) = c.strip_prefix('+') {
-                Ok(Change::Add(non_empty("label", rest)?))
+                Ok(LabelChange::Add(non_empty("label", rest)?))
             } else if let Some(rest) = c.strip_prefix('-') {
-                Ok(Change::Remove(non_empty("label", rest)?))
+                Ok(LabelChange::Remove(non_empty("label", rest)?))
             } else {
                 Err(CliError::usage(format!("'{c}' is not +label or -label")))
             }
@@ -50,36 +46,65 @@ pub fn label(ctx: &Ctx<'_>, reference: &str, changes: &[String]) -> Result<()> {
     let actor = ctx.actor()?;
     let (mut store, ws) = ctx.open()?;
     let ticket = find(&store, &ws, reference)?;
+    let mut stamper = Stamper::new(&store, actor)?;
+    let ops = label_ops(&store, &ws, &ticket, &mut stamper, &parsed)?;
+    store.commit_batch(&ops, &[])?;
+    print_ticket(ctx, &store, &ws, ticket.id)
+}
+
+/// One `+label` / `-label` token, parsed.
+pub(crate) enum LabelChange {
+    Add(String),
+    Remove(String),
+}
+
+/// The ops for `changes` on `ticket`, in order: a `label.add` per add, a
+/// `label.remove` citing the add-tags this replica currently observes per
+/// remove. `pub(crate)`: `pm app`'s label endpoint (AGT-1401) plans its
+/// ops here too, so the API and the CLI never disagree on what a remove
+/// cites.
+pub(crate) fn label_ops(
+    store: &pm_store::Store,
+    ws: &pm_core::Workspace,
+    ticket: &pm_core::Ticket,
+    stamper: &mut Stamper,
+    changes: &[LabelChange],
+) -> Result<Vec<pm_core::Op>> {
     // Only a `-label` token needs the current OR-set state (the add-tags it
     // must cite); skip the fetch entirely for a pure-add invocation.
-    let view = if parsed.iter().any(|c| matches!(c, Change::Remove(_))) {
-        Some(store.ticket_view(ticket.id)?.ok_or_else(|| {
-            CliError::not_found(format!("no ticket {}", display_id(&ws, &ticket)))
-        })?)
-    } else {
-        None
-    };
-
-    let mut stamper = Stamper::new(&store, actor)?;
-    let ops: Vec<_> = parsed
-        .into_iter()
+    let view =
+        if changes.iter().any(|c| matches!(c, LabelChange::Remove(_))) {
+            Some(store.ticket_view(ticket.id)?.ok_or_else(|| {
+                CliError::not_found(format!("no ticket {}", display_id(ws, ticket)))
+            })?)
+        } else {
+            None
+        };
+    Ok(changes
+        .iter()
         .map(|change| match change {
-            Change::Add(label) => stamper.op(ticket.id, Payload::LabelAdd(LabelAdd { label })),
-            Change::Remove(label) => {
+            LabelChange::Add(label) => stamper.op(
+                ticket.id,
+                Payload::LabelAdd(LabelAdd {
+                    label: label.clone(),
+                }),
+            ),
+            LabelChange::Remove(label) => {
                 let observed = view
                     .as_ref()
                     .expect("a Remove change means view was fetched")
                     .labels
-                    .observed(&label);
+                    .observed(label);
                 stamper.op(
                     ticket.id,
-                    Payload::LabelRemove(LabelRemove { label, observed }),
+                    Payload::LabelRemove(LabelRemove {
+                        label: label.clone(),
+                        observed,
+                    }),
                 )
             }
         })
-        .collect();
-    store.commit_batch(&ops, &[])?;
-    print_ticket(ctx, &store, &ws, ticket.id)
+        .collect())
 }
 
 // -------------------------------------------------------------- pm relate
@@ -315,36 +340,52 @@ pub fn mv(ctx: &Ctx<'_>, reference: &str, state: &str, keep_assignee: bool) -> R
     let actor = ctx.actor()?;
     let (mut store, ws) = ctx.open()?;
     let ticket = find(&store, &ws, reference)?;
-    let target = ws.state(&state).ok_or_else(|| {
+    let mut stamper = Stamper::new(&store, actor)?;
+    let (ops, cleared) = move_ops(&ws, &ticket, &mut stamper, &state, keep_assignee)?;
+    if let Some(assignee) = cleared {
+        eprintln!(
+            "pm: cleared assignee ({assignee}) moving {} to '{state}'; pass --keep-assignee to keep it",
+            display_id(&ws, &ticket),
+        );
+    }
+    store.commit_batch(&ops, &[])?;
+    print_ticket(ctx, &store, &ws, ticket.id)
+}
+
+/// The ops that move `ticket` to `state`: the `state.transition`, plus
+/// the assignee clear AGT-1379 adds when the target is unstarted/backlog
+/// (unless `keep_assignee`). Returns the assignee it cleared, if any, so
+/// the caller can say so. An unknown state is exit `3`. `pub(crate)`:
+/// `pm app`'s state endpoint (AGT-1401) plans its ops here too.
+pub(crate) fn move_ops(
+    ws: &pm_core::Workspace,
+    ticket: &pm_core::Ticket,
+    stamper: &mut Stamper,
+    state: &str,
+    keep_assignee: bool,
+) -> Result<(Vec<pm_core::Op>, Option<pm_core::ActorId>)> {
+    let target = ws.state(state).ok_or_else(|| {
         let known: Vec<&str> = ws.states.iter().map(|s| s.name.as_str()).collect();
         CliError::not_found(format!(
             "no such state '{state}': expected one of {}",
             known.join(", ")
         ))
     })?;
-
-    let mut stamper = Stamper::new(&store, actor)?;
     let mut ops = vec![stamper.op(
         ticket.id,
         Payload::StateTransition(StateTransition {
-            state: state.clone(),
+            state: state.to_string(),
         }),
     )];
-    let clear_assignee =
-        !keep_assignee && target.category.is_unstarted_or_backlog() && ticket.assignee.is_some();
-    if clear_assignee {
+    let cleared = if !keep_assignee && target.category.is_unstarted_or_backlog() {
+        ticket.assignee.clone()
+    } else {
+        None
+    };
+    if cleared.is_some() {
         ops.push(stamper.op(ticket.id, Payload::FieldSet(FieldSet::Assignee(None))));
-        eprintln!(
-            "pm: cleared assignee ({}) moving {} to '{state}'; pass --keep-assignee to keep it",
-            ticket
-                .assignee
-                .as_ref()
-                .expect("clear_assignee implies Some"),
-            display_id(&ws, &ticket),
-        );
     }
-    store.commit_batch(&ops, &[])?;
-    print_ticket(ctx, &store, &ws, ticket.id)
+    Ok((ops, cleared))
 }
 
 // ---------------------------------------------------------------- pm done

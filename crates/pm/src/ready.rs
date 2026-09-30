@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use pm_core::markers::date_from_ms;
 use pm_core::ready::{DEFAULT_MODEL, Gate, MODEL_LABEL_PREFIX, Reason, Rules, Scope, model_labels};
 use pm_core::{Ticket, Workspace};
+use pm_store::Store;
 use serde_json::{Value, json};
 use ulid::Ulid;
 
@@ -37,7 +38,69 @@ pub struct ReadyArgs {
     pub explain: bool,
 }
 
+/// What `pm ready` computes before it prints: the `--json` payload, and
+/// the pieces the human rendering needs besides it.
+pub(crate) struct Frontier {
+    pub(crate) json: Value,
+    ready: Vec<Ticket>,
+    /// `(ref, message)` per excluded candidate, for `--explain`.
+    excluded: Vec<(String, String)>,
+}
+
 pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
+    let (store, ws) = ctx.open()?;
+    let frontier = compute(&store, &ws, &args)?;
+    if ctx.json {
+        print_json(&frontier.json);
+        return Ok(());
+    }
+
+    let ready = &frontier.ready;
+    if ready.is_empty() {
+        eprintln!("no ready tickets");
+    }
+    let id_w = ready
+        .iter()
+        .map(|t| display_id(&ws, t).len())
+        .max()
+        .unwrap_or(2);
+    for t in ready {
+        let models: Vec<String> = model_labels(t)
+            .iter()
+            .map(|l| l[MODEL_LABEL_PREFIX.len()..].to_string())
+            .collect();
+        println!(
+            "{:<id_w$}  {:<8}  {:<10}  {:<12}  {}",
+            display_id(&ws, t),
+            priority_str(&t.priority),
+            if models.is_empty() {
+                "-".to_string()
+            } else {
+                models.join(",")
+            },
+            t.project.as_deref().unwrap_or("-"),
+            t.title,
+        );
+    }
+    if args.explain && !frontier.excluded.is_empty() {
+        println!("excluded:");
+        let ex_w = frontier
+            .excluded
+            .iter()
+            .map(|(name, _)| name.len())
+            .max()
+            .unwrap_or(2);
+        for (name, message) in &frontier.excluded {
+            println!("  {name:<ex_w$}  {message}");
+        }
+    }
+    Ok(())
+}
+
+/// The frontier for `args` — scope, rules, `--limit` — validated the
+/// way the verb validates its flags (exit `2`/`3`). `pub(crate)`: `pm
+/// app`'s ready endpoint (AGT-1401) serves `Frontier::json` unchanged.
+pub(crate) fn compute(store: &Store, ws: &Workspace, args: &ReadyArgs) -> Result<Frontier> {
     if args.limit == Some(0) {
         return Err(CliError::usage("--limit must be at least 1"));
     }
@@ -46,18 +109,17 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
         .as_deref()
         .map(|m| non_empty("--model", m))
         .transpose()?;
-    let (store, ws) = ctx.open()?;
 
     let scope = match (&args.project, args.ids.is_empty()) {
         (Some(p), _) => {
             let p = non_empty("--project", p)?;
-            require_project(&store, &p)?;
+            require_project(store, &p)?;
             Scope::Project(p)
         }
         (None, false) => Scope::Ids(
             args.ids
                 .iter()
-                .map(|r| find(&store, &ws, r).map(|t| t.id))
+                .map(|r| find(store, ws, r).map(|t| t.id))
                 .collect::<Result<BTreeSet<Ulid>>>()?,
         ),
         (None, true) => Scope::All,
@@ -73,7 +135,7 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
         model: model.clone(),
     };
 
-    let (tickets, frontier) = store.frontier(&ws, &scope, &rules)?;
+    let (tickets, frontier) = store.frontier(ws, &scope, &rules)?;
     let by_id: BTreeMap<Ulid, &Ticket> = tickets.iter().map(|t| (t.id, t)).collect();
     // Waves, `ids` and the excluded list are references (`ref_id`): a
     // ticket still awaiting its hub number is named by ULID, which
@@ -81,7 +143,7 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
     let name = |id: &Ulid| -> String {
         by_id
             .get(id)
-            .map(|t| ref_id(&ws, t))
+            .map(|t| ref_id(ws, t))
             .unwrap_or_else(|| id.to_string())
     };
 
@@ -99,7 +161,7 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
         .excluded()
         .into_iter()
         .map(|(id, reason)| {
-            let (message, extra) = describe(reason, &ws, &rules, &name);
+            let (message, extra) = describe(reason, ws, &rules, &name);
             let mut json = json!({ "reason": reason.kind(), "message": message });
             merge(&mut json, extra);
             (id, message, json)
@@ -127,79 +189,46 @@ pub fn ready(ctx: &Ctx<'_>, args: ReadyArgs) -> Result<()> {
         .map(|wave| wave.iter().map(&name).collect())
         .collect();
 
-    if ctx.json {
-        let mut ready_json = Vec::with_capacity(ready.len());
-        for t in &ready {
-            ready_json.push(ticket_json(&ws, &store, t)?);
-        }
-        let excluded_json: Vec<Value> = excluded
-            .into_iter()
-            .map(|(id, _, mut json)| {
-                merge(&mut json, json!({ "id": name(&id), "ulid": id }));
-                json
-            })
-            .collect();
-        print_json(&json!({
-            "schema": SCHEMA,
-            "project": args.project,
-            "ids": match &scope {
-                Scope::Ids(ids) => Some(
-                    tickets
-                        .iter()
-                        .filter(|t| ids.contains(&t.id))
-                        .map(|t| ref_id(&ws, t))
-                        .collect::<Vec<_>>(),
-                ),
-                _ => None,
-            },
-            "model": model,
-            "today": today,
-            "limit": args.limit,
-            "ready": ready_json,
-            "excluded": excluded_json,
-            "waves": waves,
-        }));
-        return Ok(());
-    }
-
-    if ready.is_empty() {
-        eprintln!("no ready tickets");
-    }
-    let id_w = ready
-        .iter()
-        .map(|t| display_id(&ws, t).len())
-        .max()
-        .unwrap_or(2);
+    let mut ready_json = Vec::with_capacity(ready.len());
     for t in &ready {
-        let models: Vec<String> = model_labels(t)
-            .iter()
-            .map(|l| l[MODEL_LABEL_PREFIX.len()..].to_string())
-            .collect();
-        println!(
-            "{:<id_w$}  {:<8}  {:<10}  {:<12}  {}",
-            display_id(&ws, t),
-            priority_str(&t.priority),
-            if models.is_empty() {
-                "-".to_string()
-            } else {
-                models.join(",")
-            },
-            t.project.as_deref().unwrap_or("-"),
-            t.title,
-        );
+        ready_json.push(ticket_json(ws, store, t)?);
     }
-    if args.explain && !excluded.is_empty() {
-        println!("excluded:");
-        let ex_w = excluded
-            .iter()
-            .map(|(id, _, _)| name(id).len())
-            .max()
-            .unwrap_or(2);
-        for (id, message, _) in &excluded {
-            println!("  {:<ex_w$}  {message}", name(id));
-        }
-    }
-    Ok(())
+    let explained: Vec<(String, String)> = excluded
+        .iter()
+        .map(|(id, message, _)| (name(id), message.clone()))
+        .collect();
+    let excluded_json: Vec<Value> = excluded
+        .into_iter()
+        .map(|(id, _, mut json)| {
+            merge(&mut json, json!({ "id": name(&id), "ulid": id }));
+            json
+        })
+        .collect();
+    let json = json!({
+        "schema": SCHEMA,
+        "project": args.project.clone(),
+        "ids": match &scope {
+            Scope::Ids(ids) => Some(
+                tickets
+                    .iter()
+                    .filter(|t| ids.contains(&t.id))
+                    .map(|t| ref_id(ws, t))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        },
+        "model": model,
+        "today": today,
+        "limit": args.limit,
+        "ready": ready_json,
+        "excluded": excluded_json,
+        "waves": waves,
+    });
+    Ok(Frontier {
+        json,
+        ready: ready.into_iter().cloned().collect(),
+        excluded: explained,
+    })
 }
 
 /// The human sentence for a reason, and the `--json` fields it carries

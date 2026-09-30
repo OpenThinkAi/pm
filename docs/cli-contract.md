@@ -484,6 +484,36 @@ zero ops committed) rather than reopening.
 - `--json`: **Ticket**, as it reads after the save's ops commit (or
   unchanged, if the save was a no-op).
 
+### `pm app`
+
+Flags: `--idle <SECS>` (exit after this long with no view connected;
+default `30`, `0` never), `--allow-origin <ORIGIN>` (a browser origin the
+API answers, e.g. the view's `http://127.0.0.1:5173`; repeatable; default
+none).
+
+Serves the localhost HTTP API the ui-leaf views use (AGT-1401; README
+§Surfaces, decision A6) — the shapes above (**Ticket**, **Project**,
+`pm list`, `pm ready`) as `GET`s, field/label/state/`body.edit` writes as
+`POST`s that commit ordinary ops, and an SSE stream of every op that
+lands in the log. The HTTP contract is `docs/app-api.md`. Binds
+`127.0.0.1` on a random port; requires a bearer token minted per launch;
+refuses any other `Host` or a non-allow-listed `Origin`; exits when the
+last connected view has been gone for `--idle` seconds. Claims are not
+served (they need the hub, AGT-1397).
+
+- Exit `1`: the workspace cannot be opened; the port cannot be bound.
+- Exit `2`: an `--allow-origin` value that is not `scheme://host[:port]`.
+- `--json`: **one compact line**, printed and flushed before the server
+  starts answering, so a launcher (AGT-1402) can read it while the
+  process runs on:
+  ```jsonc
+  {"schema": 1, "url": "http://127.0.0.1:<port>", "token": "pma_<64 hex>", "pid": 0,
+   "workspace": "<dir>", "actor": "string", "idle_secs": 30, "allowed_origins": ["string", ...]}
+  ```
+  Not a `json_contract.rs` fixture: the port and token differ every run
+  and the process does not end; `tests/app.rs` asserts the shape and
+  drives the API.
+
 ### `pm claim [ID]`
 
 Flags: `--ready` (conflicts with `ID`: claim the lowest-numbered ready
