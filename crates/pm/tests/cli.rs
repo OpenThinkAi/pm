@@ -1447,6 +1447,128 @@ fn relate_unknown_ids_exit_3_and_write_nothing() {
 }
 
 #[test]
+fn relate_blocks_and_unblocks_set_outgoing_edges() {
+    let sb = relate_sandbox();
+    // `AGT-1 blocks AGT-2,AGT-3`; --json still returns the <id> ticket.
+    let v = json(&sb.pm(&["relate", "AGT-1", "--blocks", "AGT-2,AGT-3", "--json"]));
+    assert_eq!(v["id"], "AGT-1");
+    assert_eq!(v["blocked_by"], serde_json::json!([]));
+    for id in ["AGT-2", "AGT-3"] {
+        let t = json(&sb.pm(&["show", id, "--json"]));
+        assert_eq!(sorted_strings(&t["blocked_by"]), ["AGT-1"], "{id}");
+    }
+
+    // Duplicate edge: idempotent.
+    assert_ok(&sb.pm(&["relate", "AGT-1", "--blocks", "AGT-2"]));
+    let t = json(&sb.pm(&["show", "AGT-2", "--json"]));
+    assert_eq!(sorted_strings(&t["blocked_by"]), ["AGT-1"]);
+
+    assert_ok(&sb.pm(&["relate", "AGT-1", "--unblocks", "AGT-2"]));
+    let t = json(&sb.pm(&["show", "AGT-2", "--json"]));
+    assert_eq!(t["blocked_by"], serde_json::json!([]));
+    let t = json(&sb.pm(&["show", "AGT-3", "--json"]));
+    assert_eq!(sorted_strings(&t["blocked_by"]), ["AGT-1"]);
+    // Removing an absent edge is a no-op.
+    assert_ok(&sb.pm(&["relate", "AGT-1", "--unblocks", "AGT-2"]));
+
+    // An edge created from the other side is removable from this one.
+    assert_ok(&sb.pm(&["relate", "AGT-2", "--blocked-by", "AGT-3"]));
+    assert_ok(&sb.pm(&["relate", "AGT-3", "--unblocks", "AGT-2"]));
+    let t = json(&sb.pm(&["show", "AGT-2", "--json"]));
+    assert_eq!(t["blocked_by"], serde_json::json!([]));
+}
+
+#[test]
+fn relate_mixes_incoming_and_outgoing_flags_in_one_call() {
+    let sb = relate_sandbox();
+    assert_ok(&sb.pm(&["relate", "AGT-2", "--blocks", "AGT-3"]));
+    // AGT-2: newly blocked by AGT-1, stops blocking AGT-3, starts blocking nothing else.
+    let v = json(&sb.pm(&[
+        "relate",
+        "AGT-2",
+        "--blocked-by",
+        "AGT-1",
+        "--unblocks",
+        "AGT-3",
+        "--json",
+    ]));
+    assert_eq!(sorted_strings(&v["blocked_by"]), ["AGT-1"]);
+    let t = json(&sb.pm(&["show", "AGT-3", "--json"]));
+    assert_eq!(t["blocked_by"], serde_json::json!([]));
+    // One batch: the log for the single call is not split across ticket ops
+    // that could land partially; unknown ids in any flag write nothing.
+    assert_code(
+        &sb.pm(&[
+            "relate",
+            "AGT-2",
+            "--blocks",
+            "AGT-3",
+            "--unblocks",
+            "AGT-99",
+        ]),
+        3,
+    );
+    let t = json(&sb.pm(&["show", "AGT-3", "--json"]));
+    assert_eq!(t["blocked_by"], serde_json::json!([]));
+}
+
+#[test]
+fn relate_blocks_refuses_self_cycles_and_duplicate_edges_with_exit_2() {
+    let sb = relate_sandbox();
+    assert_code(&sb.pm(&["relate", "AGT-1", "--blocks", "AGT-1"]), 2);
+    assert_code(&sb.pm(&["relate", "AGT-1", "--blocks", "AGT-99"]), 3);
+    // The same edge named twice, on both sides of the add/remove split.
+    assert_code(
+        &sb.pm(&[
+            "relate",
+            "AGT-1",
+            "--blocks",
+            "AGT-2",
+            "--unblocks",
+            "AGT-2",
+        ]),
+        2,
+    );
+    // ... including via the mirrored incoming flags.
+    assert_code(
+        &sb.pm(&[
+            "relate",
+            "AGT-2",
+            "--blocked-by",
+            "AGT-1",
+            "--unblock",
+            "AGT-1",
+        ]),
+        2,
+    );
+    assert_code(
+        &sb.pm(&[
+            "relate",
+            "AGT-1",
+            "--unblocks",
+            "AGT-2",
+            "--blocks",
+            "AGT-2",
+        ]),
+        2,
+    );
+    let v = json(&sb.pm(&["show", "AGT-2", "--json"]));
+    assert_eq!(v["blocked_by"], serde_json::json!([]));
+
+    assert_ok(&sb.pm(&["relate", "AGT-1", "--blocks", "AGT-2"]));
+    // AGT-1 blocks AGT-2 already; AGT-2 blocks AGT-3 -> AGT-3 blocking AGT-1 cycles.
+    assert_ok(&sb.pm(&["relate", "AGT-2", "--blocks", "AGT-3"]));
+    let out = sb.pm(&["relate", "AGT-3", "--blocks", "AGT-1"]);
+    assert_code(&out, 2);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cycle"));
+    assert_code(&sb.pm(&["relate", "AGT-2", "--blocks", "AGT-1"]), 2);
+    let v = json(&sb.pm(&["show", "AGT-1", "--json"]));
+    assert_eq!(v["blocked_by"], serde_json::json!([]));
+    // Removing the middle link in the same call makes the add legal.
+    assert_ok(&sb.pm(&["relate", "AGT-3", "--blocks", "AGT-1", "--unblock", "AGT-2"]));
+}
+
+#[test]
 fn relate_refuses_self_block_cycles_and_empty_calls_with_exit_2() {
     let sb = relate_sandbox();
     assert_code(&sb.pm(&["relate", "AGT-1", "--blocked-by", "AGT-1"]), 2);

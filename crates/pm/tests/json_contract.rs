@@ -597,6 +597,26 @@ fn every_verbs_json_output_matches_its_fixture() {
         0,
         &mut failures,
     );
+    // `--blocks` is the same edge from the other end; the result is still
+    // the <id> ticket (AGT-1), whose own `blocked_by` is unchanged.
+    cap(
+        "relate_blocks",
+        &["relate", "AGT-1", "--blocks", "AGT-2", "--json"],
+        0,
+        &mut failures,
+    );
+    cap(
+        "relate_unblocks",
+        &["relate", "AGT-1", "--unblocks", "AGT-2", "--json"],
+        0,
+        &mut failures,
+    );
+    cap(
+        "relate_blocks_restore",
+        &["relate", "AGT-1", "--blocks", "AGT-2", "--json"],
+        0,
+        &mut failures,
+    );
     cap(
         "comment",
         &["comment", "AGT-1", "hello from the contract test", "--json"],

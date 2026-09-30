@@ -84,26 +84,31 @@ pub fn label(ctx: &Ctx<'_>, reference: &str, changes: &[String]) -> Result<()> {
 
 // -------------------------------------------------------------- pm relate
 
-/// `pm relate AGT-N --blocked-by X,Y --unblock Z` (AGT-1383): edits the
-/// blockers of an existing ticket. `--blocked-by X` emits a `relation.add`
-/// for `X blocks N`; `--unblock Z` emits a `relation.remove` citing the
-/// add-tags this replica observes for `Z blocks N` (OR-set, add-wins).
-/// Every id is resolved before anything is written (unknown: exit 3), a
-/// ticket blocking itself is a usage error (exit 2), and so is an add
-/// that would close a blocker cycle — detected with
+/// `pm relate AGT-N --blocked-by X --unblock Y --blocks Z --unblocks W`
+/// (AGT-1383, AGT-1414): edits the blocker edges around an existing
+/// ticket. `--blocked-by X` / `--blocks Z` emit a `relation.add` for
+/// `X blocks N` / `N blocks Z`; `--unblock Y` / `--unblocks W` emit a
+/// `relation.remove` citing the add-tags this replica observes for that
+/// edge (OR-set, add-wins). Every id is resolved before anything is
+/// written (unknown: exit 3); a ticket blocking itself, or one edge named
+/// by both an add flag and a remove flag, is a usage error (exit 2), and
+/// so is an add that would close a blocker cycle — detected with
 /// `pm_core::check::blocker_cycles` over the graph as it would stand after
-/// the whole invocation. Adding an existing blocker or removing an absent
-/// one is a no-op, so the verb is idempotent. One `commit_batch`, so a
-/// multi-id invocation never lands partially.
+/// the whole invocation. Adding an existing edge or removing an absent one
+/// is a no-op, so the verb is idempotent. One `commit_batch`, so a
+/// multi-id invocation never lands partially. Added edges are owned by
+/// the blocked ticket (the `to` end), as `pm new --blocked-by` does.
 pub fn relate(
     ctx: &Ctx<'_>,
     reference: &str,
     blocked_by: &[String],
     unblock: &[String],
+    blocks: &[String],
+    unblocks: &[String],
 ) -> Result<()> {
-    if blocked_by.is_empty() && unblock.is_empty() {
+    if blocked_by.is_empty() && unblock.is_empty() && blocks.is_empty() && unblocks.is_empty() {
         return Err(CliError::usage(
-            "relate needs --blocked-by <ID>[,...] and/or --unblock <ID>[,...]",
+            "relate needs at least one of --blocked-by <ID>[,...], --unblock <ID>[,...], --blocks <ID>[,...], --unblocks <ID>[,...]",
         ));
     }
     let actor = ctx.actor()?;
@@ -119,47 +124,69 @@ pub fn relate(
         }
         Ok(out)
     };
-    let to_add = resolve(blocked_by)?;
-    let to_remove = resolve(unblock)?;
-    for other in &to_add {
+    let by_add = resolve(blocked_by)?;
+    let by_remove = resolve(unblock)?;
+    let blocks_add = resolve(blocks)?;
+    let blocks_remove = resolve(unblocks)?;
+    for other in by_add.iter().chain(&blocks_add) {
         if other.id == ticket.id {
             return Err(CliError::usage(format!(
-                "{} cannot be blocked by itself",
+                "{} cannot block itself",
                 display_id(&ws, &ticket)
             )));
         }
     }
-    if let Some(dup) = to_add
+
+    // `X blocks N` for the incoming flags, `N blocks Z` for the outgoing.
+    let incoming = |t: &pm_core::Ticket| Relation {
+        kind: RelationKind::Blocks,
+        from: t.id,
+        to: ticket.id,
+    };
+    let outgoing = |t: &pm_core::Ticket| Relation {
+        kind: RelationKind::Blocks,
+        from: ticket.id,
+        to: t.id,
+    };
+    let want_add: Vec<Relation> = by_add
         .iter()
-        .find(|a| to_remove.iter().any(|r| r.id == a.id))
-    {
+        .map(incoming)
+        .chain(blocks_add.iter().map(outgoing))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let want_remove: Vec<Relation> = by_remove
+        .iter()
+        .map(incoming)
+        .chain(blocks_remove.iter().map(outgoing))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if let Some(dup) = want_add.iter().find(|a| want_remove.contains(a)) {
+        let name = |id: ulid::Ulid| -> Result<String> {
+            Ok(match store.ticket(id)? {
+                Some(t) => display_id(&ws, &t),
+                None => id.to_string(),
+            })
+        };
         return Err(CliError::usage(format!(
-            "{} is named by both --blocked-by and --unblock",
-            display_id(&ws, dup)
+            "{} blocks {} is both added and removed in one call",
+            name(dup.from)?,
+            name(dup.to)?
         )));
     }
 
-    let blocks = |from: ulid::Ulid| Relation {
-        kind: RelationKind::Blocks,
-        from,
-        to: ticket.id,
-    };
-    let view = store
-        .ticket_view(ticket.id)?
-        .ok_or_else(|| CliError::not_found(format!("no ticket {}", display_id(&ws, &ticket))))?;
     let current: std::collections::BTreeSet<Relation> = store
-        .relations(ticket.id)?
+        .all_relations()?
         .into_iter()
-        .filter(|r| r.kind == RelationKind::Blocks && r.to == ticket.id)
+        .filter(|r| r.kind == RelationKind::Blocks)
         .collect();
-    let adds: Vec<Relation> = to_add
-        .iter()
-        .map(|t| blocks(t.id))
+    let adds: Vec<Relation> = want_add
+        .into_iter()
         .filter(|r| !current.contains(r))
         .collect();
-    let removes: Vec<Relation> = to_remove
-        .iter()
-        .map(|t| blocks(t.id))
+    let removes: Vec<Relation> = want_remove
+        .into_iter()
         .filter(|r| current.contains(r))
         .collect();
 
@@ -189,13 +216,16 @@ pub fn relate(
                         _ => id.to_string(),
                     })
                     .collect();
-                let from = match store.ticket(new.from)? {
-                    Some(t) => display_id(&ws, &t),
-                    None => new.from.to_string(),
+                let name = |id: ulid::Ulid| -> Result<String> {
+                    Ok(match store.ticket(id)? {
+                        Some(t) => display_id(&ws, &t),
+                        None => id.to_string(),
+                    })
                 };
                 return Err(CliError::usage(format!(
-                    "{from} blocking {} would create a blocker cycle ({})",
-                    display_id(&ws, &ticket),
+                    "{} blocking {} would create a blocker cycle ({})",
+                    name(new.from)?,
+                    name(new.to)?,
                     names.join(", ")
                 )));
             }
@@ -205,14 +235,24 @@ pub fn relate(
     let mut stamper = Stamper::new(&store, actor)?;
     let mut ops = Vec::new();
     for relation in adds {
-        ops.push(stamper.op(ticket.id, Payload::RelationAdd(RelationAdd { relation })));
+        ops.push(stamper.op(relation.to, Payload::RelationAdd(RelationAdd { relation })));
     }
+    // An edge may be owned by either end (the OR-set lives on the op's
+    // ticket), so cite the observed add-tags from each owner's view.
     for relation in removes {
-        let observed = view.relations.observed(&relation);
-        ops.push(stamper.op(
-            ticket.id,
-            Payload::RelationRemove(RelationRemove { relation, observed }),
-        ));
+        for owner in [relation.to, relation.from] {
+            let Some(view) = store.ticket_view(owner)? else {
+                continue;
+            };
+            let observed = view.relations.observed(&relation);
+            if observed.is_empty() {
+                continue;
+            }
+            ops.push(stamper.op(
+                owner,
+                Payload::RelationRemove(RelationRemove { relation, observed }),
+            ));
+        }
     }
     if !ops.is_empty() {
         store.commit_batch(&ops, &[])?;
