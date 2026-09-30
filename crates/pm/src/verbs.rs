@@ -513,7 +513,7 @@ fn commit_new(
 /// The line `pm new` prints for a ticket it made: `AGT-12`, or — while the
 /// number is the hub's to give — `AGT-?  <ULID>`, so the id to refer to it
 /// by until then is right there.
-fn created_line(ws: &Workspace, t: &Ticket) -> String {
+pub(crate) fn created_line(ws: &Workspace, t: &Ticket) -> String {
     match t.number {
         Some(_) => display_id(ws, t),
         None => format!("{}  {}", display_id(ws, t), t.id),

@@ -472,10 +472,27 @@ ticket instead), `--project <PROJECT>` (only meaningful with `--ready`),
   ticket is deleted.
 - Exit `75`: the ticket was not `unstarted`-and-unassigned at claim time
   (someone else has it, or it already left `unstarted`).
-- Exit `1`: a `hub` is configured in `config.toml` — this build's claim
-  authority is the local database only; a configured hub always refuses
-  (the hub client lands in phase 3, so an unconfirmed claim never
-  proceeds).
+- **Authority** (AGT-1397, README §Authority). With no `hub` in
+  config.toml the local database decides, inside the commit transaction.
+  With a `hub` configured (`pm hub login`) the verb asks the hub
+  (`GET whoami`) whether the workspace is seeded:
+  - **seeded** — the hub decides. `pm claim` first runs one sync round
+    (push, then pull — the `pm sync` below, rejections included), then
+    pushes the `claim` op **alone** and writes nothing until the hub has
+    answered. Admitted: the op is committed locally as a pulled op (not
+    re-judged) and `--branch`'s `ext` write is committed as an ordinary op
+    and pushed at once (if that push fails the claim stands and the write
+    waits in the outbox for the next `pm sync`; a note says so on stderr).
+    Refused: nothing is written, exit `75` with the same `--json` shape as
+    a local `75` — `taken_by`, `at`, `state` and `reason` are the hub's —
+    or exit `3` when the hub reports the ticket deleted. `--ready` treats a
+    hub `75` as it treats a local one: the next candidate is tried.
+  - **not yet seeded** — the local database decides, as with no hub: the
+    claim goes up with the seed, which the hub stores without arbitrating.
+  - Exit `1`, with `claims require the hub` on stderr and **nothing
+    written**, when the hub cannot be reached, no token is held, the hub
+    rejects the token (`404`), or it answers `503`; also when the sync
+    round fails for the reasons `pm sync` exits `1`.
 - `--json` on success: **Ticket**.
 - `--json` on a `75`: printed to stdout *and* the process still exits
   `75`:
@@ -1099,8 +1116,9 @@ no connection.
 - Test hooks: `PM_HUB_KEYCHAIN_SERVICE_PREFIX` replaces `pm-hub` in the
   service name; `PM_HUB_KEYCHAIN=<file>` points every keychain call at that
   keychain file instead of the login keychain.
-- A configured `hub` still makes `pm claim` refuse until the hub-side
-  claim lands (AGT-1397); `pm hub logout` restores local claiming.
+- A configured `hub` makes `pm claim` ask the hub (AGT-1397, `pm claim`
+  above): `pm hub status`, `pm sync` and `pm claim` are the three verbs
+  that touch the network. `pm hub logout` restores local claiming.
 - A configured `hub` makes `pm new` file tickets without a number
   (`AGT-?`) for the hub to assign on sync (AGT-1398; see `pm new`).
 
@@ -1171,6 +1189,18 @@ leaves the outbox and cursor consistent:
   read. A crash between the hub's commit and that mark re-sends the batch
   next time; the hub answers `stored: false` for each (idempotent on
   `op_id`), nothing is lost or doubled.
+- **Refused claims.** A `claim` in the outbox that the hub refuses
+  (`docs/hub-api.md` §Claims: `seq: null, stored: false, rejected: {…}`)
+  is acknowledged and dropped — marked pushed like any other ack — and
+  then reconciled: the local log keeps the claim as admitted, so a
+  compensating `state.transition` to the hub's `state` and `field.set
+  assignee` to its `taken_by`, stamped now by this command's actor, are
+  committed and pushed in the same round. Each one is reported on stderr
+  (`pm: the hub refused claim <op_id> on ticket <ulid>: …`), counted in
+  the text line (`; N claim(s) refused by the hub and reconciled`) and
+  listed under `rejected` in `--json`. This happens only to a claim the
+  local database admitted while it was the authority (before the seed
+  ended); `pm claim` itself goes to the hub and never leaves one behind.
 - **Pull.** `GET …/ops?since=<cursor>&limit=1000`, page by page until
   `next >= head`. Each page is applied in one transaction (foreign ops go
   through the normal commit path; an op already present by `op_id` — this
@@ -1211,7 +1241,18 @@ leaves the outbox and cursor consistent:
     "cursor": 42,               // hub seq the pull got through (= pm doctor's sync.cursor)
     "head": 42,                 // the hub's largest seq as of the last page
     "outbox": 0,                // ops still unacknowledged after the round
-    "pending_numbers": 0        // tickets still awaiting a hub-issued number
+    "pending_numbers": 0,       // tickets still awaiting a hub-issued number
+    "rejected": [               // outbox claims the hub refused this round, reconciled locally
+      {
+        "op_id": "<ULID>",        // the refused claim op
+        "ticket": "<ULID>",       // its ticket
+        "taken_by": "string" | null,
+        "at": {"wall_ms": 0, "counter": 0},
+        "state": "string",        // the ticket's state at the hub
+        "code": "not_unstarted" | "already_assigned" | "deleted",
+        "reason": "string"
+      }
+    ]
   }
   ```
 - Text output is one line: `pushed 3 op(s); pulled 5 op(s): 4 applied,
