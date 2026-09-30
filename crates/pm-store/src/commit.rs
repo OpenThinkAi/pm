@@ -1,7 +1,10 @@
-//! Writes. [`Store::commit`] is the only way a ticket changes: the op is
-//! appended and the ticket's rows are rewritten in one transaction.
-//! [`Store::allocate_number`] is the authority's number allocation, which
-//! is itself a `field.set number` op committed the same way.
+//! Writes. [`Store::commit`] is the only way a ticket — or, since
+//! AGT-1385, the workspace's config and a project's metadata — changes:
+//! the op is appended and the rows it affects are rewritten in one
+//! transaction. A config op (`Payload::is_config`) takes the same path
+//! through [`crate::config::commit_config_in`]. [`Store::allocate_number`]
+//! is the authority's number allocation, which is itself a `field.set
+//! number` op committed the same way.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,19 +15,24 @@ use ulid::Ulid;
 
 use crate::Store;
 use crate::codec::{enum_name, json, wall_ms};
-use crate::config::{project_exists, states};
+use crate::config::{commit_config_in, project_exists, states};
 use crate::error::{Result, StoreError, map_duplicate_number};
 
 impl Store {
-    /// Appends `op` to the log and materializes the ticket it touches, in
-    /// one transaction. Returns the ticket as it now reads.
+    /// Appends `op` to the log and materializes what it touches, in one
+    /// transaction. For a ticket op, returns the ticket as it now reads;
+    /// for a config op (`workspace.set`, `state.upsert`, `actor.upsert`,
+    /// `project.create`, `project.set` — [`Payload::is_config`]) the
+    /// workspace/state/actor/project rows are rewritten instead
+    /// ([`crate::config`]) and this returns `None`.
     ///
     /// Rejects, without writing anything: an op id already in the log, an
     /// op for a ticket that has no `ticket.create` yet, a `claim` the
-    /// ticket cannot admit ([`TicketView::claim_admissible`]), and any
+    /// ticket cannot admit ([`TicketView::claim_admissible`]), a
+    /// `project.set` for a project with no `project.create` yet, and any
     /// materialized row that would violate R2 (project), R4 (relation
     /// endpoint), R5 (number) or the workflow states.
-    pub fn commit(&mut self, op: &Op) -> Result<Ticket> {
+    pub fn commit(&mut self, op: &Op) -> Result<Option<Ticket>> {
         self.commit_with(op, || Ok(()))
     }
 
@@ -35,7 +43,7 @@ impl Store {
         &mut self,
         op: &Op,
         between: impl FnOnce() -> Result<()>,
-    ) -> Result<Ticket> {
+    ) -> Result<Option<Ticket>> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -57,12 +65,12 @@ impl Store {
         Ok(next)
     }
 
-    /// Commits every op in `ops`, in order, then allocates a human number
-    /// for each ticket in `to_number` (also in order) — all inside **one**
-    /// transaction (AGT-1346 AC2: `pm new --batch` is all-or-nothing across
-    /// every ticket it mints). A failure at any point — a bad relation
-    /// target, an unknown project, a duplicate op — rolls the whole batch
-    /// back; nothing partially lands.
+    /// Commits every op in `ops` (ticket or config, in order), then
+    /// allocates a human number for each ticket in `to_number` (also in
+    /// order) — all inside **one** transaction (AGT-1346 AC2: `pm new
+    /// --batch` is all-or-nothing across every ticket it mints). A failure
+    /// at any point — a bad relation target, an unknown project, a
+    /// duplicate op — rolls the whole batch back; nothing partially lands.
     ///
     /// Returns the numbered tickets, in the same order as `to_number`.
     pub fn commit_batch(
@@ -134,14 +142,14 @@ fn allocate_number_in(tx: &Transaction<'_>, ticket: Ulid, actor: &ActorId) -> Re
     Ok(next as u64)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
-fn latest_hlc(conn: &Connection) -> Result<Hlc> {
+pub(crate) fn latest_hlc(conn: &Connection) -> Result<Hlc> {
     let latest = conn
         .query_row(
             "SELECT hlc_wall_ms, hlc_counter FROM ops
@@ -157,7 +165,7 @@ fn commit_in(
     tx: &Transaction<'_>,
     op: &Op,
     between: impl FnOnce() -> Result<()>,
-) -> Result<Ticket> {
+) -> Result<Option<Ticket>> {
     if exists(
         tx,
         "SELECT 1 FROM ops WHERE op_id = ?1",
@@ -165,11 +173,15 @@ fn commit_in(
     )? {
         return Err(StoreError::DuplicateOp { op_id: op.op_id });
     }
+    if op.payload.is_config() {
+        commit_config_in(tx, op, between)?;
+        return Ok(None);
+    }
     ensure_actor(tx, &op.actor)?;
     let view = next_view(tx, op, true)?;
     append_op(tx, op)?;
     between()?;
-    materialize(tx, &view, op)
+    materialize(tx, &view, op).map(Some)
 }
 
 /// Commits an op that came from the hub (AGT-1393, [`Store::apply_pulled`]):
@@ -177,13 +189,18 @@ fn commit_in(
 /// [`commit_in`], except a `claim` is not re-checked for admissibility —
 /// the hub is the claim authority and already admitted it (README
 /// §Conflict semantics: "replicas apply admitted claims as plain LWW
-/// writes"), exactly as [`replay_in`] treats one. The caller has already
-/// ruled out a duplicate op id.
-pub(crate) fn commit_foreign_in(tx: &Transaction<'_>, op: &Op) -> Result<Ticket> {
+/// writes"), exactly as [`replay_in`] treats one. A config op takes the
+/// config path unchanged (nothing about it is authority-checked). The
+/// caller has already ruled out a duplicate op id.
+pub(crate) fn commit_foreign_in(tx: &Transaction<'_>, op: &Op) -> Result<Option<Ticket>> {
+    if op.payload.is_config() {
+        commit_config_in(tx, op, || Ok(()))?;
+        return Ok(None);
+    }
     ensure_actor(tx, &op.actor)?;
     let view = next_view(tx, op, false)?;
     append_op(tx, op)?;
-    materialize(tx, &view, op)
+    materialize(tx, &view, op).map(Some)
 }
 
 /// Re-applies an op that is already in the log: the same load → apply →
@@ -411,21 +428,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
         store
-            .init_workspace(&Workspace {
-                id: Ulid::new(),
-                prefix: "AGT".into(),
-                states: vec![State {
-                    name: "triage".into(),
-                    category: StateCategory::Unstarted,
-                    position: 0,
-                }],
-                gate_labels: Default::default(),
-                model_labels: Default::default(),
-                template_sections: Vec::new(),
-                stale_days: 30,
-            })
+            .init_workspace(
+                &Workspace {
+                    id: Ulid::new(),
+                    prefix: "AGT".into(),
+                    states: vec![State {
+                        name: "triage".into(),
+                        category: StateCategory::Unstarted,
+                        position: 0,
+                    }],
+                    gate_labels: Default::default(),
+                    model_labels: Default::default(),
+                    template_sections: Vec::new(),
+                    stale_days: 30,
+                },
+                &ActorId::new("matt"),
+            )
             .unwrap();
         (dir, store)
+    }
+
+    /// Ops `init_workspace` itself committed (AGT-1385): the baseline a
+    /// count of "this test's" ops is measured from.
+    fn baseline(store: &Store) -> i64 {
+        count(store, "SELECT COUNT(*) FROM ops")
     }
 
     fn create(ticket: Ulid, wall_ms: u64) -> Op {
@@ -455,6 +481,7 @@ mod tests {
     #[test]
     fn a_failure_between_append_and_materialize_persists_neither() {
         let (_dir, mut store) = fresh();
+        let before = baseline(&store);
         let id = Ulid::new();
         let err = store
             .commit_with(&create(id, 1), || {
@@ -462,15 +489,46 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, StoreError::UnknownTicket { .. }));
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM ops"), 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ops"), before);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM ticket"), 0);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM ticket_view"), 0);
         assert!(store.ticket(id).unwrap().is_none());
 
         // And the same op commits cleanly afterwards: nothing lingered.
         store.commit(&create(id, 1)).unwrap();
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM ops"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ops"), before + 1);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM ticket"), 1);
+    }
+
+    /// AGT-1385 AC1: the same guarantee for a config op — a failure
+    /// between the append and the rewrite of the workspace row persists
+    /// neither half.
+    #[test]
+    fn a_config_op_appends_and_materializes_together_or_not_at_all() {
+        let (_dir, mut store) = fresh();
+        let before = baseline(&store);
+        let ws = store.workspace().unwrap().unwrap();
+        // Above `init_workspace`'s own stamps, or LWW keeps the init value.
+        let after_init = store.latest_hlc().unwrap().wall_ms + 1;
+        let op = |stale_days| {
+            Op::new(
+                Ulid::new(),
+                Hlc::new(after_init, 0),
+                ActorId::new("matt"),
+                ws.id,
+                Payload::WorkspaceSet(pm_core::op::WorkspaceSet::StaleDays(stale_days)),
+            )
+        };
+        let err = store
+            .commit_with(&op(7), || Err(StoreError::NoWorkspace))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NoWorkspace));
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ops"), before);
+        assert_eq!(store.workspace().unwrap().unwrap().stale_days, 30);
+
+        assert!(store.commit(&op(7)).unwrap().is_none());
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ops"), before + 1);
+        assert_eq!(store.workspace().unwrap().unwrap().stale_days, 7);
     }
 
     /// The op row lands before the hook runs, so the injection point is

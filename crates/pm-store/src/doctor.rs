@@ -8,16 +8,25 @@
 //! the code that materialized the rows in the first place, so a clean
 //! table and a rebuilt table are produced identically.
 //!
-//! Configuration tables (workspace, state, actor, and a project's own
-//! title/status/parent/repos) are not op-logged (`config.rs`), so a
-//! rebuild leaves them alone: only [`TICKET_TABLES`] are emptied and
-//! replayed. A project's *document bodies* are the exception (AGT-1344,
-//! `project.rs`): `project.doc`, `project_doc.body` and
-//! `PROJECT_DOC_TABLES`'s `project_doc_view` are derived from `body.edit`
-//! ops the same way `ticket.description` is, and [`crate::project`]'s own
-//! replay folds into the same [`Diff`] this module produces — scoped to
-//! rows with a `doc_id`, so a document written directly (`put_project`'s
-//! bulk `documents` map, before one is assigned) is left alone.
+//! Three replays, one diff, in dependency order:
+//! 1. Config (AGT-1385, [`crate::config::replay_config`]): the
+//!    [`CONFIG_TABLES`] — the `workspace` row (all but `number_floor`),
+//!    `state`, `actor`, a project's metadata columns and the two view
+//!    tables — from the config ops. `state`, `workspace_view` and
+//!    `project_view` are emptied first; the `workspace`, `actor` and
+//!    `project` rows are rewritten in place (`ops.actor` references
+//!    `actor`; a project row's existence is not op-derived — `config.rs`
+//!    module docs).
+//! 2. Tickets: [`TICKET_TABLES`] emptied and refilled, as before.
+//! 3. Project document bodies (AGT-1344, `project.rs`): `project.doc`,
+//!    `project_doc.body` and `project_doc_view` from `body.edit` ops the
+//!    same way `ticket.description` is — scoped to rows with a `doc_id`,
+//!    so a document written directly (`put_project`'s bulk `documents`
+//!    map, before one is assigned) is left alone.
+//!
+//! What a rebuild never touches: `workspace.number_floor`, `project.doc_id`
+//! and `project_doc`'s names/ids, `backup_target`, `sync_*`,
+//! `pending_number` — bookkeeping and identity, not derived state.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,6 +62,35 @@ pub const TICKET_TABLES: [&str; 6] = [
 /// never appears here.
 pub const PROJECT_DOC_TABLES: [&str; 3] = ["project", "project_doc", "project_doc_view"];
 
+/// The tables the config ops materialize (AGT-1385): the workspace row
+/// and its merge state, states, actors, project metadata (the `project`
+/// table is shared with [`PROJECT_DOC_TABLES`]: its metadata columns are
+/// config-derived, its `doc` column document-derived) and the project
+/// merge state.
+pub const CONFIG_TABLES: [&str; 6] = [
+    "workspace",
+    "workspace_view",
+    "state",
+    "actor",
+    "project",
+    "project_view",
+];
+
+/// Every op-derived table, each once, in the order a diff lists them.
+fn derived_tables() -> Vec<&'static str> {
+    let mut tables: Vec<&'static str> = Vec::new();
+    for table in CONFIG_TABLES
+        .iter()
+        .chain(TICKET_TABLES.iter())
+        .chain(PROJECT_DOC_TABLES.iter())
+    {
+        if !tables.contains(table) {
+            tables.push(table);
+        }
+    }
+    tables
+}
+
 /// What `pm doctor` found. Healthy when [`Report::is_healthy`].
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Report {
@@ -68,7 +106,7 @@ pub struct Report {
     /// Why the log could not be replayed, if it could not. Drift is
     /// unknown in that case.
     pub replay_error: Option<String>,
-    /// Live ticket tables (`before`) against what the log produces
+    /// Live derived tables (`before`) against what the log produces
     /// (`after`). Empty when they match.
     pub drift: Diff,
     /// Client sync state (AGT-1393): outbox size, pull cursor, tickets
@@ -149,8 +187,9 @@ pub struct ColumnChange {
 impl Store {
     /// Checks the database without changing it: schema version, op and
     /// row counts, SQLite's integrity and foreign-key checks, and whether
-    /// replaying the log reproduces the ticket tables. The replay runs in
-    /// a transaction that is always rolled back.
+    /// replaying the log reproduces the derived tables (config, ticket
+    /// and project-document). The replay runs in a transaction that is
+    /// always rolled back.
     pub fn doctor(&mut self) -> Result<Report> {
         let schema_version = self.schema_version()?;
         let op_count = count(&self.conn, "ops")?;
@@ -180,10 +219,10 @@ impl Store {
         })
     }
 
-    /// Empties the ticket tables and replays the log into them, in one
-    /// transaction; returns what changed (`before` = the old rows,
-    /// `after` = the rebuilt ones). A replay failure rolls everything
-    /// back and names the op.
+    /// Regenerates the derived tables from the log, in one transaction;
+    /// returns what changed (`before` = the old rows, `after` = the
+    /// rebuilt ones). A replay failure rolls everything back and names
+    /// the op.
     pub fn rebuild(&mut self) -> Result<Diff> {
         let tx = self
             .conn
@@ -204,10 +243,19 @@ fn ticket_create_entities(tx: &Transaction<'_>) -> Result<BTreeSet<Ulid>> {
 }
 
 fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
-    let before = snapshot(tx, &TICKET_TABLES)?;
+    let tables = derived_tables();
+    let before = snapshot(tx, &tables)?;
     for table in TICKET_TABLES.iter().rev() {
         tx.execute(&format!("DELETE FROM {table}"), [])?;
     }
+    // Config first (AGT-1385): the ticket replay needs the states and
+    // projects it produces. `state` can only be emptied once no ticket
+    // references it; `workspace`, `actor` and `project` rows are rewritten
+    // in place (module docs).
+    for table in ["state", "workspace_view", "project_view"] {
+        tx.execute(&format!("DELETE FROM {table}"), [])?;
+    }
+    crate::config::replay_config(tx)?;
     // The op log shares one `entity` namespace between tickets and project
     // documents (AGT-1344): a `body.edit` whose entity is a document, not
     // a ticket, belongs to `crate::project::replay_project_docs` below,
@@ -223,6 +271,9 @@ fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
     // check has no such blind spot: it depends only on the log itself.
     let ticket_entities = ticket_create_entities(tx)?;
     for (seq, op) in read_ops(tx, "", [])? {
+        if op.payload.is_config() {
+            continue; // replayed above
+        }
         if op.kind() == "body.edit" && !ticket_entities.contains(&op.entity) {
             continue;
         }
@@ -233,24 +284,18 @@ fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
             source: Box::new(source),
         })?;
     }
-    let after = snapshot(tx, &TICKET_TABLES)?;
-    let mut diff = diff(before, after);
-
     // AGT-1344: a project document's body is derived from `body.edit` ops
-    // the same way a ticket's description is; fold its replay's drift into
-    // the same report rather than reporting it separately.
-    let doc_diff = crate::project::replay_project_docs(tx)?;
-    diff.tables.extend(doc_diff.tables);
-    Ok(diff)
+    // the same way a ticket's description is.
+    crate::project::replay_project_docs(tx)?;
+
+    let after = snapshot(tx, &tables)?;
+    Ok(diff(before, after))
 }
 
-/// Every row of `tables`, keyed by primary key. `pub(crate)` so
-/// [`crate::project::replay_project_docs`] can snapshot
-/// [`PROJECT_DOC_TABLES`] before/after its own replay the same way this
-/// module does for [`TICKET_TABLES`].
-pub(crate) type Snapshot = Vec<(&'static str, BTreeMap<String, Row>)>;
+/// Every row of `tables`, keyed by primary key.
+type Snapshot = Vec<(&'static str, BTreeMap<String, Row>)>;
 
-pub(crate) fn snapshot(conn: &Connection, tables: &[&'static str]) -> Result<Snapshot> {
+fn snapshot(conn: &Connection, tables: &[&'static str]) -> Result<Snapshot> {
     tables
         .iter()
         .map(|table| Ok((*table, rows(conn, table)?)))
@@ -297,7 +342,7 @@ fn json_cell(value: Sql) -> Value {
     }
 }
 
-pub(crate) fn diff(before: Snapshot, after: Snapshot) -> Diff {
+fn diff(before: Snapshot, after: Snapshot) -> Diff {
     let mut tables = Vec::new();
     for ((table, mut before), (_, after)) in before.into_iter().zip(after) {
         let mut missing = Vec::new();

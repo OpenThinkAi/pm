@@ -278,19 +278,13 @@ fn restore_rebuilds_a_workspace_that_doctor_reports_clean_and_show_matches() {
     assert_code(&clobber, 1);
 }
 
-/// AGT-1380: `pm workspace gate-label` writes `workspace.gate_labels`
-/// directly (`pm-store::config::set_gate_labels`), the same column
-/// `pm backup`'s `ConfigSnapshot` already captures via `Store::workspace`
-/// and `--restore` already rewrites via `Store::init_workspace` — so a
-/// gate-label change needs no dedicated backup-side code, only proof it
-/// actually round-trips.
+/// AGT-1380: `pm workspace gate-label` changes `workspace.gate_labels`;
+/// since AGT-1385 that is a `workspace.set` op in the log *and* part of
+/// the `Workspace` snapshot `pm backup` writes, so a gate-label change
+/// needs no dedicated backup-side code, only proof it round-trips.
 #[test]
 fn restore_carries_a_custom_gate_label_over() {
     let sb = Sandbox::initialized();
-    // `pm backup` refuses a target with a config snapshot but no op log
-    // (nothing to replay), so this needs at least one op committed —
-    // unrelated to the gate-label write itself, which is a direct config
-    // write with no op of its own.
     sb.new_ticket("anchor");
     assert_ok(&sb.pm(&["workspace", "gate-label", "add", "matt-gated"]));
     let before = json(&sb.pm(&["workspace", "gate-label", "list", "--json"]));
@@ -730,4 +724,132 @@ fn install_timer_to_a_custom_dir_never_loads_into_the_real_launchd() {
     assert!(plist.contains(sb.ws_str()));
     assert!(plist.contains(env!("CARGO_BIN_EXE_pm")));
     assert!(plist.contains("<integer>3600</integer>"));
+}
+
+/// The op count of a sandbox's workspace, straight from its database.
+fn op_count(sb: &Sandbox) -> i64 {
+    let conn = rusqlite::Connection::open(sb.ws.join("pm.sqlite")).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM ops", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Rewrites every shard under `work` without its config ops — what a
+/// backup written before AGT-1385 looks like: the workspace and projects
+/// only in `ops/<prefix>.config.json`.
+fn strip_config_ops(work: &Path) -> usize {
+    let mut stripped = 0;
+    for entry in std::fs::read_dir(work.join("ops").join("agt")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|line| {
+                let op: Value = serde_json::from_str(line).unwrap();
+                let kind = op["kind"].as_str().unwrap();
+                let config = matches!(
+                    kind,
+                    "workspace.set"
+                        | "state.upsert"
+                        | "actor.upsert"
+                        | "project.create"
+                        | "project.set"
+                );
+                stripped += usize::from(config);
+                !config
+            })
+            .collect();
+        std::fs::write(&path, format!("{}\n", kept.join("\n"))).unwrap();
+    }
+    stripped
+}
+
+/// A workspace with a custom gate label, a project with a repo and a
+/// parent, a project created and deleted again, and one ticket.
+fn configured() -> (Sandbox, String) {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["workspace", "gate-label", "add", "matt-gated"]));
+    assert_ok(&sb.pm(&[
+        "project",
+        "new",
+        "pm",
+        "--title",
+        "pm",
+        "--repo",
+        "OpenThinkAi/pm",
+    ]));
+    assert_ok(&sb.pm(&[
+        "project", "new", "pm-hub", "--title", "pm hub", "--parent", "pm",
+    ]));
+    assert_ok(&sb.pm(&["project", "new", "scratch", "--title", "scratch"]));
+    assert_ok(&sb.pm(&["project", "delete", "scratch"]));
+    let out = sb.pm(&["new", "--title", "configured", "--project", "pm-hub"]);
+    assert_ok(&out);
+    (sb, stdout(&out).trim().to_string())
+}
+
+fn assert_configured(restored: &Sandbox, id: &str) {
+    let ws = restored.ws_str();
+    let labels = json(&restored.pm(&[
+        "workspace",
+        "gate-label",
+        "list",
+        "--workspace",
+        ws,
+        "--json",
+    ]));
+    assert_eq!(
+        labels["gate_labels"],
+        serde_json::json!(["manual", "matt-gated"])
+    );
+    let projects = json(&restored.pm(&["project", "list", "--workspace", ws, "--json"]));
+    let ids: Vec<&str> = projects["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["pm", "pm-hub"], "the deleted project stays deleted");
+    let hub = json(&restored.pm(&["project", "show", "pm-hub", "--workspace", ws, "--json"]));
+    assert_eq!(hub["parent"], "pm");
+    let pm = json(&restored.pm(&["project", "show", "pm", "--workspace", ws, "--json"]));
+    assert_eq!(pm["repos"], serde_json::json!(["OpenThinkAi/pm"]));
+    let ticket = json(&restored.pm(&["show", id, "--workspace", ws, "--json"]));
+    assert_eq!(ticket["project"], "pm-hub");
+}
+
+/// AGT-1385 AC3, the migrated case: the log carries the config ops, so
+/// restore replays them (first) and the snapshot adds nothing — the
+/// restored log is the backed-up log, op for op.
+#[test]
+fn restore_of_a_migrated_backup_replays_config_ops_and_adds_none() {
+    let (sb, id) = configured();
+    let remote = RemoteBackup::new();
+    assert_ok(&sb.pm(&["backup", "--to", remote.work.to_str().unwrap()]));
+
+    let restored = restore_into(&remote);
+    assert_eq!(op_count(&restored), op_count(&sb));
+    assert_configured(&restored, &id);
+    assert_ok(&restored.pm(&["doctor", "--rebuild", "--workspace", restored.ws_str()]));
+}
+
+/// AGT-1385 AC3, the pre-migration case: a backup whose log has no config
+/// ops restores from the snapshot alone — `init_workspace` / `put_project`
+/// synthesize the ops the log lacks — and comes out doctor-clean.
+#[test]
+fn restore_of_a_pre_agt_1385_backup_synthesizes_config_ops_from_the_snapshot() {
+    let (sb, id) = configured();
+    let remote = RemoteBackup::new();
+    assert_ok(&sb.pm(&["backup", "--to", remote.work.to_str().unwrap()]));
+    let stripped = strip_config_ops(&remote.work);
+    assert!(stripped > 0);
+
+    let restored = restore_into(&remote);
+    assert_configured(&restored, &id);
+    assert_ok(&restored.pm(&["doctor", "--rebuild", "--workspace", restored.ws_str()]));
+    // The deleted project's ops were stripped with the rest, so it is
+    // simply never created; everything else is synthesized once.
+    assert!(op_count(&restored) < op_count(&sb));
 }

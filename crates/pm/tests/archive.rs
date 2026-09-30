@@ -67,15 +67,18 @@ impl Sandbox {
     fn project(&self, id: &str, title: &str) {
         Store::open(self.ws.join("pm.sqlite"))
             .unwrap()
-            .put_project(&Project {
-                id: id.into(),
-                title: title.into(),
-                status: ProjectStatus::InProgress,
-                parent: None,
-                repos: Default::default(),
-                doc: String::new(),
-                documents: Default::default(),
-            })
+            .put_project(
+                &Project {
+                    id: id.into(),
+                    title: title.into(),
+                    status: ProjectStatus::InProgress,
+                    parent: None,
+                    repos: Default::default(),
+                    doc: String::new(),
+                    documents: Default::default(),
+                },
+                &pm_core::ActorId::new("matt"),
+            )
             .unwrap();
     }
 

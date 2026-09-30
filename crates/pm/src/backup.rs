@@ -7,13 +7,23 @@
 //! - `pm backup [--to <dir>]` appends ops committed since the last backup
 //!   to `<dir>/ops/<prefix>/<NNNNNN>.jsonl` (one `pm_core::Op` per line,
 //!   in `seq` order, sharded — see "Layout" below), rewrites
-//!   `<dir>/ops/<prefix>.config.json` (the workspace + project snapshot a
-//!   restore needs — config tables are not op-logged, README §Op log),
-//!   commits, and pushes if `<dir>` has a remote.
+//!   `<dir>/ops/<prefix>.config.json` (the workspace + project snapshot),
+//!   commits, and pushes if `<dir>` has a remote. Since AGT-1385 the
+//!   workspace's config and project metadata are ops in the log too; the
+//!   snapshot still carries what is not — document ids, the text of any
+//!   document written outside the log — and lets a backup taken before
+//!   that ticket restore.
 //! - `pm backup --restore <dir>` reads those files and rebuilds a
-//!   workspace at the resolved `--workspace` directory: `init_workspace` +
-//!   `put_project` from the config snapshot, then `Store::commit_any` over
-//!   every op in the JSONL, in file order (append order = `seq` order).
+//!   workspace at the resolved `--workspace` directory: first every
+//!   config op in the JSONL (the states and projects everything else
+//!   needs — a migrated log carries them *after* the ticket ops they
+//!   configure, since migration 0007 appended them), then
+//!   `init_workspace` + `put_project` from the snapshot (which commit
+//!   nothing the log already said, and everything for a pre-AGT-1385
+//!   backup), then `Store::commit_any` over every other op, in file order
+//!   (append order = `seq` order). A project the log created but the
+//!   snapshot no longer lists was deleted before the backup, and is
+//!   deleted again.
 //! - `pm backup install-timer` writes an hourly launchd job that runs `pm
 //!   backup --workspace <resolved dir>` with the current binary's absolute
 //!   path.
@@ -432,10 +442,11 @@ pub fn run(ctx: &Ctx<'_>, to: Option<PathBuf>) -> Result<()> {
     }
     let shards = writer.finish()?;
 
-    // Rewritten every backup, whether or not there were new ops: config
-    // tables (workspace settings, project metadata) are not op-logged
-    // (README §Op log), so this snapshot is the only way `--restore`
-    // learns them, and it changes independently of the op count.
+    // Rewritten every backup, whether or not there were new ops: what
+    // the snapshot carries beyond the (now op-logged, AGT-1385) config —
+    // document ids, the text of any document written outside the log —
+    // changes independently of the op count, and a restore of a backup
+    // whose log predates config ops learns its workspace from it.
     let snapshot = config_snapshot(&store, &ws)?;
     fs::write(
         &layout.config,
@@ -669,10 +680,39 @@ pub fn restore(ctx: &Ctx<'_>, dir: &Path) -> Result<()> {
         )));
     }
 
+    let actor = ctx.actor()?;
     let mut store = Store::open(&db_path)?;
-    store.init_workspace(&snapshot.workspace)?;
+    let op_files = layout.op_files()?;
+
+    // Pass 1 (AGT-1385): the config ops, which everything else depends
+    // on. Order-independent among themselves (pm-core's config folds are
+    // CRDTs), so file order is fine.
+    let mut replayed: u64 = 0;
+    for path in &op_files {
+        for op in read_jsonl(path)? {
+            if op.payload.is_config() {
+                store.commit(&op)?;
+                replayed += 1;
+            }
+        }
+    }
+
+    // The snapshot: a no-op on what pass 1 already established, the
+    // whole configuration for a backup written before config was
+    // op-logged, and in both cases the document text of any document the
+    // log does not carry (`put_project`'s direct doc writes).
+    store.init_workspace(&snapshot.workspace, &actor)?;
+    let listed: BTreeSet<String> = snapshot.projects.iter().map(|p| p.id.clone()).collect();
     for project in topo_sorted(snapshot.projects)? {
-        store.put_project(&project)?;
+        store.put_project(&project, &actor)?;
+    }
+    for project in store.projects()? {
+        if !listed.contains(&project.id) {
+            // Created by the log, gone from the snapshot: deleted before
+            // the backup (`pm project delete` removes the row, never the
+            // ops). Nothing references it, or the delete was refused.
+            store.delete_project(&project.id)?;
+        }
     }
     // Reassign each document's original doc_id before any op replays
     // (AGT-1344): a `body.edit` in the JSONL below targets it, and
@@ -687,9 +727,12 @@ pub fn restore(ctx: &Ctx<'_>, dir: &Path) -> Result<()> {
         }
     }
 
-    let mut replayed: u64 = 0;
-    for path in layout.op_files()? {
-        for op in read_jsonl(&path)? {
+    // Pass 2: everything else, in file order.
+    for path in &op_files {
+        for op in read_jsonl(path)? {
+            if op.payload.is_config() {
+                continue;
+            }
             // A document's body.edit (AGT-1344) and a ticket op both live
             // in this one log; commit_any tells them apart by entity.
             store.commit_any(&op)?;

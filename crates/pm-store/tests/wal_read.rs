@@ -34,7 +34,9 @@ fn tickets_read_does_not_block_on_a_writer_holding_the_lock() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pm.sqlite");
     let mut store = Store::open(&path).unwrap();
-    store.init_workspace(&workspace()).unwrap();
+    store
+        .init_workspace(&workspace(), &pm_core::ActorId::new("matt"))
+        .unwrap();
 
     let id = Ulid::new();
     store

@@ -225,6 +225,7 @@ pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>) -> Result<()> {
     let dir = fs::canonicalize(&dir).with_context(|| format!("resolving {}", dir.display()))?;
     let db = dir.join(DB_FILE);
 
+    let actor = ctx.actor()?;
     let mut store = Store::open(&db)?;
     if let Some(existing) = store.workspace()? {
         return Err(CliError::error(format!(
@@ -242,7 +243,10 @@ pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>) -> Result<()> {
         template_sections: vec!["Problem Statement".into(), "Acceptance Criteria".into()],
         stale_days: 30,
     };
-    store.init_workspace(&ws)?;
+    // The workspace's first ops (AGT-1385): one `workspace.set` per
+    // field and gate label, one `state.upsert` per state, under this
+    // command's actor.
+    store.init_workspace(&ws, &actor)?;
 
     // config.toml records the default workspace the first time; an
     // existing file is never rewritten, so initializing a second (e.g.

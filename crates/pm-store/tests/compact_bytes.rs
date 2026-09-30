@@ -54,7 +54,9 @@ fn body_edit(entity: Ulid, wall_ms: u64, body: &mut Body, text: &str) -> Op {
 fn populated() -> (TempDir, Ulid, Ulid) {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
-    store.init_workspace(&workspace()).unwrap();
+    store
+        .init_workspace(&workspace(), &pm_core::ActorId::new("matt"))
+        .unwrap();
 
     let ticket = Ulid::new();
     store
@@ -81,7 +83,13 @@ fn populated() -> (TempDir, Ulid, Ulid) {
         .unwrap();
 
     let doc = store
-        .create_project("proj", "Proj", &BTreeSet::new(), None)
+        .create_project(
+            "proj",
+            "Proj",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     let mut doc_author = Body::with_peer(8).unwrap();
     store

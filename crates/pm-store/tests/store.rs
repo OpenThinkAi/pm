@@ -63,8 +63,12 @@ fn project(id: &str) -> Project {
 fn store() -> (TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
-    store.init_workspace(&workspace()).unwrap();
-    store.put_project(&project("pm")).unwrap();
+    store
+        .init_workspace(&workspace(), &pm_core::ActorId::new("matt"))
+        .unwrap();
+    store
+        .put_project(&project("pm"), &pm_core::ActorId::new("matt"))
+        .unwrap();
     (dir, store)
 }
 
@@ -188,9 +192,12 @@ fn open_refuses_a_database_from_the_future() {
 
 #[test]
 fn workspace_round_trips() {
-    let (_dir, mut store) = store();
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
     let ws = workspace();
-    store.init_workspace(&ws).unwrap();
+    store
+        .init_workspace(&ws, &pm_core::ActorId::new("matt"))
+        .unwrap();
     assert_eq!(store.workspace().unwrap().unwrap(), ws);
 
     let mut renamed = ws.clone();
@@ -200,7 +207,9 @@ fn workspace_round_trips() {
         category: StateCategory::Started,
         position: 3,
     });
-    store.init_workspace(&renamed).unwrap();
+    store
+        .init_workspace(&renamed, &pm_core::ActorId::new("matt"))
+        .unwrap();
     assert_eq!(store.workspace().unwrap().unwrap(), renamed);
 }
 
@@ -209,8 +218,11 @@ fn workspace_round_trips() {
 #[test]
 fn commit_appends_the_op_and_materializes_the_ticket() {
     let (_dir, mut store) = store();
+    // The workspace's own config ops (AGT-1385) are stamped at the wall
+    // clock, above this test's small stamps.
+    let config_latest = store.latest_hlc().unwrap();
     let id = Ulid::new();
-    let created = store.commit(&create(id, 1, Some("pm"))).unwrap();
+    let created = store.commit(&create(id, 1, Some("pm"))).unwrap().unwrap();
     assert_eq!(created.state, "triage");
     assert_eq!(created.project.as_deref(), Some("pm"));
     assert_eq!(created.number, None);
@@ -248,6 +260,7 @@ fn commit_appends_the_op_and_materializes_the_ticket() {
                 },
             }),
         ))
+        .unwrap()
         .unwrap();
     assert_eq!(held.hold.as_ref().unwrap().reason, "needs Matt");
     assert_eq!(held.labels.iter().collect::<Vec<_>>(), ["model:fable-5"]);
@@ -268,7 +281,10 @@ fn commit_appends_the_op_and_materializes_the_ticket() {
     );
     assert_eq!(ops[0].actor, ActorId::new("matt"));
     assert_eq!(ops[2].actor, ActorId::new("claude:pm-build"));
-    assert_eq!(store.latest_hlc().unwrap(), Hlc::new(4, 0));
+    assert_eq!(
+        store.latest_hlc().unwrap(),
+        config_latest.max(Hlc::new(4, 0))
+    );
 }
 
 #[test]
@@ -313,7 +329,9 @@ fn body_edits_materialize_the_description_and_keep_merging_across_reopens() {
 
     {
         let mut store = Store::open(&path).unwrap();
-        store.init_workspace(&workspace()).unwrap();
+        store
+            .init_workspace(&workspace(), &pm_core::ActorId::new("matt"))
+            .unwrap();
         store.commit(&create(id, 1, None)).unwrap();
         let t = store
             .commit(&op(
@@ -324,6 +342,7 @@ fn body_edits_materialize_the_description_and_keep_merging_across_reopens() {
                     update: first.into_bytes(),
                 }),
             ))
+            .unwrap()
             .unwrap();
         assert_eq!(t.description, "# Problem\n\nv1\n");
     }
@@ -339,6 +358,7 @@ fn body_edits_materialize_the_description_and_keep_merging_across_reopens() {
                 update: second.into_bytes(),
             }),
         ))
+        .unwrap()
         .unwrap();
     assert_eq!(t.description, "# Problem\n\nv1 v2\n");
     assert_eq!(
@@ -370,6 +390,7 @@ fn merge_rules_come_from_pm_core() {
             "alice",
             Payload::FieldSet(FieldSet::Title("alice".into())),
         ))
+        .unwrap()
         .unwrap();
     assert_eq!(t.title, "bob");
 
@@ -400,6 +421,7 @@ fn merge_rules_come_from_pm_core() {
                 observed,
             }),
         ))
+        .unwrap()
         .unwrap();
     assert!(t.labels.is_empty());
 }
@@ -538,7 +560,7 @@ fn claims_are_admitted_once() {
             }),
         )
     };
-    let t = store.commit(&claim(2, "claude:a")).unwrap();
+    let t = store.commit(&claim(2, "claude:a")).unwrap().unwrap();
     assert_eq!(t.state, "in-progress");
     assert_eq!(t.assignee, Some(ActorId::new("claude:a")));
     let err = store.commit(&claim(3, "claude:b")).unwrap_err();
@@ -614,7 +636,7 @@ fn one_hundred_concurrent_allocations_never_share_a_number() {
     let path = dir.path().join("pm.sqlite");
     Store::open(&path)
         .unwrap()
-        .init_workspace(&workspace())
+        .init_workspace(&workspace(), &pm_core::ActorId::new("matt"))
         .unwrap();
 
     let handles: Vec<_> = (0..100)
@@ -650,7 +672,9 @@ fn one_hundred_concurrent_allocations_never_share_a_number() {
 #[test]
 fn list_filters_by_state_project_label_repo_assignee_and_held() {
     let (_dir, mut store) = store();
-    store.put_project(&project("think-3")).unwrap();
+    store
+        .put_project(&project("think-3"), &pm_core::ActorId::new("matt"))
+        .unwrap();
     let (a, b, c) = (Ulid::new(), Ulid::new(), Ulid::new());
     store.commit(&create(a, 1, Some("pm"))).unwrap();
     store.commit(&create(b, 2, Some("think-3"))).unwrap();
@@ -947,7 +971,9 @@ fn projects_list_and_show_with_their_documents() {
     let mut child = project("pm-hub");
     child.parent = Some("pm".into());
     child.status = ProjectStatus::Complete;
-    store.put_project(&child).unwrap();
+    store
+        .put_project(&child, &pm_core::ActorId::new("matt"))
+        .unwrap();
 
     let listed = store.projects().unwrap();
     assert_eq!(
@@ -960,14 +986,16 @@ fn projects_list_and_show_with_their_documents() {
     let mut orphan = project("orphan");
     orphan.parent = Some("nope".into());
     assert!(matches!(
-        store.put_project(&orphan),
+        store.put_project(&orphan, &pm_core::ActorId::new("matt")),
         Err(StoreError::UnknownProject { project }) if project == "nope"
     ));
 
     // Replacing a project replaces its documents.
     let mut pm = project("pm");
     pm.documents = [("research/spike".to_string(), "loro".to_string())].into();
-    store.put_project(&pm).unwrap();
+    store
+        .put_project(&pm, &pm_core::ActorId::new("matt"))
+        .unwrap();
     assert_eq!(store.project("pm").unwrap().unwrap(), pm);
 }
 
