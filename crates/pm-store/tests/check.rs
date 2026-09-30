@@ -78,17 +78,22 @@ fn check_sees_cycles_across_owners_and_relations_to_tombstones() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
     let ws = workspace();
-    store.init_workspace(&ws).unwrap();
     store
-        .put_project(&Project {
-            id: "pm".into(),
-            title: "pm".into(),
-            status: ProjectStatus::InProgress,
-            parent: None,
-            repos: Default::default(),
-            doc: String::new(),
-            documents: Default::default(),
-        })
+        .init_workspace(&ws, &pm_core::ActorId::new("matt"))
+        .unwrap();
+    store
+        .put_project(
+            &Project {
+                id: "pm".into(),
+                title: "pm".into(),
+                status: ProjectStatus::InProgress,
+                parent: None,
+                repos: Default::default(),
+                doc: String::new(),
+                documents: Default::default(),
+            },
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     let (a, b, c) = (Ulid::new(), Ulid::new(), Ulid::new());
     for (i, t) in [a, b, c].into_iter().enumerate() {

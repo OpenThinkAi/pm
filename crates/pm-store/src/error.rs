@@ -2,7 +2,7 @@
 //! (R2, R4, R5) get their own variants; anything SQLite rejects that the
 //! store did not anticipate surfaces as [`StoreError::Sqlite`].
 
-use pm_core::{ApplyError, ClaimRejected, DocApplyError};
+use pm_core::{ApplyError, ClaimRejected, ConfigApplyError, DocApplyError};
 use rusqlite::ErrorCode;
 use ulid::Ulid;
 
@@ -34,6 +34,21 @@ pub enum StoreError {
     Apply(#[from] ApplyError),
     #[error(transparent)]
     DocApply(#[from] DocApplyError),
+    #[error(transparent)]
+    ConfigApply(#[from] ConfigApplyError),
+    /// A `project.set` for a project Ulid with no `project.create` yet
+    /// (AGT-1385). Within a pulled batch this defers until the create
+    /// lands; on its own it is a caller bug or a foreign writer.
+    #[error("project {project} does not exist; only project.create can start a project")]
+    UnknownProjectEntity { project: Ulid },
+    /// A workspace op (or `init_workspace`) for a workspace id other than
+    /// this database's — one workspace per database (AGT-1385).
+    #[error("op targets workspace {entity}, but this database is workspace {workspace}")]
+    ForeignWorkspace { entity: Ulid, workspace: Ulid },
+    /// A ticket op reached the config path. Only a routing bug in this
+    /// crate can produce it.
+    #[error("op {op_id}: '{kind}' is not a config op")]
+    NotAConfigOp { op_id: Ulid, kind: &'static str },
     /// AGT-1344 AC1: `pm project new` against an id that already exists.
     #[error("project '{id}' already exists")]
     DuplicateProject { id: String },
@@ -68,17 +83,11 @@ pub enum StoreError {
         #[source]
         source: Box<StoreError>,
     },
-    /// A pulled op of a kind this build's store cannot fold yet — the
-    /// AGT-1384 config kinds, until AGT-1385 wires their writers and
-    /// folds. Raised by [`crate::Store::apply_pulled`] (inside
-    /// [`StoreError::Pull`]) so the batch rolls back rather than logging
-    /// an op the tables never reflect.
-    #[error("op {op_id}: pulled '{kind}' ops cannot be applied by this build yet")]
-    UnsupportedPulledOp { op_id: Ulid, kind: &'static str },
     /// [`crate::Store::apply_pulled`] could not commit a foreign op; the
     /// whole pulled batch was rolled back. A dependency error (an unknown
-    /// ticket, relation target, document, project or state) here means
-    /// nothing in the batch — or already in the store — supplied it.
+    /// ticket, relation target, document, project, project entity or
+    /// state) here means nothing in the batch — or already in the store —
+    /// supplied it.
     #[error("applying pulled op {op_id} ({kind}) failed: {source}")]
     Pull {
         op_id: Ulid,

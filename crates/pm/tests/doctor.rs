@@ -39,15 +39,18 @@ impl Sandbox {
             0,
         );
         sb.store()
-            .put_project(&Project {
-                id: "pm".into(),
-                title: "pm".into(),
-                status: ProjectStatus::InProgress,
-                parent: None,
-                repos: Default::default(),
-                doc: String::new(),
-                documents: Default::default(),
-            })
+            .put_project(
+                &Project {
+                    id: "pm".into(),
+                    title: "pm".into(),
+                    status: ProjectStatus::InProgress,
+                    parent: None,
+                    repos: Default::default(),
+                    doc: String::new(),
+                    documents: Default::default(),
+                },
+                &pm_core::ActorId::new("matt"),
+            )
             .unwrap();
         sb
     }
@@ -173,7 +176,7 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
         text.contains(&format!("schema version  {}\n", pm_store::SCHEMA_VERSION)),
         "{text}"
     );
-    assert!(text.contains("ops             9\n"), "{text}");
+    assert!(text.contains("ops             17\n"), "{text}");
     assert!(text.contains("ticket 1"), "{text}");
     assert!(text.contains("ticket_label 2"), "{text}");
     assert!(text.contains("comment 1"), "{text}");
@@ -183,7 +186,7 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     // AGT-1393: nothing has been pushed, so the whole log is the outbox.
     assert!(
         text.contains(
-            "sync            outbox 9 op(s), pushed through seq 0, \
+            "sync            outbox 17 op(s), pushed through seq 0, \
              cursor 0 (never pulled), 0 ticket(s) awaiting a hub number\n"
         ),
         "{text}"
@@ -193,9 +196,9 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     assert_eq!(v["schema"], 1);
     assert_eq!(v["healthy"], true);
     assert_eq!(v["schema_version"], pm_store::SCHEMA_VERSION);
-    assert_eq!(v["op_count"], 9);
+    assert_eq!(v["op_count"], 17);
     assert_eq!(v["tables"]["ticket"], 1);
-    assert_eq!(v["tables"]["ops"], 9);
+    assert_eq!(v["tables"]["ops"], 17);
     assert_eq!(v["integrity"], serde_json::json!([]));
     assert_eq!(v["foreign_keys"], serde_json::json!([]));
     assert_eq!(v["replay_error"], Value::Null);
@@ -203,7 +206,7 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     assert_eq!(v["rebuilt"], Value::Null);
     assert_eq!(
         v["sync"],
-        serde_json::json!({"outbox": 9, "pushed_through": 0, "cursor": 0, "pending_numbers": 0})
+        serde_json::json!({"outbox": 17, "pushed_through": 0, "cursor": 0, "pending_numbers": 0})
     );
 }
 
@@ -219,7 +222,7 @@ fn rebuild_after_create_set_label_comment_transition_changes_nothing() {
     assert_code(&out, 0);
     let text = stdout(&out);
     assert!(
-        text.contains("rebuilt ticket tables from 9 ops: no changes, they already matched\n"),
+        text.contains("rebuilt tables from 17 ops: no changes, they already matched\n"),
         "{text}"
     );
     assert!(text.contains("replay          ok"), "{text}");
@@ -289,7 +292,7 @@ fn a_corrupted_row_is_detected_by_doctor_and_repaired_by_rebuild() {
     assert_code(&out, 0);
     let text = stdout(&out);
     assert!(
-        text.contains("rebuilt ticket tables from 9 ops: 1 row(s) changed\n"),
+        text.contains("rebuilt tables from 17 ops: 1 row(s) changed\n"),
         "{text}"
     );
     assert!(

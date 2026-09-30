@@ -41,15 +41,18 @@ impl Sandbox {
         let mut store = sb.store();
         for id in ["pm", "other"] {
             store
-                .put_project(&Project {
-                    id: id.into(),
-                    title: id.into(),
-                    status: ProjectStatus::InProgress,
-                    parent: None,
-                    repos: Default::default(),
-                    doc: String::new(),
-                    documents: Default::default(),
-                })
+                .put_project(
+                    &Project {
+                        id: id.into(),
+                        title: id.into(),
+                        status: ProjectStatus::InProgress,
+                        parent: None,
+                        repos: Default::default(),
+                        doc: String::new(),
+                        documents: Default::default(),
+                    },
+                    &pm_core::ActorId::new("matt"),
+                )
                 .unwrap();
         }
         assert_ok(&sb.run(

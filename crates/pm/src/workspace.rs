@@ -211,14 +211,15 @@ pub fn open(dir: &Path) -> Result<(Store, Workspace)> {
 
 /// `pm workspace gate-label add|remove|list <label>` (AGT-1380 AC2): the
 /// workspace's gate labels (`Rules::gate_labels`, `Workspace::gate_labels`)
-/// are a direct config write, like project metadata (`crate::project`
-/// module doc) — no op logs them. `pm ready`/`pm claim --ready` already
-/// read `Workspace::gate_labels` fresh on every call and exclude a
-/// gate-labelled ticket transitively (everything it blocks too), the same
-/// way they treat `manual`, so a label added here takes effect
-/// immediately with no other code change. It is also already part of the
-/// `Workspace` `pm backup` snapshots and `init_workspace` restores, so a
-/// gate-label change round-trips through backup/restore for free.
+/// are `workspace.set gate_label_add` / `gate_label_remove` config ops
+/// (AGT-1385; `pm_store::Store::set_gate_labels` diffs the wanted set
+/// against the workspace's view and commits exactly those). `pm ready`/`pm
+/// claim --ready` already read `Workspace::gate_labels` fresh on every
+/// call and exclude a gate-labelled ticket transitively (everything it
+/// blocks too), the same way they treat `manual`, so a label added here
+/// takes effect immediately with no other code change. Being ops, the
+/// labels replay under `pm doctor --rebuild` and travel in `pm backup`'s
+/// op log (and the `Workspace` snapshot it also writes).
 #[derive(clap::Subcommand, Debug)]
 pub enum WorkspaceCmd {
     /// Manage the workspace's gate labels
@@ -248,18 +249,20 @@ fn gate_label(ctx: &crate::verbs::Ctx<'_>, cmd: GateLabelCmd) -> Result<()> {
     match cmd {
         GateLabelCmd::Add { label } => {
             let label = crate::verbs::non_empty("gate label", &label)?;
+            let actor = ctx.actor()?;
             let (mut store, ws) = ctx.open()?;
             let mut labels = ws.gate_labels;
             labels.insert(label);
-            store.set_gate_labels(&labels)?;
+            store.set_gate_labels(&labels, &actor)?;
             print_gate_labels(ctx, &labels)
         }
         GateLabelCmd::Remove { label } => {
             let label = crate::verbs::non_empty("gate label", &label)?;
+            let actor = ctx.actor()?;
             let (mut store, ws) = ctx.open()?;
             let mut labels = ws.gate_labels;
             labels.remove(&label);
-            store.set_gate_labels(&labels)?;
+            store.set_gate_labels(&labels, &actor)?;
             print_gate_labels(ctx, &labels)
         }
         GateLabelCmd::List => {

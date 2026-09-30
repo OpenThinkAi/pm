@@ -3,13 +3,14 @@
 //! re-run appends only ops recorded since; and [`Store::ops_since`], which
 //! reads the whole log (unlike [`Store::ops`], scoped to one ticket).
 //!
-//! A target's row is written directly, like the other configuration tables
-//! (`config.rs`) — it is not derived from, or replayed from, the op log.
-//! The workspace/project snapshot a restore also needs already has public
-//! readers and writers in `config.rs` (`Store::workspace`,
-//! `Store::projects`, `Store::init_workspace`, `Store::put_project`); `pm
-//! backup` composes those with `ops_since` rather than this module growing
-//! a second copy of them.
+//! A target's row is bookkeeping written directly, like `sync_state` — it
+//! is not derived from, or replayed from, the op log. The workspace/project
+//! snapshot a restore of a pre-AGT-1385 backup needs (one whose log carries
+//! no config ops yet) already has public readers and writers in
+//! `config.rs` (`Store::workspace`, `Store::projects`,
+//! `Store::init_workspace`, `Store::put_project`); `pm backup` composes
+//! those with `ops_since` rather than this module growing a second copy of
+//! them.
 
 use pm_core::Op;
 use rusqlite::{OptionalExtension, params};
@@ -106,19 +107,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
         store
-            .init_workspace(&Workspace {
-                id: Ulid::new(),
-                prefix: "AGT".into(),
-                states: vec![State {
-                    name: "triage".into(),
-                    category: StateCategory::Unstarted,
-                    position: 0,
-                }],
-                gate_labels: Default::default(),
-                model_labels: Default::default(),
-                template_sections: Vec::new(),
-                stale_days: 30,
-            })
+            .init_workspace(
+                &Workspace {
+                    id: Ulid::new(),
+                    prefix: "AGT".into(),
+                    states: vec![State {
+                        name: "triage".into(),
+                        category: StateCategory::Unstarted,
+                        position: 0,
+                    }],
+                    gate_labels: Default::default(),
+                    model_labels: Default::default(),
+                    template_sections: Vec::new(),
+                    stale_days: 30,
+                },
+                &ActorId::new("matt"),
+            )
             .unwrap();
         (dir, store)
     }
@@ -144,10 +148,14 @@ mod tests {
     #[test]
     fn ops_since_zero_is_the_whole_log_and_advances_with_new_commits() {
         let (_dir, mut store) = fresh();
-        assert!(store.ops_since(0).unwrap().is_empty());
+        // `init_workspace` committed the workspace's config ops (AGT-1385).
+        let config = store.ops_since(0).unwrap();
+        assert!(config.iter().all(|(_, op)| op.payload.is_config()));
+        let seq = config.last().unwrap().0;
+        assert!(store.ops_since(seq).unwrap().is_empty());
 
         store.commit(&create(1)).unwrap();
-        let first = store.ops_since(0).unwrap();
+        let first = store.ops_since(seq).unwrap();
         assert_eq!(first.len(), 1);
         let seq = first[0].0;
 

@@ -85,32 +85,38 @@ mod tests {
             position,
         };
         store
-            .init_workspace(&Workspace {
-                id: Ulid::new(),
-                prefix: "AGT".into(),
-                states: vec![
-                    state("triage", StateCategory::Unstarted, 0),
-                    state("in-progress", StateCategory::Started, 1),
-                    state("done", StateCategory::Completed, 2),
-                    state("canceled", StateCategory::Canceled, 3),
-                ],
-                gate_labels: ["manual".to_string()].into(),
-                model_labels: Default::default(),
-                template_sections: Vec::new(),
-                stale_days: 30,
-            })
+            .init_workspace(
+                &Workspace {
+                    id: Ulid::new(),
+                    prefix: "AGT".into(),
+                    states: vec![
+                        state("triage", StateCategory::Unstarted, 0),
+                        state("in-progress", StateCategory::Started, 1),
+                        state("done", StateCategory::Completed, 2),
+                        state("canceled", StateCategory::Canceled, 3),
+                    ],
+                    gate_labels: ["manual".to_string()].into(),
+                    model_labels: Default::default(),
+                    template_sections: Vec::new(),
+                    stale_days: 30,
+                },
+                &ActorId::new("matt"),
+            )
             .unwrap();
         for id in ["p", "q"] {
             store
-                .put_project(&Project {
-                    id: id.into(),
-                    title: id.into(),
-                    status: ProjectStatus::InProgress,
-                    parent: None,
-                    repos: Default::default(),
-                    doc: String::new(),
-                    documents: Default::default(),
-                })
+                .put_project(
+                    &Project {
+                        id: id.into(),
+                        title: id.into(),
+                        status: ProjectStatus::InProgress,
+                        parent: None,
+                        repos: Default::default(),
+                        doc: String::new(),
+                        documents: Default::default(),
+                    },
+                    &ActorId::new("matt"),
+                )
                 .unwrap();
         }
         (dir, store)

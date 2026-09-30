@@ -1,21 +1,23 @@
 //! What `pm import vault` needs from the store beyond the ordinary write
-//! path (AGT-1347): the number allocator's floor, and project rows written
-//! from a vault snapshot without disturbing their op-derived documents.
+//! path (AGT-1347): the number allocator's floor, and project metadata
+//! upserted from a vault snapshot without disturbing the project's
+//! op-derived documents.
 //!
 //! Ticket content itself goes through [`Store::commit_batch`] like every
 //! other writer — an import is just a large, backdated batch of ordinary
-//! ops. Nothing here materializes a ticket row directly.
+//! ops. Nothing here materializes a ticket row directly, and since
+//! AGT-1385 project metadata is config ops too (`config.rs`).
 
 use std::collections::BTreeSet;
 
-use pm_core::ProjectStatus;
+use pm_core::{ActorId, ProjectStatus};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use ulid::Ulid;
 
 use crate::Store;
-use crate::codec::{enum_name, json, ulid};
-use crate::config::project_exists;
-use crate::error::{Result, StoreError};
+use crate::codec::ulid;
+use crate::config::upsert_meta_in;
+use crate::error::Result;
 
 impl Store {
     /// The allocator floor (`workspace.number_floor`): the next allocated
@@ -41,7 +43,8 @@ impl Store {
         self.number_floor()
     }
 
-    /// Inserts or updates a project's metadata from a vault snapshot and
+    /// Creates or updates a project's metadata from a vault snapshot with
+    /// config ops under `actor` (only what differs is committed) and
     /// returns its design-doc id, assigning one if the row has none. The
     /// document bodies (`doc`, named documents) are untouched: they are
     /// op-derived (AGT-1344) and the importer edits them through
@@ -53,62 +56,27 @@ impl Store {
         status: ProjectStatus,
         parent: Option<&str>,
         repos: &BTreeSet<String>,
+        actor: &ActorId,
     ) -> Result<Ulid> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(parent) = parent
-            && !project_exists(&tx, parent)?
-        {
-            return Err(StoreError::UnknownProject {
-                project: parent.to_string(),
-            });
-        }
-        let existing: Option<Option<String>> = tx
+        upsert_meta_in(&tx, id, title, status, parent, repos, actor)?;
+        let existing: Option<String> = tx
             .query_row(
                 "SELECT doc_id FROM project WHERE id = ?1",
                 params![id],
                 |r| r.get(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         let doc_id = match existing {
-            Some(Some(text)) => {
-                let doc_id = ulid("project.doc_id", &text)?;
-                tx.execute(
-                    "UPDATE project SET title = ?1, status = ?2, parent = ?3, repos = ?4 WHERE id = ?5",
-                    params![title, enum_name(&status), parent, json(repos), id],
-                )?;
-                doc_id
-            }
-            Some(None) => {
-                let doc_id = Ulid::new();
-                tx.execute(
-                    "UPDATE project SET title = ?1, status = ?2, parent = ?3, repos = ?4, doc_id = ?5
-                     WHERE id = ?6",
-                    params![
-                        title,
-                        enum_name(&status),
-                        parent,
-                        json(repos),
-                        doc_id.to_string(),
-                        id
-                    ],
-                )?;
-                doc_id
-            }
+            Some(text) => ulid("project.doc_id", &text)?,
             None => {
                 let doc_id = Ulid::new();
                 tx.execute(
-                    "INSERT INTO project (id, title, status, parent, repos, doc, doc_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, '', ?6)",
-                    params![
-                        id,
-                        title,
-                        enum_name(&status),
-                        parent,
-                        json(repos),
-                        doc_id.to_string()
-                    ],
+                    "UPDATE project SET doc_id = ?1 WHERE id = ?2",
+                    params![doc_id.to_string(), id],
                 )?;
                 doc_id
             }
@@ -140,21 +108,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
         store
-            .init_workspace(&Workspace {
-                id: Ulid::new(),
-                prefix: "AGT".into(),
-                states: vec![State {
-                    name: "triage".into(),
-                    category: StateCategory::Unstarted,
-                    position: 0,
-                }],
-                gate_labels: Default::default(),
-                model_labels: Default::default(),
-                template_sections: Vec::new(),
-                stale_days: 30,
-            })
+            .init_workspace(
+                &Workspace {
+                    id: Ulid::new(),
+                    prefix: "AGT".into(),
+                    states: vec![State {
+                        name: "triage".into(),
+                        category: StateCategory::Unstarted,
+                        position: 0,
+                    }],
+                    gate_labels: Default::default(),
+                    model_labels: Default::default(),
+                    template_sections: Vec::new(),
+                    stale_days: 30,
+                },
+                &matt(),
+            )
             .unwrap();
         (dir, store)
+    }
+
+    fn matt() -> ActorId {
+        ActorId::new("matt")
     }
 
     fn create(ticket: Ulid) -> Op {
@@ -197,7 +172,7 @@ mod tests {
         assert_eq!(store.allocate_number(c, &actor).unwrap(), 1378);
         // init_workspace on an existing row leaves the floor alone.
         let ws = store.workspace().unwrap().unwrap();
-        store.init_workspace(&ws).unwrap();
+        store.init_workspace(&ws, &matt()).unwrap();
         assert_eq!(store.number_floor().unwrap(), 1376);
     }
 
@@ -206,14 +181,21 @@ mod tests {
         let (_dir, mut store) = fresh();
         let repos: BTreeSet<String> = ["OpenThinkAi/pm".to_string()].into();
         let first = store
-            .upsert_project("pm", "pm", ProjectStatus::InProgress, None, &repos)
+            .upsert_project("pm", "pm", ProjectStatus::InProgress, None, &repos, &matt())
             .unwrap();
         assert_eq!(store.design_doc_id("pm").unwrap(), Some(first));
         let doc = store.ensure_named_doc("pm", "notes").unwrap();
         assert_eq!(store.ensure_named_doc("pm", "notes").unwrap(), doc);
 
         let again = store
-            .upsert_project("pm", "pm (renamed)", ProjectStatus::Complete, None, &repos)
+            .upsert_project(
+                "pm",
+                "pm (renamed)",
+                ProjectStatus::Complete,
+                None,
+                &repos,
+                &matt(),
+            )
             .unwrap();
         assert_eq!(again, first, "a re-import lands on the same doc_id");
         let p = store.project("pm").unwrap().unwrap();
@@ -223,19 +205,29 @@ mod tests {
 
         // A row written without a doc_id (put_project) gets one on upsert.
         store
-            .put_project(&pm_core::Project {
-                id: "old".into(),
-                title: "old".into(),
-                status: ProjectStatus::InProgress,
-                parent: None,
-                repos: Default::default(),
-                doc: String::new(),
-                documents: Default::default(),
-            })
+            .put_project(
+                &pm_core::Project {
+                    id: "old".into(),
+                    title: "old".into(),
+                    status: ProjectStatus::InProgress,
+                    parent: None,
+                    repos: Default::default(),
+                    doc: String::new(),
+                    documents: Default::default(),
+                },
+                &matt(),
+            )
             .unwrap();
         assert_eq!(store.design_doc_id("old").unwrap(), None);
         let id = store
-            .upsert_project("old", "old", ProjectStatus::Abandoned, Some("pm"), &repos)
+            .upsert_project(
+                "old",
+                "old",
+                ProjectStatus::Abandoned,
+                Some("pm"),
+                &repos,
+                &matt(),
+            )
             .unwrap();
         assert_eq!(store.design_doc_id("old").unwrap(), Some(id));
         assert_eq!(
@@ -244,8 +236,15 @@ mod tests {
         );
 
         let err = store
-            .upsert_project("x", "x", ProjectStatus::InProgress, Some("nope"), &repos)
+            .upsert_project(
+                "x",
+                "x",
+                ProjectStatus::InProgress,
+                Some("nope"),
+                &repos,
+                &matt(),
+            )
             .unwrap_err();
-        assert!(matches!(err, StoreError::UnknownProject { .. }));
+        assert!(matches!(err, crate::StoreError::UnknownProject { .. }));
     }
 }

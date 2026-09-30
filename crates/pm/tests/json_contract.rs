@@ -96,15 +96,18 @@ impl Sandbox {
     fn put_project(&self, id: &str) {
         let mut store = self.store();
         store
-            .put_project(&Project {
-                id: id.into(),
-                title: id.into(),
-                status: ProjectStatus::InProgress,
-                parent: None,
-                repos: Default::default(),
-                doc: String::new(),
-                documents: Default::default(),
-            })
+            .put_project(
+                &Project {
+                    id: id.into(),
+                    title: id.into(),
+                    status: ProjectStatus::InProgress,
+                    parent: None,
+                    repos: Default::default(),
+                    doc: String::new(),
+                    documents: Default::default(),
+                },
+                &pm_core::ActorId::new("matt"),
+            )
             .unwrap();
     }
 

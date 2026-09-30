@@ -118,7 +118,8 @@ impl Store {
     /// a no-op. Claims are not re-checked: the hub admitted them.
     ///
     /// Order-independent within the batch: an op whose ticket, relation
-    /// target, document, project or state is not there yet is deferred
+    /// target, document, project, project entity or state is not there
+    /// yet is deferred
     /// and retried once the rest of the batch has landed, so a batch
     /// applies to the same state in any order (pm-core's merge is
     /// order-independent; this makes the existence checks so too). Ops
@@ -231,35 +232,25 @@ fn outbox_len(conn: &Connection) -> Result<u64> {
 }
 
 /// Routes a foreign op to the commit path for the entity it targets. The
-/// op log shares one entity namespace between tickets and project
-/// documents; a `body.edit` whose entity is a known document goes to the
-/// document path, every other ticket kind to the ticket path.
-///
-/// Config kinds (AGT-1384: `workspace.set`, `state.upsert`,
-/// `actor.upsert`, `project.create`, `project.set`) are **rejected** with
-/// [`StoreError::UnsupportedPulledOp`], failing the whole batch: the store
-/// cannot fold them yet (AGT-1385 rewires config writes onto them), and
-/// recording one in the log without folding it would leave the log and
-/// the tables disagreeing — `pm doctor`'s replay would then fail on it.
-/// A rejected batch leaves the cursor where it was, so the same pull
-/// succeeds once this build learns to fold config. The match lists every
-/// kind so a new one has to be routed here deliberately.
+/// op log shares one entity namespace between tickets, project documents
+/// and config entities; a `body.edit` whose entity is a known document
+/// goes to the document path, and everything else — ticket kinds and the
+/// config kinds (AGT-1384: `workspace.set`, `state.upsert`,
+/// `actor.upsert`, `project.create`, `project.set`, folded by
+/// [`crate::config`] since AGT-1385) — to [`commit_foreign_in`], which
+/// dispatches on the kind. The match lists every kind so a new one has to
+/// be routed here deliberately.
 fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
     match &op.payload {
+        Payload::BodyEdit(_) if is_known_doc(tx, op.entity)? => {
+            commit_doc_edit_in(tx, op.entity, op)?;
+        }
         Payload::WorkspaceSet(_)
         | Payload::StateUpsert(_)
         | Payload::ActorUpsert(_)
         | Payload::ProjectCreate(_)
-        | Payload::ProjectSet(_) => {
-            return Err(StoreError::UnsupportedPulledOp {
-                op_id: op.op_id,
-                kind: op.kind(),
-            });
-        }
-        Payload::BodyEdit(_) if is_known_doc(tx, op.entity)? => {
-            commit_doc_edit_in(tx, op.entity, op)?;
-        }
-        Payload::TicketCreate(_)
+        | Payload::ProjectSet(_)
+        | Payload::TicketCreate(_)
         | Payload::FieldSet(_)
         | Payload::LabelAdd(_)
         | Payload::LabelRemove(_)
@@ -287,7 +278,10 @@ fn is_known_doc(conn: &Connection, doc_id: Ulid) -> Result<bool> {
     )?)
 }
 
-/// Failures another op in the same batch may yet resolve.
+/// Failures another op in the same batch may yet resolve: a missing
+/// ticket, relation target, document, project (by slug — a ticket's
+/// `project`, a project's `parent`), project entity (a `project.set`
+/// ahead of its `project.create`) or state.
 fn is_dependency(e: &StoreError) -> bool {
     matches!(
         e,
@@ -295,6 +289,7 @@ fn is_dependency(e: &StoreError) -> bool {
             | StoreError::UnknownRelationTarget { .. }
             | StoreError::UnknownDocument { .. }
             | StoreError::UnknownProject { .. }
+            | StoreError::UnknownProjectEntity { .. }
             | StoreError::UnknownState { .. }
     )
 }

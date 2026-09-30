@@ -1,47 +1,49 @@
 //! Project documents as op-derived text (AGT-1344).
 //!
-//! A project's *metadata* (title/status/parent/repos) is unchanged from
-//! AGT-1335 (`config.rs`): a direct write, not op-logged. Its *document
-//! bodies* — the design doc (`project.doc`) and any number of named
-//! documents (`project_doc.body`) — are different: each gets a stable
-//! `doc_id` (a Ulid, distinct from the project's own kebab-case `id`) that
-//! `body.edit` ops target, the exact op kind and [`pm_core::Body`] CRDT a
-//! ticket's description uses (AGT-1338). There is exactly one body format
-//! in the op log, ever.
+//! A project's *metadata* (title/status/parent/repos) is config-op
+//! derived since AGT-1385 (`config.rs`: `project.create` / `project.set`
+//! against the project's own Ulid). Its *document bodies* — the design doc
+//! (`project.doc`) and any number of named documents (`project_doc.body`)
+//! — each get a stable `doc_id` (a Ulid, distinct from both the project's
+//! kebab-case `id` and its Ulid) that `body.edit` ops target, the exact op
+//! kind and [`pm_core::Body`] CRDT a ticket's description uses (AGT-1338).
+//! There is exactly one body format in the op log, ever.
 //!
 //! [`commit_doc_edit`] is the write path — append the op, fold it into the
 //! document's [`DocView`], and update the cached text column in the same
 //! transaction, mirroring [`crate::commit::commit_in`] for tickets.
 //! [`replay_project_docs`] is the read-side twin `pm doctor` / `--rebuild`
-//! calls (via [`crate::doctor`]'s `replay_all`): it resets every row with a
-//! `doc_id` and refolds it from the `body.edit` ops in the log, so drift
-//! there is caught exactly as `ticket.description` drift is.
+//! calls (via [`crate::doctor`]'s `replay_all`, after the config and ticket
+//! replays): it resets every row with a `doc_id` and refolds it from the
+//! `body.edit` ops in the log, so drift there is caught exactly as
+//! `ticket.description` drift is.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pm_core::{DocView, Op, apply_doc};
+use pm_core::{ActorId, DocView, Op, ProjectStatus, apply_doc};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use ulid::Ulid;
 
 use crate::Store;
 use crate::codec::{json, ulid};
 use crate::commit::{append_op, ensure_actor, exists};
-use crate::config::project_exists;
-use crate::doctor::{self, PROJECT_DOC_TABLES};
+use crate::config::{project_exists, upsert_meta_in};
 use crate::error::{Result, StoreError};
 use crate::query::read_ops;
 
 impl Store {
-    /// `pm project new` (AC1): inserts a project row with a fresh
-    /// design-doc id and returns it. Fails if `id` is already taken, or if
-    /// `parent` is given and does not exist (R2, the rule a ticket's
-    /// `project` field already obeys).
+    /// `pm project new` (AC1): commits the project's `project.create` (and
+    /// one `project.set repo_add` per repo) under `actor`, stamps the new
+    /// row with a fresh design-doc id, and returns that id. Fails if `id`
+    /// is already taken, or if `parent` is given and does not exist (R2,
+    /// the rule a ticket's `project` field already obeys).
     pub fn create_project(
         &mut self,
         id: &str,
         title: &str,
         repos: &BTreeSet<String>,
         parent: Option<&str>,
+        actor: &ActorId,
     ) -> Result<Ulid> {
         let tx = self
             .conn
@@ -49,18 +51,19 @@ impl Store {
         if exists(&tx, "SELECT 1 FROM project WHERE id = ?1", id)? {
             return Err(StoreError::DuplicateProject { id: id.to_string() });
         }
-        if let Some(parent) = parent
-            && !project_exists(&tx, parent)?
-        {
-            return Err(StoreError::UnknownProject {
-                project: parent.to_string(),
-            });
-        }
+        upsert_meta_in(
+            &tx,
+            id,
+            title,
+            ProjectStatus::InProgress,
+            parent,
+            repos,
+            actor,
+        )?;
         let doc_id = Ulid::new();
         tx.execute(
-            "INSERT INTO project (id, title, status, parent, repos, doc, doc_id)
-             VALUES (?1, ?2, 'in-progress', ?3, ?4, '', ?5)",
-            params![id, title, parent, json(repos), doc_id.to_string()],
+            "UPDATE project SET doc_id = ?1 WHERE id = ?2",
+            params![doc_id.to_string(), id],
         )?;
         tx.commit()?;
         Ok(doc_id)
@@ -190,9 +193,10 @@ impl Store {
     /// `pm project delete` (AC4): refused while a ticket still references
     /// the project (R-style FK) or a child project still names it as
     /// `parent`; otherwise removes the project, its documents, and their
-    /// cached merge state. The op log itself is never pruned — a
-    /// `body.edit` for a deleted document's `doc_id` simply has nothing
-    /// left to materialize into.
+    /// cached merge state (`project_view` too). The op log itself is never
+    /// pruned — a `body.edit` for a deleted document's `doc_id` simply has
+    /// nothing left to materialize into, and the project's own config ops
+    /// are skipped by a rebuild (`config.rs`, `Mode::Rebuild`).
     pub fn delete_project(&mut self, id: &str) -> Result<()> {
         let tx = self
             .conn
@@ -224,6 +228,11 @@ impl Store {
             params![id],
         )?;
         tx.execute("DELETE FROM project_doc WHERE project = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM project_view WHERE project IN
+                (SELECT ulid FROM project WHERE id = ?1 AND ulid IS NOT NULL)",
+            params![id],
+        )?;
         tx.execute("DELETE FROM project WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(())
@@ -407,11 +416,12 @@ pub(crate) fn known_doc_ids(tx: &Transaction<'_>) -> Result<BTreeSet<Ulid>> {
 
 /// The read side of this module: resets every document row that has a
 /// `doc_id` and refolds it from the `body.edit` ops in the log, exactly the
-/// way [`crate::doctor::replay_all`] does for [`crate::doctor::TICKET_TABLES`].
-/// Called from `replay_all` itself, so both `pm doctor` and `pm doctor
-/// --rebuild` pick it up; its [`doctor::Diff`] merges into theirs.
-pub(crate) fn replay_project_docs(tx: &Transaction<'_>) -> Result<doctor::Diff> {
-    let before = doctor::snapshot(tx, &PROJECT_DOC_TABLES)?;
+/// way [`crate::doctor`]'s `replay_all` does for
+/// [`crate::doctor::TICKET_TABLES`]. Called from `replay_all` itself (which
+/// snapshots [`crate::doctor::PROJECT_DOC_TABLES`] before and after, with
+/// every other derived table), so both `pm doctor` and `pm doctor
+/// --rebuild` pick it up.
+pub(crate) fn replay_project_docs(tx: &Transaction<'_>) -> Result<()> {
     let known = known_doc_ids(tx)?;
 
     tx.execute("DELETE FROM project_doc_view", [])?;
@@ -439,7 +449,5 @@ pub(crate) fn replay_project_docs(tx: &Transaction<'_>) -> Result<doctor::Diff> 
     for view in views.values() {
         materialize_doc(tx, view)?;
     }
-
-    let after = doctor::snapshot(tx, &PROJECT_DOC_TABLES)?;
-    Ok(doctor::diff(before, after))
+    Ok(())
 }

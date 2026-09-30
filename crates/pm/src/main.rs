@@ -302,9 +302,9 @@ enum Cmd {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Check the database: constraints, and that the ticket tables replay from the op log (exit 1 if not)
+    /// Check the database: constraints, and that the derived tables replay from the op log (exit 1 if not)
     Doctor {
-        /// Regenerate the ticket tables from the op log first and print what changed
+        /// Regenerate the derived tables from the op log first and print what changed
         #[arg(long)]
         rebuild: bool,
     },
@@ -340,7 +340,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: project::ProjectCmd,
     },
-    /// Workspace config verbs (direct writes, not op-logged): gate-label add/remove/list
+    /// Workspace config verbs (config ops in the log): gate-label add/remove/list
     Workspace {
         #[command(subcommand)]
         cmd: workspace::WorkspaceCmd,

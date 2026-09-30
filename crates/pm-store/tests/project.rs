@@ -32,7 +32,9 @@ fn workspace() -> Workspace {
 fn store() -> (TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
-    store.init_workspace(&workspace()).unwrap();
+    store
+        .init_workspace(&workspace(), &pm_core::ActorId::new("matt"))
+        .unwrap();
     (dir, store)
 }
 
@@ -81,7 +83,13 @@ fn create_ticket(id: Ulid, wall_ms: u64, project: &str) -> Op {
 fn create_project_assigns_a_stable_doc_id_and_starts_empty() {
     let (_dir, mut store) = store();
     let doc_id = store
-        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "pm",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     assert_eq!(store.design_doc_id("pm").unwrap(), Some(doc_id));
     let project = store.project("pm").unwrap().unwrap();
@@ -93,10 +101,22 @@ fn create_project_assigns_a_stable_doc_id_and_starts_empty() {
 fn create_project_rejects_a_duplicate_id() {
     let (_dir, mut store) = store();
     store
-        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "pm",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     let err = store
-        .create_project("pm", "again", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "again",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap_err();
     assert!(matches!(err, StoreError::DuplicateProject { id } if id == "pm"));
 }
@@ -105,15 +125,33 @@ fn create_project_rejects_a_duplicate_id() {
 fn create_project_checks_the_parent_exists() {
     let (_dir, mut store) = store();
     let err = store
-        .create_project("child", "child", &BTreeSet::new(), Some("nope"))
+        .create_project(
+            "child",
+            "child",
+            &BTreeSet::new(),
+            Some("nope"),
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap_err();
     assert!(matches!(err, StoreError::UnknownProject { project } if project == "nope"));
 
     store
-        .create_project("parent", "parent", &BTreeSet::new(), None)
+        .create_project(
+            "parent",
+            "parent",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     store
-        .create_project("child", "child", &BTreeSet::new(), Some("parent"))
+        .create_project(
+            "child",
+            "child",
+            &BTreeSet::new(),
+            Some("parent"),
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     assert_eq!(
         store.project("child").unwrap().unwrap().parent,
@@ -127,7 +165,13 @@ fn create_project_checks_the_parent_exists() {
 fn commit_doc_edit_materializes_the_design_doc_and_keeps_merging_across_reopens() {
     let (dir, mut store) = store();
     let doc_id = store
-        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "pm",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
 
     let first = body_edit_op(doc_id, 1, None, "# pm\n\nv1");
@@ -161,7 +205,13 @@ fn commit_doc_edit_materializes_the_design_doc_and_keeps_merging_across_reopens(
 fn a_duplicate_doc_edit_op_is_refused_and_changes_nothing() {
     let (_dir, mut store) = store();
     let doc_id = store
-        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "pm",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     let edit = body_edit_op(doc_id, 1, None, "once");
     store.commit_doc_edit(doc_id, &edit).unwrap();
@@ -174,7 +224,13 @@ fn a_duplicate_doc_edit_op_is_refused_and_changes_nothing() {
 fn add_named_doc_then_commit_doc_edit_materializes_project_doc_body() {
     let (_dir, mut store) = store();
     store
-        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "pm",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     let doc_id = store.add_named_doc("pm", "research/spike").unwrap();
     assert_eq!(
@@ -198,7 +254,13 @@ fn add_named_doc_then_commit_doc_edit_materializes_project_doc_body() {
 fn add_named_doc_rejects_a_duplicate_name_and_a_missing_project() {
     let (_dir, mut store) = store();
     store
-        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "pm",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     store.add_named_doc("pm", "notes").unwrap();
     let err = store.add_named_doc("pm", "notes").unwrap_err();
@@ -218,7 +280,13 @@ fn add_named_doc_rejects_a_duplicate_name_and_a_missing_project() {
 fn delete_project_is_refused_while_it_has_tickets() {
     let (_dir, mut store) = store();
     store
-        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "pm",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     store.commit(&create_ticket(Ulid::new(), 1, "pm")).unwrap();
 
@@ -231,10 +299,22 @@ fn delete_project_is_refused_while_it_has_tickets() {
 fn delete_project_is_refused_while_it_has_children() {
     let (_dir, mut store) = store();
     store
-        .create_project("parent", "parent", &BTreeSet::new(), None)
+        .create_project(
+            "parent",
+            "parent",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     store
-        .create_project("child", "child", &BTreeSet::new(), Some("parent"))
+        .create_project(
+            "child",
+            "child",
+            &BTreeSet::new(),
+            Some("parent"),
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
 
     let err = store.delete_project("parent").unwrap_err();
@@ -245,7 +325,13 @@ fn delete_project_is_refused_while_it_has_children() {
 fn delete_project_removes_it_and_its_document_view_rows() {
     let (_dir, mut store) = store();
     let doc_id = store
-        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "pm",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     store
         .commit_doc_edit(doc_id, &body_edit_op(doc_id, 1, None, "text"))
@@ -268,7 +354,13 @@ fn delete_project_removes_it_and_its_document_view_rows() {
 fn doctor_and_rebuild_survive_a_deleted_project_that_had_document_edits() {
     let (_dir, mut store) = store();
     let doc_id = store
-        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "pm",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     store
         .commit_doc_edit(doc_id, &body_edit_op(doc_id, 1, None, "design text"))
@@ -278,7 +370,13 @@ fn doctor_and_rebuild_survive_a_deleted_project_that_had_document_edits() {
     // fix is proven not to also start skipping (or otherwise mishandle)
     // genuine ticket ops.
     store
-        .create_project("other", "other", &BTreeSet::new(), None)
+        .create_project(
+            "other",
+            "other",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     let ticket = Ulid::new();
     store.commit(&create_ticket(ticket, 2, "other")).unwrap();
@@ -304,7 +402,13 @@ fn doctor_and_rebuild_survive_a_deleted_project_that_had_document_edits() {
 fn doctor_rebuild_reproduces_project_doc_bodies_and_repairs_corruption() {
     let (dir, mut store) = store();
     let doc_id = store
-        .create_project("pm", "pm", &BTreeSet::new(), None)
+        .create_project(
+            "pm",
+            "pm",
+            &BTreeSet::new(),
+            None,
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     store
         .commit_doc_edit(doc_id, &body_edit_op(doc_id, 1, None, "design"))
@@ -344,15 +448,18 @@ fn doctor_rebuild_leaves_a_directly_written_document_alone() {
     // put_project (not create_project): no doc_id, so it's not op-derived
     // and doctor/rebuild must not touch it (config.rs, project.rs docs).
     store
-        .put_project(&pm_core::Project {
-            id: "legacy".into(),
-            title: "legacy".into(),
-            status: pm_core::ProjectStatus::InProgress,
-            parent: None,
-            repos: Default::default(),
-            doc: "# written directly\n".into(),
-            documents: Default::default(),
-        })
+        .put_project(
+            &pm_core::Project {
+                id: "legacy".into(),
+                title: "legacy".into(),
+                status: pm_core::ProjectStatus::InProgress,
+                parent: None,
+                repos: Default::default(),
+                doc: "# written directly\n".into(),
+                documents: Default::default(),
+            },
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     assert_eq!(store.design_doc_id("legacy").unwrap(), None);
 

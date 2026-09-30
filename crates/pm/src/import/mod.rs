@@ -104,6 +104,7 @@ pub fn vault(
         }
     }
 
+    let actor = ActorId::new(IMPORT_ACTOR);
     if !dry_run {
         for stub in &report.project_stubs {
             store.upsert_project(
@@ -112,11 +113,23 @@ pub fn vault(
                 ProjectStatus::Abandoned,
                 None,
                 &Default::default(),
+                &actor,
             )?;
         }
         // Two passes so a parent is present whatever the folder order.
+        // The first leaves an existing project's parent as it is (a
+        // re-import must not emit a `project.set parent` pair per
+        // project); the second sets it.
         for p in &snapshot.projects {
-            store.upsert_project(&p.id, &p.title, p.status, None, &p.repos)?;
+            let parent = store.project(&p.id)?.and_then(|c| c.parent);
+            store.upsert_project(
+                &p.id,
+                &p.title,
+                p.status,
+                parent.as_deref(),
+                &p.repos,
+                &actor,
+            )?;
         }
         for p in snapshot.projects.iter().filter(|p| p.parent.is_some()) {
             let parent = p.parent.as_deref();
@@ -128,7 +141,7 @@ pub fn vault(
                 ));
                 continue;
             }
-            store.upsert_project(&p.id, &p.title, p.status, parent, &p.repos)?;
+            store.upsert_project(&p.id, &p.title, p.status, parent, &p.repos, &actor)?;
         }
     }
 
@@ -144,7 +157,6 @@ pub fn vault(
     }
 
     // Document bodies: one body.edit per document whose text differs.
-    let actor = ActorId::new(IMPORT_ACTOR);
     let mut intents = plan.intents;
     for p in &snapshot.projects {
         let current = store.project(&p.id)?;

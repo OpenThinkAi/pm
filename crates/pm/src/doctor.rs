@@ -1,8 +1,9 @@
 //! `pm doctor [--rebuild]` (AGT-1337): renders `pm_store::Store::doctor`
 //! and `Store::rebuild`. Exit 0 when the database is healthy — every
-//! constraint holds and replaying the op log reproduces the ticket tables
-//! exactly — else 1. `--rebuild` regenerates the ticket tables from the
-//! log first, prints what changed, then reports on the result.
+//! constraint holds and replaying the op log reproduces the derived
+//! tables (config, ticket and project-document; AGT-1385 added config)
+//! exactly — else 1. `--rebuild` regenerates them from the log first,
+//! prints what changed, then reports on the result.
 
 use pm_store::{Diff, Report};
 use serde_json::{Value, json};
@@ -52,17 +53,17 @@ pub fn doctor(ctx: &Ctx<'_>, rebuild: bool) -> Result<()> {
         ))
     } else {
         Err(CliError::error(
-            "database is unhealthy; `pm doctor --rebuild` regenerates the ticket tables from the op log",
+            "database is unhealthy; `pm doctor --rebuild` regenerates the derived tables from the op log",
         ))
     }
 }
 
 fn print_rebuilt(diff: &Diff, op_count: u64) {
     if diff.is_empty() {
-        println!("rebuilt ticket tables from {op_count} ops: no changes, they already matched");
+        println!("rebuilt tables from {op_count} ops: no changes, they already matched");
     } else {
         println!(
-            "rebuilt ticket tables from {op_count} ops: {} row(s) changed",
+            "rebuilt tables from {op_count} ops: {} row(s) changed",
             diff.row_count()
         );
         print_diff(diff);
@@ -116,7 +117,7 @@ fn print_report(report: &Report) {
     match &report.replay_error {
         Some(error) => println!("replay          FAILED: {error}"),
         None if report.drift.is_empty() => {
-            println!("replay          ok: ticket tables match the op log");
+            println!("replay          ok: derived tables match the op log");
         }
         None => {
             println!(

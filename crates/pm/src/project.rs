@@ -2,13 +2,15 @@
 //! projects/pm/README.md §CLI verbs: "`pm project new/show/list/edit` —
 //! project README template, `view-projects --json`").
 //!
-//! Project *metadata* (title/status/parent/repos) is a direct write
-//! (`pm_store::Store::create_project`, mirroring AGT-1335's `put_project`);
-//! only a document's *body* — the design doc `pm project edit` opens, and
-//! any named document `pm project doc add` creates — is a `body.edit` op
+//! Project *metadata* (title/status/parent/repos) is config ops since
+//! AGT-1385 (`project.create` + `project.set`, committed by
+//! `pm_store::Store::create_project` against the project's own Ulid); a
+//! document's *body* — the design doc `pm project edit` opens, and any
+//! named document `pm project doc add` creates — is a `body.edit` op
 //! against that document's own `doc_id`, the same op kind and
 //! [`pm_core::Body`] CRDT a ticket's description uses (AGT-1338): there is
-//! exactly one body format in the op log, ever.
+//! exactly one body format in the op log, ever. `pm project delete` is the
+//! one direct write left: it removes the row, and the log keeps the ops.
 //!
 //! `pm project edit` opens the design doc the same way `pm edit` opens a
 //! ticket (`crate::edit::{run_editor, TempFile}`, AGT-1345): `$VISUAL`,
@@ -147,8 +149,9 @@ fn new(ctx: &Ctx<'_>, id: &str, title: &str, repos: &[String], parent: Option<&s
         .map(|r| non_empty("--repo", r))
         .collect::<Result<_>>()?;
 
+    let actor = ctx.actor()?;
     let (mut store, _ws) = ctx.open()?;
-    store.create_project(id, &title, &repos, parent)?;
+    store.create_project(id, &title, &repos, parent, &actor)?;
     let project = store
         .project(id)?
         .ok_or_else(|| CliError::error(format!("project '{id}' vanished after create")))?;

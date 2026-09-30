@@ -1,7 +1,7 @@
-//! `Store::doctor` / `Store::rebuild` (AGT-1337): the ticket tables
-//! regenerate from `ops` byte-for-byte, drift is detected without writing,
-//! and a rebuild repairs it in one transaction while leaving the
-//! configuration tables alone.
+//! `Store::doctor` / `Store::rebuild` (AGT-1337): the ticket tables — and,
+//! since AGT-1385, the configuration tables — regenerate from `ops`
+//! byte-for-byte, drift is detected without writing, and a rebuild repairs
+//! it in one transaction.
 
 use std::collections::BTreeMap;
 
@@ -13,7 +13,7 @@ use pm_core::{
     ActorId, Body, Hlc, Hold, Op, Payload, Priority, Project, ProjectStatus, Relation,
     RelationKind, State, StateCategory, Workspace,
 };
-use pm_store::{SCHEMA_VERSION, Store, StoreError, TICKET_TABLES};
+use pm_store::{CONFIG_TABLES, SCHEMA_VERSION, Store, StoreError, TICKET_TABLES};
 use rusqlite::Connection;
 use rusqlite::types::Value;
 use tempfile::TempDir;
@@ -50,17 +50,22 @@ fn workspace() -> Workspace {
 fn store() -> (TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
-    store.init_workspace(&workspace()).unwrap();
     store
-        .put_project(&Project {
-            id: "pm".into(),
-            title: "pm".into(),
-            status: ProjectStatus::InProgress,
-            parent: None,
-            repos: ["OpenThinkAi/pm".to_string()].into(),
-            doc: "# pm\n".into(),
-            documents: Default::default(),
-        })
+        .init_workspace(&workspace(), &pm_core::ActorId::new("matt"))
+        .unwrap();
+    store
+        .put_project(
+            &Project {
+                id: "pm".into(),
+                title: "pm".into(),
+                status: ProjectStatus::InProgress,
+                parent: None,
+                repos: ["OpenThinkAi/pm".to_string()].into(),
+                doc: "# pm\n".into(),
+                documents: Default::default(),
+            },
+            &pm_core::ActorId::new("matt"),
+        )
         .unwrap();
     (dir, store)
 }
@@ -253,7 +258,10 @@ fn dump_all(conn: &Connection, tables: &[&str]) -> BTreeMap<String, Vec<Vec<Valu
         .collect()
 }
 
-const CONFIG_TABLES: [&str; 5] = ["workspace", "state", "project", "project_doc", "actor"];
+/// Ops `store()`'s own `init_workspace` + `put_project` committed
+/// (AGT-1385: prefix, template sections, stale days, one gate label, three
+/// states; the project's create and one repo).
+const CONFIG_OPS: u64 = 9;
 
 // ---- AC1: the report ----
 
@@ -264,8 +272,8 @@ fn doctor_reports_counts_and_is_healthy_on_a_fresh_store() {
     let report = store.doctor().unwrap();
     assert!(report.is_healthy(), "{report:#?}");
     assert_eq!(report.schema_version, SCHEMA_VERSION);
-    assert_eq!(report.op_count, 19);
-    assert_eq!(report.tables["ops"], 19);
+    assert_eq!(report.op_count, 19 + CONFIG_OPS);
+    assert_eq!(report.tables["ops"], 19 + CONFIG_OPS);
     assert_eq!(report.tables["ticket"], 2);
     assert_eq!(report.tables["ticket_view"], 2);
     assert_eq!(report.tables["ticket_label"], 1);
@@ -301,16 +309,63 @@ fn rebuild_reproduces_every_ticket_table_byte_for_byte() {
     assert!(store.doctor().unwrap().is_healthy());
 }
 
+/// AGT-1385: the configuration tables are replayed from the config ops
+/// too, and come out byte-identical (`workspace.number_floor` and the
+/// document columns, which no config op writes, included).
 #[test]
-fn rebuild_leaves_the_configuration_tables_alone() {
+fn rebuild_reproduces_the_configuration_tables() {
+    let (dir, mut store) = store();
+    exercise(&dir);
+    store.raise_number_floor(500).unwrap();
+    let conn = raw(&dir);
+    let config = dump_all(&conn, &CONFIG_TABLES);
+    let docs = dump(&conn, "project_doc");
+    let ops = dump(&conn, "ops");
+    assert!(store.rebuild().unwrap().is_empty());
+    assert_eq!(dump_all(&conn, &CONFIG_TABLES), config);
+    assert_eq!(dump(&conn, "project_doc"), docs);
+    assert_eq!(dump(&conn, "ops"), ops, "the log itself is never touched");
+    assert_eq!(store.number_floor().unwrap(), 500);
+}
+
+/// AGT-1385 AC3: drift in a configuration row is detected by doctor and
+/// repaired by rebuild the way ticket drift is — and a project row a
+/// foreign writer removed stays removed (a rebuild never resurrects a
+/// project, `pm project delete` being a direct write).
+#[test]
+fn config_drift_is_detected_and_repaired() {
     let (dir, mut store) = store();
     exercise(&dir);
     let conn = raw(&dir);
-    let config = dump_all(&conn, &CONFIG_TABLES);
-    let ops = dump(&conn, "ops");
-    store.rebuild().unwrap();
-    assert_eq!(dump_all(&conn, &CONFIG_TABLES), config);
-    assert_eq!(dump(&conn, "ops"), ops, "the log itself is never touched");
+    let clean = dump_all(&conn, &CONFIG_TABLES);
+
+    conn.execute("UPDATE workspace SET stale_days = 99, prefix = 'ZZ'", [])
+        .unwrap();
+    conn.execute("UPDATE state SET position = 42 WHERE name = 'done'", [])
+        .unwrap();
+    conn.execute("UPDATE project SET title = 'tampered' WHERE id = 'pm'", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO state (name, category, position) VALUES ('rogue', 'started', 9)",
+        [],
+    )
+    .unwrap();
+
+    let report = store.doctor().unwrap();
+    assert!(!report.is_healthy());
+    let tables: Vec<&str> = report
+        .drift
+        .tables
+        .iter()
+        .map(|t| t.table.as_str())
+        .collect();
+    assert_eq!(tables, ["workspace", "state", "project"], "{report:#?}");
+    assert_ne!(dump_all(&conn, &CONFIG_TABLES), clean);
+
+    let diff = store.rebuild().unwrap();
+    assert_eq!(diff.row_count(), 4, "{diff:#?}");
+    assert_eq!(dump_all(&conn, &CONFIG_TABLES), clean);
+    assert!(store.doctor().unwrap().is_healthy());
 }
 
 // ---- AC3: drift is detected without writing and repaired by rebuild ----
@@ -479,6 +534,7 @@ fn an_empty_store_is_healthy_and_rebuilds_to_nothing() {
     let (_dir, mut store) = store();
     let report = store.doctor().unwrap();
     assert!(report.is_healthy());
-    assert_eq!(report.op_count, 0);
+    assert_eq!(report.op_count, CONFIG_OPS, "only the configuration");
+    assert_eq!(report.tables["ticket"], 0);
     assert!(store.rebuild().unwrap().is_empty());
 }

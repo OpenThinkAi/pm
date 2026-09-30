@@ -36,21 +36,32 @@ fn workspace() -> Workspace {
     }
 }
 
+/// A workspace with one project whose configuration the hub already
+/// has: `init_workspace` / `put_project` commit config ops (AGT-1385),
+/// and marking those pushed leaves the outbox empty for the tests below,
+/// which count their own ops.
 fn store() -> (TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
-    store.init_workspace(&workspace()).unwrap();
     store
-        .put_project(&Project {
-            id: "pm".into(),
-            title: "pm".into(),
-            status: ProjectStatus::InProgress,
-            parent: None,
-            repos: Default::default(),
-            doc: String::new(),
-            documents: Default::default(),
-        })
+        .init_workspace(&workspace(), &ActorId::new("matt"))
         .unwrap();
+    store
+        .put_project(
+            &Project {
+                id: "pm".into(),
+                title: "pm".into(),
+                status: ProjectStatus::InProgress,
+                parent: None,
+                repos: Default::default(),
+                doc: String::new(),
+                documents: Default::default(),
+            },
+            &ActorId::new("matt"),
+        )
+        .unwrap();
+    let config = ids(&store.ops_since(0).unwrap());
+    store.mark_pushed(&config).unwrap();
     (dir, store)
 }
 
@@ -191,7 +202,13 @@ fn observed(
 #[test]
 fn a_fresh_store_has_an_empty_outbox_and_a_zero_cursor() {
     let (_dir, store) = store();
-    assert_eq!(store.sync_status().unwrap(), SyncStatus::default());
+    assert_eq!(
+        store.sync_status().unwrap(),
+        SyncStatus {
+            pushed_through: config_ops(&store) as i64,
+            ..SyncStatus::default()
+        }
+    );
     assert!(store.outbox(10).unwrap().is_empty());
     assert_eq!(store.cursor().unwrap(), 0);
 }
@@ -226,7 +243,10 @@ fn mark_pushed_advances_the_marker_over_contiguous_acks_only() {
         ids(&store.outbox(10).unwrap()),
         vec![ops[0].op_id, ops[1].op_id, ops[3].op_id]
     );
-    assert_eq!(store.sync_status().unwrap().pushed_through, 0);
+    assert_eq!(
+        store.sync_status().unwrap().pushed_through,
+        config_ops(&store) as i64
+    );
 
     // Closing the gap folds the early ack in.
     store.mark_pushed(&[ops[0].op_id, ops[1].op_id]).unwrap();
@@ -419,7 +439,7 @@ fn an_unmet_dependency_rolls_the_whole_batch_back() {
             || matches!(**source, StoreError::UnknownRelationTarget { ticket } if ticket == a),
         "{err:?}"
     );
-    assert!(store.ops_since(0).unwrap().is_empty());
+    assert_eq!(store.ops_since(0).unwrap().len(), config_ops(&store));
     // b's creation had nothing to wait on, yet did not land either.
     assert!(store.ticket(b).unwrap().is_none());
 }
@@ -539,27 +559,133 @@ fn the_pending_marker_survives_a_rebuild() {
     assert_eq!(store.pending_numbers().unwrap(), vec![a]);
 }
 
-// ---- config kinds (AGT-1384) ----
+// ---- config kinds (AGT-1384, folded since AGT-1385) ----
 
+/// A pulled batch may carry config ops in any order: a `project.set`
+/// ahead of its `project.create` defers, a `state.upsert` and a
+/// `workspace.set` fold into the workspace, and a ticket created in the
+/// same batch may name the new project and state. Every applied op counts
+/// as pushed, like any other foreign op.
 #[test]
-fn a_pulled_config_op_is_rejected_and_rolls_the_batch_back() {
+fn a_pulled_config_batch_folds_in_any_order_and_is_not_outbox() {
+    let (_dir, mut store) = store();
+    let ws = store.workspace().unwrap().unwrap();
+    // Above the init's own stamps, or LWW keeps the init values.
+    let base = store.latest_hlc().unwrap().wall_ms + 1;
+    let project = Ulid::new();
+    let t = Ulid::new();
+    let ops = vec![
+        op(
+            project,
+            base + 3,
+            "laptop",
+            Payload::ProjectSet(pm_core::op::ProjectSet::RepoAdd(
+                "OpenThinkAi/pm-hub".into(),
+            )),
+        ),
+        op(
+            t,
+            base + 4,
+            "laptop",
+            Payload::TicketCreate(TicketCreate {
+                title: "hub".into(),
+                state: "qa".into(),
+                priority: Priority::Medium,
+                project: Some("pm-hub".into()),
+                repo: None,
+                source: None,
+                ext: Default::default(),
+            }),
+        ),
+        op(
+            ws.id,
+            base + 1,
+            "laptop",
+            Payload::StateUpsert(pm_core::op::StateUpsert {
+                name: "qa".into(),
+                category: StateCategory::Started,
+                position: 5,
+            }),
+        ),
+        op(
+            ws.id,
+            base + 1,
+            "laptop",
+            Payload::WorkspaceSet(pm_core::op::WorkspaceSet::StaleDays(7)),
+        ),
+        op(
+            project,
+            base + 2,
+            "laptop",
+            Payload::ProjectCreate(pm_core::op::ProjectCreate {
+                id: "pm-hub".into(),
+                title: "pm-hub".into(),
+                status: ProjectStatus::InProgress,
+                parent: Some("pm".into()),
+            }),
+        ),
+    ];
+    let pulled = store.apply_pulled(&ops).unwrap();
+    assert_eq!(
+        pulled,
+        Pulled {
+            applied: 5,
+            skipped: 0
+        }
+    );
+
+    let ws = store.workspace().unwrap().unwrap();
+    assert_eq!(ws.stale_days, 7);
+    assert!(ws.states.iter().any(|s| s.name == "qa" && s.position == 5));
+    let p = store.project("pm-hub").unwrap().unwrap();
+    assert_eq!(p.parent.as_deref(), Some("pm"));
+    assert_eq!(p.repos, ["OpenThinkAi/pm-hub".to_string()].into());
+    let ticket = store.ticket(t).unwrap().unwrap();
+    assert_eq!(ticket.state, "qa");
+    assert_eq!(ticket.project.as_deref(), Some("pm-hub"));
+
+    assert_eq!(
+        store.outbox_len().unwrap(),
+        0,
+        "foreign ops are never outbox"
+    );
+    assert_eq!(store.ops_since(0).unwrap().len(), 5 + config_ops(&store));
+    // Re-pulling is a no-op, and the rebuild reproduces it all.
+    assert_eq!(store.apply_pulled(&ops).unwrap().skipped, 5);
+    assert!(store.rebuild().unwrap().is_empty());
+    assert!(store.doctor().unwrap().is_healthy());
+}
+
+/// A `project.set` whose `project.create` is in no batch is what the rest
+/// waits on forever: the batch rolls back, config and tickets alike.
+#[test]
+fn a_config_op_with_an_unmet_dependency_rolls_the_batch_back() {
     let (_dir, mut store) = store();
     let (a, _b, mut ops) = foreign_batch();
-    let config = op(
+    let orphan = op(
         Ulid::new(),
         30,
         "laptop",
-        Payload::WorkspaceSet(pm_core::op::WorkspaceSet::StaleDays(7)),
+        Payload::ProjectSet(pm_core::op::ProjectSet::Title("x".into())),
     );
-    ops.push(config.clone());
+    ops.push(orphan.clone());
     let err = store.apply_pulled(&ops).unwrap_err();
     assert!(
         matches!(&err, StoreError::Pull { op_id, source, .. }
-            if *op_id == config.op_id
-                && matches!(**source, StoreError::UnsupportedPulledOp { kind: "workspace.set", .. })),
+            if *op_id == orphan.op_id
+                && matches!(**source, StoreError::UnknownProjectEntity { .. })),
         "{err:?}"
     );
-    assert!(store.ops_since(0).unwrap().is_empty());
+    assert_eq!(store.ops_since(0).unwrap().len(), config_ops(&store));
     assert!(store.ticket(a).unwrap().is_none());
-    assert_eq!(store.workspace().unwrap().unwrap().stale_days, 30);
+}
+
+/// How many ops `store()`'s own configuration took.
+fn config_ops(store: &Store) -> usize {
+    store
+        .ops_since(0)
+        .unwrap()
+        .iter()
+        .filter(|(_, o)| o.actor == ActorId::new("matt") && o.payload.is_config())
+        .count()
 }

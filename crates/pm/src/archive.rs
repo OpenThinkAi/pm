@@ -165,9 +165,10 @@ fn archive_auto(ctx: &Ctx<'_>, dry_run: bool) -> Result<()> {
         }
     }
 
-    if !dry_run {
+    if !dry_run && !project_targets.is_empty() {
+        let actor = ctx.actor()?;
         for p in &project_targets {
-            store.set_project_status(&p.id, ProjectStatus::Complete)?;
+            store.set_project_status(&p.id, ProjectStatus::Complete, &actor)?;
         }
     }
 
