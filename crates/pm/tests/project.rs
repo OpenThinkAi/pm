@@ -678,3 +678,51 @@ fn from_file_edits_merge_with_a_concurrent_replica_edit() {
     assert_eq!(merged, "line A left\nline B right\n");
     assert_eq!(other.doc_of("pm"), merged);
 }
+
+#[test]
+fn doc_add_reserves_names_that_read_as_the_design_doc() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    let f = sb.fixture("a.md", "one\n");
+    for name in ["design", "Design", "README", "readme"] {
+        let out = sb.pm(&[
+            "project",
+            "doc",
+            "add",
+            "pm",
+            name,
+            "--from-file",
+            f.to_str().unwrap(),
+        ]);
+        assert_code(&out, 2);
+        assert!(stderr(&out).contains("project edit pm --from-file"));
+    }
+    let v = json(&sb.pm(&["project", "show", "pm", "--json"]));
+    assert!(v["documents"].as_object().is_none_or(|d| d.is_empty()));
+}
+
+#[test]
+fn text_output_says_design_doc_versus_named_doc() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    let f = sb.fixture("a.md", "one\n");
+    let p = f.to_str().unwrap();
+    assert_ok(&sb.pm(&["project", "doc", "add", "pm", "notes", "--from-file", p]));
+
+    let out = sb.pm(&["project", "edit", "pm", "--from-file", p]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out).trim(), "pm: design doc updated");
+    let out = sb.pm(&["project", "edit", "pm", "--from-file", p]);
+    assert_eq!(stdout(&out).trim(), "pm: design doc unchanged");
+    let out = sb.pm(&["project", "edit", "pm", "--doc", "notes", "--from-file", p]);
+    assert_ok(&out);
+    assert_eq!(stdout(&out).trim(), "pm: named doc 'notes' unchanged");
+
+    let shown = sb.pm(&["project", "show", "pm"]);
+    let text = stdout(&shown);
+    assert!(text.contains("named docs: notes"), "{text}");
+    assert!(text.contains("design doc:"), "{text}");
+    let named = sb.pm(&["project", "show", "pm", "--doc", "notes"]);
+    assert_eq!(stdout(&named), "one\n", "stdout stays the bare body");
+    assert!(stderr(&named).contains("pm: named doc 'notes'"));
+}
