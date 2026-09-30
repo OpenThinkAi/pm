@@ -108,7 +108,7 @@ pub fn relate(
 ) -> Result<()> {
     if blocked_by.is_empty() && unblock.is_empty() && blocks.is_empty() && unblocks.is_empty() {
         return Err(CliError::usage(
-            "relate needs --blocked-by, --unblock, --blocks and/or --unblocks <ID>[,...]",
+            "relate needs at least one of --blocked-by <ID>[,...], --unblock <ID>[,...], --blocks <ID>[,...], --unblocks <ID>[,...]",
         ));
     }
     let actor = ctx.actor()?;
