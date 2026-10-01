@@ -252,6 +252,7 @@ export default function Board({ mutate }: ViewProps) {
                   </span>
                 )}
               </h2>
+              <div className="pm-column-body">
               {column.map((t) => (
                 <Card
                   key={t.ulid}
@@ -268,6 +269,7 @@ export default function Board({ mutate }: ViewProps) {
                   onMove={(target) => move(t, target)}
                 />
               ))}
+              </div>
             </section>
           );
         })}
@@ -301,11 +303,17 @@ function Card(props: {
   const { ticket: t, workspace } = props;
   const marks = markers(t, workspace.gate_labels, props.today);
   const gate = new Set(marks.filter((m) => m.kind === "gate").map((m) => m.text));
+  const labels = t.labels.filter((l) => !gate.has(l));
+  // One line per ticket: what doesn't fit (full title, labels) is in the tooltip.
+  const tip = [t.title, `${t.priority}${t.project ? ` · ${t.project}` : ""}`, labels.join(", ")]
+    .filter(Boolean)
+    .join("\n");
   return (
     <article
-      className={`pm-card${props.dragging ? " pm-dragging" : ""}${t.hold ? " pm-held" : ""}`}
+      className={`pm-card pm-prio-edge-${t.priority}${props.dragging ? " pm-dragging" : ""}${t.hold ? " pm-held" : ""}`}
       data-ticket={t.id}
       data-ulid={t.ulid}
+      title={tip}
       draggable
       onDragStart={(e) => {
         e.dataTransfer.effectAllowed = "move";
@@ -314,55 +322,51 @@ function Card(props: {
       }}
       onDragEnd={props.onDragEnd}
     >
-      <div className="pm-card-top pm-muted">
-        <span className="pm-id" title={t.number === null ? `pending number — ${t.ulid}` : t.ulid}>
-          {t.id}
+      <span className="pm-id pm-muted" title={t.number === null ? `pending number — ${t.ulid}` : t.ulid}>
+        {t.id}
+      </span>
+      {/* Priority is the row's edge colour; high/critical also get a glyph so it is not colour-only. */}
+      {(t.priority === "high" || t.priority === "critical") && (
+        <span className={`pm-prio pm-prio-${t.priority}`} aria-hidden="true">
+          {t.priority === "critical" ? "!!" : "!"}
         </span>
-        <span className={`pm-prio pm-prio-${t.priority}`}>{t.priority}</span>
-        {t.project && <span>{t.project}</span>}
-      </div>
+      )}
+      <span className="pm-sr">{t.priority} priority</span>
       <button type="button" className="pm-title" onClick={props.onOpen}>
         {t.title}
       </button>
-      {(marks.length > 0 || t.labels.length > 0) && (
-        <div className="pm-marks">
-          {marks.map((m) => (
-            <span key={`${m.kind}:${m.text}`} className={`pm-chip pm-mark-${m.kind}`} title={m.title}>
-              {m.text}
-              <span className="pm-sr"> ({m.title})</span>
-            </span>
-          ))}
-          {t.labels
-            .filter((l) => !gate.has(l))
-            .map((l) => (
-              <span key={l} className="pm-chip">
-                {l}
-              </span>
-            ))}
-        </div>
+      {marks.map((m) => (
+        <span key={`${m.kind}:${m.text}`} className={`pm-chip pm-mark-${m.kind}`} title={m.title}>
+          {m.text}
+          <span className="pm-sr"> ({m.title})</span>
+        </span>
+      ))}
+      {t.project && <span className="pm-proj pm-muted">{t.project}</span>}
+      {t.assignee && (
+        <span className="pm-who pm-muted" title={t.assignee}>
+          {t.assignee}
+        </span>
       )}
-      <div className="pm-card-bottom">
-        <span className="pm-muted">{t.assignee ?? "unassigned"}</span>
-        <select
-          className="pm-move"
-          aria-label={`Move ${t.id} to…`}
-          value=""
-          onChange={(e) => {
-            if (e.target.value) props.onMove(e.target.value);
-          }}
-        >
-          <option value="">Move…</option>
-          {orderStates(workspace.states).map((s) => {
-            const plan = planMove(t, s.name, workspace.states);
-            return (
-              <option key={s.name} value={s.name} disabled={plan.kind !== "move"}>
-                {s.name}
-                {plan.kind === "refused" ? " (pm claim)" : plan.kind === "noop" ? " (here)" : ""}
-              </option>
-            );
-          })}
-        </select>
-      </div>
+      <select
+        className="pm-move"
+        aria-label={`Move ${t.id} to…`}
+        title="Move…"
+        value=""
+        onChange={(e) => {
+          if (e.target.value) props.onMove(e.target.value);
+        }}
+      >
+        <option value="">⋯</option>
+        {orderStates(workspace.states).map((s) => {
+          const plan = planMove(t, s.name, workspace.states);
+          return (
+            <option key={s.name} value={s.name} disabled={plan.kind !== "move"}>
+              {s.name}
+              {plan.kind === "refused" ? " (pm claim)" : plan.kind === "noop" ? " (here)" : ""}
+            </option>
+          );
+        })}
+      </select>
     </article>
   );
 }
@@ -462,7 +466,6 @@ function DetailPanel(props: {
 }
 
 const boardCss = `
-.pm-board { padding: 1rem; }
 .pm-bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1.25rem; margin-bottom: .75rem; }
 .pm-bar h1 { font-size: 1.1rem; margin: 0; }
 .pm-filters { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
@@ -472,26 +475,37 @@ const boardCss = `
 .pm-link { font: inherit; font-size: 12px; background: none; border: 0; color: var(--muted);
   text-decoration: underline; cursor: pointer; padding: 0; }
 .pm-error-inline { color: #c0392b; font-size: 12px; }
-.pm-columns { display: flex; gap: .75rem; align-items: flex-start; overflow-x: auto; padding-bottom: 1rem; }
-.pm-column { min-width: 15rem; flex: 0 0 15rem; min-height: 6rem; border-radius: 8px; padding: .35rem;
-  border: 2px dashed transparent; }
-.pm-column h2 { font-size: .85rem; margin: 0 0 .5rem; padding: 0 .2rem; }
+.pm-board { display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; padding: .75rem 1rem 0; }
+.pm-columns { display: flex; gap: .75rem; flex: 1; min-height: 0; overflow-x: auto; }
+.pm-column { flex: 1 1 0; min-width: 22rem; display: flex; flex-direction: column; min-height: 0;
+  border-radius: 8px; padding: .25rem; border: 2px dashed transparent; }
+.pm-column h2 { font-size: .85rem; margin: 0 0 .35rem; padding: 0 .2rem; flex: none; }
+.pm-column-body { overflow-y: auto; min-height: 0; flex: 1; }
 .pm-hint { font-weight: normal; font-size: 11px; }
 .pm-accept { border-color: #3b82f6; background: color-mix(in srgb, #3b82f6 8%, transparent); }
 .pm-refuse { border-color: #c0392b; background: color-mix(in srgb, #c0392b 8%, transparent); cursor: not-allowed; }
-.pm-card { background: var(--card); border: 1px solid var(--line); border-radius: 6px;
-  padding: .45rem .55rem; margin-bottom: .5rem; cursor: grab; }
+.pm-card { display: flex; align-items: center; gap: .5rem; height: 1.9rem; padding: 0 .4rem 0 .5rem;
+  font-size: 13px; background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--line);
+  border-radius: 4px; margin-bottom: 3px; cursor: grab; white-space: nowrap; }
+.pm-card:hover { border-color: color-mix(in srgb, var(--fg) 30%, var(--line)); }
 .pm-card.pm-dragging { opacity: .45; }
-.pm-card.pm-held { border-left: 3px solid #d97706; }
-.pm-card-top, .pm-card-bottom { display: flex; gap: .4rem; align-items: center; font-size: 12px; }
-.pm-card-bottom { justify-content: space-between; margin-top: .3rem; }
-.pm-id { font-variant-numeric: tabular-nums; }
+.pm-card.pm-held { box-shadow: inset 0 0 0 1px #d97706; }
+.pm-prio { flex: none; font-size: 12px; font-weight: 700; }
 .pm-prio-high { color: #d97706; }
-.pm-prio-critical { color: #c0392b; font-weight: 600; }
-.pm-title { display: block; width: 100%; text-align: left; font: inherit; color: inherit; background: none;
-  border: 0; padding: .15rem 0; cursor: pointer; }
+.pm-prio-critical { color: #c0392b; }
+.pm-prio-edge-low { border-left-color: var(--line); }
+.pm-prio-edge-medium { border-left-color: #3b82f6; }
+.pm-prio-edge-high { border-left-color: #d97706; }
+.pm-prio-edge-critical { border-left-color: #c0392b; }
+.pm-id { flex: none; font-size: 12px; font-variant-numeric: tabular-nums; min-width: 4.6em; }
+.pm-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: left;
+  font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
 .pm-title:hover { text-decoration: underline; }
-.pm-marks { margin-top: .2rem; }
+.pm-card .pm-chip { flex: none; font-size: 11px; line-height: 1.35; }
+.pm-proj, .pm-who { flex: none; font-size: 11px; max-width: 9rem; overflow: hidden; text-overflow: ellipsis; }
+.pm-card .pm-move { flex: none; width: 1.6rem; padding: 0; border: 0; background: none; color: var(--muted);
+  cursor: pointer; opacity: 0; appearance: none; text-align: center; }
+.pm-card:hover .pm-move, .pm-card .pm-move:focus { opacity: 1; }
 .pm-mark-held { color: #d97706; border-color: #d97706; }
 .pm-mark-parked { color: #6b7280; border-style: dashed; }
 .pm-mark-gate { color: #7c3aed; border-color: #7c3aed; }
