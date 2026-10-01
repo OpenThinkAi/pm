@@ -756,7 +756,10 @@ fn disposition(e: &StoreError, op: &Op) -> Disposition {
         | E::DuplicateProjectCreate { .. }
         | E::Body(_)
         | E::ProjectHasTickets { .. }
-        | E::ProjectHasChildren { .. } => Disposition::Refuse,
+        | E::ProjectHasChildren { .. }
+        // Only `Store::set_project` raises it, never an ingest path; were
+        // it ever to, it is the op's own content, like the FK refusals.
+        | E::ProjectCycle { .. } => Disposition::Refuse,
         // A constraint the op's own content violates is as deterministic
         // as a typed refusal; any other SQLite failure is the database's.
         E::Sqlite(rusqlite::Error::SqliteFailure(f, _))

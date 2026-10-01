@@ -50,8 +50,8 @@ impl From<anyhow::Error> for CliError {
 }
 
 /// A store failure that names something missing (a project, a ticket, a
-/// state) is "not found", a refused claim is "taken"; anything else is a
-/// plain error.
+/// state) is "not found", a refused claim is "taken", a re-parent that
+/// would close a loop is "usage"; anything else is a plain error.
 impl From<StoreError> for CliError {
     fn from(err: StoreError) -> Self {
         let code = match err {
@@ -60,6 +60,7 @@ impl From<StoreError> for CliError {
             | StoreError::UnknownState { .. }
             | StoreError::UnknownRelationTarget { .. } => NOT_FOUND,
             StoreError::ClaimRejected(_) => TAKEN,
+            StoreError::ProjectCycle { .. } => USAGE,
             _ => ERROR,
         };
         CliError {

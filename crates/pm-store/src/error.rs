@@ -102,6 +102,15 @@ pub enum StoreError {
     /// Same rule, for a child project's `parent` reference.
     #[error("project '{project}' has child projects; reparent or delete them first")]
     ProjectHasChildren { project: String },
+    /// AGT-1489: `pm project set <id> parent=<parent>` where `parent` is
+    /// the project itself or one of its descendants. `cycle` is the loop
+    /// the new link would close, child-first (`a -> b -> a`).
+    #[error("parent '{parent}' would make project '{project}' its own ancestor: {cycle}")]
+    ProjectCycle {
+        project: String,
+        parent: String,
+        cycle: String,
+    },
     /// A stamp that is not admissible: out of the storable range, or too
     /// far ahead of this machine's clock (oaudit 2026-09-30, see
     /// [`crate::Store::apply_pulled`]; every ingest path since AGT-1464).

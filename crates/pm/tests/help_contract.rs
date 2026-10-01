@@ -50,6 +50,7 @@ const PATHS: &[&[&str]] = &[
     &["project", "show"],
     &["project", "list"],
     &["project", "edit"],
+    &["project", "set"],
     &["project", "delete"],
     &["project", "doc"],
     &["project", "doc", "add"],

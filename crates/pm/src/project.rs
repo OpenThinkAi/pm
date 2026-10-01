@@ -1,4 +1,4 @@
-//! `pm project new/show/list/edit/doc/delete` (AGT-1344,
+//! `pm project new/show/list/edit/set/doc/delete` (AGT-1344,
 //! projects/pm/README.md §CLI verbs: "`pm project new/show/list/edit` —
 //! project README template, `view-projects --json`").
 //!
@@ -78,6 +78,13 @@ pub enum ProjectCmd {
         #[arg(long, value_name = "NAME", requires = "from_file")]
         doc: Option<String>,
     },
+    /// Change a project's title, status or parent: title=… status=in-progress|complete|abandoned parent=<id|->
+    Set {
+        id: String,
+        /// key=value pairs (keys: title, status, parent; parent=- clears it)
+        #[arg(required = true, value_name = "KEY=VALUE")]
+        assignments: Vec<String>,
+    },
     /// Refuses while the project still has tickets or child projects (FK)
     Delete { id: String },
     /// Named documents beyond the design doc
@@ -115,6 +122,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: ProjectCmd) -> Result<()> {
             ..
         } => edit_from_file(ctx, &id, doc.as_deref(), &src),
         ProjectCmd::Edit { id, view, .. } => edit(ctx, &id, view),
+        ProjectCmd::Set { id, assignments } => set(ctx, &id, &assignments),
         ProjectCmd::Delete { id } => delete(ctx, &id),
         ProjectCmd::Doc { cmd } => match cmd {
             ProjectDocCmd::Add {
@@ -371,6 +379,92 @@ fn edit_from_file(ctx: &Ctx<'_>, id: &str, doc: Option<&str>, src: &str) -> Resu
     }
     println!("{}: {label} updated", crate::text::inline(id));
     Ok(())
+}
+
+// -------------------------------------------------------------------- set
+
+/// The fields one `pm project set` changes; `None` leaves a field alone,
+/// `parent: Some(None)` clears the parent.
+#[derive(Debug, Default, PartialEq)]
+struct ProjectAssignments {
+    title: Option<String>,
+    status: Option<ProjectStatus>,
+    parent: Option<Option<String>>,
+}
+
+/// Parses `pm project set`'s `key=value` list (AGT-1489). Unlike `pm set`,
+/// a project has no `ext`, so an unknown key is a usage error, as is a
+/// malformed assignment or a key given twice. Every assignment is parsed
+/// before anything is committed.
+fn parse_project_assignments(assignments: &[String]) -> Result<ProjectAssignments> {
+    let mut out = ProjectAssignments::default();
+    for assignment in assignments {
+        let Some((key, value)) = assignment.split_once('=') else {
+            return Err(CliError::usage(format!(
+                "'{}' is not key=value (e.g. title=\"New title\", status=complete, parent=-)",
+                crate::text::inline(assignment)
+            )));
+        };
+        let key = key.trim();
+        let twice = || CliError::usage(format!("'{key}' given more than once"));
+        match key {
+            "title" => {
+                if out.title.is_some() {
+                    return Err(twice());
+                }
+                out.title = Some(non_empty("title", value)?);
+            }
+            "status" => {
+                if out.status.is_some() {
+                    return Err(twice());
+                }
+                out.status = Some(parse_status(value.trim()).map_err(CliError::usage)?);
+            }
+            "parent" => {
+                if out.parent.is_some() {
+                    return Err(twice());
+                }
+                out.parent = Some(match value.trim() {
+                    "-" => None,
+                    "" => {
+                        return Err(CliError::usage(
+                            "parent= needs a project id, or - to clear the parent",
+                        ));
+                    }
+                    parent => Some(parent.to_string()),
+                });
+            }
+            other => {
+                return Err(CliError::usage(format!(
+                    "unknown key '{}': expected title, status or parent",
+                    crate::text::inline(other)
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `pm project set <id> key=value…` (AGT-1489): one `project.set` op per
+/// field that changes, over the existing `ProjectSet::{Title,Status,Parent}`
+/// (no new op kind). The store refuses an unknown parent (exit 3) and a
+/// parent that is the project itself or a descendant (exit 2).
+fn set(ctx: &Ctx<'_>, id: &str, assignments: &[String]) -> Result<()> {
+    let change = parse_project_assignments(assignments)?;
+    let actor = ctx.actor()?;
+    let (mut store, _ws) = ctx.open()?;
+    store.project(id)?.ok_or_else(|| not_found(id))?;
+    store.set_project(
+        id,
+        change.title.as_deref(),
+        change.status,
+        change.parent.as_ref().map(Option::as_deref),
+        &actor,
+    )?;
+    let project = store
+        .project(id)?
+        .ok_or_else(|| CliError::error(format!("project '{id}' vanished after set")))?;
+    print_project(ctx, &project)
 }
 
 // ----------------------------------------------------------------- delete

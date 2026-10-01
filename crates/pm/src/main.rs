@@ -368,7 +368,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ExportCmd,
     },
-    /// Project verbs: new, show, list, edit, doc, delete
+    /// Project verbs: new, show, list, edit, set, doc, delete
     Project {
         #[command(subcommand)]
         cmd: project::ProjectCmd,

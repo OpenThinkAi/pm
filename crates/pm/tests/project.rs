@@ -726,3 +726,127 @@ fn text_output_says_design_doc_versus_named_doc() {
     assert_eq!(stdout(&named), "one\n", "stdout stays the bare body");
     assert!(stderr(&named).contains("pm: named doc 'notes'"));
 }
+
+// ------------------------------------------------- pm project set (AGT-1489)
+
+/// How many `project.set` ops the workspace log holds.
+fn project_set_ops(sb: &Sandbox) -> usize {
+    let v = json(&sb.pm(&["log", "--json"]));
+    v.to_string().matches("\"project.set\"").count()
+}
+
+#[test]
+fn set_changes_title_status_and_parent_and_show_reflects_it() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "a", "--title", "A"]));
+    assert_ok(&sb.pm(&["project", "new", "b", "--title", "B"]));
+    let before = project_set_ops(&sb);
+
+    let v = json(&sb.pm(&[
+        "project",
+        "set",
+        "b",
+        "title=Bravo",
+        "status=complete",
+        "parent=a",
+        "--json",
+    ]));
+    assert_eq!(v["title"], "Bravo");
+    assert_eq!(v["status"], "complete");
+    assert_eq!(v["parent"], "a");
+    assert_eq!(
+        project_set_ops(&sb),
+        before + 3,
+        "one project.set per field"
+    );
+
+    let v = json(&sb.pm(&["project", "show", "b", "--json"]));
+    assert_eq!(
+        (&v["title"], &v["status"], &v["parent"]),
+        (&"Bravo".into(), &"complete".into(), &"a".into())
+    );
+    let text = stdout(&sb.pm(&["project", "show", "b"]));
+    assert!(text.contains("parent:  a"), "{text}");
+
+    // An unchanged value commits nothing.
+    assert_ok(&sb.pm(&["project", "set", "b", "title=Bravo", "parent=a"]));
+    assert_eq!(project_set_ops(&sb), before + 3);
+
+    // AC2: `parent=-` clears it.
+    let v = json(&sb.pm(&["project", "set", "b", "parent=-", "--json"]));
+    assert_eq!(v["parent"], Value::Null);
+    let v = json(&sb.pm(&["project", "show", "b", "--json"]));
+    assert_eq!(v["parent"], Value::Null);
+
+    assert_ok(&sb.pm(&["doctor"]));
+    let v = json(&sb.pm(&["doctor", "--rebuild", "--json"]));
+    assert_eq!(v["healthy"], true);
+}
+
+#[test]
+fn set_refuses_a_parent_that_closes_a_cycle() {
+    let sb = Sandbox::initialized();
+    for (id, parent) in [("a", None), ("b", Some("a")), ("c", Some("b"))] {
+        let mut args = vec!["project", "new", id, "--title", id];
+        if let Some(p) = parent {
+            args.extend(["--parent", p]);
+        }
+        assert_ok(&sb.pm(&args));
+    }
+    let before = project_set_ops(&sb);
+
+    let out = sb.pm(&["project", "set", "a", "parent=a"]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("a -> a"), "{}", stderr(&out));
+
+    let out = sb.pm(&["project", "set", "a", "parent=b"]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("a -> b -> a"), "{}", stderr(&out));
+
+    // A grandchild: the message names the whole loop.
+    let out = sb.pm(&["project", "set", "a", "parent=c", "title=renamed"]);
+    assert_code(&out, 2);
+    assert!(
+        stderr(&out).contains("a -> c -> b -> a"),
+        "{}",
+        stderr(&out)
+    );
+
+    assert_eq!(project_set_ops(&sb), before, "a refusal commits nothing");
+    let v = json(&sb.pm(&["project", "show", "a", "--json"]));
+    assert_eq!((&v["parent"], &v["title"]), (&Value::Null, &"a".into()));
+
+    // Moving a sub-tree under a sibling (not a descendant) is fine.
+    assert_ok(&sb.pm(&["project", "new", "d", "--title", "d"]));
+    assert_ok(&sb.pm(&["project", "set", "b", "parent=d"]));
+    assert_ok(&sb.pm(&["project", "set", "d", "parent=a"]));
+}
+
+#[test]
+fn set_rejects_unknown_parents_projects_and_bad_assignments() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "a", "--title", "A"]));
+    let before = project_set_ops(&sb);
+
+    assert_code(&sb.pm(&["project", "set", "a", "parent=nope"]), 3);
+    assert_code(&sb.pm(&["project", "set", "nope", "title=x"]), 3);
+    for bad in [
+        "colour=red",
+        "title",
+        "title=",
+        "status=bogus",
+        "parent=",
+        "repo=OpenThinkAi/pm",
+    ] {
+        let out = sb.pm(&["project", "set", "a", bad]);
+        assert_code(&out, 2);
+        assert!(!stderr(&out).is_empty(), "{bad}");
+    }
+    // Every assignment parses before anything commits.
+    assert_code(&sb.pm(&["project", "set", "a", "title=ok", "bogus=1"]), 2);
+    assert_code(&sb.pm(&["project", "set", "a", "title=x", "title=y"]), 2);
+    assert_code(&sb.pm(&["project", "set", "a"]), 2);
+    assert_eq!(project_set_ops(&sb), before);
+    let v = json(&sb.pm(&["project", "show", "a", "--json"]));
+    assert_eq!(v["title"], "A");
+}
