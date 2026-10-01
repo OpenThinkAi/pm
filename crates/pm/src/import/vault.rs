@@ -1,7 +1,7 @@
 //! Reading a saltline-style vault from disk (AGT-1347 AC1, AC2, AC4, AC6):
 //! `tickets/**` and `archive/20*/**` ticket files, `projects/*/README.md`
 //! (and the retired ones under `archive/projects/`) with their sibling
-//! `.md` documents and `ideation/IDEA-*`.
+//! and nested `.md` documents and `ideation/IDEA-*`.
 //!
 //! The vault's frontmatter is YAML in spirit but hand-written in
 //! practice — 682 bare titles, some with `: ` or ` #` in them, which a
@@ -713,42 +713,7 @@ fn read_project(root: &Path, rel: &Path, findings: &mut Findings) -> Result<Vaul
         })
         .unwrap_or_else(|| id.clone());
 
-    let mut documents = BTreeMap::new();
-    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
-        .with_context(|| format!("listing {}", dir.display()))?
-        .map(|e| e.map(|e| e.path()))
-        .collect::<std::io::Result<_>>()
-        .with_context(|| format!("listing {}", dir.display()))?;
-    let ideation = dir.join("ideation");
-    if ideation.is_dir() {
-        entries.extend(
-            fs::read_dir(&ideation)
-                .with_context(|| format!("listing {}", ideation.display()))?
-                .map(|e| e.map(|e| e.path()))
-                .collect::<std::io::Result<Vec<_>>>()
-                .with_context(|| format!("listing {}", ideation.display()))?,
-        );
-    }
-    entries.sort();
-    for path in entries {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let is_doc = path.is_file()
-            && path.extension().is_some_and(|e| e == "md")
-            && name != "README.md"
-            && (path.parent() == Some(dir.as_path()) || name.starts_with("IDEA-"));
-        if !is_doc {
-            continue;
-        }
-        let stem = name.trim_end_matches(".md");
-        let doc_name = if path.parent() == Some(ideation.as_path()) {
-            format!("ideation/{stem}")
-        } else {
-            stem.to_string()
-        };
-        let text =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        documents.insert(doc_name, (text, mtime_ms(&path)));
-    }
+    let documents = project_documents(&dir, rel, findings)?;
 
     Ok(VaultProject {
         id,
@@ -761,6 +726,108 @@ fn read_project(root: &Path, rel: &Path, findings: &mut Findings) -> Result<Vaul
         documents,
         path: rel.to_path_buf(),
     })
+}
+
+/// A project's top-level subfolders that hold vault resources, not
+/// documents (vault-anatomy.md: research notes, committed screenshots,
+/// gitignored design-QA captures). Nothing under them is imported or
+/// reported. `ideation/` is not here: it has its own rule, see
+/// [`project_documents`].
+pub const RESOURCE_SUBTREES: [&str; 3] = ["research", "assets", "design-qa"];
+
+/// A project folder's named documents, `name` → (text, mtime): every
+/// `.md` under it except its own README.md, named by its path relative to
+/// the folder minus `.md` (`EXECUTION`, `cutover/README`,
+/// `blog-drafts/AGT-679-preview`; AGT-1485). `ideation/` keeps its rule —
+/// only the `IDEA-*.md` directly in it, as `ideation/IDEA-…` — and the
+/// [`RESOURCE_SUBTREES`] are skipped whole. Hidden entries are skipped.
+/// A non-markdown file is never imported; each project's are listed in
+/// one anomaly so the report shows what stayed behind, as is a markdown
+/// file whose path is not a safe document name.
+fn project_documents(
+    dir: &Path,
+    rel: &Path,
+    findings: &mut Findings,
+) -> Result<BTreeMap<String, (String, u64)>> {
+    let mut files = Vec::new();
+    walk_project(dir, dir, &mut files)?;
+    files.sort();
+    let mut documents = BTreeMap::new();
+    let mut not_markdown = Vec::new();
+    for path in files {
+        let inner = path.strip_prefix(dir).unwrap_or(&path);
+        let segments: Vec<&str> = inner
+            .iter()
+            .map(|s| s.to_str().unwrap_or_default())
+            .collect();
+        let shown = rel.join(inner).display().to_string();
+        if !path.extension().is_some_and(|e| e == "md") {
+            not_markdown.push(shown);
+            continue;
+        }
+        let doc_name = segments.join("/");
+        let doc_name = doc_name.trim_end_matches(".md");
+        if !pm_core::ids::is_safe_doc_name(doc_name) {
+            findings
+                .anomalies
+                .push(format!("{shown}: not a safe document name; not imported"));
+            continue;
+        }
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        documents.insert(doc_name.to_string(), (text, mtime_ms(&path)));
+    }
+    if !not_markdown.is_empty() {
+        findings.anomalies.push(format!(
+            "{}: {} non-markdown file(s) left in the vault, not imported: {}",
+            rel.display(),
+            not_markdown.len(),
+            not_markdown.join(", ")
+        ));
+    }
+    Ok(documents)
+}
+
+/// The candidate files under project folder `root`, from `dir` down:
+/// see [`project_documents`] for what is skipped.
+fn walk_project(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))?;
+    let top = dir == root;
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("listing {}", dir.display()))?
+            .path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            if top && RESOURCE_SUBTREES.contains(&name) {
+                continue;
+            }
+            if top && name == "ideation" {
+                for idea in
+                    fs::read_dir(&path).with_context(|| format!("listing {}", path.display()))?
+                {
+                    let idea = idea
+                        .with_context(|| format!("listing {}", path.display()))?
+                        .path();
+                    let n = idea.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if idea.is_file()
+                        && n.starts_with("IDEA-")
+                        && idea.extension().is_some_and(|e| e == "md")
+                    {
+                        out.push(idea);
+                    }
+                }
+                continue;
+            }
+            walk_project(root, &path, out)?;
+        } else if path.is_file() && !(top && name == "README.md") {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// A project README's frontmatter (00-meta/templates/project.md), plus
