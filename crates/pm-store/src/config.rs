@@ -244,8 +244,9 @@ impl Store {
     /// op per field that actually changes, all in one transaction, under
     /// `actor`; `None` leaves a field alone. A new parent must exist
     /// ([`StoreError::UnknownProject`]) and must not be the project itself
-    /// or one of its descendants ([`StoreError::ProjectCycle`]); either
-    /// refusal commits nothing.
+    /// or one of its descendants ([`StoreError::ProjectCycle`]), and an
+    /// initiative takes no parent ([`StoreError::InitiativeParent`],
+    /// AGT-1488); any refusal commits nothing.
     pub fn set_project(
         &mut self,
         id: &str,
@@ -269,6 +270,9 @@ impl Store {
             check_parent_cycle(&tx, id, parent)?;
         }
         let view = load_project_view(&tx, ulid)?.unwrap_or_else(|| ProjectView::new(ulid));
+        if view.kind == ProjectKind::Initiative && matches!(parent, Some(Some(_))) {
+            return Err(StoreError::InitiativeParent { id: id.to_string() });
+        }
         let mut payloads = Vec::new();
         if let Some(title) = title
             && (view.title.stamp.is_none() || view.title.value != title)

@@ -1196,7 +1196,8 @@ descendants, is refused, and the message names the loop child-first —
 
 - Exit `2`: an assignment is not `key=value`; an unknown key; a key given
   twice; empty `title=` or `parent=`; an unknown `status=`; a parent that
-  is the project itself or one of its descendants.
+  is the project itself or one of its descendants; a parent on an
+  initiative (`kind=initiative` has none; `parent=-` is still accepted).
 - Exit `3`: unknown project; `parent=` names a project that does not
   exist.
 - `--json`: **Project** (as it reads after every assignment lands).

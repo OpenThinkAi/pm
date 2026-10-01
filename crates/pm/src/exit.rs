@@ -60,7 +60,7 @@ impl From<StoreError> for CliError {
             | StoreError::UnknownState { .. }
             | StoreError::UnknownRelationTarget { .. } => NOT_FOUND,
             StoreError::ClaimRejected(_) => TAKEN,
-            StoreError::ProjectCycle { .. } => USAGE,
+            StoreError::ProjectCycle { .. } | StoreError::InitiativeParent { .. } => USAGE,
             _ => ERROR,
         };
         CliError {

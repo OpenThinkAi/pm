@@ -903,6 +903,34 @@ fn set_refuses_a_parent_that_closes_a_cycle() {
 }
 
 #[test]
+fn set_refuses_a_parent_on_an_initiative() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&[
+        "project",
+        "new",
+        "i",
+        "--title",
+        "I",
+        "--kind",
+        "initiative",
+    ]));
+    assert_ok(&sb.pm(&["project", "new", "p", "--title", "P"]));
+    let before = project_set_ops(&sb);
+
+    // AGT-1489 AC5: an initiative has no parent, so setting one exits 2.
+    let out = sb.pm(&["project", "set", "i", "parent=p"]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("initiative"), "{}", stderr(&out));
+    assert_eq!(project_set_ops(&sb), before, "a refusal commits nothing");
+
+    // Clearing it, other keys, and filing a project under it still work.
+    assert_ok(&sb.pm(&["project", "set", "i", "parent=-", "title=Init"]));
+    assert_ok(&sb.pm(&["project", "set", "p", "parent=i"]));
+    let v = json(&sb.pm(&["project", "show", "p", "--json"]));
+    assert_eq!(v["parent"], "i");
+}
+
+#[test]
 fn set_rejects_unknown_parents_projects_and_bad_assignments() {
     let sb = Sandbox::initialized();
     assert_ok(&sb.pm(&["project", "new", "a", "--title", "A"]));
