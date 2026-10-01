@@ -18,7 +18,6 @@ import {
   pickTab,
   ref,
   ticketSections,
-  type DocTab,
   type Project,
 } from "./project";
 

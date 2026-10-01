@@ -147,8 +147,7 @@ export function BoardPage({ api }: { api: Api }) {
     [api, workspace, say, refresh],
   );
 
-  const failure = error;
-  if (failure && !workspace) return <p className="pm-error">pm: {failure}</p>;
+  if (error && !workspace) return <p className="pm-error">pm: {error}</p>;
   if (!workspace) return <p className="pm-muted" style={{ padding: "1rem" }}>Loading…</p>;
 
   const states = orderStates(workspace.states);
@@ -200,7 +199,7 @@ export function BoardPage({ api }: { api: Api }) {
             </button>
           )}
         </div>
-        {failure && <span className="pm-error-inline">pm: {failure}</span>}
+        {error && <span className="pm-error-inline">pm: {error}</span>}
       </header>
       <main className="pm-columns">
         {columns.map(({ state, tickets: column }) => {
