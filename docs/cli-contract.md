@@ -215,7 +215,7 @@ wrapping object), `pm ready`'s `ready` array, `pm holds`'s `tickets`
 array, `pm new --batch`'s `tickets` array.
 
 A **Project** shape (`project::project_json`), similarly shared by
-`pm project new`/`show`/`edit` and each element of `pm project list`'s
+`pm project new`/`show`/`edit`/`set` and each element of `pm project list`'s
 `projects` array:
 
 ```jsonc
@@ -263,7 +263,8 @@ commits `workspace.set` / `state.upsert` ops, `pm project new` a
 `project.create` carrying the design doc's `doc_id` (+ `project.set
 repo_add`), `pm project doc add` a `project.doc_add` binding the new
 document's `doc_id`, `pm workspace gate-label` a `workspace.set`, `pm
-archive --auto`'s project retire a `project.set status`, and `pm project
+archive --auto`'s project retire a `project.set status`, `pm project set`
+one `project.set` per changed `title`/`status`/`parent`, and `pm project
 delete` a `project.delete`; `pm log` (no id) lists them. The only direct
 config-table write left is the allocator floor (`workspace.number_floor`).
 
@@ -1168,6 +1169,28 @@ named document, with `pm edit`'s no-TTY-fails-fast behavior.
 - `--json`: **Project** (as it reads after the save commits, or
   unchanged — or, from the project view, as it reads when the window
   closed).
+
+### `pm project set <ID> <KEY=VALUE>...`
+
+No flags beyond the globals. At least one assignment is required. Keys:
+`title` (non-empty), `status` (`in-progress`, `complete`, `abandoned`)
+and `parent` (an existing project's id, or `-` to clear it). Each changed
+key commits one `project.set` op over the existing `title`/`status`/`parent`
+fields (AGT-1489); a value the project already has commits nothing. Every
+assignment is parsed and checked before any op is committed. Unlike `pm
+set`, there is no `ext`: an unknown key is an error, not a stored field.
+
+A parent may not close a loop: the project itself, or any of its
+descendants, is refused, and the message names the loop child-first —
+`pm project set a parent=b` with `b` already under `a` says
+`... its own ancestor: a -> b -> a`.
+
+- Exit `2`: an assignment is not `key=value`; an unknown key; a key given
+  twice; empty `title=` or `parent=`; an unknown `status=`; a parent that
+  is the project itself or one of its descendants.
+- Exit `3`: unknown project; `parent=` names a project that does not
+  exist.
+- `--json`: **Project** (as it reads after every assignment lands).
 
 ### `pm project delete <ID>`
 

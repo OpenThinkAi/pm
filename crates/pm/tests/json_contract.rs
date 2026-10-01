@@ -627,6 +627,22 @@ fn every_verbs_json_output_matches_its_fixture() {
         0,
         &mut failures,
     );
+    // AGT-1489: every value is the one `pm` already has, so this commits
+    // nothing and leaves the fixtures after it untouched.
+    cap(
+        "project_set",
+        &[
+            "project",
+            "set",
+            "pm",
+            "title=pm",
+            "status=in-progress",
+            "parent=-",
+            "--json",
+        ],
+        0,
+        &mut failures,
+    );
     let editor = sb.noop_editor();
     {
         let out = sb.run(

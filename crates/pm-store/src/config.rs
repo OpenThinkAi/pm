@@ -238,6 +238,58 @@ impl Store {
         Ok(())
     }
 
+    /// `pm project set` (AGT-1489): sets any of a project's `title`,
+    /// `status` and `parent` (`Some(None)` clears it) with one `project.set`
+    /// op per field that actually changes, all in one transaction, under
+    /// `actor`; `None` leaves a field alone. A new parent must exist
+    /// ([`StoreError::UnknownProject`]) and must not be the project itself
+    /// or one of its descendants ([`StoreError::ProjectCycle`]); either
+    /// refusal commits nothing.
+    pub fn set_project(
+        &mut self,
+        id: &str,
+        title: Option<&str>,
+        status: Option<ProjectStatus>,
+        parent: Option<Option<&str>>,
+        actor: &ActorId,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ulid = project_ulid(&tx, id)?.ok_or_else(|| StoreError::UnknownProject {
+            project: id.to_string(),
+        })?;
+        if let Some(Some(parent)) = parent {
+            if !project_exists(&tx, parent)? {
+                return Err(StoreError::UnknownProject {
+                    project: parent.to_string(),
+                });
+            }
+            check_parent_cycle(&tx, id, parent)?;
+        }
+        let view = load_project_view(&tx, ulid)?.unwrap_or_else(|| ProjectView::new(ulid));
+        let mut payloads = Vec::new();
+        if let Some(title) = title
+            && (view.title.stamp.is_none() || view.title.value != title)
+        {
+            payloads.push(ProjectSet::Title(title.to_string()));
+        }
+        if let Some(status) = status
+            && (view.status.stamp.is_none() || view.status.value != status)
+        {
+            payloads.push(ProjectSet::Status(status));
+        }
+        if let Some(parent) = parent
+            && (view.parent.stamp.is_none() || view.parent.value.as_deref() != parent)
+        {
+            payloads.push(ProjectSet::Parent(parent.map(str::to_string)));
+        }
+        let payloads = payloads.into_iter().map(Payload::ProjectSet).collect();
+        commit_payloads(&tx, ulid, actor, payloads)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// `pm project delete` (AC4): commits a `project.delete` op under
     /// `actor`, whose materialization removes the project, its documents
     /// and their cached merge state (see [`remove_project_rows`]). Refused
@@ -1232,6 +1284,40 @@ pub(crate) fn actors(conn: &Connection) -> Result<Vec<ActorUpsert>> {
         })
     })
     .collect()
+}
+
+/// Refuses making `parent` the parent of `id` when that closes a loop
+/// (AGT-1489): `parent` is `id` itself, or `id` is among `parent`'s
+/// ancestors (so `parent` is one of `id`'s descendants). The error names
+/// the loop child-first, e.g. `a -> b -> a`. Walks the materialized
+/// `project.parent` column; a loop already in the data (only concurrent
+/// re-parents on two replicas make one) ends the walk instead of spinning.
+fn check_parent_cycle(conn: &Connection, id: &str, parent: &str) -> Result<()> {
+    let mut chain = vec![id.to_string(), parent.to_string()];
+    let mut seen = BTreeSet::from([parent.to_string()]);
+    let mut at = parent.to_string();
+    while at != id {
+        let up: Option<String> = conn
+            .query_row(
+                "SELECT parent FROM project WHERE id = ?1",
+                params![at],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        match up {
+            Some(up) if seen.insert(up.clone()) => {
+                chain.push(up.clone());
+                at = up;
+            }
+            _ => return Ok(()),
+        }
+    }
+    Err(StoreError::ProjectCycle {
+        project: id.to_string(),
+        parent: parent.to_string(),
+        cycle: chain.join(" -> "),
+    })
 }
 
 pub(crate) fn project_exists(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
