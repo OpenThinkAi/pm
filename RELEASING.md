@@ -143,7 +143,7 @@ through the normal stamp flow.
 gh release view v<version> --json assets --jq '.assets[].name'
 
 # Build provenance for a downloaded artifact
-gh attestation verify pm-x86_64-unknown-linux-gnu.tar.xz \
+gh attestation verify pm-x86_64-unknown-linux-gnu.tar.gz \
   --repo OpenThinkAi/pm
 
 # npm package published via OIDC with provenance

@@ -1607,7 +1607,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "pm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1632,7 +1632,7 @@ dependencies = [
 
 [[package]]
 name = "pm-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "loro",
  "proptest",
@@ -1645,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "pm-hub"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1668,7 +1668,7 @@ dependencies = [
 
 [[package]]
 name = "pm-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "pm-core",
  "rusqlite",

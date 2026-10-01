@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/pm-core", "crates/pm-store", "crates/pm", "crates/pm-hub"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "pm — local-first, relational ticketing (the vault, as a database)"
 license = "MIT OR Apache-2.0"
@@ -24,6 +24,10 @@ ci = "github"
 installers = ["shell", "npm"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+# Unix archive format. .tar.gz, not dist's default .tar.xz: the npm installer
+# shells out to `tar`, and .tar.xz needs an `xz` binary that slim images
+# (node:*-slim, many CI runners) lack; gzip is always present (AGT-1483).
+unix-archive = ".tar.gz"
 # Publish jobs to run in CI
 publish-jobs = ["npm"]
 # Which actions to run on pull requests. "skip": release.yml has no
