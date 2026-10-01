@@ -1344,3 +1344,195 @@ fn post_tickets_leaves_the_number_to_a_configured_hub() {
     assert_eq!(t["description"], "filled in");
     assert_eq!(app.get("/tickets/AGT-?").0, 400);
 }
+
+/// `{backlog, unstarted, started, completed, canceled}` as the API spells
+/// it.
+fn cats(unstarted: u64, started: u64, completed: u64) -> Value {
+    json!({
+        "backlog": 0,
+        "unstarted": unstarted,
+        "started": started,
+        "completed": completed,
+        "canceled": 0,
+    })
+}
+
+#[test]
+fn initiatives_are_a_project_tree_with_ticket_rollups() {
+    let sb = Sandbox::new();
+    for args in [
+        vec![
+            "project",
+            "new",
+            "ini",
+            "--title",
+            "Initiative",
+            "--kind",
+            "initiative",
+        ],
+        vec![
+            "project", "new", "child", "--title", "Child", "--parent", "ini",
+        ],
+        vec![
+            "project", "new", "sub", "--title", "Sub", "--parent", "child",
+        ],
+    ] {
+        assert_ok(&sb.run(&args, &[]));
+    }
+    // AGT-3 on the initiative itself, started; AGT-4 on child, done;
+    // AGT-5 on sub, triage; AGT-6 on sub, archived (counts nowhere).
+    for (n, (project, state)) in [
+        ("ini", "in-progress"),
+        ("child", "done"),
+        ("sub", "triage"),
+        ("sub", "done"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_ok(&sb.run(&["new", "--title", "t", "--project", project], &[]));
+        if state != "triage" {
+            let id = format!("AGT-{}", n + 3);
+            assert_ok(&sb.run(&["move", &id, state], &[]));
+        }
+    }
+    assert_ok(&sb.run(&["archive", "AGT-6"], &[]));
+    // A parent cycle only a concurrent sync could produce: put straight
+    // into the store, past `pm project set`'s guard.
+    {
+        let mut store = sb.store();
+        for (id, parent) in [
+            ("cy-a", None),
+            ("cy-b", Some("cy-a")),
+            ("cy-a", Some("cy-b")),
+        ] {
+            store
+                .put_project(
+                    &Project {
+                        kind: Default::default(),
+                        id: id.into(),
+                        title: id.into(),
+                        status: ProjectStatus::InProgress,
+                        parent: parent.map(str::to_string),
+                        repos: Default::default(),
+                        doc: "a doc body the tree leaves out".into(),
+                        documents: Default::default(),
+                    },
+                    &pm_core::ActorId::new("matt"),
+                )
+                .unwrap();
+        }
+    }
+    assert_eq!(sb.json(&["project", "show", "cy-a"])["parent"], "cy-b");
+    assert_eq!(sb.json(&["project", "show", "cy-b"])["parent"], "cy-a");
+    assert_ok(&sb.run(&["new", "--title", "t", "--project", "cy-b"], &[]));
+    assert_ok(&sb.run(&["move", "AGT-7", "in-progress"], &[]));
+    let app = App::start(&sb, &["--idle", "0"]);
+
+    let (status, tree) = app.get("/initiatives");
+    assert_eq!(status, 200, "{tree}");
+    assert_eq!(
+        tree,
+        json!({
+            "schema": 1,
+            "initiatives": [{
+                "id": "ini",
+                "title": "Initiative",
+                "kind": "initiative",
+                "status": "in-progress",
+                "tickets": cats(0, 1, 0),
+                "total": cats(1, 1, 1),
+                "children": [{
+                    "id": "child",
+                    "title": "Child",
+                    "kind": "project",
+                    "status": "in-progress",
+                    "tickets": cats(0, 0, 1),
+                    "total": cats(1, 0, 1),
+                    "children": [{
+                        "id": "sub",
+                        "title": "Sub",
+                        "kind": "project",
+                        "status": "in-progress",
+                        "tickets": cats(1, 0, 0),
+                        "total": cats(1, 0, 0),
+                        "children": [],
+                    }],
+                }],
+            }],
+            "unfiled": {
+                "total": cats(2, 1, 0),
+                "projects": [
+                    // The cycle is cut at its smallest id; each member once.
+                    {
+                        "id": "cy-a",
+                        "title": "cy-a",
+                        "kind": "project",
+                        "status": "in-progress",
+                        "tickets": cats(0, 0, 0),
+                        "total": cats(0, 1, 0),
+                        "children": [{
+                            "id": "cy-b",
+                            "title": "cy-b",
+                            "kind": "project",
+                            "status": "in-progress",
+                            "tickets": cats(0, 1, 0),
+                            "total": cats(0, 1, 0),
+                            "children": [],
+                        }],
+                    },
+                    {
+                        "id": "other",
+                        "title": "other",
+                        "kind": "project",
+                        "status": "in-progress",
+                        "tickets": cats(0, 0, 0),
+                        "total": cats(0, 0, 0),
+                        "children": [],
+                    },
+                    {
+                        "id": "pm",
+                        "title": "pm",
+                        "kind": "project",
+                        "status": "in-progress",
+                        "tickets": cats(2, 0, 0),
+                        "total": cats(2, 0, 0),
+                        "children": [],
+                    },
+                ],
+            },
+        }),
+    );
+
+    // `?status=` filters as `GET /projects` does: a completed child drops
+    // out and its sub-project hangs under the initiative instead.
+    assert_ok(&sb.run(&["project", "set", "child", "status=complete"], &[]));
+    let (status, tree) = app.get("/initiatives?status=in-progress");
+    assert_eq!(status, 200, "{tree}");
+    let ini = &tree["initiatives"][0];
+    assert_eq!(ini["children"][0]["id"], "sub", "{tree}");
+    assert_eq!(ini["total"], cats(1, 1, 0), "{tree}");
+    let (status, tree) = app.get("/initiatives?status=complete");
+    assert_eq!(status, 200, "{tree}");
+    assert_eq!(tree["initiatives"], json!([]), "{tree}");
+    // `child` is filed under `ini`, which is not shown: not Unfiled.
+    assert_eq!(tree["unfiled"]["projects"], json!([]), "{tree}");
+    assert_eq!(app.get("/initiatives?status=bogus").0, 400);
+
+    // The same guard as every route.
+    let host = format!("Host: 127.0.0.1:{}", app.port());
+    let (code, _) = app.raw("GET", "/initiatives", std::slice::from_ref(&host));
+    assert_eq!(code, 401);
+    let (code, _) = app.raw(
+        "GET",
+        "/initiatives",
+        &["Host: evil.example".into(), app.bearer()],
+    );
+    assert_eq!(code, 403);
+    let (code, _) = app.raw(
+        "GET",
+        "/initiatives",
+        &[host, app.bearer(), "Origin: http://evil.example".into()],
+    );
+    assert_eq!(code, 403);
+}

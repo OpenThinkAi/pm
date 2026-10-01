@@ -138,6 +138,61 @@ on every `body.edit` op event for its ticket and after every (re)connect
 
 **Project**.
 
+### `GET /initiatives[?status=…]`
+
+The initiatives entry view's one read (AGT-1491): every initiative with its
+projects as a tree — sub-projects nested under their parent — and the
+**Unfiled** group, every non-initiative project with no initiative above
+it (its own sub-projects nested the same way). Nodes are compact: `id`,
+`title`, `kind`, `status`, no doc bodies. Each carries `tickets`, its own
+unarchived tickets counted by state category (an initiative's directly
+filed tickets included), and `total`, those counts rolled up over the
+subtree the answer shows; `unfiled.total` sums its top-level nodes.
+Siblings are in `GET /projects` order (by id).
+
+```jsonc
+{
+  "schema": 1,
+  "initiatives": [{
+    "id": "q4-launch", "title": "Q4 launch", "kind": "initiative", "status": "in-progress",
+    "tickets": {"backlog": 0, "unstarted": 0, "started": 1, "completed": 0, "canceled": 0},
+    "total":   {"backlog": 0, "unstarted": 1, "started": 1, "completed": 1, "canceled": 0},
+    "children": [{
+      "id": "pm", "title": "pm", "kind": "project", "status": "in-progress",
+      "tickets": {"backlog": 0, "unstarted": 0, "started": 0, "completed": 1, "canceled": 0},
+      "total":   {"backlog": 0, "unstarted": 1, "started": 0, "completed": 1, "canceled": 0},
+      "children": [{
+        "id": "pm-app", "title": "pm app", "kind": "project", "status": "in-progress",
+        "tickets": {"backlog": 0, "unstarted": 1, "started": 0, "completed": 0, "canceled": 0},
+        "total":   {"backlog": 0, "unstarted": 1, "started": 0, "completed": 0, "canceled": 0},
+        "children": []
+      }]
+    }]
+  }],
+  "unfiled": {
+    "total": {"backlog": 0, "unstarted": 2, "started": 0, "completed": 0, "canceled": 0},
+    "projects": [{
+      "id": "site", "title": "Site", "kind": "project", "status": "in-progress",
+      "tickets": {"backlog": 0, "unstarted": 2, "started": 0, "completed": 0, "canceled": 0},
+      "total":   {"backlog": 0, "unstarted": 2, "started": 0, "completed": 0, "canceled": 0},
+      "children": []
+    }]
+  }
+}
+```
+
+`status` takes the values `GET /projects` does (anything else is `400`)
+and keeps only projects with that status: a kept project hangs under its
+nearest kept ancestor, one filed under an initiative that was filtered out
+is left out (it is not Unfiled), and the rollups count the nodes shown.
+
+The parent links are synced data, so the tree never trusts them to be a
+tree: an initiative is always a root, a parent not known on this replica
+is no parent, and a parent cycle (two replicas re-parenting concurrently,
+each past its own `pm project set` guard) is cut at its smallest id — every
+project appears exactly once and no ticket is counted twice. A ticket in a
+state the workspace no longer defines counts nowhere.
+
 ### `GET /projects/{id}/body[?since=<base64>]`, `GET /projects/{id}/docs/{name}/body[?since=<base64>]`
 
 A project document as a CRDT document (AGT-1405): the design doc, or the
