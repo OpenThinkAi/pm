@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use ulid::Ulid;
 
-use super::{AppState, auth, events};
+use super::{AppState, auth, events, initiatives};
 use crate::exit::{self, CliError, Result};
 use crate::verbs::{
     NewTicket, SCHEMA, Stamper, display_id, file_ticket, find, non_empty, parse_assignment,
@@ -37,6 +37,7 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/tickets/{id}/labels", axum::routing::post(labels))
         .route("/tickets/{id}/state", axum::routing::post(state_move))
         .route("/projects", get(projects))
+        .route("/initiatives", get(initiatives_tree))
         .route("/projects/{id}", get(project_show))
         .route(
             "/projects/{id}/body",
@@ -303,8 +304,21 @@ struct ProjectsQuery {
 }
 
 async fn projects(State(state): State<Arc<AppState>>, Query(q): Query<ProjectsQuery>) -> ApiResult {
-    let status = q
-        .status
+    let status = project_status(q.status)?;
+    with_store(&state, move |store, _ws| {
+        let mut projects = store.projects()?;
+        if let Some(status) = status {
+            projects.retain(|p| p.status == status);
+        }
+        let out: Vec<Value> = projects.iter().map(project::project_json).collect();
+        Ok(Json(json!({ "schema": SCHEMA, "projects": out })))
+    })
+    .await
+}
+
+/// A `?status=` value, parsed as `pm project list --status` parses it.
+fn project_status(status: Option<String>) -> Result<Option<pm_core::ProjectStatus>> {
+    status
         .map(|s| {
             serde_json::from_value::<pm_core::ProjectStatus>(Value::String(s.clone())).map_err(
                 |_| {
@@ -314,14 +328,22 @@ async fn projects(State(state): State<Arc<AppState>>, Query(q): Query<ProjectsQu
                 },
             )
         })
-        .transpose()?;
-    with_store(&state, move |store, _ws| {
-        let mut projects = store.projects()?;
-        if let Some(status) = status {
-            projects.retain(|p| p.status == status);
-        }
-        let out: Vec<Value> = projects.iter().map(project::project_json).collect();
-        Ok(Json(json!({ "schema": SCHEMA, "projects": out })))
+        .transpose()
+}
+
+/// `GET /initiatives[?status=…]` (AGT-1491): the initiative -> project
+/// tree with per-node ticket rollups (`app/initiatives.rs`). Takes the
+/// same `status` as `GET /projects`.
+async fn initiatives_tree(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ProjectsQuery>,
+) -> ApiResult {
+    let status = project_status(q.status)?;
+    with_store(&state, move |store, ws| {
+        let projects = store.projects()?;
+        let tickets = store.tickets(&TicketFilter::default())?;
+        let own = initiatives::own_counts(ws, &tickets);
+        Ok(Json(initiatives::tree(&projects, &own, status)))
     })
     .await
 }

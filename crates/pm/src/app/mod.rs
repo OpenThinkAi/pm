@@ -42,6 +42,7 @@
 
 mod auth;
 mod events;
+mod initiatives;
 pub(crate) mod launch;
 mod routes;
 mod views;
