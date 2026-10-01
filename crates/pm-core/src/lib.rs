@@ -51,7 +51,8 @@ pub use config::{
 pub use doc::{DocApplyError, DocView, apply_doc, apply_doc_persisted};
 pub use domain::{
     Actor, ActorId, ActorKind, Comment, DocsOwner, Hold, NotBefore, Parked, Priority, Project,
-    ProjectStatus, Relation, RelationKind, Source, State, StateCategory, Ticket, Waiver, Workspace,
+    ProjectKind, ProjectStatus, Relation, RelationKind, Source, State, StateCategory, Ticket,
+    Waiver, Workspace,
 };
 pub use hlc::{
     Clock, ClockError, Hlc, MAX_COUNTER, MAX_FUTURE_SKEW_MS, MAX_WALL_MS, Stamp, StampError,

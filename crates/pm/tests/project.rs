@@ -195,6 +195,86 @@ fn new_rejects_a_duplicate_id_and_checks_the_parent_exists() {
     assert_eq!(v["parent"], "pm");
 }
 
+/// AGT-1488: `--kind initiative` creates an initiative, no `--kind` a
+/// plain project; `list --kind` filters; an initiative cannot take
+/// `--parent` (exit 2, nothing created); the kind survives a rebuild and
+/// names itself in `pm log`.
+#[test]
+fn kind_is_set_at_creation_filtered_by_list_and_initiatives_have_no_parent() {
+    let sb = Sandbox::initialized();
+    let v = json(&sb.pm(&[
+        "project",
+        "new",
+        "q4",
+        "--title",
+        "Q4",
+        "--kind",
+        "initiative",
+        "--json",
+    ]));
+    assert_eq!(v["kind"], "initiative");
+    let v = json(&sb.pm(&["project", "new", "pm", "--title", "pm", "--json"]));
+    assert_eq!(v["kind"], "project");
+    assert_ok(&sb.pm(&[
+        "project", "new", "pm-app", "--title", "app", "--kind", "project", "--parent", "q4",
+    ]));
+
+    let ids = |args: &[&str]| -> Vec<String> {
+        json(&sb.pm(args))["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(&["project", "list", "--kind", "initiative", "--json"]),
+        ["q4"]
+    );
+    assert_eq!(
+        ids(&["project", "list", "--kind", "project", "--json"]),
+        ["pm", "pm-app"]
+    );
+    assert_eq!(ids(&["project", "list", "--json"]).len(), 3);
+    assert_code(&sb.pm(&["project", "list", "--kind", "epic"]), 2);
+
+    let out = sb.pm(&[
+        "project",
+        "new",
+        "z",
+        "--title",
+        "z",
+        "--kind",
+        "initiative",
+        "--parent",
+        "pm",
+    ]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("initiative"), "{}", stderr(&out));
+    assert_code(
+        &sb.pm(&["project", "new", "z", "--title", "z", "--kind", "epic"]),
+        2,
+    );
+    assert!(sb.store().project("z").unwrap().is_none());
+
+    let human = stdout(&sb.pm(&["project", "show", "q4"]));
+    assert!(human.contains("kind:    initiative\n"), "{human}");
+    let log = json(&sb.pm(&["log", "--json"]));
+    assert!(
+        log.as_array().unwrap().iter().any(|o| o["summary"]
+            .as_str()
+            .unwrap()
+            .contains("created initiative 'q4'")),
+        "{log}"
+    );
+
+    let v = json(&sb.pm(&["doctor", "--rebuild", "--json"]));
+    assert_eq!(v["healthy"], true);
+    assert_eq!(v["rebuilt"]["tables"], serde_json::json!([]));
+    let v = json(&sb.pm(&["project", "show", "q4", "--json"]));
+    assert_eq!(v["kind"], "initiative");
+}
+
 // -------------------------------------------------------------------- AC2
 
 /// `run_editor` (crate::edit, AGT-1345) is `$VISUAL`, then `$EDITOR`, then

@@ -63,8 +63,8 @@ use pm_core::op::{
     ActorUpsert, ProjectCreate, ProjectDocAdd, ProjectSet, StateUpsert, WorkspaceSet,
 };
 use pm_core::{
-    ActorId, ActorKind, Clock, DocsOwner, Op, Payload, Project, ProjectStatus, ProjectView, State,
-    Workspace, WorkspaceView, apply_project, apply_workspace,
+    ActorId, ActorKind, Clock, DocsOwner, Op, Payload, Project, ProjectKind, ProjectStatus,
+    ProjectView, State, Workspace, WorkspaceView, apply_project, apply_workspace,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use ulid::Ulid;
@@ -164,6 +164,7 @@ impl Store {
             &tx,
             &project.id,
             &project.title,
+            project.kind,
             project.status,
             project.parent.as_deref(),
             &project.repos,
@@ -642,14 +643,16 @@ fn materialize_project(tx: &Transaction<'_>, view: &ProjectView, mode: Mode) -> 
     };
     if project_row_exists(tx, view.id)? {
         tx.execute(
-            "UPDATE project SET id = ?1, title = ?2, status = ?3, parent = ?4, repos = ?5
-             WHERE ulid = ?6",
+            "UPDATE project SET id = ?1, title = ?2, status = ?3, parent = ?4, repos = ?5,
+                                kind = ?6
+             WHERE ulid = ?7",
             params![
                 p.id,
                 p.title,
                 enum_name(&p.status),
                 parent,
                 json(&p.repos),
+                p.kind.as_str(),
                 ulid
             ],
         )?;
@@ -667,15 +670,16 @@ fn materialize_project(tx: &Transaction<'_>, view: &ProjectView, mode: Mode) -> 
             return Err(StoreError::DuplicateProject { id: p.id });
         }
         tx.execute(
-            "INSERT INTO project (ulid, id, title, status, parent, repos, doc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '')",
+            "INSERT INTO project (ulid, id, title, status, parent, repos, kind, doc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '')",
             params![
                 ulid,
                 p.id,
                 p.title,
                 enum_name(&p.status),
                 parent,
-                json(&p.repos)
+                json(&p.repos),
+                p.kind.as_str()
             ],
         )?;
         relink(tx, &p.id)?;
@@ -907,17 +911,26 @@ pub(crate) fn commit_payloads(
 /// a fresh id. Shared by [`Store::put_project`],
 /// `project.rs::create_project` and `import.rs::upsert_project`, which
 /// differ only in what they do with the project's documents afterwards.
+/// `kind` (AGT-1488) is only ever written by the create: an existing
+/// project keeps its kind whatever is passed. Creating an initiative with
+/// a `parent` is refused ([`StoreError::InitiativeParent`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn upsert_meta_in(
     tx: &Transaction<'_>,
     slug: &str,
     title: &str,
+    kind: ProjectKind,
     status: ProjectStatus,
     parent: Option<&str>,
     repos: &BTreeSet<String>,
     design_doc: Option<Ulid>,
     actor: &ActorId,
 ) -> Result<Ulid> {
+    if kind == ProjectKind::Initiative && parent.is_some() && !project_exists(tx, slug)? {
+        return Err(StoreError::InitiativeParent {
+            id: slug.to_string(),
+        });
+    }
     if let Some(parent) = parent
         && !project_exists(tx, parent)?
     {
@@ -953,6 +966,7 @@ pub(crate) fn upsert_meta_in(
         view.as_ref(),
         slug,
         title,
+        kind,
         status,
         parent,
         repos,
@@ -1058,11 +1072,15 @@ pub fn workspace_diff(current: Option<&WorkspaceView>, target: &Workspace) -> Ve
 /// and a repo add/remove per set difference. `design_doc` is the design
 /// doc's id for a project that has none bound yet: carried by the create,
 /// or by a `project.doc_add` for a project created without one
-/// (AGT-1413); ignored once one is bound.
+/// (AGT-1413); ignored once one is bound. `kind` is carried by the create
+/// only (AGT-1488): there is no `project.set` for it, so a created
+/// project's kind is never diffed.
+#[allow(clippy::too_many_arguments)]
 pub fn project_diff(
     current: Option<&ProjectView>,
     slug: &str,
     title: &str,
+    kind: ProjectKind,
     status: ProjectStatus,
     parent: Option<&str>,
     repos: &BTreeSet<String>,
@@ -1078,6 +1096,7 @@ pub fn project_diff(
                 status,
                 parent: parent.map(str::to_string),
                 doc_id: bound.is_none().then_some(design_doc),
+                kind,
             }));
             for repo in repos {
                 out.push(Payload::ProjectSet(ProjectSet::RepoAdd(repo.clone())));
@@ -1249,6 +1268,22 @@ pub(crate) fn add_docs_owned_by_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migration 0013's one step (AGT-1488): adds `project.kind` unless the
+/// table already has it (migrations from 0005 on must be re-runnable).
+pub(crate) fn add_project_kind_column(conn: &Connection) -> Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('project') WHERE name = 'kind'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch(
+            "ALTER TABLE project ADD COLUMN kind TEXT NOT NULL DEFAULT 'project' CHECK (kind IN ('project', 'initiative'))",
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn states(conn: &Connection) -> Result<Vec<State>> {
     let mut stmt =
         conn.prepare("SELECT name, category, position FROM state ORDER BY position, name")?;
@@ -1334,7 +1369,7 @@ fn load_projects(
     args: impl rusqlite::Params,
 ) -> Result<Vec<Project>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, title, status, parent, repos, doc FROM project {where_clause} ORDER BY id"
+        "SELECT id, title, status, parent, repos, doc, kind FROM project {where_clause} ORDER BY id"
     ))?;
     let rows = stmt.query_map(args, |r| {
         Ok((
@@ -1344,13 +1379,14 @@ fn load_projects(
             r.get::<_, Option<String>>(3)?,
             r.get::<_, String>(4)?,
             r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?,
         ))
     })?;
     let mut docs =
         conn.prepare("SELECT name, body FROM project_doc WHERE project = ?1 ORDER BY name")?;
     let mut projects = Vec::new();
     for row in rows {
-        let (id, title, status, parent, repos, doc) = row?;
+        let (id, title, status, parent, repos, doc, kind) = row?;
         let documents: BTreeMap<String, String> = docs
             .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -1358,6 +1394,7 @@ fn load_projects(
         projects.push(Project {
             id,
             title,
+            kind: enum_from_name("project.kind", kind)?,
             status: enum_from_name("project.status", status)?,
             parent,
             repos,
@@ -1542,6 +1579,7 @@ mod tests {
         let (_dir, mut store, _) = fresh();
         let repos: BTreeSet<String> = ["OpenThinkAi/pm".to_string()].into();
         let p = Project {
+            kind: Default::default(),
             id: "pm".into(),
             title: "pm".into(),
             status: ProjectStatus::InProgress,

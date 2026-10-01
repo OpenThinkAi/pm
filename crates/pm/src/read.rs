@@ -193,7 +193,8 @@ fn op_summary_in(op: &Op, slugs: &BTreeMap<Ulid, String>) -> String {
         ),
         Payload::ActorUpsert(a) => format!("registered {} actor '{}'", word(&a.kind), a.id),
         Payload::ProjectCreate(p) => format!(
-            "created project '{}' \"{}\" ({}{})",
+            "created {} '{}' \"{}\" ({}{})",
+            p.kind.as_str(),
             p.id,
             p.title,
             word(&p.status),

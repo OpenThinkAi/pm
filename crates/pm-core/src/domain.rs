@@ -199,12 +199,45 @@ pub enum ProjectStatus {
     Abandoned,
 }
 
+/// What a project is (AGT-1488, design doc §Initiatives): a plain
+/// `project`, or an `initiative` — a project that groups others under it
+/// through their `parent` link and has no parent of its own. Fixed by the
+/// `project.create` op: there is no `project.set` for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectKind {
+    #[default]
+    Project,
+    Initiative,
+}
+
+impl ProjectKind {
+    /// The serde spelling (`project`, `initiative`), also the `project.kind`
+    /// column's value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectKind::Project => "project",
+            ProjectKind::Initiative => "initiative",
+        }
+    }
+
+    /// `true` for the default kind; serde's `skip_serializing_if` uses it
+    /// so a plain project's op and view keep the bytes they had before
+    /// `kind` existed.
+    pub fn is_project(&self) -> bool {
+        *self == ProjectKind::Project
+    }
+}
+
 /// A project: kebab-case id, a design doc (today's README) and any extra
 /// named documents (today's sibling `.md` files, `ideation/IDEA-*`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub title: String,
+    /// `project` unless created as an initiative (AGT-1488).
+    #[serde(default)]
+    pub kind: ProjectKind,
     pub status: ProjectStatus,
     pub parent: Option<String>,
     pub repos: BTreeSet<String>,
@@ -368,6 +401,7 @@ mod tests {
             docs_owned_by: Default::default(),
         });
         round_trip(&Project {
+            kind: Default::default(),
             id: "pm".into(),
             title: "pm".into(),
             status: ProjectStatus::InProgress,

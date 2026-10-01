@@ -720,6 +720,7 @@ fn pushed_project_identity_is_admission_checked() {
             wall_ms,
             project,
             Payload::ProjectCreate(pm_core::op::ProjectCreate {
+                kind: Default::default(),
                 id: "pm".into(),
                 title: "pm".into(),
                 status: pm_core::ProjectStatus::InProgress,
@@ -837,6 +838,7 @@ fn a_backdated_doc_add_as_the_creator_needs_a_token_for_the_creator() {
         ActorId::new("matt"),
         project,
         Payload::ProjectCreate(pm_core::op::ProjectCreate {
+            kind: Default::default(),
             id: "pm".into(),
             title: "pm".into(),
             status: pm_core::ProjectStatus::InProgress,

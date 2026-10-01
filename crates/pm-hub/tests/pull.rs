@@ -228,6 +228,7 @@ fn seed_log() -> Vec<(String, String)> {
         "studio",
         project,
         Payload::ProjectCreate(pm_core::op::ProjectCreate {
+            kind: Default::default(),
             id: "pm".to_string(),
             title: "pm — tickets".to_string(),
             status: pm_core::domain::ProjectStatus::InProgress,

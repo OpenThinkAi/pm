@@ -27,7 +27,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pm_core::op::{BodyEdit, ProjectDocAdd};
 use pm_core::{
-    ActorId, Body, Clock, DocView, Op, Payload, ProjectStatus, apply_doc, apply_doc_persisted,
+    ActorId, Body, Clock, DocView, Op, Payload, ProjectKind, ProjectStatus, apply_doc,
+    apply_doc_persisted,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use ulid::Ulid;
@@ -45,10 +46,26 @@ impl Store {
     /// repo_add` per repo under `actor`, and returns the design doc's id.
     /// Fails if `id` is already taken, or if `parent` is given and does not
     /// exist (R2, the rule a ticket's `project` field already obeys).
+    /// A plain project: [`Store::create_project_of_kind`] names the kind.
     pub fn create_project(
         &mut self,
         id: &str,
         title: &str,
+        repos: &BTreeSet<String>,
+        parent: Option<&str>,
+        actor: &ActorId,
+    ) -> Result<Ulid> {
+        self.create_project_of_kind(id, title, ProjectKind::Project, repos, parent, actor)
+    }
+
+    /// [`Store::create_project`] of `kind` (AGT-1488), which the create op
+    /// fixes for good. An initiative cannot have a `parent`
+    /// ([`StoreError::InitiativeParent`]).
+    pub fn create_project_of_kind(
+        &mut self,
+        id: &str,
+        title: &str,
+        kind: ProjectKind,
         repos: &BTreeSet<String>,
         parent: Option<&str>,
         actor: &ActorId,
@@ -64,6 +81,7 @@ impl Store {
             &tx,
             id,
             title,
+            kind,
             ProjectStatus::InProgress,
             parent,
             repos,

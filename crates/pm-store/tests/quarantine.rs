@@ -53,6 +53,7 @@ fn log_head() -> Log {
     source
         .put_project(
             &Project {
+                kind: Default::default(),
                 id: "pm".into(),
                 title: "pm".into(),
                 status: ProjectStatus::InProgress,
@@ -412,6 +413,7 @@ fn hostile_log(log: &Log) -> (Vec<(i64, Op)>, Vec<Ulid>, Op) {
         1,
         "matt",
         Payload::ProjectCreate(ProjectCreate {
+            kind: Default::default(),
             id: "pm".into(),
             title: "backdated twin".into(),
             status: ProjectStatus::InProgress,

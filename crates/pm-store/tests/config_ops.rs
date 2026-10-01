@@ -46,6 +46,7 @@ fn workspace() -> Workspace {
 
 fn project(id: &str, parent: Option<&str>) -> Project {
     Project {
+        kind: Default::default(),
         id: id.into(),
         title: format!("{id} title"),
         status: ProjectStatus::InProgress,

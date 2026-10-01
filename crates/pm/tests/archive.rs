@@ -69,6 +69,7 @@ impl Sandbox {
             .unwrap()
             .put_project(
                 &Project {
+                    kind: Default::default(),
                     id: id.into(),
                     title: title.into(),
                     status: ProjectStatus::InProgress,

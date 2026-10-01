@@ -750,6 +750,7 @@ fn disposition(e: &StoreError, op: &Op) -> Disposition {
         | E::ConfigApply(_)
         | E::ForeignWorkspace { .. }
         | E::DuplicateProject { .. }
+        | E::InitiativeParent { .. }
         | E::DuplicateDocument { .. }
         | E::DocIdInUse { .. }
         | E::EntityInUse { .. }

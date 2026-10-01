@@ -14,8 +14,8 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use crate::domain::{
-    ActorId, ActorKind, Hold, NotBefore, Parked, Priority, ProjectStatus, Relation, Source,
-    StateCategory, Waiver,
+    ActorId, ActorKind, Hold, NotBefore, Parked, Priority, ProjectKind, ProjectStatus, Relation,
+    Source, StateCategory, Waiver,
 };
 use crate::hlc::{Hlc, Stamp, StampError};
 
@@ -457,6 +457,13 @@ pub struct ActorUpsert {
 /// (the key is omitted, and an old op still parses); such a project gets
 /// its design doc from a `project.doc_add` without a `name` instead.
 ///
+/// `kind` (AGT-1488) is fixed here and nowhere else — there is no
+/// `project.set` for it. Absent means `project`, and a plain project's
+/// create omits the key, so it keeps the bytes it had before `kind`
+/// existed; an initiative's create carries `"kind": "initiative"`, which a
+/// build without the field (an older hub or replica) ignores, as serde
+/// ignores any unknown key here.
+///
 /// Two replicas creating the same `id` offline mint two Ulids; the
 /// authority (the hub, from P3) arbitrates that the way it does ticket
 /// numbers — this crate merges, it does not allocate.
@@ -468,6 +475,8 @@ pub struct ProjectCreate {
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_id: Option<Ulid>,
+    #[serde(default, skip_serializing_if = "ProjectKind::is_project")]
+    pub kind: ProjectKind,
 }
 
 /// Binds `doc_id` to one of the project's documents (`entity` = the
@@ -748,6 +757,7 @@ mod tests {
                 kind: ActorKind::Agent,
             })),
             op(Payload::ProjectCreate(ProjectCreate {
+                kind: Default::default(),
                 id: "pm".into(),
                 title: "pm".into(),
                 status: ProjectStatus::InProgress,
@@ -869,6 +879,84 @@ mod tests {
         let back: ProjectDocAdd =
             serde_json::from_value(serde_json::json!({"doc_id": doc_id.to_string()})).unwrap();
         assert_eq!(back, design);
+    }
+
+    /// AGT-1488: a create without `kind` (every create logged before it)
+    /// decodes as a plain project, and a plain project's create omits the
+    /// key; an initiative's create carries it.
+    #[test]
+    fn project_kind_is_optional_on_the_wire() {
+        let legacy = serde_json::json!({
+            "id": "pm", "title": "pm", "status": "in-progress", "parent": null
+        });
+        let create: ProjectCreate = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(create.kind, ProjectKind::Project);
+        assert_eq!(serde_json::to_value(&create).unwrap(), legacy);
+
+        let initiative = ProjectCreate {
+            kind: ProjectKind::Initiative,
+            ..create
+        };
+        let json = serde_json::to_value(&initiative).unwrap();
+        assert_eq!(json["kind"], "initiative");
+        let back: ProjectCreate = serde_json::from_value(json).unwrap();
+        assert_eq!(back, initiative);
+    }
+
+    /// AGT-1488 AC6: an initiative's `project.create` still decodes on a
+    /// build whose `ProjectCreate` has no `kind` (the hub deployed before
+    /// this field, an older replica) — the unknown key is ignored, so no
+    /// hub deploy has to precede it. `OldProjectCreate` is that build's
+    /// struct, verbatim.
+    #[test]
+    fn a_create_with_kind_decodes_without_the_field() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct OldProjectCreate {
+            id: String,
+            title: String,
+            status: ProjectStatus,
+            parent: Option<String>,
+            #[serde(default)]
+            doc_id: Option<Ulid>,
+        }
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "kind", content = "payload")]
+        enum OldPayload {
+            #[serde(rename = "project.create")]
+            ProjectCreate(OldProjectCreate),
+        }
+        #[derive(Debug, Deserialize)]
+        struct OldOp {
+            #[serde(flatten)]
+            payload: OldPayload,
+        }
+
+        let doc_id = Ulid::new();
+        let op = op(Payload::ProjectCreate(ProjectCreate {
+            id: "q4".into(),
+            title: "Q4".into(),
+            status: ProjectStatus::InProgress,
+            parent: None,
+            doc_id: Some(doc_id),
+            kind: ProjectKind::Initiative,
+        }));
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(json["payload"]["kind"], "initiative");
+        let old: OldOp = serde_json::from_value(json.clone()).unwrap();
+        let OldPayload::ProjectCreate(old) = old.payload;
+        assert_eq!(
+            old,
+            OldProjectCreate {
+                id: "q4".into(),
+                title: "Q4".into(),
+                status: ProjectStatus::InProgress,
+                parent: None,
+                doc_id: Some(doc_id),
+            }
+        );
+        // And the current build reads it back whole.
+        let back: Op = serde_json::from_value(json).unwrap();
+        assert_eq!(back, op);
     }
 
     #[test]

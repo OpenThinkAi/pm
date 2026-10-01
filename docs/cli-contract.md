@@ -223,6 +223,7 @@ A **Project** shape (`project::project_json`), similarly shared by
   "schema": 1,
   "id": "kebab-id",
   "title": "string",
+  "kind": "project" | "initiative", // fixed at `pm project new`; an initiative has no parent
   "status": "in-progress" | "complete" | "abandoned",
   "parent": "string" | null,
   "repos": ["owner/name", ...],
@@ -880,7 +881,7 @@ op's content is dropped 30 days after its refusal, on the next pull).
     "healthy": true,
     "rebuilt": {"tables": [...]} | null,   // a Diff, only present with --rebuild
     "pruned_quarantine": 2,                 // only with --prune-quarantine: refused ops whose content it dropped (AGT-1482)
-    "schema_version": 12,                   // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state); 9 since AGT-1396 (seeded flag); 12 since AGT-1467 (sync quarantine)
+    "schema_version": 13,                   // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state); 9 since AGT-1396 (seeded flag); 12 since AGT-1467 (sync quarantine); 13 since AGT-1488 (project kind)
     "op_count": 30,
     "tables": {"ticket": 5, "comment": 2, ...},
     "integrity": [],                        // SQLite integrity_check messages, if any
@@ -1092,10 +1093,16 @@ reads both forms back to the same fields).
 ### `pm project new <ID>`
 
 Flags: `--title <TITLE>` (required), `--repo <OWNER/NAME>`
-(repeatable/comma-separated), `--parent <PARENT>`.
+(repeatable/comma-separated), `--parent <PARENT>`, `--kind <KIND>`
+(`project`, the default, or `initiative`).
+
+A project's kind is fixed when it is created: no verb changes it. An
+initiative groups the projects whose `parent` names it, and has no parent
+of its own.
 
 - Exit `2`: invalid `ID` (not lowercase/digits/single-hyphens, or
-  leading/trailing/doubled hyphen); empty `--title`/`--repo`.
+  leading/trailing/doubled hyphen); empty `--title`/`--repo`; unknown
+  `--kind`; `--parent` with `--kind initiative`.
 - `--json`: **Project**.
 
 ### `pm project show <ID>`
@@ -1120,7 +1127,9 @@ stderr, leaving stdout the bare body. `--json` shapes are unchanged.
 
 ### `pm project list`
 
-Flags: `--status <STATUS>` (`in-progress`, `complete`, `abandoned`).
+Flags: `--status <STATUS>` (`in-progress`, `complete`, `abandoned`),
+`--kind <KIND>` (`project`, `initiative`). Both filter; given together, a
+project must match both.
 
 - `--json`: `{"schema": 1, "projects": [/* Project, ... */]}`.
 

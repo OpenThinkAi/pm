@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::domain::{
-    Actor, ActorId, ActorKind, DocsOwner, Project, ProjectStatus, State, Workspace,
+    Actor, ActorId, ActorKind, DocsOwner, Project, ProjectKind, ProjectStatus, State, Workspace,
 };
 use crate::hlc::Stamp;
 use crate::merge::{Lww, OrSet};
@@ -129,6 +129,14 @@ pub struct ProjectView {
     pub status: Lww<ProjectStatus>,
     pub parent: Lww<Option<String>>,
     pub repos: OrSet<String>,
+    /// `project` or `initiative` (AGT-1488): the kind the *earliest*
+    /// `project.create` carries — the same create [`ProjectView::created`]
+    /// is, so the outcome is independent of arrival order — and never
+    /// changed after (there is no `project.set` for it). A view stored
+    /// before the field existed reads as `project`, and a plain project's
+    /// view omits it, keeping the text it had.
+    #[serde(default, skip_serializing_if = "ProjectKind::is_project")]
+    pub kind: ProjectKind,
     /// Tombstone: the earliest `project.delete` stamp seen. Permanent —
     /// no later op un-deletes the project (README §Conflict semantics,
     /// the ticket tombstone's rule) — and, being a minimum, independent
@@ -257,6 +265,7 @@ impl ProjectView {
             status: Lww::default(),
             parent: Lww::default(),
             repos: OrSet::default(),
+            kind: ProjectKind::default(),
             deleted_at: None,
             design_doc: DocClaims::default(),
             documents: BTreeMap::new(),
@@ -292,6 +301,7 @@ impl ProjectView {
         Project {
             id: self.slug.value.clone(),
             title: self.title.value.clone(),
+            kind: self.kind,
             status: self.status.value,
             parent: self.parent.value.clone(),
             repos: self.repos.iter().cloned().collect(),
@@ -410,6 +420,7 @@ pub fn apply_project(view: &mut ProjectView, op: &Op) -> Result<(), ConfigApplyE
         Payload::ProjectCreate(c) => {
             if view.created.as_ref().is_none_or(|s| stamp < *s) {
                 view.created = Some(stamp.clone());
+                view.kind = c.kind;
             }
             view.slug.set(c.id.clone(), stamp.clone());
             view.title.set(c.title.clone(), stamp.clone());
@@ -535,6 +546,7 @@ mod tests {
             wall_ms,
             "matt",
             Payload::ProjectCreate(ProjectCreate {
+                kind: Default::default(),
                 id: "pm".into(),
                 title: "pm".into(),
                 status: ProjectStatus::InProgress,
@@ -915,6 +927,75 @@ mod tests {
         assert_eq!(back.design_doc_id(), None);
     }
 
+    /// AGT-1488: `kind` comes from the earliest create, in any arrival
+    /// order, and survives a snapshot; a stored view without the key (and
+    /// a plain project's, which omits it) reads as `project`.
+    #[test]
+    fn project_kind_is_the_earliest_creates_and_optional_when_stored() {
+        let id = Ulid::new();
+        let create = |wall_ms, kind| {
+            op(
+                id,
+                wall_ms,
+                "matt",
+                Payload::ProjectCreate(ProjectCreate {
+                    id: "q4".into(),
+                    title: "Q4".into(),
+                    status: ProjectStatus::InProgress,
+                    parent: None,
+                    doc_id: None,
+                    kind,
+                }),
+            )
+        };
+        let ops = [
+            create(100, ProjectKind::Initiative),
+            create(200, ProjectKind::Project),
+            op(
+                id,
+                300,
+                "matt",
+                Payload::ProjectSet(ProjectSet::Title("Q4 bets".into())),
+            ),
+        ];
+        for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0]] {
+            let mut view = ProjectView::new(id);
+            for i in order {
+                apply_project(&mut view, &ops[i]).unwrap();
+            }
+            assert_eq!(view.kind, ProjectKind::Initiative, "{order:?}");
+            let snap = view.snapshot(String::new(), BTreeMap::new());
+            assert_eq!(snap.kind, ProjectKind::Initiative);
+
+            let json = serde_json::to_value(&view).unwrap();
+            assert_eq!(json["kind"], "initiative");
+            let back: ProjectView = serde_json::from_value(json).unwrap();
+            assert_eq!(back, view);
+        }
+
+        let mut plain = ProjectView::new(id);
+        apply_project(&mut plain, &ops[1]).unwrap();
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("kind").is_none(), "a plain project omits kind");
+        let back: ProjectView = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kind, ProjectKind::Project);
+        assert_eq!(back, plain);
+
+        // A view stored before AGT-1488, whatever else it says.
+        let mut json = serde_json::to_value(&plain).unwrap();
+        json.as_object_mut().unwrap().remove("kind");
+        let back: ProjectView = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kind, ProjectKind::Project);
+
+        // And a `Project` snapshot without the key.
+        let mut json =
+            serde_json::to_value(plain.snapshot(String::new(), BTreeMap::new())).unwrap();
+        assert_eq!(json["kind"], "project", "the plain shape always names it");
+        json.as_object_mut().unwrap().remove("kind");
+        let back: Project = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kind, ProjectKind::Project);
+    }
+
     /// AGT-1464: a binding stamped before the project's create, by anyone
     /// but its creator, cannot take a slot another binding holds — in any
     /// arrival order — while the creator's own backdated binding (migration
@@ -939,6 +1020,7 @@ mod tests {
             100,
             "matt",
             Payload::ProjectCreate(ProjectCreate {
+                kind: Default::default(),
                 id: "pm".into(),
                 title: "pm".into(),
                 status: ProjectStatus::InProgress,
@@ -1288,6 +1370,7 @@ mod tests {
                 // A small pool of doc ids, so two slots and two bindings
                 // of one slot collide often.
                 Spec::Create(t, d) => Payload::ProjectCreate(ProjectCreate {
+                    kind: Default::default(),
                     id: "p".into(),
                     title: t.to_string(),
                     status: ProjectStatus::InProgress,

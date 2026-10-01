@@ -171,6 +171,7 @@ fn every_synced_field_is_clean_in_text_output() {
         r.op(
             project,
             Payload::ProjectCreate(ProjectCreate {
+                kind: Default::default(),
                 id: "evilp".into(),
                 title: format!("P {evil}"),
                 status: ProjectStatus::InProgress,
