@@ -535,7 +535,9 @@ pub(crate) fn choose(env: &Env, explicit: bool) -> Result<Choice> {
 /// Which view to open.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Target {
-    Board,
+    /// `pm app`'s entry view (AGT-1492): initiatives → projects → a
+    /// project, with the board as a tab.
+    Initiatives,
     Ticket {
         id: String,
     },
@@ -574,11 +576,11 @@ fn csp(api: &str) -> String {
 /// served to anyone who asks ui-leaf's `GET /`.
 pub(crate) fn mount_config(target: &Target, views_root: &Path, api: &str) -> Value {
     let (view, title, data, size) = match target {
-        Target::Board => (
-            "board",
-            "pm — board".to_string(),
-            json!({"schema": SCHEMA, "view": "board"}),
-            (1280, 820),
+        Target::Initiatives => (
+            "initiatives",
+            "pm — initiatives".to_string(),
+            json!({"schema": SCHEMA, "view": "initiatives"}),
+            (1280, 900),
         ),
         Target::Ticket { id } => (
             "ticket",
@@ -1093,9 +1095,13 @@ mod tests {
         assert!(!csp.contains("'unsafe-eval'"), "{csp}");
         let text = config.to_string();
         assert!(!text.contains("pma_") && !text.contains("token"), "{text}");
-        let board = mount_config(&Target::Board, Path::new("/views"), "http://127.0.0.1:1");
-        assert_eq!(board["view"], "board");
-        assert!(board["data"].get("ticket").is_none());
+        let app = mount_config(
+            &Target::Initiatives,
+            Path::new("/views"),
+            "http://127.0.0.1:1",
+        );
+        assert_eq!(app["view"], "initiatives");
+        assert_eq!(app["data"], json!({"schema": 1, "view": "initiatives"}));
         let project = mount_config(
             &Target::Project { id: "pm".into() },
             Path::new("/views"),

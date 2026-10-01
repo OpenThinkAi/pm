@@ -218,7 +218,8 @@ impl Launch {
 }
 
 /// `pm app [--idle SECS] [--allow-origin ORIGIN]...`: with `--json`, the
-/// headless server for tooling; otherwise the board in ui-leaf, falling
+/// headless server for tooling; otherwise the initiatives view (AGT-1492;
+/// the board is its tab) in ui-leaf, falling
 /// back to the headless server (with a note) when there is no display or
 /// no pinned ui-leaf.
 pub fn app(ctx: &Ctx<'_>, args: AppArgs) -> Result<()> {
@@ -233,7 +234,7 @@ pub fn app(ctx: &Ctx<'_>, args: AppArgs) -> Result<()> {
         Choice::Launch(runtime) => (
             Mode::View {
                 runtime,
-                target: Target::Board,
+                target: Target::Initiatives,
             },
             LAUNCHED_IDLE_SECS,
         ),

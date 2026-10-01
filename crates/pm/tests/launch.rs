@@ -410,7 +410,7 @@ fn pm_edit_opens_the_ticket_view_and_returns_when_it_closes() {
         "{}",
         root.display()
     );
-    for file in ["ticket.tsx", "board.tsx", "lib/pm.ts"] {
+    for file in ["ticket.tsx", "board.tsx", "initiatives.tsx", "lib/pm.ts"] {
         assert!(root.join(file).is_file(), "{file} not unpacked");
     }
 
@@ -439,15 +439,16 @@ fn pm_edit_opens_the_ticket_view_and_returns_when_it_closes() {
 }
 
 #[test]
-fn pm_app_opens_the_board_and_ends_with_ui_leaf() {
+fn pm_app_opens_the_initiatives_view_and_ends_with_ui_leaf() {
     let sb = Sandbox::new();
     let mut child = sb.spawn(&["app", "--idle", "0"], &[("FAKE_UI_LEAF_MODE", "quit")]);
     let session = Session::from_reply(&sb.wait_for_session(&mut child));
     assert_passed_explicitly(&sb, &session);
     assert_api_reachable(&session);
     let config: Value = serde_json::from_str(sb.recorded("config.json").unwrap().trim()).unwrap();
-    assert_eq!(config["view"], "board");
-    assert_eq!(config["data"], json!({"schema": 1, "view": "board"}));
+    // AGT-1492: the initiatives view, with the board as its tab.
+    assert_eq!(config["view"], "initiatives");
+    assert_eq!(config["data"], json!({"schema": 1, "view": "initiatives"}));
 
     // ui-leaf exiting (the window closed, Ctrl-C) ends pm app, even with
     // --idle 0.
@@ -456,7 +457,7 @@ fn pm_app_opens_the_board_and_ends_with_ui_leaf() {
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
         !stdout.contains(&session.token) && !stderr.contains(&session.token),
-        "the launched board never prints the token"
+        "the launched view never prints the token"
     );
 }
 

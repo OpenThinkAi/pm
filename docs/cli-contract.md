@@ -139,7 +139,7 @@ invocation (no TTY) fails fast rather than hanging, and `pm edit` reports
 that as an aborted edit (exit `1`), never a hang. `pm edit`'s (and `pm project edit`'s)
 default ui-leaf view is used only at a terminal (stdin and stdout both TTYs) or
 when asked for explicitly, and then waits on a window until it closes;
-`pm app` without `--json` always opens (and waits on) the board.
+`pm app` without `--json` always opens (and waits on) the initiatives view.
 
 ### Ticket ids
 
@@ -552,7 +552,7 @@ rather than reopening.
 ### `pm app`
 
 Flags: `--idle <SECS>` (exit after this long with no view connected;
-`0` never; default `30` headless, `5` when pm opened the board),
+`0` never; default `30` headless, `5` when pm opened the view),
 `--allow-origin <ORIGIN>` (a browser origin the API answers, e.g. an
 external view's `http://127.0.0.1:5173`; repeatable; default none).
 
@@ -568,21 +568,25 @@ refuses any other `Host` or a non-allow-listed `Origin`; exits when the
 last connected view has been gone for `--idle` seconds. Claims are not
 served (they need the hub, AGT-1397).
 
-**Without `--json`** (AGT-1402) it opens the **board** in ui-leaf — the
-runtime, display and pin rules are `pm edit`'s above — and prints nothing
-on stdout: the API's URL and token go to the view only. It exits `0` when
-the board's window has been closed for `--idle` seconds, or when ui-leaf
+**Without `--json`** (AGT-1402) it opens the **initiatives view**
+(AGT-1492) in ui-leaf — the runtime, display and pin rules are `pm edit`'s
+above — and prints nothing on stdout: the API's URL and token go to the
+view only. It exits `0` when the window has been closed for `--idle` seconds, or when ui-leaf
 exits. With no display or no pinned ui-leaf it says why on stderr and
 serves headless instead, printing `url:` and `token:` lines.
 
-The board (AGT-1404; `docs/app-api.md` §The board) is a column per
+The initiatives view (`docs/app-api.md` §The initiatives view) lists
+initiatives, then Unfiled, as rollup rows (project count, tickets by
+category, progress); an initiative opens its projects and documents, a
+project opens the project view inline under a breadcrumb back. Its
+**Board** tab is the board (AGT-1404; `docs/app-api.md` §The board): a column per
 workflow state in state order, a card per unarchived ticket with its
 held/parked/gate markers, filters by project, label and assignee, and a
 live refetch as ops land. Dragging a card (or its **Move…** menu) is
 `pm move` without `--keep-assignee`; dropping into a `started` state is
 refused with a pointer to `pm claim` — claims stay CLI-only.
 
-It opens the board whether or not stdin/stdout are terminals: `pm app`
+It opens the view whether or not stdin/stdout are terminals: `pm app`
 is itself the request to open it (unlike `pm edit`'s default). Scripts and
 agents that want only the API use `--json`.
 

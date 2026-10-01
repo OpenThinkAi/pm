@@ -2,8 +2,8 @@
 //! run under node (`node --test`, no browser) against a real `pm app` in a
 //! temp workspace — two editor sessions converging through the API on a
 //! ticket's description and on a project's documents, a CLI
-//! `pm edit`/`pm project edit`/`pm set` reaching an open one, "New ticket"
-//! — then `pm doctor --rebuild` on what they left behind.
+//! `pm edit`/`pm project edit`/`pm set` reaching an open one, "New ticket",
+//! the initiatives view's landing → initiative → project (AGT-1492) — then `pm doctor --rebuild` on what they left behind.
 //!
 //! node is not a required toolchain for pm: without a `node` (>= 22, for
 //! TypeScript type stripping) on `PATH` this test prints why and passes.
@@ -132,6 +132,30 @@ fn the_editor_binding_converges_against_a_real_server() {
         "notes",
         "--from-file",
         seed.to_str().unwrap(),
+    ]));
+
+    // tests/views/initiatives.test.ts: initiative `launch` > `site` >
+    // `site-docs` (`design` stays Unfiled).
+    assert_ok(&run(&[
+        "project",
+        "new",
+        "launch",
+        "--title",
+        "Launch",
+        "--kind",
+        "initiative",
+    ]));
+    assert_ok(&run(&[
+        "project", "new", "site", "--title", "Site", "--parent", "launch",
+    ]));
+    assert_ok(&run(&[
+        "project",
+        "new",
+        "site-docs",
+        "--title",
+        "Site docs",
+        "--parent",
+        "site",
     ]));
 
     // A short idle grace: once the tests close their streams, the server
