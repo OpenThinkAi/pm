@@ -12,31 +12,33 @@ job, calling `pm` the way it calls `git`.
 
 ## Install
 
-pm is not published to npm or a release channel yet. Install it from
-source with Cargo:
+```sh
+npm i -g @openthink/pm
+```
+
+Prebuilt binaries for macOS (arm64, x64) and Linux x64 (glibc and musl);
+no Rust toolchain needed. The npm package downloads the binary for your
+platform from the matching GitHub Release. Each release carries SLSA build
+provenance; check a downloaded archive with
+`gh attestation verify <archive> --repo OpenThinkAi/pm`.
+
+Without npm, the shell installer from the same release:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/OpenThinkAi/pm/releases/latest/download/pm-installer.sh | sh
+```
+
+npm puts `pm` on its global bin path; the shell installer puts it in
+`~/.cargo/bin`. There's no separate daemon or service to run.
+
+**From source** (stable Rust 1.85 or newer; the workspace uses edition
+2024. The workspace declares no `rust-version`, and the minimum is not
+CI-verified; it is known to build on 1.91 and current stable):
 
 ```sh
 cargo install --locked --git https://github.com/OpenThinkAi/pm pm
 ```
-
-This puts a `pm` binary in `~/.cargo/bin`. There's no separate daemon or
-service to run.
-
-**Rust toolchain:** stable Rust 1.85 or newer (the workspace uses edition
-2024, which needs 1.85). The workspace declares no `rust-version`, and the
-minimum is not CI-verified; it is known to build on 1.91 and current
-stable.
-
-Or build from a clone:
-
-```sh
-git clone https://github.com/OpenThinkAi/pm && cd pm
-cargo build --release --locked
-./target/release/pm --version
-```
-
-**Coming with the first release:** `npm i -g @openthink/pm` and a shell
-installer (`pm-installer.sh`). Neither exists yet; don't look for them.
 
 ## First workspace
 
