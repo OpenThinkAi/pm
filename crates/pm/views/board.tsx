@@ -325,6 +325,13 @@ function Card(props: {
       <span className="pm-id pm-muted" title={t.number === null ? `pending number — ${t.ulid}` : t.ulid}>
         {t.id}
       </span>
+      {/* Priority is the row's edge colour; high/critical also get a glyph so it is not colour-only. */}
+      {(t.priority === "high" || t.priority === "critical") && (
+        <span className={`pm-prio pm-prio-${t.priority}`} aria-hidden="true">
+          {t.priority === "critical" ? "!!" : "!"}
+        </span>
+      )}
+      <span className="pm-sr">{t.priority} priority</span>
       <button type="button" className="pm-title" onClick={props.onOpen}>
         {t.title}
       </button>
@@ -459,7 +466,6 @@ function DetailPanel(props: {
 }
 
 const boardCss = `
-.pm-board { padding: .75rem 1rem 0; }
 .pm-bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1.25rem; margin-bottom: .75rem; }
 .pm-bar h1 { font-size: 1.1rem; margin: 0; }
 .pm-filters { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
@@ -469,7 +475,7 @@ const boardCss = `
 .pm-link { font: inherit; font-size: 12px; background: none; border: 0; color: var(--muted);
   text-decoration: underline; cursor: pointer; padding: 0; }
 .pm-error-inline { color: #c0392b; font-size: 12px; }
-.pm-board { display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+.pm-board { display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; padding: .75rem 1rem 0; }
 .pm-columns { display: flex; gap: .75rem; flex: 1; min-height: 0; overflow-x: auto; }
 .pm-column { flex: 1 1 0; min-width: 22rem; display: flex; flex-direction: column; min-height: 0;
   border-radius: 8px; padding: .25rem; border: 2px dashed transparent; }
@@ -483,6 +489,10 @@ const boardCss = `
   border-radius: 4px; margin-bottom: 3px; cursor: grab; white-space: nowrap; }
 .pm-card:hover { border-color: color-mix(in srgb, var(--fg) 30%, var(--line)); }
 .pm-card.pm-dragging { opacity: .45; }
+.pm-card.pm-held { box-shadow: inset 0 0 0 1px #d97706; }
+.pm-prio { flex: none; font-size: 12px; font-weight: 700; }
+.pm-prio-high { color: #d97706; }
+.pm-prio-critical { color: #c0392b; }
 .pm-prio-edge-low { border-left-color: var(--line); }
 .pm-prio-edge-medium { border-left-color: #3b82f6; }
 .pm-prio-edge-high { border-left-color: #d97706; }
