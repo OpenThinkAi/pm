@@ -936,3 +936,101 @@ fn docs_owned_by_survives_doctor_rebuild() {
     assert_eq!(v["docs_owned_by"], "pm");
     assert_ok(&sb.pm(&["doctor"]));
 }
+
+// ------------------------------------------------------------ AGT-1485
+
+/// Nested markdown under a project folder (and a retired one) imports as
+/// named docs named by relative path; the resource subtrees produce
+/// neither docs nor anomalies; non-markdown files are reported, never
+/// imported; `ideation/` keeps its `IDEA-*` rule.
+#[test]
+fn nested_project_docs_import_by_relative_path() {
+    let sb = Sandbox::initialized();
+    let vault = sb.vault_copy();
+    let write = |rel: &str, text: &str| {
+        let path = vault.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write("projects/alpha/sub/x.md", "# x\n");
+    write("projects/alpha/cutover/README.md", "# cutover\n");
+    write("projects/alpha/deep/er/y.md", "# y\n");
+    write("projects/alpha/sub/run.sh", "echo hi\n");
+    write("projects/alpha/plan.json", "{}\n");
+    write("projects/alpha/.hidden/z.md", "# hidden\n");
+    write("projects/alpha/research/notes.md", "# research\n");
+    write("projects/alpha/research/data.json", "{}\n");
+    write("projects/alpha/design-qa/AGT-1/qa.md", "# qa\n");
+    write("projects/alpha/design-qa/AGT-1/shot.png", "png");
+    write("projects/alpha/assets/logo.png", "png");
+    write("projects/alpha/ideation/notes.md", "# not an idea\n");
+    write("archive/projects/old-audit/drafts/d.md", "# draft\n");
+    // A symlinked folder (here a cycle back to the project) is not followed.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        vault.join("projects/alpha"),
+        vault.join("projects/alpha/loop"),
+    )
+    .unwrap();
+
+    let report = sb.import(&vault);
+    assert_eq!(report["docs"]["created"], 10, "{report}");
+
+    let alpha = sb.project("alpha");
+    let names: Vec<&String> = alpha["documents"].as_object().unwrap().keys().collect();
+    assert_eq!(
+        names,
+        [
+            "EXECUTION",
+            "cutover/README",
+            "deep/er/y",
+            "ideation/IDEA-001-first-idea",
+            "sub/x"
+        ]
+    );
+    assert_eq!(alpha["documents"]["sub/x"], "# x\n");
+    let old = sb.project("old-audit");
+    assert_eq!(old["documents"], json!({"drafts/d": "# draft\n"}));
+
+    // One anomaly lists alpha's non-markdown files; nothing names an
+    // excluded subtree or the ideation file outside the IDEA-* rule.
+    let anomalies: Vec<String> = report["anomalies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect();
+    let non_md: Vec<&String> = anomalies
+        .iter()
+        .filter(|a| a.contains("non-markdown"))
+        .collect();
+    assert_eq!(
+        non_md,
+        [
+            &"projects/alpha: 2 non-markdown file(s) left in the vault, not imported: \
+           projects/alpha/plan.json, projects/alpha/sub/run.sh"
+                .to_string()
+        ]
+    );
+    for a in &anomalies {
+        for noise in ["research", "design-qa", "assets", "ideation", ".hidden"] {
+            assert!(!a.contains(noise), "{a}");
+        }
+    }
+
+    // Re-importing the same vault changes nothing.
+    let again = sb.import(&vault);
+    assert_eq!(again["docs"]["created"], 0);
+    assert_eq!(again["docs"]["updated"], 0);
+
+    // Once pm owns the docs (AGT-1406), a nested doc is skipped and
+    // reported like any other, and pm's copy is left alone.
+    assert_ok(&sb.pm(&["workspace", "docs-owned-by", "pm"]));
+    write("projects/alpha/sub/x.md", "# x, edited in the vault\n");
+    let owned = sb.import(&vault);
+    assert!(
+        strings(&owned["docs"]["skipped"]).contains("projects/alpha/sub/x.md"),
+        "{owned}"
+    );
+    assert_eq!(sb.project("alpha")["documents"]["sub/x"], "# x\n");
+}
