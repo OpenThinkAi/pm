@@ -733,14 +733,15 @@ fn read_project(root: &Path, rel: &Path, findings: &mut Findings) -> Result<Vaul
 /// gitignored design-QA captures). Nothing under them is imported or
 /// reported. `ideation/` is not here: it has its own rule, see
 /// [`project_documents`].
-pub const RESOURCE_SUBTREES: [&str; 3] = ["research", "assets", "design-qa"];
+const RESOURCE_SUBTREES: [&str; 3] = ["research", "assets", "design-qa"];
 
 /// A project folder's named documents, `name` → (text, mtime): every
 /// `.md` under it except its own README.md, named by its path relative to
 /// the folder minus `.md` (`EXECUTION`, `cutover/README`,
 /// `blog-drafts/AGT-679-preview`; AGT-1485). `ideation/` keeps its rule —
 /// only the `IDEA-*.md` directly in it, as `ideation/IDEA-…` — and the
-/// [`RESOURCE_SUBTREES`] are skipped whole. Hidden entries are skipped.
+/// [`RESOURCE_SUBTREES`] are skipped whole. Hidden entries and symlinked
+/// folders are skipped.
 /// A non-markdown file is never imported; each project's are listed in
 /// one anomaly so the report shows what stayed behind, as is a markdown
 /// file whose path is not a safe document name.
@@ -756,17 +757,23 @@ fn project_documents(
     let mut not_markdown = Vec::new();
     for path in files {
         let inner = path.strip_prefix(dir).unwrap_or(&path);
-        let segments: Vec<&str> = inner
-            .iter()
-            .map(|s| s.to_str().unwrap_or_default())
-            .collect();
         let shown = rel.join(inner).display().to_string();
-        if !path.extension().is_some_and(|e| e == "md") {
+        if path.extension().is_none_or(|e| e != "md") {
             not_markdown.push(shown);
             continue;
         }
-        let doc_name = segments.join("/");
-        let doc_name = doc_name.trim_end_matches(".md");
+        let Some(segments) = inner
+            .iter()
+            .map(|s| s.to_str())
+            .collect::<Option<Vec<&str>>>()
+        else {
+            findings
+                .anomalies
+                .push(format!("{shown}: path is not UTF-8; not imported"));
+            continue;
+        };
+        let joined = segments.join("/");
+        let doc_name = joined.trim_end_matches(".md");
         if !pm_core::ids::is_safe_doc_name(doc_name) {
             findings
                 .anomalies
@@ -801,7 +808,16 @@ fn walk_project(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         if name.starts_with('.') {
             continue;
         }
+        // A symlinked folder is not followed, so a link cycle cannot
+        // recurse forever and nothing outside the project is read.
+        let linked = fs::symlink_metadata(&path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .file_type()
+            .is_symlink();
         if path.is_dir() {
+            if linked {
+                continue;
+            }
             if top && RESOURCE_SUBTREES.contains(&name) {
                 continue;
             }

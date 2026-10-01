@@ -965,6 +965,13 @@ fn nested_project_docs_import_by_relative_path() {
     write("projects/alpha/assets/logo.png", "png");
     write("projects/alpha/ideation/notes.md", "# not an idea\n");
     write("archive/projects/old-audit/drafts/d.md", "# draft\n");
+    // A symlinked folder (here a cycle back to the project) is not followed.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        vault.join("projects/alpha"),
+        vault.join("projects/alpha/loop"),
+    )
+    .unwrap();
 
     let report = sb.import(&vault);
     assert_eq!(report["docs"]["created"], 10, "{report}");
