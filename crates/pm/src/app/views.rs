@@ -35,8 +35,16 @@ pub(crate) const FILES: &[(&str, &str)] = &[
     ("board.tsx", include_str!("../../views/board.tsx")),
     ("ticket.tsx", include_str!("../../views/ticket.tsx")),
     ("project.tsx", include_str!("../../views/project.tsx")),
+    (
+        "initiatives.tsx",
+        include_str!("../../views/initiatives.tsx"),
+    ),
     ("lib/board.ts", include_str!("../../views/lib/board.ts")),
     ("lib/project.ts", include_str!("../../views/lib/project.ts")),
+    (
+        "lib/initiatives.ts",
+        include_str!("../../views/lib/initiatives.ts"),
+    ),
     (
         "lib/projectpage.tsx",
         include_str!("../../views/lib/projectpage.tsx"),

@@ -198,9 +198,9 @@ enum Cmd {
         /// Ticket id (e.g. PM-12) or ULID
         id: String,
     },
-    /// Open the board in ui-leaf, served by a localhost API (127.0.0.1, random port, one-shot token); with --json, serve the API headless and print its URL and token
+    /// Open the initiatives view (projects by initiative; the board is a tab) in ui-leaf, served by a localhost API (127.0.0.1, random port, one-shot token); with --json, serve the API headless and print its URL and token
     App {
-        /// Seconds without a connected view before exiting (0 = never). Default: 30 headless, 5 when pm opened the board
+        /// Seconds without a connected view before exiting (0 = never). Default: 30 headless, 5 when pm opened the view
         #[arg(long, value_name = "SECS")]
         idle: Option<u64>,
         /// A browser origin allowed to call the API (e.g. the view's http://127.0.0.1:5173); repeat for several. Default: none

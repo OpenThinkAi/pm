@@ -34,7 +34,7 @@ prints **one line** and keeps running:
 - `idle_secs` — see [Lifetime](#lifetime).
 - `allowed_origins` — the `--allow-origin` values, normalized.
 
-`pm app` without `--json` launches the board instead (see
+`pm app` without `--json` launches the initiatives view instead (see
 [Launching a view](#launching-a-view)) and prints neither; only when it
 cannot (no display, no pinned ui-leaf) does it serve headless and print
 the same facts as `url:` and `token:` lines.
@@ -379,7 +379,7 @@ compiling the view); ui-leaf exiting ends the server too.
 `pm edit <ID>` (the ticket view), `pm project edit <ID>` (the project
 view, AGT-1405 — under exactly `pm edit`'s rules: `--view`, then
 `edit.view`, and the default ui-leaf only when stdin and stdout are
-terminals) and `pm app` without `--json` (the board) start this server in-process and mount a view in
+terminals) and `pm app` without `--json` (the initiatives view) start this server in-process and mount a view in
 [ui-leaf](https://github.com/OpenThinkAi/ui-leaf) over its stdio protocol
 (`ui-leaf mount`, line-delimited JSON; `crates/pm/src/app/launch.rs`).
 
@@ -455,7 +455,7 @@ A view imports only relative files and `react`/`react-dom` (ui-leaf
 aliases those two; it resolves no other npm package), so the views carry
 no npm dependencies; third-party code a view needs is vendored as relative
 files (the ticket editor's, below). Logic worth testing lives in plain `.ts` beside them
-(`lib/board.ts`, `lib/project.ts`), written in erasable TypeScript so Node runs it
+(`lib/board.ts`, `lib/project.ts`, `lib/initiatives.ts`), written in erasable TypeScript so Node runs it
 directly: `node --test crates/pm/views-test/*.test.ts` (Node ≥ 22.18; no
 install, no browser). Those tests sit outside `crates/pm/views/` so they
 are not shipped, and are not part of `cargo test`.
@@ -486,7 +486,9 @@ session's own ops and POSTed 250 ms after the last keystroke (at most
 a `200`; on close (`pagehide`, or the window going hidden) whatever is
 unsent is flushed with `keepalive`. Its tests
 (`crates/pm/tests/views/*.test.ts`: `body.test.ts` on a ticket,
-`project.test.ts` on a project's documents and "New ticket") run under
+`project.test.ts` on a project's documents and "New ticket",
+`initiatives.test.ts` driving the initiatives view's landing → initiative →
+project over `GET /initiatives`) run under
 node against a real `pm app` from `cargo test` (`crates/pm/tests/views_js.rs`); without node
 >= 22 on `PATH` that test skips, and `PM_REQUIRE_NODE_TESTS=1` makes the
 skip a failure.
@@ -501,12 +503,40 @@ instead, for developing a view without rebuilding pm.
 | View | Opened by | Today (AGT-1402) | Becomes |
 |---|---|---|---|
 | `ticket` | `pm edit <ID>` | the editor: title, priority, project, labels, state, and the description bound to the text CRDT; live (AGT-1403) | — |
-| `board` | `pm app` | the board (AGT-1404, below) | — |
+| `initiatives` | `pm app` | initiatives → projects → a project, the board as a tab (AGT-1492, below) | — |
+| `board` | — (the initiatives view's Board tab; `board.tsx` mounts the same `BoardPage` standalone) | the board (AGT-1404, below) | — |
 | `project` | `pm project edit <ID>` | the design doc and named documents in the CRDT editor, the project's tickets, "New ticket" (AGT-1405, below) | — |
+
+### The initiatives view
+
+`pm app`'s view (AGT-1492; `initiatives.tsx`, its policy `lib/initiatives.ts`,
+covered by `crates/pm/views-test/initiatives.test.ts`). ui-leaf cannot open
+a second view, so everything below is inline in it:
+
+- **Landing** — one compact row per initiative (from `GET /initiatives`),
+  then **Unfiled**: title, project count (every project below it),
+  tickets not started (backlog + unstarted), started and completed, and a
+  progress bar — completed ÷ non-canceled tickets over the whole subtree —
+  with the percentage beside it as text (`—` with no tickets), so progress
+  is never colour alone.
+- **An initiative** — its projects as the same rollup rows (sub-projects
+  indented under their parent), then its own documents and tickets
+  (`ProjectPage`: an initiative is a project). **Unfiled** shows its
+  projects only.
+- **A project** — `ProjectPage` (the project view, below) inline, under a
+  breadcrumb `Initiatives › <initiative> › <project>` (every project
+  between them included) whose steps go back.
+- **Board** — a tab beside **Initiatives** renders the board (`BoardPage`,
+  below) inline.
+- **Live** — a ticket, project, workspace or `state.upsert` op on
+  `GET /events` (not a `body.edit`) schedules a refetch of `GET /initiatives`, debounced 150 ms;
+  only the newest fetch may land. The embedded project page and board keep
+  their own streams and refetch as they do standalone.
 
 ### The board
 
-`pm app`'s view (`board.tsx`; its policy is `lib/board.ts`):
+`board.tsx` (its policy is `lib/board.ts`), shown as the initiatives view's
+Board tab (`lib/boardpage.tsx`'s `BoardPage`):
 
 - **Columns** — one per workflow state from `GET /workspace`, ordered by
   `position`; each keeps `pm list`'s ticket order. A ticket whose state the
