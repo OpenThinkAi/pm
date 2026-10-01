@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Subcommand;
 use pm_core::op::BodyEdit;
-use pm_core::{ActorId, Body, Payload, Project, ProjectStatus};
+use pm_core::{ActorId, Body, Payload, Project, ProjectKind, ProjectStatus};
 use pm_store::Store;
 use serde_json::{Map, Value, json};
 use ulid::Ulid;
@@ -48,9 +48,12 @@ pub enum ProjectCmd {
         /// Repo this project ships in; repeat or comma-separate for several
         #[arg(long = "repo", value_name = "OWNER/NAME", value_delimiter = ',')]
         repos: Vec<String>,
-        /// An existing project this one is a sub-project of
+        /// An existing project this one is a sub-project of (not with --kind initiative)
         #[arg(long)]
         parent: Option<String>,
+        /// project (default) or initiative (groups projects; has no parent). Fixed at creation
+        #[arg(long, value_parser = parse_kind)]
+        kind: Option<ProjectKind>,
     },
     /// Print a project, or one of its documents with --doc
     Show {
@@ -64,6 +67,9 @@ pub enum ProjectCmd {
         /// in-progress, complete or abandoned
         #[arg(long, value_parser = parse_status)]
         status: Option<ProjectStatus>,
+        /// project or initiative
+        #[arg(long, value_parser = parse_kind)]
+        kind: Option<ProjectKind>,
     },
     /// Open the project view in ui-leaf (design doc + named docs in the CRDT editor, its tickets), or the design doc in $EDITOR; every change becomes body.edit ops
     Edit {
@@ -112,9 +118,17 @@ pub fn run(ctx: &Ctx<'_>, cmd: ProjectCmd) -> Result<()> {
             title,
             repos,
             parent,
-        } => new(ctx, &id, &title, &repos, parent.as_deref()),
+            kind,
+        } => new(
+            ctx,
+            &id,
+            &title,
+            kind.unwrap_or_default(),
+            &repos,
+            parent.as_deref(),
+        ),
         ProjectCmd::Show { id, doc } => show(ctx, &id, doc.as_deref()),
-        ProjectCmd::List { status } => list(ctx, status),
+        ProjectCmd::List { status, kind } => list(ctx, status, kind),
         ProjectCmd::Edit {
             id,
             from_file: Some(src),
@@ -141,14 +155,32 @@ fn parse_status(s: &str) -> std::result::Result<ProjectStatus, String> {
     })
 }
 
+/// Clap value parser for `--kind`.
+fn parse_kind(s: &str) -> std::result::Result<ProjectKind, String> {
+    serde_json::from_value(Value::String(s.to_string()))
+        .map_err(|_| format!("unknown kind '{s}': expected one of project, initiative"))
+}
+
 fn not_found(id: &str) -> CliError {
     CliError::not_found(format!("no project '{id}'"))
 }
 
 // -------------------------------------------------------------------- new
 
-fn new(ctx: &Ctx<'_>, id: &str, title: &str, repos: &[String], parent: Option<&str>) -> Result<()> {
+fn new(
+    ctx: &Ctx<'_>,
+    id: &str,
+    title: &str,
+    kind: ProjectKind,
+    repos: &[String],
+    parent: Option<&str>,
+) -> Result<()> {
     crate::ids::validate_project_id(id)?;
+    if kind == ProjectKind::Initiative && parent.is_some() {
+        return Err(CliError::usage(
+            "--parent cannot be used with --kind initiative: an initiative has no parent",
+        ));
+    }
     let title = non_empty("--title", title)?;
     let repos: BTreeSet<String> = repos
         .iter()
@@ -157,7 +189,7 @@ fn new(ctx: &Ctx<'_>, id: &str, title: &str, repos: &[String], parent: Option<&s
 
     let actor = ctx.actor()?;
     let (mut store, _ws) = ctx.open()?;
-    store.create_project(id, &title, &repos, parent, &actor)?;
+    store.create_project_of_kind(id, &title, kind, &repos, parent, &actor)?;
     let project = store
         .project(id)?
         .ok_or_else(|| CliError::error(format!("project '{id}' vanished after create")))?;
@@ -192,11 +224,14 @@ fn show(ctx: &Ctx<'_>, id: &str, doc: Option<&str>) -> Result<()> {
 
 // ------------------------------------------------------------------- list
 
-fn list(ctx: &Ctx<'_>, status: Option<ProjectStatus>) -> Result<()> {
+fn list(ctx: &Ctx<'_>, status: Option<ProjectStatus>, kind: Option<ProjectKind>) -> Result<()> {
     let (store, _ws) = ctx.open()?;
     let mut projects = store.projects()?;
     if let Some(status) = status {
         projects.retain(|p| p.status == status);
+    }
+    if let Some(kind) = kind {
+        projects.retain(|p| p.kind == kind);
     }
     if ctx.json {
         let out: Vec<Value> = projects.iter().map(project_json).collect();
@@ -206,9 +241,10 @@ fn list(ctx: &Ctx<'_>, status: Option<ProjectStatus>) -> Result<()> {
     } else {
         for p in &projects {
             println!(
-                "{:<24} {:<12} {}",
+                "{:<24} {:<12} {:<11} {}",
                 crate::text::inline(&p.id),
                 status_str(p.status),
+                p.kind.as_str(),
                 crate::text::inline(&p.title)
             );
         }
@@ -574,6 +610,7 @@ fn print_project(ctx: &Ctx<'_>, project: &Project) -> Result<()> {
         crate::text::inline(&project.id),
         crate::text::inline(&project.title)
     );
+    println!("kind:    {}", project.kind.as_str());
     println!("status:  {}", status_str(project.status));
     println!(
         "parent:  {}",

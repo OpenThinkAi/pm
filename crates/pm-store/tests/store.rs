@@ -50,6 +50,7 @@ fn workspace() -> Workspace {
 
 fn project(id: &str) -> Project {
     Project {
+        kind: Default::default(),
         id: id.into(),
         title: id.into(),
         status: ProjectStatus::InProgress,

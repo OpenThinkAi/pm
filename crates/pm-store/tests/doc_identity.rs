@@ -213,6 +213,7 @@ fn migration_0008_binds_every_document_with_no_data_change() {
     store
         .put_project(
             &Project {
+                kind: Default::default(),
                 id: "pm-hub".into(),
                 title: "pm-hub".into(),
                 status: ProjectStatus::InProgress,

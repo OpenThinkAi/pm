@@ -50,6 +50,7 @@ fn store() -> (TempDir, Store) {
     store
         .put_project(
             &Project {
+                kind: Default::default(),
                 id: "pm".into(),
                 title: "pm".into(),
                 status: ProjectStatus::InProgress,
@@ -545,6 +546,7 @@ fn a_pulled_op_with_a_path_unsafe_id_is_a_typed_error() {
         ActorId::new("laptop"),
         Ulid::new(),
         Payload::ProjectCreate(pm_core::op::ProjectCreate {
+            kind: Default::default(),
             id: "a/b".into(),
             title: "t".into(),
             status: ProjectStatus::InProgress,
@@ -806,6 +808,7 @@ fn a_pulled_config_batch_folds_in_any_order_and_is_not_outbox() {
             base + 2,
             "laptop",
             Payload::ProjectCreate(pm_core::op::ProjectCreate {
+                kind: Default::default(),
                 id: "pm-hub".into(),
                 title: "pm-hub".into(),
                 status: ProjectStatus::InProgress,
@@ -912,6 +915,7 @@ fn outbox_config_is_the_outbox_s_config_ops_in_seq_order() {
     store
         .put_project(
             &Project {
+                kind: Default::default(),
                 id: "late".into(),
                 title: "late".into(),
                 status: ProjectStatus::InProgress,

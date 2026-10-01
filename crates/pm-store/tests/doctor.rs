@@ -57,6 +57,7 @@ fn store() -> (TempDir, Store) {
     store
         .put_project(
             &Project {
+                kind: Default::default(),
                 id: "pm".into(),
                 title: "pm".into(),
                 status: ProjectStatus::InProgress,

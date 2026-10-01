@@ -44,6 +44,7 @@ fn workspace() -> Workspace {
 
 fn project(id: &str, parent: Option<&str>) -> Project {
     Project {
+        kind: Default::default(),
         id: id.into(),
         title: id.into(),
         status: ProjectStatus::InProgress,
@@ -284,6 +285,7 @@ fn a_backdated_doc_add_cannot_take_a_bound_document() {
         "mallory",
         pm,
         Payload::ProjectCreate(ProjectCreate {
+            kind: Default::default(),
             id: "pm".into(),
             title: "pm".into(),
             status: ProjectStatus::InProgress,

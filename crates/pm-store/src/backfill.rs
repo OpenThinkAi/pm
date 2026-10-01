@@ -136,6 +136,8 @@ pub(crate) fn run(tx: &Transaction<'_>) -> Result<Backfilled> {
             // Bound by migration 0008's `project.doc_add` instead
             // ([`doc_identity`]), which runs right after.
             doc_id: None,
+            // Every project predates initiatives (AGT-1488).
+            kind: pm_core::ProjectKind::Project,
         })];
         payloads.extend(
             row.repos

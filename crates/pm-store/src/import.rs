@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use pm_core::{ActorId, ProjectStatus};
+use pm_core::{ActorId, ProjectKind, ProjectStatus};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use ulid::Ulid;
 
@@ -61,7 +61,17 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let project = upsert_meta_in(&tx, id, title, status, parent, repos, None, actor)?;
+        let project = upsert_meta_in(
+            &tx,
+            id,
+            title,
+            ProjectKind::Project,
+            status,
+            parent,
+            repos,
+            None,
+            actor,
+        )?;
         let doc_id = load_project_view(&tx, project)?
             .and_then(|view| view.design_doc_id())
             .ok_or(StoreError::UnknownProjectEntity { project })?;
@@ -192,6 +202,7 @@ mod tests {
         let old = store
             .put_project(
                 &pm_core::Project {
+                    kind: Default::default(),
                     id: "old".into(),
                     title: "old".into(),
                     status: ProjectStatus::InProgress,

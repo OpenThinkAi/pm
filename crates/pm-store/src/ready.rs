@@ -108,6 +108,7 @@ mod tests {
             store
                 .put_project(
                     &Project {
+                        kind: Default::default(),
                         id: id.into(),
                         title: id.into(),
                         status: ProjectStatus::InProgress,

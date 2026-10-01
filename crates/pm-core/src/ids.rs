@@ -202,6 +202,7 @@ mod tests {
 
     fn create(id: &str, parent: Option<&str>) -> Op {
         op(Payload::ProjectCreate(ProjectCreate {
+            kind: Default::default(),
             id: id.into(),
             title: "t".into(),
             status: ProjectStatus::InProgress,

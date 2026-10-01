@@ -8,7 +8,9 @@
 use std::collections::BTreeSet;
 
 use pm_core::op::{BodyEdit, TicketCreate};
-use pm_core::{ActorId, Body, Hlc, Op, Payload, Priority, State, StateCategory, Workspace};
+use pm_core::{
+    ActorId, Body, Hlc, Op, Payload, Priority, ProjectKind, State, StateCategory, Workspace,
+};
 use pm_store::{Store, StoreError};
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -464,6 +466,7 @@ fn put_project_documents_are_op_derived() {
     store
         .put_project(
             &pm_core::Project {
+                kind: Default::default(),
                 id: "legacy".into(),
                 title: "legacy".into(),
                 status: pm_core::ProjectStatus::InProgress,
@@ -490,4 +493,93 @@ fn put_project_documents_are_op_derived() {
         "# written directly\n"
     );
     let _ = dir; // keep the tempdir alive for the whole test
+}
+
+/// AGT-1488: `create_project_of_kind` fixes an initiative's kind in its
+/// create (the row, the view and a doctor replay agree); an initiative
+/// with a parent is refused before anything commits; `put_project`
+/// carries `Project::kind` into a new project's create.
+#[test]
+fn an_initiative_is_created_with_its_kind_and_without_a_parent() {
+    let (_dir, mut store) = store();
+    let matt = ActorId::new("matt");
+    store
+        .create_project_of_kind(
+            "q4",
+            "Q4",
+            ProjectKind::Initiative,
+            &BTreeSet::new(),
+            None,
+            &matt,
+        )
+        .unwrap();
+    store
+        .create_project("pm", "pm", &BTreeSet::new(), Some("q4"), &matt)
+        .unwrap();
+    assert_eq!(
+        store.project("q4").unwrap().unwrap().kind,
+        ProjectKind::Initiative
+    );
+    assert_eq!(
+        store.project_view("q4").unwrap().unwrap().kind,
+        ProjectKind::Initiative
+    );
+    assert_eq!(
+        store.project("pm").unwrap().unwrap().kind,
+        ProjectKind::Project
+    );
+
+    let err = store
+        .create_project_of_kind(
+            "h1",
+            "H1",
+            ProjectKind::Initiative,
+            &BTreeSet::new(),
+            Some("pm"),
+            &matt,
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InitiativeParent { id } if id == "h1"));
+    assert!(store.project("h1").unwrap().is_none());
+
+    let mut h2 = store.project("q4").unwrap().unwrap();
+    h2.id = "h2".into();
+    store.put_project(&h2, &matt).unwrap();
+    assert_eq!(
+        store.project("h2").unwrap().unwrap().kind,
+        ProjectKind::Initiative
+    );
+
+    assert!(store.doctor().unwrap().is_healthy());
+    assert!(store.rebuild().unwrap().is_empty());
+    assert_eq!(
+        store.project("q4").unwrap().unwrap().kind,
+        ProjectKind::Initiative
+    );
+}
+
+/// AGT-1488: migration 0013 adds `project.kind` to a schema-12 database,
+/// reading every existing project as a plain one, doctor-clean.
+#[test]
+fn upgrading_from_schema_12_reads_existing_projects_as_plain() {
+    let (dir, mut store) = store();
+    store
+        .create_project("pm", "pm", &BTreeSet::new(), None, &ActorId::new("matt"))
+        .unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(dir.path().join("pm.sqlite")).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE project DROP COLUMN kind;
+         DELETE FROM schema_version WHERE version >= 13;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 13);
+    assert_eq!(
+        store.project("pm").unwrap().unwrap().kind,
+        ProjectKind::Project
+    );
+    assert!(store.doctor().unwrap().is_healthy());
 }

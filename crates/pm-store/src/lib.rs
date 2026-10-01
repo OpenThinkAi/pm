@@ -90,10 +90,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (10, include_str!("../migrations/0010_docs_owned_by.sql")),
     (11, include_str!("../migrations/0011_reserialize_views.sql")),
     (12, include_str!("../migrations/0012_sync_quarantine.sql")),
+    (13, include_str!("../migrations/0013_project_kind.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// The migration whose work is Rust, not SQL: after its (comment-only)
 /// SQL file runs, [`reencode::run`] rewrites every stored byte payload in
@@ -124,6 +125,10 @@ const DOCS_OWNED_BY_VERSION: u32 = 10;
 /// followed by [`reencode::views`], which re-serializes every view row
 /// through the current types; a no-op on rows already in that form.
 const RESERIALIZE_VIEWS_VERSION: u32 = 11;
+
+/// And for `project.kind` (AGT-1488): the column is added by
+/// [`config::add_project_kind_column`], idempotently.
+const PROJECT_KIND_VERSION: u32 = 13;
 
 /// How long a writer waits for the database lock before giving up. Sized
 /// for many concurrent CLI invocations (build loops fan out), not for a
@@ -197,6 +202,9 @@ impl Store {
             }
             if *version == RESERIALIZE_VIEWS_VERSION {
                 reencode::views(&tx)?;
+            }
+            if *version == PROJECT_KIND_VERSION {
+                config::add_project_kind_column(&tx)?;
             }
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",

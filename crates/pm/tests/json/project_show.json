@@ -2,6 +2,7 @@
   "doc": "",
   "documents": {},
   "id": "pm",
+  "kind": "project",
   "parent": null,
   "repos": [
     "OpenThinkAi/pm"

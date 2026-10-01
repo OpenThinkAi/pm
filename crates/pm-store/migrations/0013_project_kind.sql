@@ -1,0 +1,17 @@
+-- AGT-1488: a project's kind, `project` or `initiative` (design doc
+-- §Initiatives), materialized from `ProjectView::kind` like the rest of the
+-- row (rewritten by `pm doctor --rebuild`) — fixed by the project's
+-- `project.create` op, which omits the key for a plain project.
+--
+-- The column itself is added in Rust (`src/config.rs::add_project_kind_column`,
+-- run by `Store::open` in this migration's transaction): SQLite has no
+-- `ADD COLUMN IF NOT EXISTS`, and every migration from 0005 on must be
+-- re-runnable against a database that already has its shape. The effect is:
+--
+--   ALTER TABLE project ADD COLUMN kind TEXT NOT NULL DEFAULT 'project'
+--       CHECK (kind IN ('project', 'initiative'));
+--
+-- Every existing row is a plain project: no build before this one writes
+-- `kind`, and one that pulled an initiative's create stored it without the
+-- key (pm-store re-serializes an op through its own types), so its log
+-- reads that project as plain as well.

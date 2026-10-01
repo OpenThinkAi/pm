@@ -830,6 +830,7 @@ fn populate(r: &Replica, tickets: usize, floor: u64, big_bytes: usize) -> (Vec<U
     store
         .put_project(
             &Project {
+                kind: Default::default(),
                 id: "big".into(),
                 title: "Big project".into(),
                 status: ProjectStatus::InProgress,

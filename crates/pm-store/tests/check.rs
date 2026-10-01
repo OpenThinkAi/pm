@@ -85,6 +85,7 @@ fn check_sees_cycles_across_owners_and_relations_to_tombstones() {
     store
         .put_project(
             &Project {
+                kind: Default::default(),
                 id: "pm".into(),
                 title: "pm".into(),
                 status: ProjectStatus::InProgress,

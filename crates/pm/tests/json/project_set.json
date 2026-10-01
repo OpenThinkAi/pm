@@ -4,6 +4,7 @@
     "notes": "Some project notes.\n"
   },
   "id": "pm",
+  "kind": "project",
   "parent": null,
   "repos": [
     "OpenThinkAi/pm"

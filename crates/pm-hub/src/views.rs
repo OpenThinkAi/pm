@@ -843,6 +843,7 @@ mod tests {
                 wall_ms,
                 "matt",
                 Payload::ProjectCreate(pm_core::op::ProjectCreate {
+                    kind: Default::default(),
                     id: "pm".into(),
                     title: "pm".into(),
                     status: pm_core::ProjectStatus::InProgress,

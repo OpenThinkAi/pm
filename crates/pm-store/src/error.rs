@@ -57,6 +57,10 @@ pub enum StoreError {
     /// crate can produce it.
     #[error("op {op_id}: '{kind}' is not a config op")]
     NotAConfigOp { op_id: Ulid, kind: &'static str },
+    /// AGT-1488: an initiative is created with a `parent`; initiatives
+    /// have none (design doc §Initiatives).
+    #[error("project '{id}' is an initiative, which cannot have a parent")]
+    InitiativeParent { id: String },
     /// AGT-1344 AC1: `pm project new` against an id that already exists.
     #[error("project '{id}' already exists")]
     DuplicateProject { id: String },
