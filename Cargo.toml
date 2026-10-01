@@ -9,8 +9,50 @@ description = "pm — local-first, relational ticketing (the vault, as a databas
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/OpenThinkAi/pm"
 
-# Used by `cargo dist` in a later ticket; kept here now so the profile exists
-# alongside the license/description metadata this ticket adds.
+# Release profile for `dist` (cargo-dist). See RELEASING.md.
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "npm"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+# Publish jobs to run in CI
+publish-jobs = ["npm"]
+# Which actions to run on pull requests. "skip": release.yml has no
+# pull_request trigger (it runs on push to main only).
+pr-run-mode = "skip"
+# Build provenance (SLSA) attestations for every release artifact. Attest in
+# the `host` job, not in build-local-artifacts, so the OIDC token is never
+# exposed to jobs that run crate build scripts.
+github-attestations = true
+github-attestations-phase = "host"
+# Where to host releases
+hosting = "github"
+# The npm package should have this name
+npm-package = "@openthink/pm"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+# release.yml is hand-patched (push-to-main trigger + npm version gate,
+# least-privilege permissions, lockfile check, OIDC publish-npm). Each patch
+# is marked in the workflow. Tell dist not to flag these as drift. See
+# RELEASING.md.
+allow-dirty = ["ci"]
+
+# Pin every third-party Action dist emits to a full commit SHA. Keep in sync
+# with the `uses:` lines in .github/workflows/release.yml.
+[workspace.metadata.dist.github-action-commits]
+"actions/checkout" = "d23441a48e516b6c34aea4fa41551a30e30af803" # v6.1.0
+"actions/upload-artifact" = "b7c566a772e6b6bfb58ed0dc250532a479d7789f" # v6.0.0
+"actions/download-artifact" = "37930b1c2abaa49bbe596cd826c3c89aef350131" # v7.0.0
+"actions/setup-node" = "249970729cb0ef3589644e2896645e5dc5ba9c38" # v6.5.0
+"actions/attest-build-provenance" = "96278af6caaf10aea03fd8d33a09a777ca52d62f" # v3.2.0

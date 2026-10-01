@@ -41,3 +41,7 @@ pm-store = { path = "../pm-store" }
 tempfile = "3.27"
 # `writer`'s unit tests time out a lock wait.
 tokio = { version = "1", features = ["time"] }
+
+# pm-hub is deployed to Railway (scripts/deploy-hub.sh), never released via dist/npm.
+[package.metadata.dist]
+dist = false
