@@ -1,0 +1,21 @@
+-- AGT-1635: a project's status may be `parked` (set aside, may come back),
+-- so `project.status`'s CHECK grows from
+--
+--   CHECK (status IN ('in-progress', 'complete', 'abandoned'))
+--
+-- to
+--
+--   CHECK (status IN ('in-progress', 'complete', 'abandoned', 'parked'))
+--
+-- The change is made in Rust (`src/config.rs::allow_parked_project_status`,
+-- run by `Store::open` in this migration's transaction). SQLite cannot alter
+-- a CHECK, and rebuilding `project` would need foreign keys off — which
+-- cannot be switched inside a transaction — since `ticket`, `project_doc`
+-- and `project.parent` reference it. Widening a CHECK changes no stored
+-- byte, so it edits the table's recorded schema text instead, the
+-- procedure SQLite documents for exactly this (sqlite.org/lang_altertable,
+-- "making other kinds of table schema changes"): `writable_schema`, one
+-- `replace` in the `project` row, and a schema-cookie bump so every
+-- connection rereads it. A table already allowing `parked` is left alone,
+-- so the migration can run again.
+SELECT 1 WHERE 0;

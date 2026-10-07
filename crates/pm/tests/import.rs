@@ -1179,3 +1179,29 @@ fn a_bad_map_state_is_a_usage_error() {
     assert_code(&out, 2);
     assert!(stderr(&out).contains("twice"));
 }
+
+/// AGT-1635 AC3: a vault project whose `status:` is `parked` imports as a
+/// parked project, without a "project status" note; re-importing it
+/// unchanged commits nothing.
+#[test]
+fn a_parked_vault_project_imports_as_parked() {
+    let sb = Sandbox::initialized();
+    let vault = sb.vault_copy();
+    let readme = vault.join("projects/gamma/README.md");
+    std::fs::write(
+        &readme,
+        std::fs::read_to_string(&readme)
+            .unwrap()
+            .replace("status: in-progress", "status: parked"),
+    )
+    .unwrap();
+    let report = sb.import(&vault);
+    assert_eq!(sb.project("gamma")["status"], "parked");
+    assert!(
+        !report.to_string().contains("project status: parked"),
+        "{report}"
+    );
+    let before = sb.store().doctor().unwrap().op_count;
+    sb.import(&vault);
+    assert_eq!(sb.store().doctor().unwrap().op_count, before);
+}

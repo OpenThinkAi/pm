@@ -289,7 +289,7 @@ A **Project** shape (`project::project_json`), similarly shared by
   "id": "kebab-id",
   "title": "string",
   "kind": "project" | "initiative", // fixed at `pm project new`; an initiative has no parent
-  "status": "in-progress" | "complete" | "abandoned",
+  "status": "in-progress" | "complete" | "abandoned" | "parked", // parked: set aside, may come back (AGT-1635)
   "parent": "string" | null,
   "repos": ["owner/name", ...],
   "doc": "string",                 // the design doc's markdown
@@ -880,6 +880,13 @@ unlabeled tickets default to `opus-5`), `--exclude-label <LABEL>`
 `--explain` (human output only: also lists every excluded candidate with
 its reason).
 
+A ticket whose project's status is `parked` (AGT-1635) is never ready —
+not even with `--project` naming that project, so a build loop scoped to
+it finds nothing to build. Its reason is `project-parked`, after the
+ticket's own `parked` and before `not-before`. Like a parked ticket, it
+still counts as a pending blocker of tickets elsewhere (`blocked-by`, no
+gate). `pm claim --ready` uses the same frontier.
+
 - Exit `2`: `--limit 0`; empty `--project`/`--model`/`--exclude-label`.
 - Exit `3`: `--project` names a project that does not exist; an `--ids`
   entry does not exist.
@@ -896,12 +903,13 @@ its reason).
     "excluded": [
       {
         "id": "AGT-4", "ulid": "<ULID>",  // id is a ref: the ULID while the number is pending
-        "reason": "state" | "assigned" | "held" | "label" | "parked" | "not-before"
-                | "cycle" | "blocked-by" | "transitively-blocked" | "model" | "done",
+        "reason": "state" | "assigned" | "held" | "label" | "parked" | "project-parked"
+                | "not-before" | "cycle" | "blocked-by" | "transitively-blocked" | "model" | "done",
         "message": "string",
         /* plus reason-specific fields:
              state -> {state}; assigned -> {assignee}; held -> {hold}; label -> {label};
-             parked -> {until}; not-before -> {date}; cycle -> {tickets};
+             parked -> {until}; project-parked -> {project}; not-before -> {date};
+             cycle -> {tickets};
              blocked-by -> {blocker, gate: Gate | null};
              transitively-blocked -> {via, root, gate: Gate};
              model -> {labels, wanted}; done -> {} (only for an --ids entry that is
@@ -995,7 +1003,7 @@ op's content is dropped 30 days after its refusal, on the next pull).
     "healthy": true,
     "rebuilt": {"tables": [...]} | null,   // a Diff, only present with --rebuild
     "pruned_quarantine": 2,                 // only with --prune-quarantine: refused ops whose content it dropped (AGT-1482)
-    "schema_version": 13,                   // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state); 9 since AGT-1396 (seeded flag); 12 since AGT-1467 (sync quarantine); 13 since AGT-1488 (project kind)
+    "schema_version": 14,                   // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state); 9 since AGT-1396 (seeded flag); 12 since AGT-1467 (sync quarantine); 13 since AGT-1488 (project kind); 14 since AGT-1635 (parked project status)
     "op_count": 30,
     "tables": {"ticket": 5, "comment": 2, ...},
     "integrity": [],                        // SQLite integrity_check messages, if any
@@ -1226,7 +1234,8 @@ every `ext` key sorted; values are quoted only when YAML needs it; the
 body is the description followed by `## Comments` with one
 `### <YYYY-MM-DD> — <author>` entry per comment. A project is
 `projects/<id>/README.md` (the design doc verbatim), or
-`archive/projects/<id>/` when its status is complete or abandoned, with
+`archive/projects/<id>/` when its status is complete or abandoned (a
+parked project may come back, so it stays under `projects/`), with
 each named document as `<name>.md` beside it. Flags: `--legacy-markers`
 (write waivers, the hold and parked as the vault's prose lines —
 `waived: <rule> — <reason>`, `⚠ NEEDS-HUMAN: <reason>`,
@@ -1296,9 +1305,11 @@ stderr, leaving stdout the bare body. `--json` shapes are unchanged.
 
 ### `pm project list`
 
-Flags: `--status <STATUS>` (`in-progress`, `complete`, `abandoned`),
-`--kind <KIND>` (`project`, `initiative`). Both filter; given together, a
-project must match both.
+Flags: `--status <STATUS>` (`in-progress`, `complete`, `abandoned`,
+`parked`), `--kind <KIND>` (`project`, `initiative`). Both filter; given
+together, a project must match both. Without `--status` every project is
+listed, a parked one with `parked` in its status column (text) or
+`"status": "parked"` (`--json`).
 
 - `--json`: `{"schema": 1, "projects": [/* Project, ... */]}`.
 
@@ -1351,8 +1362,8 @@ named document, with `pm edit`'s no-TTY-fails-fast behavior.
 ### `pm project set <ID> <KEY=VALUE>...`
 
 No flags beyond the globals. At least one assignment is required. Keys:
-`title` (non-empty), `status` (`in-progress`, `complete`, `abandoned`)
-and `parent` (an existing project's id, or `-` to clear it). Each changed
+`title` (non-empty), `status` (`in-progress`, `complete`, `abandoned`,
+`parked`) and `parent` (an existing project's id, or `-` to clear it). Each changed
 key commits one `project.set` op over the existing `title`/`status`/`parent`
 fields (AGT-1489); a value the project already has commits nothing. Every
 assignment is parsed and checked before any op is committed. Unlike `pm
@@ -1362,6 +1373,13 @@ A parent may not close a loop: the project itself, or any of its
 descendants, is refused, and the message names the loop child-first —
 `pm project set a parent=b` with `b` already under `a` says
 `... its own ancestor: a -> b -> a`.
+
+`status=parked` (AGT-1635) sets a project aside without abandoning it:
+its tickets drop out of `pm ready` (reason `project-parked`) until its
+status changes again. On the wire the op carries `"value": "in-progress"`
+plus `"parked": true` (likewise a `project.create`), so a hub or replica
+built before `parked` reads the project as in progress rather than failing
+to decode the op; a build that knows `parked` reads it as parked.
 
 - Exit `2`: an assignment is not `key=value`; an unknown key; a key given
   twice; empty `title=` or `parent=`; an unknown `status=`; a parent that

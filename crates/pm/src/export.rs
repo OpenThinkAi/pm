@@ -30,7 +30,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
 use pm_core::markers::{PARKED_FOREVER, date_from_ms};
-use pm_core::{Project, ProjectStatus, RelationKind, Ticket, Workspace};
+use pm_core::{Project, RelationKind, Ticket, Workspace};
 use pm_store::Store;
 use serde_json::{Value, json};
 
@@ -542,10 +542,12 @@ pub(crate) fn render_project(p: &Project) -> Result<Vec<Rendered>> {
         crate::ids::safe_component(&p.id, "project id")?,
         "project id",
     )?;
-    let base = if p.status == ProjectStatus::InProgress {
-        Path::new("projects").join(id)
-    } else {
+    // A parked project may come back (AGT-1635): not retired, so not
+    // archived.
+    let base = if p.status.is_retired() {
         Path::new("archive").join("projects").join(id)
+    } else {
+        Path::new("projects").join(id)
     };
     let readme = if p.doc.trim().is_empty() {
         // A project pm created without a doc (an import stub): a README

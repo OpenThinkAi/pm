@@ -1321,6 +1321,38 @@ pub(crate) fn add_project_kind_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Migration 0014's one step (AGT-1635): lets `project.status` hold
+/// `parked` by widening its CHECK in the recorded schema (see the
+/// migration file for why it is not a table rebuild). Idempotent: a table
+/// whose CHECK already names `parked` is untouched.
+pub(crate) fn allow_parked_project_status(conn: &Connection) -> Result<()> {
+    const OLD: &str = "'abandoned'))";
+    const NEW: &str = "'abandoned', 'parked'))";
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'project'",
+        [],
+        |r| r.get(0),
+    )?;
+    if sql.contains("'parked'") {
+        return Ok(());
+    }
+    if sql.matches(OLD).count() != 1 {
+        return Err(StoreError::corrupt("project schema")(&format!(
+            "expected one status CHECK ending {OLD} in {sql}"
+        )));
+    }
+    let cookie: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+    conn.pragma_update(None, "writable_schema", true)?;
+    let updated = conn.execute(
+        "UPDATE sqlite_master SET sql = ?1 WHERE type = 'table' AND name = 'project'",
+        [sql.replacen(OLD, NEW, 1)],
+    );
+    conn.pragma_update(None, "schema_version", cookie + 1)?;
+    conn.pragma_update(None, "writable_schema", false)?;
+    updated?;
+    Ok(())
+}
+
 pub(crate) fn states(conn: &Connection) -> Result<Vec<State>> {
     let mut stmt =
         conn.prepare("SELECT name, category, position FROM state ORDER BY position, name")?;

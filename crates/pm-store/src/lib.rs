@@ -91,10 +91,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (11, include_str!("../migrations/0011_reserialize_views.sql")),
     (12, include_str!("../migrations/0012_sync_quarantine.sql")),
     (13, include_str!("../migrations/0013_project_kind.sql")),
+    (14, include_str!("../migrations/0014_project_parked.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// The migration whose work is Rust, not SQL: after its (comment-only)
 /// SQL file runs, [`reencode::run`] rewrites every stored byte payload in
@@ -129,6 +130,10 @@ const RESERIALIZE_VIEWS_VERSION: u32 = 11;
 /// And for `project.kind` (AGT-1488): the column is added by
 /// [`config::add_project_kind_column`], idempotently.
 const PROJECT_KIND_VERSION: u32 = 13;
+
+/// And for `parked` (AGT-1635): `project.status`'s CHECK is widened by
+/// [`config::allow_parked_project_status`], idempotently.
+const PROJECT_PARKED_VERSION: u32 = 14;
 
 /// How long a writer waits for the database lock before giving up. Sized
 /// for many concurrent CLI invocations (build loops fan out), not for a
@@ -205,6 +210,9 @@ impl Store {
             }
             if *version == PROJECT_KIND_VERSION {
                 config::add_project_kind_column(&tx)?;
+            }
+            if *version == PROJECT_PARKED_VERSION {
+                config::allow_parked_project_status(&tx)?;
             }
             tx.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",

@@ -467,15 +467,18 @@ pub struct ActorUpsert {
 /// Two replicas creating the same `id` offline mint two Ulids; the
 /// authority (the hub, from P3) arbitrates that the way it does ticket
 /// numbers — this crate merges, it does not allocate.
+///
+/// A `parked` status (AGT-1635) is written as `"status": "in-progress"`
+/// plus `"parked": true` — see [`ProjectStatus`] and the private
+/// `wire` module.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "wire::ProjectCreate", into = "wire::ProjectCreate")]
 pub struct ProjectCreate {
     pub id: String,
     pub title: String,
     pub status: ProjectStatus,
     pub parent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_id: Option<Ulid>,
-    #[serde(default, skip_serializing_if = "ProjectKind::is_project")]
     pub kind: ProjectKind,
 }
 
@@ -497,15 +500,149 @@ pub struct ProjectDocAdd {
 
 /// One project-metadata write; scalars are LWW registers and `repos` an
 /// OR-set (remove cites observed add-tags, as [`LabelRemove`]).
-/// Serialized as `{"field": "<name>", "value": …}`.
+/// Serialized as `{"field": "<name>", "value": …}`; a `parked` status
+/// (AGT-1635) as `{"field": "status", "value": "in-progress", "parked":
+/// true}` — see [`ProjectStatus`] and the private `wire` module.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "field", content = "value", rename_all = "snake_case")]
+#[serde(from = "wire::ProjectSet", into = "wire::ProjectSet")]
 pub enum ProjectSet {
     Title(String),
     Status(ProjectStatus),
     Parent(Option<String>),
     RepoAdd(String),
     RepoRemove { repo: String, observed: Vec<Ulid> },
+}
+
+/// The wire shapes of [`ProjectCreate`] and [`ProjectSet`] (AGT-1635).
+///
+/// A build before `parked` cannot decode it as a status (serde refuses an
+/// unknown variant, which would fail the op at an older hub's push and an
+/// older replica's whole pull). So a status of `parked` is written as the
+/// `in-progress` it reads as on such a build, plus a sibling
+/// `"parked": true` key that build ignores — the posture project `kind`
+/// took (AGT-1488 AC6). Every other status, and every op without the key,
+/// keeps the exact bytes it had before. Reading, `"parked": true` makes
+/// the status `parked`; a literal `"parked"` value is read too.
+mod wire {
+    use serde::{Deserialize, Serialize};
+    use ulid::Ulid;
+
+    use crate::domain::{ProjectKind, ProjectStatus};
+
+    fn is_false(b: &bool) -> bool {
+        !*b
+    }
+
+    /// `status` as an older build can read it, and the flag that restores
+    /// `parked` on this one.
+    fn split(status: ProjectStatus) -> (ProjectStatus, bool) {
+        match status {
+            ProjectStatus::Parked => (ProjectStatus::InProgress, true),
+            other => (other, false),
+        }
+    }
+
+    fn join(status: ProjectStatus, parked: bool) -> ProjectStatus {
+        if parked {
+            ProjectStatus::Parked
+        } else {
+            status
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct ProjectCreate {
+        id: String,
+        title: String,
+        status: ProjectStatus,
+        parent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        doc_id: Option<Ulid>,
+        #[serde(default, skip_serializing_if = "ProjectKind::is_project")]
+        kind: ProjectKind,
+        #[serde(default, skip_serializing_if = "is_false")]
+        parked: bool,
+    }
+
+    impl From<super::ProjectCreate> for ProjectCreate {
+        fn from(c: super::ProjectCreate) -> Self {
+            let (status, parked) = split(c.status);
+            ProjectCreate {
+                id: c.id,
+                title: c.title,
+                status,
+                parent: c.parent,
+                doc_id: c.doc_id,
+                kind: c.kind,
+                parked,
+            }
+        }
+    }
+
+    impl From<ProjectCreate> for super::ProjectCreate {
+        fn from(c: ProjectCreate) -> Self {
+            super::ProjectCreate {
+                id: c.id,
+                title: c.title,
+                status: join(c.status, c.parked),
+                parent: c.parent,
+                doc_id: c.doc_id,
+                kind: c.kind,
+            }
+        }
+    }
+
+    /// [`super::ProjectSet`]'s `{"field", "value"}` pair, verbatim.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "field", content = "value", rename_all = "snake_case")]
+    enum Field {
+        Title(String),
+        Status(ProjectStatus),
+        Parent(Option<String>),
+        RepoAdd(String),
+        RepoRemove { repo: String, observed: Vec<Ulid> },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct ProjectSet {
+        #[serde(flatten)]
+        field: Field,
+        #[serde(default, skip_serializing_if = "is_false")]
+        parked: bool,
+    }
+
+    impl From<super::ProjectSet> for ProjectSet {
+        fn from(set: super::ProjectSet) -> Self {
+            use super::ProjectSet as S;
+            let mut parked = false;
+            let field = match set {
+                S::Title(v) => Field::Title(v),
+                S::Status(v) => {
+                    let (status, flag) = split(v);
+                    parked = flag;
+                    Field::Status(status)
+                }
+                S::Parent(v) => Field::Parent(v),
+                S::RepoAdd(v) => Field::RepoAdd(v),
+                S::RepoRemove { repo, observed } => Field::RepoRemove { repo, observed },
+            };
+            ProjectSet { field, parked }
+        }
+    }
+
+    impl From<ProjectSet> for super::ProjectSet {
+        fn from(set: ProjectSet) -> Self {
+            use super::ProjectSet as S;
+            match set.field {
+                Field::Title(v) => S::Title(v),
+                // The flag means something only on a status write.
+                Field::Status(v) => S::Status(join(v, set.parked)),
+                Field::Parent(v) => S::Parent(v),
+                Field::RepoAdd(v) => S::RepoAdd(v),
+                Field::RepoRemove { repo, observed } => S::RepoRemove { repo, observed },
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -901,6 +1038,140 @@ mod tests {
         assert_eq!(json["kind"], "initiative");
         let back: ProjectCreate = serde_json::from_value(json).unwrap();
         assert_eq!(back, initiative);
+    }
+
+    /// AGT-1635: `parked` goes on the wire as `in-progress` plus
+    /// `"parked": true`, on a `project.set` and a `project.create` alike,
+    /// and reads back as `parked`; every other status keeps its bytes.
+    #[test]
+    fn parked_rides_beside_an_in_progress_status() {
+        let set = op(Payload::ProjectSet(ProjectSet::Status(
+            ProjectStatus::Parked,
+        )));
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(
+            json["payload"],
+            serde_json::json!({"field": "status", "value": "in-progress", "parked": true})
+        );
+        assert_eq!(serde_json::from_value::<Op>(json).unwrap(), set);
+        // A literal `parked` value (never written, but valid) reads too.
+        let literal: ProjectSet =
+            serde_json::from_value(serde_json::json!({"field": "status", "value": "parked"}))
+                .unwrap();
+        assert_eq!(literal, ProjectSet::Status(ProjectStatus::Parked));
+        for status in [
+            ProjectStatus::InProgress,
+            ProjectStatus::Complete,
+            ProjectStatus::Abandoned,
+        ] {
+            let json = serde_json::to_value(ProjectSet::Status(status)).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({"field": "status", "value": status.as_str()})
+            );
+        }
+        // The flag means nothing beside any other field.
+        let title: ProjectSet = serde_json::from_value(
+            serde_json::json!({"field": "title", "value": "t", "parked": true}),
+        )
+        .unwrap();
+        assert_eq!(title, ProjectSet::Title("t".into()));
+
+        let create = ProjectCreate {
+            id: "api-router".into(),
+            title: "api-router".into(),
+            status: ProjectStatus::Parked,
+            parent: None,
+            doc_id: None,
+            kind: ProjectKind::Project,
+        };
+        let json = serde_json::to_value(&create).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "id": "api-router", "title": "api-router", "status": "in-progress",
+                "parent": null, "parked": true
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ProjectCreate>(json).unwrap(),
+            create
+        );
+    }
+
+    /// AGT-1635 AC1: a `parked` write still decodes on a build whose
+    /// `ProjectStatus` has no `parked` (an older hub or replica) — as
+    /// `in-progress`, the unknown key ignored, the AGT-1488 AC6 posture —
+    /// instead of failing the op (and with it the old replica's pull).
+    /// `OldProjectSet` / `OldProjectCreate` are that build's types,
+    /// verbatim.
+    #[test]
+    fn a_parked_write_decodes_on_a_build_without_parked() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        #[allow(dead_code)] // only some variants are decoded below
+        enum OldProjectStatus {
+            InProgress,
+            Complete,
+            Abandoned,
+        }
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "field", content = "value", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldProjectSet {
+            Title(String),
+            Status(OldProjectStatus),
+            Parent(Option<String>),
+            RepoAdd(String),
+            RepoRemove { repo: String, observed: Vec<Ulid> },
+        }
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct OldProjectCreate {
+            id: String,
+            title: String,
+            status: OldProjectStatus,
+            parent: Option<String>,
+            #[serde(default)]
+            doc_id: Option<Ulid>,
+        }
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "kind", content = "payload")]
+        enum OldPayload {
+            #[serde(rename = "project.create")]
+            ProjectCreate(OldProjectCreate),
+            #[serde(rename = "project.set")]
+            ProjectSet(OldProjectSet),
+        }
+        #[derive(Debug, Deserialize)]
+        struct OldOp {
+            #[serde(flatten)]
+            payload: OldPayload,
+        }
+
+        let set = op(Payload::ProjectSet(ProjectSet::Status(
+            ProjectStatus::Parked,
+        )));
+        let old: OldOp = serde_json::from_value(serde_json::to_value(&set).unwrap()).unwrap();
+        let OldPayload::ProjectSet(old) = old.payload else {
+            panic!("decoded as another kind");
+        };
+        assert_eq!(old, OldProjectSet::Status(OldProjectStatus::InProgress));
+
+        let create = op(Payload::ProjectCreate(ProjectCreate {
+            id: "p".into(),
+            title: "P".into(),
+            status: ProjectStatus::Parked,
+            parent: None,
+            doc_id: None,
+            kind: ProjectKind::Project,
+        }));
+        let old: OldOp = serde_json::from_value(serde_json::to_value(&create).unwrap()).unwrap();
+        let OldPayload::ProjectCreate(old) = old.payload else {
+            panic!("decoded as another kind");
+        };
+        assert_eq!(old.status, OldProjectStatus::InProgress);
+        assert_eq!((old.id.as_str(), old.title.as_str()), ("p", "P"));
+        assert_eq!((old.parent, old.doc_id), (None, None));
     }
 
     /// AGT-1488 AC6: an initiative's `project.create` still decodes on a

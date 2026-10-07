@@ -252,6 +252,9 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
         Reason::Parked {
             until: "forever".into(),
         },
+        Reason::ProjectParked {
+            project: "api-router".into(),
+        },
         Reason::NotBefore {
             date: "2099-01-01".into(),
         },
@@ -274,6 +277,7 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             | Reason::Held { .. }
             | Reason::Label { .. }
             | Reason::Parked { .. }
+            | Reason::ProjectParked { .. }
             | Reason::NotBefore { .. }
             | Reason::Cycle { .. }
             | Reason::BlockedBy { .. }

@@ -560,6 +560,10 @@ fn reads_are_the_clis_json_shapes() {
             "/projects?status=complete",
             vec!["project", "list", "--status", "complete"],
         ),
+        (
+            "/projects?status=parked",
+            vec!["project", "list", "--status", "parked"],
+        ),
         ("/projects/pm", vec!["project", "show", "pm"]),
         ("/ready", vec!["ready"]),
         (
@@ -1518,6 +1522,21 @@ fn initiatives_are_a_project_tree_with_ticket_rollups() {
     // `child` is filed under `ini`, which is not shown: not Unfiled.
     assert_eq!(tree["unfiled"]["projects"], json!([]), "{tree}");
     assert_eq!(app.get("/initiatives?status=bogus").0, 400);
+    // AGT-1635: a parked project carries its status in the tree, and
+    // `?status=parked` is a valid filter (it keeps only `sub`, filed
+    // under an initiative it does not show, so neither group lists it).
+    assert_ok(&sb.run(&["project", "set", "sub", "status=parked"], &[]));
+    let (status, tree) = app.get("/initiatives?status=parked");
+    assert_eq!(status, 200, "{tree}");
+    assert_eq!(tree["initiatives"], json!([]), "{tree}");
+    assert_eq!(tree["unfiled"]["projects"], json!([]), "{tree}");
+    let (_, tree) = app.get("/initiatives");
+    let sub = &tree["initiatives"][0]["children"][0]["children"][0];
+    assert_eq!(
+        (&sub["id"], &sub["status"]),
+        (&json!("sub"), &json!("parked")),
+        "{tree}"
+    );
 
     // The same guard as every route.
     let host = format!("Host: 127.0.0.1:{}", app.port());

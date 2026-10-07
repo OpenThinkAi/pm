@@ -10,7 +10,7 @@
   "rebuilt": null,
   "replay_error": null,
   "schema": 1,
-  "schema_version": 13,
+  "schema_version": 14,
   "sync": {
     "cursor": 0,
     "outbox": 50,
@@ -33,7 +33,7 @@
     "project_doc_view": 1,
     "project_view": 1,
     "relation": 2,
-    "schema_version": 13,
+    "schema_version": 14,
     "state": 3,
     "sync_pushed": 0,
     "sync_quarantine": 0,

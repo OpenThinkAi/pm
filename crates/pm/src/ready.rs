@@ -137,6 +137,8 @@ pub(crate) fn compute(store: &Store, ws: &Workspace, args: &ReadyArgs) -> Result
         today: today.clone(),
         gate_labels,
         model: model.clone(),
+        // `Store::frontier` adds every parked project (AGT-1635).
+        parked_projects: Default::default(),
     };
 
     let (tickets, frontier) = store.frontier(ws, &scope, &rules)?;
@@ -263,6 +265,10 @@ fn describe(
         ),
         Reason::Label { label } => (format!("label {label}"), json!({ "label": label })),
         Reason::Parked { until } => (format!("parked until {until}"), json!({ "until": until })),
+        Reason::ProjectParked { project } => (
+            format!("project {project} is parked"),
+            json!({ "project": project }),
+        ),
         Reason::NotBefore { date } => (format!("not_before {date}"), json!({ "date": date })),
         Reason::Cycle { tickets } => {
             let ids: Vec<String> = tickets.iter().map(name).collect();
