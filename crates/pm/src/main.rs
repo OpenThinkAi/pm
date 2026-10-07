@@ -128,8 +128,9 @@ enum Cmd {
         #[arg(required = true, value_name = "KEY=VALUE")]
         assignments: Vec<String>,
     },
-    /// Add or remove labels: +x adds, -y removes. Since `-y` looks like a flag,
-    /// put global flags (--json, --as, --workspace) before `label`, not after.
+    /// Add or remove labels: +x adds, -y removes. Global flags (--json, --as,
+    /// --workspace) work before `label` or after the changes; any other
+    /// `--`-prefixed token after the id is an unknown flag (exit 2)
     Label {
         /// Ticket id (e.g. PM-12) or ULID
         id: String,
@@ -478,7 +479,11 @@ enum TicketCmd {
 
 fn main() -> ExitCode {
     // Clap exits 2 on usage errors and 0 for --help/--version.
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if let Err(e) = hoist_label_globals(&mut cli) {
+        eprintln!("pm: {}", text::printable(&format!("{:#}", e.error)));
+        return ExitCode::from(e.code);
+    }
     let env = workspace::Env::from_process();
     let ctx = verbs::Ctx {
         env: &env,
@@ -493,6 +498,60 @@ fn main() -> ExitCode {
             ExitCode::from(e.code)
         }
     }
+}
+
+/// `pm label`'s `changes` takes hyphen-prefixed values (`-y` removes `y`),
+/// so clap hands it every token after the id, global flags included (AGT-1577).
+/// Pull the global flags back out here: `--json`, `--as <ACTOR>`/`--as=ACTOR`
+/// and `--workspace <DIR>`/`--workspace=DIR` apply as if given before
+/// `label` (a later occurrence wins, as clap does); any other `--`-prefixed
+/// token is an unknown flag, never a removal. Single-dash tokens stay
+/// removals. `-h`/`--help` never reach here: clap still handles them.
+fn hoist_label_globals(cli: &mut Cli) -> exit::Result<()> {
+    let Cli {
+        workspace,
+        as_actor,
+        json,
+        cmd,
+    } = cli;
+    let Cmd::Label { changes, .. } = cmd else {
+        return Ok(());
+    };
+    let mut kept = Vec::with_capacity(changes.len());
+    let mut tokens = std::mem::take(changes).into_iter();
+    while let Some(token) = tokens.next() {
+        if !token.starts_with("--") {
+            kept.push(token);
+            continue;
+        }
+        let (flag, inline) = match token.split_once('=') {
+            Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
+            None => (token.clone(), None),
+        };
+        let mut value = |name: &str| {
+            inline
+                .clone()
+                .or_else(|| tokens.next())
+                .ok_or_else(|| exit::CliError::usage(format!("{name} needs a value")))
+        };
+        match flag.as_str() {
+            "--json" if inline.is_none() => *json = true,
+            "--as" => *as_actor = Some(value("--as")?),
+            "--workspace" => *workspace = Some(PathBuf::from(value("--workspace")?)),
+            _ => {
+                return Err(exit::CliError::usage(format!(
+                    "unknown flag '{token}' for `pm label` (removals are `-label`, one dash)"
+                )));
+            }
+        }
+    }
+    if kept.is_empty() {
+        return Err(exit::CliError::usage(
+            "`pm label` needs at least one +label or -label",
+        ));
+    }
+    *changes = kept;
+    Ok(())
 }
 
 fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {

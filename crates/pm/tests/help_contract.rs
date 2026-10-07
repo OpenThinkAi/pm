@@ -344,3 +344,19 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
         "docs/cli-contract.md `pm check` findings[].rule values"
     );
 }
+
+/// AGT-1577: `pm label --help` tells the reader global flags may follow the
+/// changes (no more "put them before `label`" trap), and the contract doc
+/// documents the same form.
+#[test]
+fn label_help_documents_trailing_global_flags() {
+    let help = help_text(&["label"]);
+    assert!(help.contains("+x adds, -y removes"), "{help}");
+    assert!(help.contains("after the changes"), "{help}");
+    assert!(!help.contains("before `label`, not after"), "{help}");
+    let doc = raw_contract_doc();
+    assert!(
+        doc.contains("`pm label AGT-12 +x -y --json` works"),
+        "docs/cli-contract.md must document trailing global flags on `pm label`"
+    );
+}

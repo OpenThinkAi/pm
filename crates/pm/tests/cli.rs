@@ -694,8 +694,6 @@ fn label_adds_and_removes() {
     let sb = Sandbox::initialized();
     assert_ok(&sb.pm(&["new", "--title", "T", "--label", "keep"]));
 
-    // `changes` accepts hyphen-prefixed values (`-y`), so global flags like
-    // `--json` must precede the subcommand rather than trail the list.
     let v = json(&sb.pm(&["--json", "label", "AGT-1", "+x", "+y"]));
     let mut labels: Vec<&str> = v["labels"]
         .as_array()
@@ -715,6 +713,65 @@ fn label_adds_and_removes() {
         .collect();
     labels.sort();
     assert_eq!(labels, ["keep", "y", "z"]);
+}
+
+fn sorted_labels(v: &serde_json::Value) -> Vec<String> {
+    let mut labels: Vec<String> = v["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap().to_string())
+        .collect();
+    labels.sort();
+    labels
+}
+
+/// AGT-1577: global flags after the changes are flags, not `-json`-style
+/// removals; single-dash tokens are still removals.
+#[test]
+fn label_takes_global_flags_after_the_changes() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T", "--label", "b,json"]));
+
+    let v = json(&sb.pm(&["label", "AGT-1", "+a", "-b", "--json"]));
+    assert_eq!(sorted_labels(&v), ["a", "json"]);
+
+    // `--as` (both spellings) and `--workspace` after the changes apply too.
+    let other = tempfile::tempdir().unwrap();
+    let v = json(&sb.pm(&[
+        "--workspace",
+        other.path().to_str().unwrap(),
+        "label",
+        "AGT-1",
+        "+c",
+        "--workspace",
+        sb.ws_str(),
+        "--as=carol",
+        "--json",
+    ]));
+    assert_eq!(sorted_labels(&v), ["a", "c", "json"]);
+    let log = stdout(&sb.pm(&["log", "AGT-1"]));
+    assert!(log.contains("carol"), "{log}");
+
+    let v = json(&sb.pm(&["label", "AGT-1", "-c", "--as", "dave", "--json"]));
+    assert_eq!(sorted_labels(&v), ["a", "json"]);
+}
+
+#[test]
+fn label_rejects_unknown_double_dash_tokens_as_usage() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "T", "--label", "x"]));
+    for bad in [
+        &["label", "AGT-1", "-x", "--bogus"][..],
+        &["label", "AGT-1", "-x", "--json=1"],
+        &["label", "AGT-1", "-x", "--as"],
+        &["label", "AGT-1", "--json"],
+    ] {
+        assert_code(&sb.pm(bad), 2);
+    }
+    // Nothing landed: `x` is still there.
+    let v = json(&sb.pm(&["--json", "show", "AGT-1"]));
+    assert_eq!(sorted_labels(&v), ["x"]);
 }
 
 #[test]
