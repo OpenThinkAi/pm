@@ -1210,6 +1210,46 @@ fn every_verbs_json_output_matches_its_fixture() {
         }
     }
 
+    // ---- bulk comment/hold/archive (AGT-1576) ----
+    // Several ids print `{schema, results: [{id, result, ticket}]}`. In its
+    // own sandbox so the extra ops/holds/archives never reach the fixtures
+    // above or below.
+    {
+        let bulk = Sandbox::new();
+        let mut setup = vec![bulk.pm(&[
+            "init",
+            "--prefix",
+            "AGT",
+            "--preset",
+            "saltline",
+            "--workspace",
+            bulk.ws_str(),
+        ])];
+        for title in ["bulk one", "bulk two"] {
+            setup.push(bulk.pm(&["new", "--title", title]));
+        }
+        if let Some(out) = setup.iter().find(|o| !o.status.success()) {
+            failures.push(format!("bulk setup failed: {}", stderr(out)));
+        }
+        for (name, args) in [
+            (
+                "comment_bulk",
+                &["comment", "AGT-1,AGT-2", "provenance", "--json"][..],
+            ),
+            (
+                "hold_bulk",
+                &["hold", "AGT-1", "AGT-2", "needs Matt", "--json"],
+            ),
+            (
+                "hold_clear_bulk",
+                &["hold", "--clear", "AGT-1", "AGT-2", "--json"],
+            ),
+            ("archive_bulk", &["archive", "AGT-1", "AGT-2", "--json"]),
+        ] {
+            capture(&bulk, name, args, 0, &mut failures);
+        }
+    }
+
     // ---- pm project delete ----
     // The creation here is only scaffolding for the delete below (already
     // covered by the "project_new" fixture above), so it runs unfixtured.

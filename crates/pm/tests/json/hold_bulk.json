@@ -1,0 +1,95 @@
+{
+  "results": [
+    {
+      "id": "AGT-1",
+      "result": "held",
+      "ticket": {
+        "archived_at": null,
+        "assignee": null,
+        "blocked_by": [],
+        "created": {
+          "counter": 0,
+          "wall_ms": 0
+        },
+        "deleted": false,
+        "description": "",
+        "ext": {},
+        "hold": {
+          "at": {
+            "counter": 0,
+            "wall_ms": 0
+          },
+          "by": "tester",
+          "reason": "needs Matt"
+        },
+        "id": "AGT-1",
+        "labels": [],
+        "linear": null,
+        "linked_github": null,
+        "linked_pr": null,
+        "not_before": null,
+        "number": 1,
+        "parked": null,
+        "priority": "medium",
+        "project": null,
+        "repo": null,
+        "schema": 1,
+        "source": null,
+        "state": "triage",
+        "title": "bulk one",
+        "ulid": "<ULID>",
+        "updated": {
+          "counter": 0,
+          "wall_ms": 0
+        },
+        "waivers": []
+      }
+    },
+    {
+      "id": "AGT-2",
+      "result": "held",
+      "ticket": {
+        "archived_at": null,
+        "assignee": null,
+        "blocked_by": [],
+        "created": {
+          "counter": 0,
+          "wall_ms": 0
+        },
+        "deleted": false,
+        "description": "",
+        "ext": {},
+        "hold": {
+          "at": {
+            "counter": 0,
+            "wall_ms": 0
+          },
+          "by": "tester",
+          "reason": "needs Matt"
+        },
+        "id": "AGT-2",
+        "labels": [],
+        "linear": null,
+        "linked_github": null,
+        "linked_pr": null,
+        "not_before": null,
+        "number": 2,
+        "parked": null,
+        "priority": "medium",
+        "project": null,
+        "repo": null,
+        "schema": 1,
+        "source": null,
+        "state": "triage",
+        "title": "bulk two",
+        "ulid": "<ULID>",
+        "updated": {
+          "counter": 0,
+          "wall_ms": 0
+        },
+        "waivers": []
+      }
+    }
+  ],
+  "schema": 1
+}

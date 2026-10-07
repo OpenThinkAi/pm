@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use pm_core::markers::{MarkerError, date_from_ms, normalize_rule, with_waiver};
 use pm_core::op::{FieldSet, HoldSet};
-use pm_core::{Hlc, Hold, Payload, Ticket, Waiver};
+use pm_core::{Hold, Payload, Ticket, Waiver};
 use pm_store::TicketFilter;
 use serde_json::json;
 use ulid::Ulid;
@@ -27,52 +27,52 @@ impl From<MarkerError> for CliError {
 
 /// `pm hold AGT-N "why"` sets `hold{reason, by, at}` (`by` is this
 /// command's actor, `at` its op's HLC); `pm hold --clear AGT-N` clears it.
-/// Clearing a ticket that is not held is a no-op, not an error.
-pub fn hold(ctx: &Ctx<'_>, reference: &str, reason: Option<&str>, clear: bool) -> Result<()> {
-    let reason = match (reason, clear) {
-        (Some(_), true) => {
-            return Err(CliError::usage(
-                "a hold reason and --clear are mutually exclusive",
-            ));
-        }
-        (None, false) => {
-            return Err(CliError::usage(
-                "a hold reason is required (or --clear to release the hold)",
-            ));
-        }
-        (Some(reason), false) => Some(non_empty("hold reason", reason)?),
-        (None, true) => None,
-    };
+/// Clearing a ticket that is not held is a no-op, not an error. AGT-1576:
+/// several ids (`pm hold AGT-1 AGT-2 "why"`, or `AGT-1,AGT-2`) are held or
+/// cleared in one `commit_batch`, every id resolved first (`crate::bulk`).
+pub fn hold(ctx: &Ctx<'_>, positionals: &[String], clear: bool) -> Result<()> {
+    let (refs, reason) = crate::bulk::split_text(
+        positionals,
+        clear,
+        "a hold reason",
+        "a hold reason is required (or --clear to release the hold)",
+        "a hold reason and --clear are mutually exclusive",
+    )?;
+    let reason = reason.map(|r| non_empty("hold reason", r)).transpose()?;
     let actor = ctx.actor()?;
     let (mut store, ws) = ctx.open()?;
-    let ticket = find(&store, &ws, reference)?;
+    let targets = crate::bulk::resolve(&store, &ws, refs)?;
     let mut stamper = Stamper::new(&store, actor.clone())?;
-    match reason {
-        Some(reason) => {
-            let mut op = stamper.op(
-                ticket.id,
-                Payload::HoldSet(HoldSet {
-                    hold: Hold {
-                        reason,
-                        by: actor,
-                        at: Hlc::ZERO,
-                    },
-                }),
-            );
-            let hlc = op.hlc;
-            if let Payload::HoldSet(set) = &mut op.payload {
-                set.hold.at = hlc;
+    let mut ops = Vec::new();
+    let mut results: Vec<(Ulid, &str)> = Vec::new();
+    for ticket in &targets.tickets {
+        match &reason {
+            Some(reason) => {
+                ops.push(stamper.op_with_hlc(ticket.id, |hlc| {
+                    Payload::HoldSet(HoldSet {
+                        hold: Hold {
+                            reason: reason.clone(),
+                            by: actor.clone(),
+                            at: hlc,
+                        },
+                    })
+                }));
+                results.push((ticket.id, "held"));
             }
-            store.commit(&op)?;
-        }
-        None if ticket.hold.is_none() => {
-            eprintln!("pm: {} is not held", display_id(&ws, &ticket));
-        }
-        None => {
-            store.commit(&stamper.op(ticket.id, Payload::HoldClear))?;
+            None if ticket.hold.is_none() => {
+                eprintln!("pm: {} is not held", display_id(&ws, ticket));
+                results.push((ticket.id, "not-held"));
+            }
+            None => {
+                ops.push(stamper.op(ticket.id, Payload::HoldClear));
+                results.push((ticket.id, "cleared"));
+            }
         }
     }
-    print_result(ctx, &store, &ws, ticket.id)
+    if !ops.is_empty() {
+        store.commit_batch(&ops, &[])?;
+    }
+    crate::bulk::print_results(ctx, &store, &ws, targets.many, &results)
 }
 
 pub struct HoldsArgs {
@@ -218,7 +218,7 @@ fn print_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pm_core::{ActorId, NotBefore, Parked};
+    use pm_core::{ActorId, Hlc, NotBefore, Parked};
 
     #[test]
     fn marker_block_is_fixed_order_and_empty_without_markers() {

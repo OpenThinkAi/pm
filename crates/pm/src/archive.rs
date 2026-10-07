@@ -34,33 +34,42 @@ use ulid::Ulid;
 use crate::exit::{CliError, Result};
 use crate::verbs::{Ctx, SCHEMA, Stamper, display_id, find, print_json, ref_id, ticket_json};
 
-/// `pm archive AGT-N` or `pm archive --auto [--dry-run]`; clap's
+/// `pm archive AGT-N…` or `pm archive --auto [--dry-run]`; clap's
 /// `conflicts_with`/`requires` rule out the other two combinations
-/// (`id` with `--auto`, `--dry-run` without `--auto`).
-pub fn archive(ctx: &Ctx<'_>, id: Option<String>, auto: bool, dry_run: bool) -> Result<()> {
-    match (id, auto) {
-        (Some(id), false) => archive_one(ctx, &id),
-        (None, true) => archive_auto(ctx, dry_run),
-        (None, false) => Err(CliError::usage("pm archive requires an id or --auto")),
-        (Some(_), true) => unreachable!("clap's conflicts_with rules this out"),
+/// (ids with `--auto`, `--dry-run` without `--auto`).
+pub fn archive(ctx: &Ctx<'_>, ids: &[String], auto: bool, dry_run: bool) -> Result<()> {
+    match (ids.is_empty(), auto) {
+        (false, false) => archive_ids(ctx, ids),
+        (true, true) => archive_auto(ctx, dry_run),
+        (true, false) => Err(CliError::usage("pm archive requires an id or --auto")),
+        (false, true) => unreachable!("clap's conflicts_with rules this out"),
     }
 }
 
-// ------------------------------------------------------------ single ticket
+// ------------------------------------------------------------ named tickets
 
 /// `pm archive AGT-N` (AC3): sets `archived_at` to this op's own HLC,
 /// regardless of the ticket's current state — an explicit request, unlike
-/// `--auto`, which only ever touches completed tickets.
-fn archive_one(ctx: &Ctx<'_>, reference: &str) -> Result<()> {
+/// `--auto`, which only ever touches completed tickets. AGT-1576: several
+/// ids (`pm archive AGT-1 AGT-2`, or `AGT-1,AGT-2`) archive in one
+/// `commit_batch`, every id resolved first (`crate::bulk`).
+fn archive_ids(ctx: &Ctx<'_>, refs: &[String]) -> Result<()> {
     let actor = ctx.actor()?;
     let (mut store, ws) = ctx.open()?;
-    let ticket = find(&store, &ws, reference)?;
+    let targets = crate::bulk::resolve(&store, &ws, refs)?;
     let mut stamper = Stamper::new(&store, actor)?;
-    let op = stamper.op_with_hlc(ticket.id, |hlc| {
-        Payload::FieldSet(FieldSet::ArchivedAt(Some(hlc)))
-    });
-    store.commit(&op)?;
-    print_ticket(ctx, &store, &ws, ticket.id)
+    let ops: Vec<pm_core::Op> = targets
+        .tickets
+        .iter()
+        .map(|t| {
+            stamper.op_with_hlc(t.id, |hlc| {
+                Payload::FieldSet(FieldSet::ArchivedAt(Some(hlc)))
+            })
+        })
+        .collect();
+    store.commit_batch(&ops, &[])?;
+    let results: Vec<(Ulid, &str)> = targets.tickets.iter().map(|t| (t.id, "archived")).collect();
+    crate::bulk::print_results(ctx, &store, &ws, targets.many, &results)
 }
 
 /// `pm unarchive AGT-N` (AC3): clears `archived_at`.

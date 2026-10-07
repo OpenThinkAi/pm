@@ -274,10 +274,45 @@ referenced below as **Ticket** rather than repeated per verb:
 Verbs that print exactly this shape (a single object, or — for `pm list`
 and `pm new --batch`'s `tickets` — an array/field of them): `pm new`
 (single, `--from-file`), `pm show` (no `--field`/`--section`), `pm set`,
-`pm label`, `pm relate`, `pm comment`, `pm move`, `pm done`, `pm unclaim`, `pm claim`
+`pm label`, `pm relate`, `pm comment` (one id; several print **Results**,
+below), `pm move`, `pm done`, `pm unclaim`, `pm claim`
 (on success), `pm edit`, `pm list` (a bare JSON array of Ticket, no
 wrapping object), `pm ready`'s `ready` array, `pm holds`'s `tickets`
 array, `pm new --batch`'s `tickets` array.
+
+A **Results** shape (`bulk::print_results`, AGT-1576) — what `pm
+comment`, `pm hold` and `pm archive` print with `--json` when more than
+one id is named (one id keeps **Ticket**):
+
+```jsonc
+{
+  "schema": 1,
+  "results": [
+    {
+      "id": "AGT-12",              // a ref (see "Ticket ids"): the ULID while the number is pending
+      "result": "string",          // what happened to this ticket; per verb below
+      "ticket": {/* Ticket, as it reads after the call */}
+    },
+    ...                            // one per distinct ticket, in the order named
+  ]
+}
+```
+
+**Bulk forms** (AGT-1576). `pm comment`, `pm hold` and `pm archive`
+take one id or several — repeated (`pm archive AGT-1 AGT-2`),
+comma-separated (`pm hold AGT-1,AGT-2 "why"`), or both. Every id is
+resolved before anything is written, so an unknown id (exit `3`) or a
+malformed one (exit `2`, including an empty piece such as `AGT-1,,AGT-2`)
+fails the whole call with nothing committed; otherwise every ticket's ops
+land in one transaction (`commit_batch`). A ticket named twice is acted
+on once. `comment`/`hold` take their text (comment body, hold reason) as
+the **last** positional unless `--file`/`--clear` stands in for it, so
+two guards keep text and ids apart, both exit `2`: a text that is itself
+nothing but id-shaped tokens (`pm comment AGT-1 AGT-2` — text forgotten;
+use `--file` to post a comment that really is just an id), and a last
+positional that is not id-shaped next to `--file`/`--clear` (text given
+twice). Text output for several ids is one display id per line, in the
+order named.
 
 A **Project** shape (`project::project_json`), similarly shared by
 `pm project new`/`show`/`edit`/`set` and each element of `pm project list`'s
@@ -541,14 +576,17 @@ that is not, is a no-op.
   unchanged (the affected tickets are the flags' targets; `pm show` them
   to see their `blocked_by`).
 
-### `pm comment <ID> [TEXT]`
+### `pm comment <ID>... [TEXT]`
 
 Flags: `--file <PATH|->` (mutually exclusive with the positional `TEXT`;
-`-` reads stdin).
+`-` reads stdin). Several ids each get the same comment, in one
+transaction (see **Bulk forms**).
 
-- Exit `2`: neither `TEXT` nor `--file` given, both given, or the body is
-  empty after trimming.
-- `--json`: **Ticket**.
+- Exit `2`: neither `TEXT` nor `--file` given, both given, the body is
+  empty after trimming, or `TEXT` is id-shaped (**Bulk forms**).
+- Exit `3`: any id does not exist (nothing is written).
+- `--json`: **Ticket** for one id; **Results** for several, each
+  `result` `"commented"`.
 
 ### `pm move <ID> <STATE>`
 
@@ -922,13 +960,19 @@ gate). `pm claim --ready` uses the same frontier.
   }
   ```
 
-### `pm hold <ID> [REASON]`
+### `pm hold <ID>... [REASON]`
 
 Flags: `--clear` (mutually exclusive with `REASON`; releases the hold —
-a no-op, not an error, if the ticket was not held).
+a no-op, not an error, if the ticket was not held: `pm: <id> is not
+held` on stderr). Several ids are held (each `hold.at` its own op's HLC)
+or cleared in one transaction (see **Bulk forms**).
 
-- Exit `2`: neither `REASON` nor `--clear`; both given; empty `REASON`.
-- `--json`: **Ticket** (`hold` set, or `null` after `--clear`).
+- Exit `2`: neither `REASON` nor `--clear`; both given; empty `REASON`;
+  `REASON` is id-shaped (**Bulk forms**).
+- Exit `3`: any id does not exist (nothing is written).
+- `--json`: **Ticket** for one id (`hold` set, or `null` after
+  `--clear`); **Results** for several, each `result` `"held"`, or with
+  `--clear` `"cleared"` / `"not-held"` (the no-op).
 
 ### `pm holds`
 
@@ -1045,20 +1089,21 @@ op's content is dropped 30 days after its refusal, on the next pull).
   report is preceded by `pruned the content of N refused op(s) in the sync
   quarantine`.
 
-### `pm archive [ID]`
+### `pm archive [ID]...`
 
 Fields instead of `vault-sweep`'s folder moves: `archived_at` on a ticket,
 `status: complete` on a project. Flags: `--auto` (conflicts with `ID`:
 archive every completed ticket whose completion month has passed and
-retire every idle project, instead of one ticket), `--dry-run` (requires
-`--auto`: report what would change without writing anything).
+retire every idle project, instead of named tickets), `--dry-run` (requires
+`--auto`: report what would change without writing anything). Several
+ids archive in one transaction (see **Bulk forms**).
 
-- Exit `2`: neither `ID` nor `--auto` given.
-- Exit `3`: unknown ticket (single-ticket form).
-- `--json` (single-ticket form, `pm archive AGT-N`): **Ticket**,
-  `archived_at` now set to this op's own HLC — regardless of the ticket's
-  current state, unlike `--auto`, which only ever touches completed
-  tickets.
+- Exit `2`: neither `ID` nor `--auto` given; an id with `--auto`.
+- Exit `3`: any named ticket does not exist (nothing is written).
+- `--json` (named form, `pm archive AGT-N`): **Ticket**, `archived_at`
+  now set to this op's own HLC — regardless of the ticket's current
+  state, unlike `--auto`, which only ever touches completed tickets. For
+  several ids: **Results**, each `result` `"archived"`.
 - `--json --auto`:
   ```jsonc
   {
