@@ -19,6 +19,7 @@ mod ids;
 mod import;
 mod markers;
 mod mutate;
+mod pipe;
 mod project;
 mod read;
 mod ready;
@@ -35,7 +36,7 @@ use ticket::{Filter, State, Ticket};
 /// pm - local-first ticketing for agents and humans
 ///
 /// Exit codes: 0 ok, 1 error (or an unhealthy database, for doctor; findings, for check), 2 usage,
-/// 3 not found, 75 taken (claim).
+/// 3 not found, 75 taken (claim), 141 stdout closed early (e.g. `| head`).
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Cli {
@@ -477,6 +478,10 @@ enum TicketCmd {
 }
 
 fn main() -> ExitCode {
+    pipe::run(cli_main)
+}
+
+fn cli_main() -> ExitCode {
     // Clap exits 2 on usage errors and 0 for --help/--version.
     let cli = Cli::parse();
     let env = workspace::Env::from_process();
@@ -488,6 +493,7 @@ fn main() -> ExitCode {
     };
     match run(&ctx, cli.cmd) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if pipe::is_broken_pipe(&e.error) => ExitCode::from(exit::BROKEN_PIPE),
         Err(e) => {
             eprintln!("pm: {}", text::printable(&format!("{:#}", e.error)));
             ExitCode::from(e.code)

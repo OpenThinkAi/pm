@@ -50,6 +50,7 @@ Defined once, in `crates/pm/src/exit.rs`, and used by every verb:
 | `2` | usage | Bad arguments: clap's own parse failures (missing required flag, unknown flag, conflicting flags), and this crate's own validation (empty `--title`, an unparseable `--priority`, a malformed `key=value`, `pm new --batch` failing to validate any single entry before committing anything). |
 | `3` | not found | A named ticket, project, state, document or backup file does not exist. `pm claim --ready` with no ready ticket also exits `3`. |
 | `75` | taken | `pm claim`'s conditional op was rejected: the ticket was not `unstarted`-and-unassigned at the moment the authority admitted the winning claim. Only `pm claim` uses this code. |
+| `141` | stdout closed | Stdout's reader went away before pm finished writing (`pm list \| head -1`, quitting `less` early, `grep -q`). pm stops quietly — nothing on stderr — with `128 + SIGPIPE`, the status a shell reports for a writer `SIGPIPE` killed, so `set -o pipefail` sees it as it would for any other early-closed writer. Any verb can exit this way. |
 
 Clap's own `--help`/`--version` handling exits `0`; a clap parse error
 (unknown subcommand, missing required argument) exits `2` before any verb
