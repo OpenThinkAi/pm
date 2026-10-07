@@ -19,7 +19,8 @@ use std::process::Command;
 
 use anyhow::Context;
 use pm_core::markers::parse_date;
-use pm_core::{Priority, ProjectStatus, Source, Waiver, Workspace};
+use pm_core::{Priority, ProjectStatus, Source, StateCategory, Waiver, Workspace};
+use serde::Serialize;
 use serde_json::Value;
 
 use super::prose::{self, CommentEntry, Markers, Migrated};
@@ -76,6 +77,215 @@ pub struct VaultTicket {
     /// Read from a git object because the working-tree file had lost its
     /// frontmatter.
     pub recovered: bool,
+    /// The file's own `state:` when a [`StateMap`] rule rewrote it into
+    /// `state` (AGT-1518); `None` when the file's state is used as is.
+    pub mapped_from: Option<String>,
+}
+
+// ---------------------------------------------------------- state mapping
+
+/// Whether a mapped ticket is also put on hold (`pm hold`, by `import`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HoldRule {
+    Never,
+    Always,
+    /// Only when the file names no `blocked-by`: a ticket whose blockers
+    /// are imported as relations is already off the ready frontier.
+    NoBlockers,
+}
+
+/// How tickets in one vault state import (AGT-1518 AC4): into pm state
+/// `state`, optionally archived (`archived_at` = the first of the month
+/// of the file's `updated`, unless it already lives under `archive/20*/`)
+/// and/or held. From `--map-state VAULT=STATE[+archive][+hold]`, or one of
+/// the built-in defaults for `archived` and `blocked` ([`StateMap::new`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StateRule {
+    pub vault: String,
+    pub state: String,
+    pub archive: bool,
+    pub hold: HoldRule,
+    /// A built-in default rather than a `--map-state` flag.
+    pub default: bool,
+}
+
+/// Every vault-state rewrite an import applies. A vault state with no
+/// rule must be a workspace state of the same name.
+#[derive(Clone, Debug, Default)]
+pub struct StateMap {
+    rules: BTreeMap<String, StateRule>,
+}
+
+/// What a vault state imports as.
+enum Resolved<'a> {
+    /// A workspace state of the same name.
+    Same,
+    Rule(&'a StateRule),
+}
+
+impl StateMap {
+    /// The `--map-state` flags, checked against `ws`, plus the defaults:
+    /// a vault state the workspace has no state for and no flag maps
+    ///
+    /// - `archived` → the workspace's first `canceled` state (by position),
+    ///   else its first `completed` one, **archived**: pm models archive
+    ///   as `archived_at`, not a state, and a vault's `archived` folder
+    ///   holds tickets that were dropped;
+    /// - `blocked` → the workspace's initial (`unstarted`) state, **held**
+    ///   only when the file names no `blocked-by`: pm models blockers as
+    ///   relations (imported from `blocked-by`) and a human wait as a hold,
+    ///   so a blocked ticket with no recorded blocker is held rather than
+    ///   made claimable.
+    pub fn new(ws: &Workspace, flags: &[String]) -> Result<StateMap> {
+        let known = || {
+            ws.states
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut rules = BTreeMap::new();
+        for flag in flags {
+            let bad = || {
+                CliError::usage(format!(
+                    "--map-state '{flag}' is not VAULT=STATE[+archive][+hold] (e.g. qa=in-progress, archived=done+archive)"
+                ))
+            };
+            let (vault, target) = flag.split_once('=').ok_or_else(bad)?;
+            let vault = vault.trim();
+            let mut parts = target.split('+');
+            let state = parts.next().unwrap_or_default().trim();
+            if vault.is_empty() || state.is_empty() {
+                return Err(bad());
+            }
+            let (mut archive, mut hold) = (false, HoldRule::Never);
+            for modifier in parts {
+                match modifier.trim() {
+                    "archive" => archive = true,
+                    "hold" => hold = HoldRule::Always,
+                    _ => return Err(bad()),
+                }
+            }
+            if ws.state(state).is_none() {
+                return Err(CliError::usage(format!(
+                    "--map-state '{flag}': '{state}' is not a workflow state (expected one of {}; add it with `pm workspace state add`)",
+                    known()
+                )));
+            }
+            let rule = StateRule {
+                vault: vault.to_string(),
+                state: state.to_string(),
+                archive,
+                hold,
+                default: false,
+            };
+            if rules.insert(vault.to_string(), rule).is_some() {
+                return Err(CliError::usage(format!(
+                    "--map-state maps vault state '{vault}' twice"
+                )));
+            }
+        }
+        let first = |category: StateCategory| {
+            ws.states
+                .iter()
+                .find(|s| s.category == category)
+                .map(|s| s.name.clone())
+        };
+        let defaults = [
+            (
+                "archived",
+                first(StateCategory::Canceled).or_else(|| first(StateCategory::Completed)),
+                true,
+                HoldRule::Never,
+            ),
+            (
+                "blocked",
+                crate::verbs::initial_state(ws).ok(),
+                false,
+                HoldRule::NoBlockers,
+            ),
+        ];
+        for (vault, state, archive, hold) in defaults {
+            if let Some(state) = state
+                && ws.state(vault).is_none()
+                && !rules.contains_key(vault)
+            {
+                rules.insert(
+                    vault.to_string(),
+                    StateRule {
+                        vault: vault.to_string(),
+                        state,
+                        archive,
+                        hold,
+                        default: true,
+                    },
+                );
+            }
+        }
+        Ok(StateMap { rules })
+    }
+
+    /// Every rule, by vault state.
+    pub fn rules(&self) -> impl Iterator<Item = &StateRule> {
+        self.rules.values()
+    }
+
+    fn resolve(&self, ws: &Workspace, vault_state: &str) -> Option<Resolved<'_>> {
+        match self.rules.get(vault_state) {
+            Some(rule) => Some(Resolved::Rule(rule)),
+            None => ws.state(vault_state).map(|_| Resolved::Same),
+        }
+    }
+}
+
+/// The pre-flight (AGT-1518 AC4): reads just the `state:` of every ticket
+/// file and fails — before any file is fully parsed, and so before
+/// anything is written — listing every state that is neither a workspace
+/// state nor mapped, with how many files carry it. A file whose
+/// frontmatter does not parse is skipped here; the full read names it.
+fn preflight_states(files: &[PathBuf], ws: &Workspace, map: &StateMap) -> Result<()> {
+    let mut unknown: BTreeMap<String, usize> = BTreeMap::new();
+    for path in files {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok((fm_text, _)) = batch::split_frontmatter(&text) else {
+            continue;
+        };
+        let normalized = quote_bare_scalars(fm_text, "", &mut Findings::default());
+        let Ok(fm) = crate::yaml::from_str::<FileFrontmatter>(&normalized) else {
+            continue;
+        };
+        if let Some(Value::String(state)) = fm.state {
+            let state = state.trim();
+            if !state.is_empty() && map.resolve(ws, state).is_none() {
+                *unknown.entry(state.to_string()).or_default() += 1;
+            }
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let known: Vec<&str> = ws.states.iter().map(|s| s.name.as_str()).collect();
+    let lines: Vec<String> = unknown
+        .iter()
+        .map(|(state, n)| {
+            format!(
+                "  {} ({n} ticket{})",
+                crate::text::inline(state),
+                if *n == 1 { "" } else { "s" }
+            )
+        })
+        .collect();
+    Err(CliError::usage(format!(
+        "the vault uses {} ticket state(s) this workspace lacks (it has {}):\n{}\n\
+         add each with `pm workspace state add <NAME> --category <CATEGORY>`, or map it with \
+         `--map-state <VAULT>=<STATE>[+archive][+hold]`; nothing was imported",
+        unknown.len(),
+        known.join(", "),
+        lines.join("\n")
+    )))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,7 +346,14 @@ pub struct Snapshot {
 /// the import before anything is written, naming the file and line.
 /// `recover` is `(relative path, git rev)` pairs beyond
 /// [`RECOVER_FROM_GIT`].
-pub fn read(root: &Path, ws: &Workspace, recover: &[(String, String)]) -> Result<Snapshot> {
+/// `map` rewrites vault states the workspace lacks; a state neither the
+/// workspace nor `map` knows fails the pre-flight ([`preflight_states`]).
+pub fn read(
+    root: &Path,
+    ws: &Workspace,
+    recover: &[(String, String)],
+    map: &StateMap,
+) -> Result<Snapshot> {
     let root = fs::canonicalize(root).with_context(|| format!("resolving {}", root.display()))?;
     if !root.join("tickets").is_dir() {
         return Err(CliError::usage(format!(
@@ -153,9 +370,11 @@ pub fn read(root: &Path, ws: &Workspace, recover: &[(String, String)]) -> Result
         root: root.clone(),
         ..Snapshot::default()
     };
-    for path in ticket_files(&root)? {
+    let files = ticket_files(&root)?;
+    preflight_states(&files, ws, map)?;
+    for path in files {
         let rel = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
-        let ticket = read_ticket(&root, &rel, ws, &recover, &mut snapshot.findings)?;
+        let ticket = read_ticket(&root, &rel, ws, map, &recover, &mut snapshot.findings)?;
         snapshot.tickets.push(ticket);
     }
     merge_recovered(&mut snapshot, &ws.prefix);
@@ -278,6 +497,7 @@ fn read_ticket(
     root: &Path,
     rel: &Path,
     ws: &Workspace,
+    map: &StateMap,
     recover: &[(&str, &str)],
     findings: &mut Findings,
 ) -> Result<VaultTicket> {
@@ -300,7 +520,7 @@ fn read_ticket(
         ));
         (recovered, Some(text))
     };
-    parse_ticket(&text, appended.as_deref(), rel, ws, findings)
+    parse_ticket(&text, appended.as_deref(), rel, ws, map, findings)
 }
 
 /// Parses one ticket file's text (`pub(super)`: the parity report parses
@@ -312,6 +532,7 @@ pub(super) fn parse_ticket(
     appended: Option<&str>,
     rel: &Path,
     ws: &Workspace,
+    map: &StateMap,
     findings: &mut Findings,
 ) -> Result<VaultTicket> {
     let shown = rel.display().to_string();
@@ -340,15 +561,15 @@ pub(super) fn parse_ticket(
             ws.prefix
         ))
     })?;
-    let state = scalar("state", &fm.state)?;
-    if ws.state(&state).is_none() {
+    let vault_state = scalar("state", &fm.state)?;
+    let Some(resolved) = map.resolve(ws, &vault_state) else {
         let known: Vec<&str> = ws.states.iter().map(|s| s.name.as_str()).collect();
         return Err(CliError::usage(format!(
-            "{}: state '{state}' is not a workflow state (expected one of {})",
+            "{}: state '{vault_state}' is not a workflow state (expected one of {})",
             at("state"),
             known.join(", ")
         )));
-    }
+    };
     let created = scalar("created", &fm.created)?;
     let created_ms = parse_timestamp(&created).ok_or_else(|| {
         CliError::usage(format!(
@@ -475,12 +696,29 @@ pub(super) fn parse_ticket(
     // exported file carries it in both places) is one marker.
     dedup(&mut markers.waivers);
     dedup(&mut markers.holds);
-    let hold = (!markers.holds.is_empty()).then(|| markers.holds.join("; "));
+    let mut hold = (!markers.holds.is_empty()).then(|| markers.holds.join("; "));
     let parked = markers.parked.last().map(|p| prose::parked_until(p));
     if let Some((_, Some(reason))) = &parked {
         ext.insert("parked_reason".to_string(), Value::String(reason.clone()));
     }
-    let archived_month_ms = archive_month(rel).map(|(y, m)| date_ms(y, m, 1));
+    let mut archived_month_ms = archive_month(rel).map(|(y, m)| date_ms(y, m, 1));
+    let (state, mapped_from) = match resolved {
+        Resolved::Same => (vault_state, None),
+        Resolved::Rule(rule) => {
+            if rule.archive && archived_month_ms.is_none() {
+                archived_month_ms = Some(month_start(updated_ms));
+            }
+            let held = match rule.hold {
+                HoldRule::Never => false,
+                HoldRule::Always => true,
+                HoldRule::NoBlockers => blocked_by.is_empty(),
+            };
+            if held && hold.is_none() {
+                hold = Some(format!("vault state '{vault_state}'"));
+            }
+            (rule.state.clone(), Some(vault_state))
+        }
+    };
 
     Ok(VaultTicket {
         path: rel.to_path_buf(),
@@ -523,7 +761,18 @@ pub(super) fn parse_ticket(
         archived_month_ms,
         migrated,
         recovered,
+        mapped_from,
     })
+}
+
+/// UTC midnight on the first of `ms`'s month — the `archived_at` an
+/// `archive/YYYY-MM/` folder gives, so a mapped-and-archived ticket
+/// exports into the month its file was last updated.
+fn month_start(ms: u64) -> u64 {
+    let date = pm_core::markers::date_from_ms(ms);
+    let year: i64 = date[..4].parse().unwrap_or(1970);
+    let month: u32 = date[5..7].parse().unwrap_or(1);
+    date_ms(year, month, 1)
 }
 
 /// Drops later repeats, keeping first occurrences in order.
@@ -1010,5 +1259,68 @@ mod tests {
         assert_eq!(fm_line("id: x\ntitle: t\nstate: s", "state"), 4);
         assert_eq!(project_status("shipped"), Some(ProjectStatus::Complete));
         assert_eq!(project_status("weird"), None);
+    }
+
+    fn ws(states: &[(&str, StateCategory)]) -> Workspace {
+        Workspace {
+            id: ulid::Ulid::new(),
+            prefix: "AGT".into(),
+            states: states
+                .iter()
+                .enumerate()
+                .map(|(i, (name, category))| pm_core::State {
+                    name: name.to_string(),
+                    category: *category,
+                    position: i as u32,
+                })
+                .collect(),
+            gate_labels: Default::default(),
+            model_labels: Default::default(),
+            template_sections: Vec::new(),
+            stale_days: 30,
+            docs_owned_by: Default::default(),
+        }
+    }
+
+    #[test]
+    fn state_map_defaults_prefer_a_canceled_state_and_yield_to_flags_and_real_states() {
+        use StateCategory::*;
+        let rule = |m: &StateMap, v: &str| m.rules.get(v).cloned();
+        let plain = ws(&[("todo", Unstarted), ("done", Completed)]);
+        let m = StateMap::new(&plain, &[]).unwrap();
+        assert_eq!(rule(&m, "archived").unwrap().state, "done");
+        assert!(rule(&m, "archived").unwrap().archive);
+        assert_eq!(rule(&m, "blocked").unwrap().state, "todo");
+        assert_eq!(rule(&m, "blocked").unwrap().hold, HoldRule::NoBlockers);
+
+        let canceled = ws(&[
+            ("todo", Unstarted),
+            ("done", Completed),
+            ("dropped", Canceled),
+        ]);
+        let m = StateMap::new(&canceled, &[]).unwrap();
+        assert_eq!(rule(&m, "archived").unwrap().state, "dropped");
+
+        // A workspace state of that name wins over the default...
+        let real = ws(&[
+            ("todo", Unstarted),
+            ("blocked", Started),
+            ("done", Completed),
+        ]);
+        let m = StateMap::new(&real, &[]).unwrap();
+        assert!(rule(&m, "blocked").is_none());
+        // ...and a flag over both.
+        let m = StateMap::new(&real, &["blocked=done+archive+hold".into()]).unwrap();
+        let r = rule(&m, "blocked").unwrap();
+        assert_eq!(
+            (r.state.as_str(), r.archive, r.hold, r.default),
+            ("done", true, HoldRule::Always, false)
+        );
+    }
+
+    #[test]
+    fn month_start_is_the_first_of_the_month() {
+        let ms = parse_timestamp("2026-08-15T10:00:00Z").unwrap();
+        assert_eq!(date_from_ms(month_start(ms)), "2026-08-01");
     }
 }

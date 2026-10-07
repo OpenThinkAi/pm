@@ -69,6 +69,9 @@ enum Cmd {
         /// Join an existing workspace by its ULID as an empty replica: no states, no ops; `pm hub login` then `pm sync` pull its log from the hub
         #[arg(long, value_name = "WORKSPACE-ULID", conflicts_with = "preset")]
         join: Option<ulid::Ulid>,
+        /// Seed this workflow instead of the preset's: NAME:CATEGORY, repeat or comma-separate, in order (category backlog|unstarted|started|completed|canceled)
+        #[arg(long = "state", value_name = "NAME:CATEGORY", value_delimiter = ',', value_parser = verbs::parse_state_spec, conflicts_with = "join")]
+        states: Vec<(String, pm_core::StateCategory)>,
     },
     /// File a ticket (or several) and print their id(s)
     New {
@@ -373,7 +376,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: project::ProjectCmd,
     },
-    /// Workspace config verbs (config ops in the log): gate-label add/remove/list
+    /// Workspace config verbs (config ops in the log): gate-label, state, docs-owned-by
     Workspace {
         #[command(subcommand)]
         cmd: workspace::WorkspaceCmd,
@@ -443,6 +446,10 @@ enum ImportCmd {
         /// `pm export md --legacy-markers` would and diffed against its source file
         #[arg(long = "report", value_name = "FILE")]
         report: Option<PathBuf>,
+        /// Import tickets in vault state VAULT as pm state STATE, optionally archived and/or held:
+        /// VAULT=STATE[+archive][+hold]; repeatable (see docs/cli-contract.md for the defaults)
+        #[arg(long = "map-state", value_name = "VAULT=STATE")]
+        map_state: Vec<String>,
     },
 }
 
@@ -501,7 +508,8 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             prefix,
             preset,
             join,
-        } => verbs::init(ctx, preset, prefix.as_deref(), join),
+            states,
+        } => verbs::init(ctx, preset, prefix.as_deref(), join, &states),
         Cmd::New {
             title,
             project,
@@ -650,8 +658,9 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
                     dry_run,
                     recover,
                     report,
+                    map_state,
                 },
-        } => import::vault(ctx, &path, dry_run, &recover, report.as_deref()),
+        } => import::vault(ctx, &path, dry_run, &recover, report.as_deref(), &map_state),
         Cmd::Export {
             cmd: ExportCmd::Md {
                 dir,

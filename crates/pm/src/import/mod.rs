@@ -60,6 +60,7 @@ pub fn vault(
     dry_run: bool,
     recover: &[String],
     report_path: Option<&Path>,
+    map_state: &[String],
 ) -> Result<()> {
     let started = Instant::now();
     let recover: Vec<(String, String)> = recover
@@ -76,9 +77,11 @@ pub fn vault(
         })
         .collect::<Result<_>>()?;
     let (mut store, ws) = ctx.open()?;
-    let snapshot = vault::read(path, &ws, &recover)?;
+    let state_map = vault::StateMap::new(&ws, map_state)?;
+    let snapshot = vault::read(path, &ws, &recover, &state_map)?;
     let mut report = Report::new(path.display().to_string(), &ws.prefix, dry_run);
     report.files = snapshot.tickets.len();
+    report.state_map = report::state_map(&state_map, &snapshot.tickets);
     report.archived = snapshot
         .tickets
         .iter()

@@ -326,6 +326,35 @@ pub enum WorkspaceCmd {
         /// `vault` or `pm`
         owner: Option<String>,
     },
+    /// Manage the workflow states (AGT-1518): add or re-categorise one, list them
+    State {
+        #[command(subcommand)]
+        cmd: StateCmd,
+    },
+}
+
+/// `pm workspace state add|list` (AGT-1518). A state is a `state.upsert`
+/// config op — the same kind `pm init` writes — so it syncs, backs up and
+/// replays like any other config op, and `pm move`/`pm list --state`/`pm
+/// status`/`pm ready`/the app board read it from the workspace on their
+/// next call. States are add-only: there is no `state.remove` kind and
+/// tickets reference a state by name (foreign key), so a state that is no
+/// longer wanted is re-categorised or moved to the end instead.
+#[derive(clap::Subcommand, Debug)]
+pub enum StateCmd {
+    /// Add a workflow state, or change an existing one's category/position (upsert)
+    Add {
+        /// The state's name, as `pm move` and the vault's `state:` spell it
+        name: String,
+        /// backlog, unstarted, started, completed or canceled; required for a new state
+        #[arg(long, value_parser = crate::verbs::parse_category)]
+        category: Option<pm_core::StateCategory>,
+        /// Order among the states (0 first): later states at or after N shift down one; default: after the last state for a new one, unchanged for an existing one
+        #[arg(long, value_name = "N")]
+        position: Option<u32>,
+    },
+    /// List the workflow states in order
+    List,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -342,7 +371,135 @@ pub fn run(ctx: &crate::verbs::Ctx<'_>, cmd: WorkspaceCmd) -> Result<()> {
     match cmd {
         WorkspaceCmd::GateLabel { cmd } => gate_label(ctx, cmd),
         WorkspaceCmd::DocsOwnedBy { owner } => docs_owned_by(ctx, owner),
+        WorkspaceCmd::State { cmd } => state(ctx, cmd),
     }
+}
+
+fn state(ctx: &crate::verbs::Ctx<'_>, cmd: StateCmd) -> Result<()> {
+    match cmd {
+        StateCmd::List => {
+            let (_store, ws) = ctx.open()?;
+            if ctx.json {
+                crate::verbs::print_json(&serde_json::json!({
+                    "schema": crate::verbs::SCHEMA,
+                    "states": ws.states,
+                }));
+            } else {
+                for s in &ws.states {
+                    println!(
+                        "{}\t{}\t{}",
+                        crate::text::inline(&s.name),
+                        crate::verbs::category_name(s.category),
+                        s.position
+                    );
+                }
+            }
+            Ok(())
+        }
+        StateCmd::Add {
+            name,
+            category,
+            position,
+        } => {
+            let name = crate::verbs::non_empty("state name", &name)?;
+            crate::ids::safe_component(&name, "state name")?;
+            let actor = ctx.actor()?;
+            let (mut store, ws) = ctx.open()?;
+            let existing = ws.state(&name).cloned();
+            let wanted = match &existing {
+                Some(s) => pm_core::State {
+                    name: name.clone(),
+                    category: category.unwrap_or(s.category),
+                    position: position.unwrap_or(s.position),
+                },
+                None => pm_core::State {
+                    name: name.clone(),
+                    category: category.ok_or_else(|| {
+                        CliError::usage(format!(
+                            "'{name}' is a new state: --category is required \
+                             (backlog, unstarted, started, completed or canceled)"
+                        ))
+                    })?,
+                    position: position.unwrap_or_else(|| {
+                        ws.states.iter().map(|s| s.position + 1).max().unwrap_or(0)
+                    }),
+                },
+            };
+            if let Some(old) = &existing {
+                keeps_required_categories(&ws, old, wanted.category)?;
+            }
+            // An explicit position that another state already holds is an
+            // insert: that state and every later one shift down by one, so
+            // the new order is the one asked for rather than a name-ordered
+            // tie.
+            let mut upserts = vec![wanted.clone()];
+            if position.is_some()
+                && ws
+                    .states
+                    .iter()
+                    .any(|s| s.name != wanted.name && s.position == wanted.position)
+            {
+                upserts.extend(
+                    ws.states
+                        .iter()
+                        .filter(|s| s.name != wanted.name && s.position >= wanted.position)
+                        .map(|s| pm_core::State {
+                            position: s.position + 1,
+                            ..s.clone()
+                        }),
+                );
+            }
+            let changed = store.upsert_states(&upserts, &actor)? > 0;
+            if ctx.json {
+                let states = store.workspace()?.map(|w| w.states).unwrap_or_default();
+                crate::verbs::print_json(&serde_json::json!({
+                    "schema": crate::verbs::SCHEMA,
+                    "state": wanted,
+                    "created": existing.is_none(),
+                    "changed": changed,
+                    "states": states,
+                }));
+            } else {
+                let verb = match (&existing, changed) {
+                    (None, _) => "added",
+                    (Some(_), true) => "updated",
+                    (Some(_), false) => "unchanged",
+                };
+                println!(
+                    "{verb} state {} ({}, position {})",
+                    crate::text::inline(&wanted.name),
+                    crate::verbs::category_name(wanted.category),
+                    wanted.position
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Re-categorising `old` must not leave the workflow without an
+/// `unstarted` state (where `pm new` files) or a `completed` one (where
+/// `pm done` moves): exit `2` if it would.
+fn keeps_required_categories(
+    ws: &Workspace,
+    old: &pm_core::State,
+    category: pm_core::StateCategory,
+) -> Result<()> {
+    use pm_core::StateCategory::{Completed, Unstarted};
+    for required in [Unstarted, Completed] {
+        let others = ws
+            .states
+            .iter()
+            .any(|s| s.name != old.name && s.category == required);
+        if old.category == required && category != required && !others {
+            return Err(CliError::usage(format!(
+                "'{}' is the workspace's only {} state; add another before re-categorising it",
+                old.name,
+                crate::verbs::category_name(required)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn docs_owned_by(ctx: &crate::verbs::Ctx<'_>, owner: Option<String>) -> Result<()> {
