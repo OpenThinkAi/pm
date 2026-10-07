@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use pm_core::ready::{Frontier, Rules, Scope, frontier};
-use pm_core::{Ticket, Workspace};
+use pm_core::{ProjectStatus, Ticket, Workspace};
 
 use crate::Store;
 use crate::error::{Result, StoreError};
@@ -40,6 +40,7 @@ impl Store {
             today: query.today.clone(),
             gate_labels: query.gate_labels.clone(),
             model: None,
+            parked_projects: Default::default(),
         };
         let (tickets, frontier) = self.frontier(&ws, &scope, &rules)?;
         let ready: BTreeSet<_> = frontier.ready().into_iter().collect();
@@ -51,7 +52,9 @@ impl Store {
 
     /// [`pm_core::ready::frontier`] over this database, with the snapshot
     /// it ran on (so a caller can render the ids it names without going
-    /// back to the store).
+    /// back to the store). Every project whose status is `parked` here is
+    /// added to `rules.parked_projects` (AGT-1635), so no caller can
+    /// forget it.
     pub fn frontier(
         &self,
         ws: &Workspace,
@@ -60,7 +63,14 @@ impl Store {
     ) -> Result<(Vec<Ticket>, Frontier)> {
         let tickets = self.all_tickets()?;
         let relations = self.all_relations()?;
-        let frontier = frontier(ws, &tickets, &relations, scope, rules);
+        let mut rules = rules.clone();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM project WHERE status = ?1")?;
+        for id in stmt.query_map([ProjectStatus::Parked.as_str()], |r| r.get::<_, String>(0))? {
+            rules.parked_projects.insert(id?);
+        }
+        let frontier = frontier(ws, &tickets, &relations, scope, &rules);
         Ok((tickets, frontier))
     }
 }
@@ -340,6 +350,30 @@ mod tests {
             ..query()
         };
         assert!(ready_ids(&store, &none).is_empty());
+    }
+
+    /// AGT-1635: a parked project's tickets leave the frontier, scoped to
+    /// it or not, and come back when it is in progress again.
+    #[test]
+    fn a_parked_projects_tickets_are_not_ready() {
+        let (_dir, mut store) = fresh();
+        let mut seq = Seq(0);
+        let in_p = create(&mut store, &mut seq, Some("p"));
+        let in_q = create(&mut store, &mut seq, Some("q"));
+        let matt = ActorId::new("matt");
+        store
+            .set_project_status("p", ProjectStatus::Parked, &matt)
+            .unwrap();
+        assert_eq!(ready_ids(&store, &query()), vec![in_q]);
+        let p = ReadyQuery {
+            project: Some("p".into()),
+            ..query()
+        };
+        assert!(ready_ids(&store, &p).is_empty());
+        store
+            .set_project_status("p", ProjectStatus::InProgress, &matt)
+            .unwrap();
+        assert_eq!(ready_ids(&store, &query()), vec![in_p, in_q]);
     }
 
     // AGT-1351 AC2 ("archived tickets ... count as done for `pm ready`") is

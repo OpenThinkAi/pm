@@ -319,15 +319,7 @@ async fn projects(State(state): State<Arc<AppState>>, Query(q): Query<ProjectsQu
 /// A `?status=` value, parsed as `pm project list --status` parses it.
 fn project_status(status: Option<String>) -> Result<Option<pm_core::ProjectStatus>> {
     status
-        .map(|s| {
-            serde_json::from_value::<pm_core::ProjectStatus>(Value::String(s.clone())).map_err(
-                |_| {
-                    CliError::usage(format!(
-                        "unknown status '{s}': expected one of in-progress, complete, abandoned"
-                    ))
-                },
-            )
-        })
+        .map(|s| s.parse::<pm_core::ProjectStatus>().map_err(CliError::usage))
         .transpose()
 }
 

@@ -933,7 +933,7 @@ fn read_project(root: &Path, rel: &Path, findings: &mut Findings) -> Result<Vaul
                     &format!("project status: {s} (unknown, kept as in-progress)"),
                     shown.clone(),
                 );
-            } else if !matches!(s.as_str(), "in-progress" | "complete" | "abandoned") {
+            } else if s.parse::<ProjectStatus>().is_err() {
                 findings.note(&format!("project status: {s}"), shown.clone());
             }
             status = Some(mapped.unwrap_or(ProjectStatus::InProgress));
@@ -1110,12 +1110,14 @@ struct ProjectFm {
     repos: Vec<String>,
 }
 
-/// The vault's `status:` spellings onto pm's three (README §Data model).
+/// The vault's `status:` spellings onto pm's four (README §Data model;
+/// `parked`, AGT-1635).
 fn project_status(s: &str) -> Option<ProjectStatus> {
     Some(match s {
         "in-progress" | "active" | "planning" => ProjectStatus::InProgress,
         "complete" | "done" | "shipped" | "phase-1-complete" => ProjectStatus::Complete,
         "abandoned" | "obsolete" => ProjectStatus::Abandoned,
+        "parked" => ProjectStatus::Parked,
         _ => return None,
     })
 }
@@ -1258,6 +1260,7 @@ mod tests {
         assert_eq!(archive_month(Path::new("tickets/done/AGT-1220.md")), None);
         assert_eq!(fm_line("id: x\ntitle: t\nstate: s", "state"), 4);
         assert_eq!(project_status("shipped"), Some(ProjectStatus::Complete));
+        assert_eq!(project_status("parked"), Some(ProjectStatus::Parked));
         assert_eq!(project_status("weird"), None);
     }
 

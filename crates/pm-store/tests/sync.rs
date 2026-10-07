@@ -1121,3 +1121,40 @@ fn an_upserted_state_is_config_that_reaches_another_replica() {
     a.apply_pulled(&back).unwrap();
     assert_eq!(a.workspace().unwrap().unwrap().state("qa"), Some(&review));
 }
+
+/// AGT-1635 AC1: a `parked` status round-trips through the wire — the
+/// outbox op, serialized as the hub stores and serves it, pulled into a
+/// second replica — and survives that replica's doctor replay.
+#[test]
+fn a_parked_project_status_round_trips_through_a_pull() {
+    let (dir, store) = store();
+    drop(store);
+    let other = tempfile::tempdir().unwrap();
+    for name in ["pm.sqlite", "pm.sqlite-wal", "pm.sqlite-shm"] {
+        let from = dir.path().join(name);
+        if from.exists() {
+            std::fs::copy(&from, other.path().join(name)).unwrap();
+        }
+    }
+    let mut a = Store::open(dir.path().join("pm.sqlite")).unwrap();
+    let mut b = Store::open(other.path().join("pm.sqlite")).unwrap();
+    a.set_project_status("pm", ProjectStatus::Parked, &ActorId::new("matt"))
+        .unwrap();
+    let outbox = a.outbox(10).unwrap();
+    assert_eq!(outbox.len(), 1);
+    let wire: Vec<(i64, Op)> = outbox
+        .iter()
+        .map(|(seq, op)| {
+            let text = serde_json::to_string(op).unwrap();
+            assert!(text.contains(r#""parked":true"#), "{text}");
+            (*seq, serde_json::from_str(&text).unwrap())
+        })
+        .collect();
+    let pulled = b.apply_pulled_page(&wire, wire[0].0).unwrap();
+    assert_eq!(pulled.applied, 1, "{pulled:?}");
+    assert_eq!(
+        b.project("pm").unwrap().unwrap().status,
+        ProjectStatus::Parked
+    );
+    assert!(b.doctor().unwrap().is_healthy());
+}

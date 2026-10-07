@@ -12,7 +12,8 @@
 //! - it has no `hold`;
 //! - it carries no gate label ([`Rules::gate_labels`]: the workspace's,
 //!   e.g. `manual`, plus any the caller excludes);
-//! - it is not parked, and any `not_before` date has arrived;
+//! - it is not parked, its project is not parked ([`Rules::parked_projects`],
+//!   AGT-1635), and any `not_before` date has arrived;
 //! - it is not in a blocker cycle;
 //! - every ticket that `blocks` it is **done**: tombstoned, absent,
 //!   **archived**, or in a `completed` / `canceled` state. Archiving is
@@ -84,6 +85,10 @@ pub struct Rules {
     /// name `Workspace::model_labels` maps a label to). A ticket with no
     /// `model:` label counts as [`DEFAULT_MODEL`].
     pub model: Option<String>,
+    /// Projects whose status is `parked` (AGT-1635): their tickets are not
+    /// live work, so none of them is ready. They still count as pending
+    /// blockers, as a parked ticket does.
+    pub parked_projects: BTreeSet<String>,
 }
 
 /// Why a candidate is not ready. Tickets are ULIDs; the CLI renders them.
@@ -100,6 +105,8 @@ pub enum Reason {
     Label { label: String },
     /// Parked until `until` (or forever).
     Parked { until: String },
+    /// Its project's status is `parked` (AGT-1635).
+    ProjectParked { project: String },
     /// Its `not_before` date has not arrived.
     NotBefore { date: String },
     /// In a blocker cycle with `tickets` (sorted, itself included).
@@ -132,6 +139,7 @@ impl Reason {
             Reason::Held { .. } => "held",
             Reason::Label { .. } => "label",
             Reason::Parked { .. } => "parked",
+            Reason::ProjectParked { .. } => "project-parked",
             Reason::NotBefore { .. } => "not-before",
             Reason::Cycle { .. } => "cycle",
             Reason::BlockedBy { .. } => "blocked-by",
@@ -324,6 +332,15 @@ fn own_reason(t: &Ticket, ws: &Workspace, rules: &Rules, today: &str) -> Option<
     if let Some(parked) = t.parked.as_ref().filter(|p| p.is_active(today)) {
         return Some(Reason::Parked {
             until: parked.until.clone(),
+        });
+    }
+    if let Some(project) = t
+        .project
+        .as_ref()
+        .filter(|p| rules.parked_projects.contains(*p))
+    {
+        return Some(Reason::ProjectParked {
+            project: project.clone(),
         });
     }
     if let Some(nb) = t.not_before.as_ref().filter(|n| n.is_active(today)) {
@@ -570,6 +587,7 @@ mod tests {
             today: TODAY.into(),
             gate_labels: ["manual".to_string()].into(),
             model: None,
+            parked_projects: Default::default(),
         }
     }
 
@@ -992,6 +1010,67 @@ mod tests {
         assert_eq!(f.waves, vec![ids(&[5])]);
     }
 
+    /// AGT-1635: a parked project's tickets are never ready — after the
+    /// ticket's own park, before `not_before` — and a ticket elsewhere
+    /// blocked by one waits on it, as on a parked ticket.
+    #[test]
+    fn a_parked_projects_tickets_are_not_ready() {
+        let mut in_parked = ticket(1);
+        in_parked.project = Some("api-router".into());
+        let mut also_parked = ticket(2);
+        also_parked.project = Some("api-router".into());
+        also_parked.parked = Some(Parked {
+            until: "forever".into(),
+        });
+        let mut later = ticket(3);
+        later.project = Some("api-router".into());
+        later.not_before = Some(NotBefore {
+            date: "2026-10-01".into(),
+        });
+        let elsewhere = ticket(4);
+        let blocked = ticket(5);
+        let rel = blocks(1, 5);
+        let mut rules = rules();
+        rules.parked_projects.insert("api-router".into());
+        let tickets = [in_parked, also_parked, later, elsewhere, blocked];
+        let f = frontier(
+            &ws(),
+            &tickets,
+            std::slice::from_ref(&rel),
+            &Scope::All,
+            &rules,
+        );
+        let parked = Verdict::Excluded(Reason::ProjectParked {
+            project: "api-router".into(),
+        });
+        assert_eq!(verdict(&f, 1), &parked);
+        assert_eq!(
+            verdict(&f, 2),
+            &Verdict::Excluded(Reason::Parked {
+                until: "forever".into()
+            })
+        );
+        assert_eq!(verdict(&f, 3), &parked);
+        assert_eq!(verdict(&f, 4), &Verdict::Ready);
+        assert_eq!(
+            verdict(&f, 5),
+            &Verdict::Excluded(Reason::BlockedBy {
+                blocker: id(1),
+                gate: None
+            })
+        );
+        // Scoped to the parked project itself, still nothing is ready.
+        let scoped = frontier(
+            &ws(),
+            &tickets,
+            &[rel],
+            &Scope::Project("api-router".into()),
+            &rules,
+        );
+        assert!(scoped.ready().is_empty());
+        assert_eq!(f.ready(), ids(&[4]));
+    }
+
     #[test]
     fn waves_reports_stuck_nodes() {
         let nodes = ids(&[1, 2, 3]);
@@ -1015,6 +1094,9 @@ mod tests {
             Reason::Held { hold: hold() },
             Reason::Label { label: "l".into() },
             Reason::Parked { until: "u".into() },
+            Reason::ProjectParked {
+                project: "p".into(),
+            },
             Reason::NotBefore { date: "d".into() },
             Reason::Cycle { tickets: vec![] },
             Reason::BlockedBy {

@@ -9,7 +9,8 @@ use std::collections::BTreeSet;
 
 use pm_core::op::{BodyEdit, TicketCreate};
 use pm_core::{
-    ActorId, Body, Hlc, Op, Payload, Priority, ProjectKind, State, StateCategory, Workspace,
+    ActorId, Body, Hlc, Op, Payload, Priority, ProjectKind, ProjectStatus, State, StateCategory,
+    Workspace,
 };
 use pm_store::{Store, StoreError};
 use tempfile::TempDir;
@@ -576,10 +577,88 @@ fn upgrading_from_schema_12_reads_existing_projects_as_plain() {
     drop(conn);
 
     let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 13);
+    assert_eq!(store.schema_version().unwrap(), pm_store::SCHEMA_VERSION);
     assert_eq!(
         store.project("pm").unwrap().unwrap().kind,
         ProjectKind::Project
     );
     assert!(store.doctor().unwrap().is_healthy());
+}
+
+/// The `project` table's recorded schema.
+fn project_sql(conn: &rusqlite::Connection) -> String {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'project'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// AGT-1635: migration 0014 widens `project.status`'s CHECK to allow
+/// `parked` on a schema-13 database — rows, foreign keys and integrity
+/// intact — and running it again changes nothing.
+#[test]
+fn upgrading_from_schema_13_allows_a_parked_status() {
+    let (dir, mut store) = store();
+    let matt = ActorId::new("matt");
+    store
+        .create_project("pm", "pm", &BTreeSet::new(), None, &matt)
+        .unwrap();
+    store.commit(&create_ticket(Ulid::new(), 10, "pm")).unwrap();
+    drop(store);
+    let path = dir.path().join("pm.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let widened = project_sql(&conn);
+    assert!(widened.contains("'abandoned', 'parked'))"), "{widened}");
+    // Put back the schema-13 CHECK.
+    let cookie: i64 = conn
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    conn.execute_batch("PRAGMA writable_schema = ON").unwrap();
+    conn.execute(
+        "UPDATE sqlite_master SET sql = ?1 WHERE type = 'table' AND name = 'project'",
+        [widened.replace("'abandoned', 'parked'))", "'abandoned'))")],
+    )
+    .unwrap();
+    conn.execute_batch(&format!(
+        "PRAGMA schema_version = {}; PRAGMA writable_schema = OFF;
+         DELETE FROM schema_version WHERE version >= 14;",
+        cookie + 1
+    ))
+    .unwrap();
+    drop(conn);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        conn.execute("UPDATE project SET status = 'parked'", [])
+            .is_err(),
+        "schema 13 refuses parked"
+    );
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), pm_store::SCHEMA_VERSION);
+    store
+        .set_project_status("pm", ProjectStatus::Parked, &matt)
+        .unwrap();
+    assert_eq!(
+        store.project("pm").unwrap().unwrap().status,
+        ProjectStatus::Parked
+    );
+    assert_eq!(store.tickets(&Default::default()).unwrap().len(), 1);
+    assert!(store.doctor().unwrap().is_healthy());
+    drop(store);
+
+    // Re-running 0014 against a widened table is a no-op.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("DELETE FROM schema_version WHERE version >= 14", [])
+        .unwrap();
+    drop(conn);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(project_sql_of(&path), widened);
+    assert!(store.doctor().unwrap().is_healthy());
+}
+
+fn project_sql_of(path: &std::path::Path) -> String {
+    project_sql(&rusqlite::Connection::open(path).unwrap())
 }

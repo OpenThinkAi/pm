@@ -143,7 +143,7 @@ fn archive_auto(ctx: &Ctx<'_>, dry_run: bool) -> Result<()> {
     let mut project_targets: Vec<Project> = Vec::new();
     for p in store.projects()? {
         if p.status != ProjectStatus::InProgress {
-            continue; // already complete or abandoned
+            continue; // already complete or abandoned, or parked (AGT-1635)
         }
         let live = store.tickets(&TicketFilter {
             project: vec![p.id.clone()],

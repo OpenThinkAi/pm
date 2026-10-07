@@ -958,3 +958,67 @@ fn set_rejects_unknown_parents_projects_and_bad_assignments() {
     let v = json(&sb.pm(&["project", "show", "a", "--json"]));
     assert_eq!(v["title"], "A");
 }
+
+// ------------------------------------------- parked projects (AGT-1635)
+
+/// AC1/AC2: `status=parked` sets a project aside: `project list` shows it
+/// as parked (and `--status parked` finds it), `pm ready` leaves its
+/// tickets out — scoped to it or not — with reason `project-parked`, the
+/// doctor replay reproduces it, and setting it back brings them back.
+#[test]
+fn a_parked_projects_tickets_leave_the_ready_frontier() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "router", "--title", "Router"]));
+    assert_ok(&sb.pm(&["project", "new", "site", "--title", "Site"]));
+    assert_ok(&sb.pm(&["new", "--title", "route it", "--project", "router"]));
+    assert_ok(&sb.pm(&["new", "--title", "ship it", "--project", "site"]));
+    let ready_titles = |args: &[&str]| -> Vec<String> {
+        let mut all = vec!["ready", "--json"];
+        all.extend_from_slice(args);
+        json(&sb.pm(&all))["ready"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["title"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(ready_titles(&[]), ["route it", "ship it"]);
+
+    let v = json(&sb.pm(&["project", "set", "router", "status=parked", "--json"]));
+    assert_eq!(v["status"], "parked");
+    let text = stdout(&sb.pm(&["project", "list"]));
+    let router = text.lines().find(|l| l.starts_with("router")).unwrap();
+    assert!(router.contains(" parked "), "{text}");
+    let parked = json(&sb.pm(&["project", "list", "--status", "parked", "--json"]));
+    let ids: Vec<&str> = parked["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["router"]);
+    let log = stdout(&sb.pm(&["log"]));
+    assert!(
+        log.contains("set project 'router' status to parked"),
+        "{log}"
+    );
+
+    assert_eq!(ready_titles(&[]), ["ship it"]);
+    assert!(ready_titles(&["--project", "router"]).is_empty());
+    let v = json(&sb.pm(&["ready", "--json", "--project", "router"]));
+    assert_eq!(v["excluded"][0]["reason"], "project-parked");
+    assert_eq!(v["excluded"][0]["project"], "router");
+    let explain = stdout(&sb.pm(&["ready", "--explain", "--project", "router"]));
+    assert!(explain.contains("project router is parked"), "{explain}");
+    // `pm claim --ready` draws from the same frontier.
+    let out = sb.pm(&["claim", "--ready", "--project", "router"]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+
+    let v = json(&sb.pm(&["doctor", "--rebuild", "--json"]));
+    assert_eq!(v["healthy"], true);
+    let v = json(&sb.pm(&["project", "show", "router", "--json"]));
+    assert_eq!(v["status"], "parked");
+
+    assert_ok(&sb.pm(&["project", "set", "router", "status=in-progress"]));
+    assert_eq!(ready_titles(&[]), ["route it", "ship it"]);
+}

@@ -187,9 +187,17 @@ pub enum Priority {
 
 /// Deliberately `kebab-case`, unlike every other enum here: these are the
 /// literal `status:` values in `projects/*/README.md` frontmatter
-/// (`in-progress|complete|abandoned`, README §Data model), and import must
-/// read them verbatim. A new project is `in-progress` (the default the
-/// [`crate::config::ProjectView`] register starts from).
+/// (`in-progress|complete|abandoned|parked`, README §Data model), and
+/// import must read them verbatim. A new project is `in-progress` (the
+/// default the [`crate::config::ProjectView`] register starts from).
+///
+/// `parked` (AGT-1635) is set aside but may come back — unlike
+/// `abandoned` — and its tickets are not live work (`pm ready` leaves them
+/// out). Builds before it do not know the value, so an op never carries it
+/// as a status: it goes on the wire as `in-progress` plus `"parked": true`
+/// ([`crate::op::ProjectSet`], [`crate::op::ProjectCreate`]), which an
+/// older build reads as `in-progress` (the unknown key ignored, as for
+/// project `kind`, AGT-1488) instead of failing to decode the op.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProjectStatus {
@@ -197,6 +205,49 @@ pub enum ProjectStatus {
     InProgress,
     Complete,
     Abandoned,
+    Parked,
+}
+
+impl ProjectStatus {
+    /// Every status, in the order help text and errors list them.
+    pub const ALL: [ProjectStatus; 4] = [
+        ProjectStatus::InProgress,
+        ProjectStatus::Complete,
+        ProjectStatus::Abandoned,
+        ProjectStatus::Parked,
+    ];
+
+    /// The serde spelling (`in-progress`, `complete`, `abandoned`,
+    /// `parked`), also the `project.status` column's value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectStatus::InProgress => "in-progress",
+            ProjectStatus::Complete => "complete",
+            ProjectStatus::Abandoned => "abandoned",
+            ProjectStatus::Parked => "parked",
+        }
+    }
+
+    /// `true` for a retired project — `complete` or `abandoned` — whose
+    /// files `pm export` writes under `archive/`. A `parked` project may
+    /// come back, so it is not retired.
+    pub fn is_retired(self) -> bool {
+        matches!(self, ProjectStatus::Complete | ProjectStatus::Abandoned)
+    }
+}
+
+impl std::str::FromStr for ProjectStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        ProjectStatus::ALL
+            .into_iter()
+            .find(|status| status.as_str() == s)
+            .ok_or_else(|| {
+                format!(
+                    "unknown status '{s}': expected one of in-progress, complete, abandoned, parked"
+                )
+            })
+    }
 }
 
 /// What a project is (AGT-1488, design doc §Initiatives): a plain
@@ -484,6 +535,14 @@ mod tests {
             serde_json::to_string(&ProjectStatus::InProgress).unwrap(),
             r#""in-progress""#
         );
+        for status in ProjectStatus::ALL {
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                serde_json::Value::String(status.as_str().into())
+            );
+            assert_eq!(status.as_str().parse::<ProjectStatus>(), Ok(status));
+        }
+        assert!("paused".parse::<ProjectStatus>().is_err());
         assert!(Priority::Low < Priority::Critical);
     }
 

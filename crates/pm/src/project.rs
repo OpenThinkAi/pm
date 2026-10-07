@@ -64,7 +64,7 @@ pub enum ProjectCmd {
     },
     /// List every project
     List {
-        /// in-progress, complete or abandoned
+        /// in-progress, complete, abandoned or parked
         #[arg(long, value_parser = parse_status)]
         status: Option<ProjectStatus>,
         /// project or initiative
@@ -84,7 +84,7 @@ pub enum ProjectCmd {
         #[arg(long, value_name = "NAME", requires = "from_file")]
         doc: Option<String>,
     },
-    /// Change a project's title, status or parent: title=… status=in-progress|complete|abandoned parent=<id|->
+    /// Change a project's title, status or parent: title=… status=in-progress|complete|abandoned|parked parent=<id|->
     Set {
         id: String,
         /// key=value pairs (keys: title, status, parent; parent=- clears it)
@@ -150,9 +150,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: ProjectCmd) -> Result<()> {
 
 /// Clap value parser for `--status`.
 fn parse_status(s: &str) -> std::result::Result<ProjectStatus, String> {
-    serde_json::from_value(Value::String(s.to_string())).map_err(|_| {
-        format!("unknown status '{s}': expected one of in-progress, complete, abandoned")
-    })
+    s.parse()
 }
 
 /// Clap value parser for `--kind`.
@@ -243,7 +241,7 @@ fn list(ctx: &Ctx<'_>, status: Option<ProjectStatus>, kind: Option<ProjectKind>)
             println!(
                 "{:<24} {:<12} {:<11} {}",
                 crate::text::inline(&p.id),
-                status_str(p.status),
+                p.status.as_str(),
                 p.kind.as_str(),
                 crate::text::inline(&p.title)
             );
@@ -580,14 +578,6 @@ fn doc_add(ctx: &Ctx<'_>, id: &str, name: &str, from_file: &std::path::Path) -> 
 
 // ---------------------------------------------------------------- output
 
-fn status_str(status: ProjectStatus) -> &'static str {
-    match status {
-        ProjectStatus::InProgress => "in-progress",
-        ProjectStatus::Complete => "complete",
-        ProjectStatus::Abandoned => "abandoned",
-    }
-}
-
 /// The **Project** `--json` shape. `pub(crate)`: `pm app` (AGT-1401)
 /// serves it unchanged.
 pub(crate) fn project_json(p: &Project) -> Value {
@@ -611,7 +601,7 @@ fn print_project(ctx: &Ctx<'_>, project: &Project) -> Result<()> {
         crate::text::inline(&project.title)
     );
     println!("kind:    {}", project.kind.as_str());
-    println!("status:  {}", status_str(project.status));
+    println!("status:  {}", project.status.as_str());
     println!(
         "parent:  {}",
         crate::text::inline(project.parent.as_deref().unwrap_or("-"))
