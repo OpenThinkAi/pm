@@ -288,20 +288,19 @@ pub fn relate(
 // ------------------------------------------------------------- pm comment
 
 /// `pm comment AGT-N "…"` / `pm comment AGT-N --file -` (AC2): appends one
-/// comment, stamped with this command's actor and HLC.
-pub fn comment(
-    ctx: &Ctx<'_>,
-    reference: &str,
-    text: Option<&str>,
-    file: Option<&str>,
-) -> Result<()> {
+/// comment, stamped with this command's actor and HLC. AGT-1576: several
+/// ids (`pm comment AGT-1 AGT-2 "…"`, or `AGT-1,AGT-2`) get the same
+/// comment in one `commit_batch`, every id resolved first (`crate::bulk`).
+pub fn comment(ctx: &Ctx<'_>, positionals: &[String], file: Option<&str>) -> Result<()> {
+    let (refs, text) = crate::bulk::split_text(
+        positionals,
+        file.is_some(),
+        "a comment",
+        "comment text or --file is required",
+        "comment text and --file are mutually exclusive",
+    )?;
     let body = match (text, file) {
-        (Some(_), Some(_)) => {
-            return Err(CliError::usage(
-                "comment text and --file are mutually exclusive",
-            ));
-        }
-        (Some(text), None) => text.to_string(),
+        (Some(text), _) => text.to_string(),
         (None, Some("-")) => {
             let mut buf = String::new();
             std::io::stdin()
@@ -311,18 +310,26 @@ pub fn comment(
         }
         (None, Some(path)) => fs::read_to_string(path)
             .map_err(|e| CliError::error(format!("reading --file {path}: {e}")))?,
-        (None, None) => {
-            return Err(CliError::usage("comment text or --file is required"));
-        }
+        (None, None) => unreachable!("split_text requires text without --file"),
     };
     let body = non_empty("comment", &body)?;
 
     let actor = ctx.actor()?;
     let (mut store, ws) = ctx.open()?;
-    let ticket = find(&store, &ws, reference)?;
+    let targets = crate::bulk::resolve(&store, &ws, refs)?;
     let mut stamper = Stamper::new(&store, actor)?;
-    store.commit(&stamper.op(ticket.id, Payload::CommentAdd(CommentAdd { body })))?;
-    print_ticket(ctx, &store, &ws, ticket.id)
+    let ops: Vec<pm_core::Op> = targets
+        .tickets
+        .iter()
+        .map(|t| stamper.op(t.id, Payload::CommentAdd(CommentAdd { body: body.clone() })))
+        .collect();
+    store.commit_batch(&ops, &[])?;
+    let results: Vec<(ulid::Ulid, &str)> = targets
+        .tickets
+        .iter()
+        .map(|t| (t.id, "commented"))
+        .collect();
+    crate::bulk::print_results(ctx, &store, &ws, targets.many, &results)
 }
 
 // ---------------------------------------------------------------- pm move
@@ -504,7 +511,7 @@ pub fn unclaim(ctx: &Ctx<'_>, reference: &str) -> Result<()> {
 
 // ----------------------------------------------------------------- shared
 
-/// The `set`/`label`/`comment`/`move`/`done`/`unclaim` result shape: the
+/// The `set`/`label`/`move`/`done`/`unclaim` result shape: the
 /// ticket as it now reads, same as `pm show`.
 fn print_ticket(
     ctx: &Ctx<'_>,

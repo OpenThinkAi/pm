@@ -7,6 +7,7 @@ mod app;
 mod archive;
 mod backup;
 mod batch;
+mod bulk;
 mod check;
 mod claim;
 mod doctor;
@@ -168,12 +169,13 @@ enum Cmd {
         #[arg(long, value_name = "ID", value_delimiter = ',')]
         unblocks: Vec<String>,
     },
-    /// Append a comment
+    /// Append a comment to one ticket or several (`pm comment PM-1 PM-2 "text"`): one transaction
+    #[command(override_usage = "pm comment [OPTIONS] <ID>... [TEXT]")]
     Comment {
-        /// Ticket id (e.g. PM-12) or ULID
-        id: String,
-        /// Comment text; omit when using --file
-        text: Option<String>,
+        /// Ticket id(s) (e.g. PM-12) or ULID, repeat or comma-separate; then the comment text
+        /// (last), unless --file gives it
+        #[arg(required = true, value_name = "ID")]
+        args: Vec<String>,
         /// Read the comment body from a file, or `-` for stdin
         #[arg(long, value_name = "PATH|-")]
         file: Option<String>,
@@ -307,12 +309,13 @@ enum Cmd {
         #[arg(long)]
         explain: bool,
     },
-    /// Hold a ticket for a human (`pm hold PM-N "why"`), or release it (`--clear`)
+    /// Hold tickets for a human (`pm hold PM-N [PM-M…] "why"`), or release them (`--clear`): one transaction
+    #[command(override_usage = "pm hold [OPTIONS] <ID>... [REASON]")]
     Hold {
-        /// Ticket id (e.g. PM-12) or ULID
-        id: String,
-        /// Why the ticket is waiting on a human
-        reason: Option<String>,
+        /// Ticket id(s) (e.g. PM-12) or ULID, repeat or comma-separate; then why they wait on a
+        /// human (last), unless --clear
+        #[arg(required = true, value_name = "ID")]
+        args: Vec<String>,
         /// Clear the hold instead of setting one
         #[arg(long)]
         clear: bool,
@@ -351,13 +354,14 @@ enum Cmd {
         #[arg(long)]
         prune_quarantine: bool,
     },
-    /// Archive a ticket (`pm archive PM-N`), or sweep for eligible tickets/projects (`--auto`)
+    /// Archive tickets (`pm archive PM-N [PM-M…]`, one transaction), or sweep for eligible tickets/projects (`--auto`)
     Archive {
-        /// Ticket id (e.g. PM-12) or ULID; omit with --auto
-        id: Option<String>,
+        /// Ticket id(s) (e.g. PM-12) or ULID, repeat or comma-separate; omit with --auto
+        #[arg(value_name = "ID")]
+        ids: Vec<String>,
         /// Archive every completed ticket whose completion month has passed, and retire
-        /// every idle project, instead of one ticket
-        #[arg(long, conflicts_with = "id")]
+        /// every idle project, instead of named tickets
+        #[arg(long, conflicts_with = "ids")]
         auto: bool,
         /// With --auto: print what would change without writing anything
         #[arg(long, requires = "auto")]
@@ -628,9 +632,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             blocks,
             unblocks,
         } => mutate::relate(ctx, &id, &blocked_by, &unblock, &blocks, &unblocks),
-        Cmd::Comment { id, text, file } => {
-            mutate::comment(ctx, &id, text.as_deref(), file.as_deref())
-        }
+        Cmd::Comment { args, file } => mutate::comment(ctx, &args, file.as_deref()),
         Cmd::Move {
             id,
             state,
@@ -717,7 +719,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
                 explain,
             },
         ),
-        Cmd::Hold { id, reason, clear } => markers::hold(ctx, &id, reason.as_deref(), clear),
+        Cmd::Hold { args, clear } => markers::hold(ctx, &args, clear),
         Cmd::Holds { project, ids } => markers::holds(ctx, markers::HoldsArgs { project, ids }),
         Cmd::Waive { id, rule, reason } => markers::waive(ctx, &id, &rule, &reason),
         Cmd::Check { project } => check::check(ctx, project.as_deref()),
@@ -725,7 +727,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             rebuild,
             prune_quarantine,
         } => doctor::doctor(ctx, rebuild, prune_quarantine),
-        Cmd::Archive { id, auto, dry_run } => archive::archive(ctx, id, auto, dry_run),
+        Cmd::Archive { ids, auto, dry_run } => archive::archive(ctx, &ids, auto, dry_run),
         Cmd::Unarchive { id } => archive::unarchive(ctx, &id),
         Cmd::Import {
             cmd:

@@ -403,3 +403,109 @@ fn check_reports_parked_forever_until_waived() {
     assert_code(&sb.pm(&["waive", &t, "parked", "reference only"]), 0);
     assert_code(&sb.pm(&["check"]), 0);
 }
+
+// ------------------------------------------- AGT-1576: bulk comment/hold/archive
+
+fn comment_count(sb: &Sandbox, id: &str) -> usize {
+    sb.show(id)["comments"].as_array().unwrap().len()
+}
+
+#[test]
+fn bulk_forms_apply_to_every_id_repeated_or_comma_separated() {
+    let sb = Sandbox::new();
+    let a = sb.new_ticket(&[]);
+    let b = sb.new_ticket(&[]);
+    let c = sb.new_ticket(&[]);
+
+    // Comment: repeat and comma-separate in one call; a ticket named twice
+    // is commented once.
+    let ab = format!("{a},{b}");
+    let v = json(&sb.pm(&["comment", &ab, &c, &a, "provenance, noted", "--json"]));
+    assert_eq!(v["schema"], 1);
+    let results = v["results"].as_array().unwrap();
+    let ids: Vec<&str> = results.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [a.as_str(), b.as_str(), c.as_str()]);
+    assert!(results.iter().all(|r| r["result"] == "commented"));
+    assert_eq!(results[1]["ticket"]["id"], b.as_str());
+    for id in [&a, &b, &c] {
+        assert_eq!(comment_count(&sb, id), 1, "{id}");
+        assert_eq!(sb.show(id)["comments"][0]["body"], "provenance, noted");
+    }
+
+    // Text output: one display id per line.
+    let out = sb.pm(&["comment", &a, &b, "again"]);
+    assert_code(&out, 0);
+    assert_eq!(stdout(&out), format!("{a}\n{b}\n"));
+
+    // Hold: every id held with its own op's HLC; then a mixed clear.
+    let v = json(&sb.pm(&["hold", &a, &b, "needs Matt", "--json"]));
+    assert!(
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["result"] == "held")
+    );
+    for id in [&a, &b] {
+        assert_eq!(sb.show(id)["hold"]["reason"], "needs Matt");
+    }
+    let out = sb.pm(&["hold", "--clear", &format!("{a},{c}"), "--json"]);
+    let v = json(&out);
+    let results: Vec<(&str, &str)> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["id"].as_str().unwrap(), r["result"].as_str().unwrap()))
+        .collect();
+    assert_eq!(results, [(a.as_str(), "cleared"), (c.as_str(), "not-held")]);
+    assert!(stderr(&out).contains(&format!("{c} is not held")));
+    assert!(sb.show(&a)["hold"].is_null());
+    assert_eq!(sb.show(&b)["hold"]["reason"], "needs Matt");
+
+    // Archive.
+    let v = json(&sb.pm(&["archive", &a, &format!("{b},{c}"), "--json"]));
+    assert_eq!(v["results"].as_array().unwrap().len(), 3);
+    for id in [&a, &b, &c] {
+        assert!(!sb.show(id)["archived_at"].is_null(), "{id}");
+    }
+}
+
+#[test]
+fn bulk_forms_write_nothing_when_any_id_is_unknown() {
+    let sb = Sandbox::new();
+    let a = sb.new_ticket(&[]);
+    let b = sb.new_ticket(&[]);
+    let ops_before = json(&sb.pm(&["log", &a, "--json"]));
+
+    assert_code(&sb.pm(&["comment", &a, "AGT-999", &b, "x"]), 3);
+    assert_code(&sb.pm(&["hold", &format!("{a},AGT-999"), "why"]), 3);
+    assert_code(&sb.pm(&["archive", &a, &b, "AGT-999"]), 3);
+    assert_code(&sb.pm(&["archive", &format!("{a},,{b}")]), 2);
+
+    for id in [&a, &b] {
+        let t = sb.show(id);
+        assert_eq!(t["comments"].as_array().unwrap().len(), 0);
+        assert!(t["hold"].is_null());
+        assert!(t["archived_at"].is_null());
+    }
+    assert_eq!(json(&sb.pm(&["log", &a, "--json"])), ops_before);
+}
+
+#[test]
+fn bulk_forms_keep_text_and_ids_apart() {
+    let sb = Sandbox::new();
+    let a = sb.new_ticket(&[]);
+    let b = sb.new_ticket(&[]);
+    // The text was forgotten: the last positional is an id, not a comment.
+    let out = sb.pm(&["comment", &a, &b]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("looks like a ticket id"));
+    assert_code(&sb.pm(&["hold", &a, &format!("{b},{a}")]), 2);
+    // Text given twice: positional text next to --file / --clear.
+    assert_code(&sb.pm(&["comment", &a, &b, "hi", "--file", "-"]), 2);
+    assert_code(&sb.pm(&["hold", &a, &b, "why", "--clear"]), 2);
+    // --auto takes no ids.
+    assert_code(&sb.pm(&["archive", &a, &b, "--auto"]), 2);
+    assert_eq!(comment_count(&sb, &a), 0);
+    assert!(sb.show(&a)["hold"].is_null());
+}
