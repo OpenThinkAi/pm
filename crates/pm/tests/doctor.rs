@@ -177,7 +177,7 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
         text.contains(&format!("schema version  {}\n", pm_store::SCHEMA_VERSION)),
         "{text}"
     );
-    assert!(text.contains("ops             17\n"), "{text}");
+    assert!(text.contains("ops             18\n"), "{text}");
     assert!(text.contains("ticket 1"), "{text}");
     assert!(text.contains("ticket_label 2"), "{text}");
     assert!(text.contains("comment 1"), "{text}");
@@ -187,7 +187,7 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     // AGT-1393: nothing has been pushed, so the whole log is the outbox.
     assert!(
         text.contains(
-            "sync            outbox 17 op(s), pushed through seq 0, \
+            "sync            outbox 18 op(s), pushed through seq 0, \
              cursor 0 (never pulled), 0 ticket(s) awaiting a hub number\n"
         ),
         "{text}"
@@ -197,9 +197,9 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     assert_eq!(v["schema"], 1);
     assert_eq!(v["healthy"], true);
     assert_eq!(v["schema_version"], pm_store::SCHEMA_VERSION);
-    assert_eq!(v["op_count"], 17);
+    assert_eq!(v["op_count"], 18);
     assert_eq!(v["tables"]["ticket"], 1);
-    assert_eq!(v["tables"]["ops"], 17);
+    assert_eq!(v["tables"]["ops"], 18);
     assert_eq!(v["integrity"], serde_json::json!([]));
     assert_eq!(v["foreign_keys"], serde_json::json!([]));
     assert_eq!(v["replay_error"], Value::Null);
@@ -207,7 +207,7 @@ fn doctor_reports_counts_and_exits_0_on_a_healthy_database() {
     assert_eq!(v["rebuilt"], Value::Null);
     assert_eq!(
         v["sync"],
-        serde_json::json!({"outbox": 17, "pushed_through": 0, "cursor": 0, "pending_numbers": 0, "seeded": false, "parked": 0, "refused": 0})
+        serde_json::json!({"outbox": 18, "pushed_through": 0, "cursor": 0, "pending_numbers": 0, "seeded": false, "parked": 0, "refused": 0})
     );
     // AGT-1467: nothing pulled, nothing quarantined.
     assert_eq!(v["quarantine"], serde_json::json!([]));
@@ -226,7 +226,7 @@ fn rebuild_after_create_set_label_comment_transition_changes_nothing() {
     assert_code(&out, 0);
     let text = stdout(&out);
     assert!(
-        text.contains("rebuilt tables from 17 ops: no changes, they already matched\n"),
+        text.contains("rebuilt tables from 18 ops: no changes, they already matched\n"),
         "{text}"
     );
     assert!(text.contains("replay          ok"), "{text}");
@@ -296,7 +296,7 @@ fn a_corrupted_row_is_detected_by_doctor_and_repaired_by_rebuild() {
     assert_code(&out, 0);
     let text = stdout(&out);
     assert!(
-        text.contains("rebuilt tables from 17 ops: 1 row(s) changed\n"),
+        text.contains("rebuilt tables from 18 ops: 1 row(s) changed\n"),
         "{text}"
     );
     assert!(

@@ -158,8 +158,9 @@ pub enum Preset {
     /// labels.
     Default,
     /// Reproduces the workspace this repo's own build loops have always
-    /// used: prefix `AGT`, states `triage`/`in-progress`/`done`, and the
-    /// `manual` gate label.
+    /// used: prefix `AGT`, states `triage`/`in-progress`/`done`, the
+    /// `manual` gate label, and (AGT-1572) a `canceled` state for retiring
+    /// a ticket without silently unblocking its dependents.
     Saltline,
 }
 
@@ -190,6 +191,7 @@ impl Preset {
                 ("triage", StateCategory::Unstarted),
                 ("in-progress", StateCategory::Started),
                 ("done", StateCategory::Completed),
+                ("canceled", StateCategory::Canceled),
             ]
             .as_slice(),
         };

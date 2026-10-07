@@ -20,6 +20,11 @@
       "category": "completed",
       "name": "done",
       "position": 2
+    },
+    {
+      "category": "canceled",
+      "name": "canceled",
+      "position": 3
     }
   ],
   "workspace": "<HOME>/ws"

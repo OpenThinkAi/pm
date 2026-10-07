@@ -1106,16 +1106,17 @@ fn map_state_and_the_archived_blocked_defaults_import_and_re_import_idempotently
     assert_eq!(
         report["state_map"],
         serde_json::json!([
-            {"vault": "archived", "state": "done", "archive": true, "hold": "never", "default": true, "tickets": 1},
+            {"vault": "archived", "state": "canceled", "archive": true, "hold": "never", "default": true, "tickets": 1},
             {"vault": "blocked", "state": "triage", "archive": false, "hold": "no-blockers", "default": true, "tickets": 2},
             {"vault": "refined", "state": "triage", "archive": false, "hold": "never", "default": false, "tickets": 2},
         ])
     );
     assert_eq!(sb.show("AGT-2")["state"], "triage");
     assert_eq!(sb.show("AGT-4")["state"], "qa");
-    // archived → done, archived at the first of its `updated` month.
+    // archived → canceled (the saltline preset's canceled state, AGT-1572),
+    // archived at the first of its `updated` month.
     let archived = sb.show("AGT-7");
-    assert_eq!(archived["state"], "done");
+    assert_eq!(archived["state"], "canceled");
     assert_eq!(archived["archived_at"]["wall_ms"], AUG_1);
     // blocked with a blocker: not held (the relation keeps it off ready);
     // blocked with none: held.

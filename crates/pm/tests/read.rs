@@ -427,6 +427,7 @@ fn status_counts_per_state_plus_held_and_parked() {
             {"name": "triage", "category": "unstarted", "count": 1},
             {"name": "in-progress", "category": "started", "count": 1},
             {"name": "done", "category": "completed", "count": 0},
+            {"name": "canceled", "category": "canceled", "count": 0},
         ])
     );
     assert_eq!(out["held"], 0);

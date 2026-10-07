@@ -463,7 +463,7 @@ fn bulk_forms_apply_to_every_id_repeated_or_comma_separated() {
     assert_eq!(sb.show(&b)["hold"]["reason"], "needs Matt");
 
     // Archive.
-    let v = json(&sb.pm(&["archive", &a, &format!("{b},{c}"), "--json"]));
+    let v = json(&sb.pm(&["archive", &a, &format!("{b},{c}"), "--force", "--json"]));
     assert_eq!(v["results"].as_array().unwrap().len(), 3);
     for id in [&a, &b, &c] {
         assert!(!sb.show(id)["archived_at"].is_null(), "{id}");

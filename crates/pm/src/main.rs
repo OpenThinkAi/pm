@@ -368,6 +368,10 @@ enum Cmd {
         /// With --auto: print what would change without writing anything
         #[arg(long, requires = "auto")]
         dry_run: bool,
+        /// Archive the named tickets even if some are neither completed nor canceled
+        /// (they then count as done for their dependents); without it that is refused
+        #[arg(long, conflicts_with = "auto")]
+        force: bool,
     },
     /// Clear a ticket's archived_at, undoing `pm archive`
     Unarchive {
@@ -729,7 +733,12 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             rebuild,
             prune_quarantine,
         } => doctor::doctor(ctx, rebuild, prune_quarantine),
-        Cmd::Archive { ids, auto, dry_run } => archive::archive(ctx, &ids, auto, dry_run),
+        Cmd::Archive {
+            ids,
+            auto,
+            dry_run,
+            force,
+        } => archive::archive(ctx, &ids, auto, dry_run, force),
         Cmd::Unarchive { id } => archive::unarchive(ctx, &id),
         Cmd::Import {
             cmd:

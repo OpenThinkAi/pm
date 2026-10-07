@@ -1,0 +1,32 @@
+{
+  "excluded": [
+    {
+      "blocker": "AGT-1",
+      "id": "AGT-2",
+      "message": "blocked by canceled AGT-1 (state 'canceled'): remove the edge if the cancellation unblocks it, or cancel this ticket too",
+      "reason": "blocked-by-canceled",
+      "state": "canceled",
+      "ulid": "<ULID>"
+    },
+    {
+      "gate": {
+        "kind": "canceled",
+        "state": "canceled"
+      },
+      "id": "AGT-3",
+      "message": "transitively blocked by AGT-1 (canceled: in state 'canceled') via AGT-2",
+      "reason": "transitively-blocked",
+      "root": "AGT-1",
+      "ulid": "<ULID>",
+      "via": "AGT-2"
+    }
+  ],
+  "ids": null,
+  "limit": null,
+  "model": null,
+  "project": "pm",
+  "ready": [],
+  "schema": 1,
+  "today": "<TODAY>",
+  "waves": []
+}

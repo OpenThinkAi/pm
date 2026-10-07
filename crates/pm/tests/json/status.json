@@ -18,6 +18,11 @@
       "category": "completed",
       "count": 0,
       "name": "done"
+    },
+    {
+      "category": "canceled",
+      "count": 0,
+      "name": "canceled"
     }
   ]
 }

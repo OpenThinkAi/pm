@@ -264,6 +264,10 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             blocker: id,
             gate: None,
         },
+        Reason::BlockedByCanceled {
+            blocker: id,
+            state: "canceled".into(),
+        },
         Reason::TransitivelyBlocked {
             via: id,
             root: id,
@@ -282,6 +286,7 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             | Reason::NotBefore { .. }
             | Reason::Cycle { .. }
             | Reason::BlockedBy { .. }
+            | Reason::BlockedByCanceled { .. }
             | Reason::TransitivelyBlocked { .. }
             | Reason::Model { .. } => {}
         }
@@ -319,6 +324,11 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             ticket: id,
             project: "p".into(),
         },
+        Finding::BlockedByCanceled {
+            ticket: id,
+            blocker: id,
+            state: "canceled".into(),
+        },
     ];
     for f in &findings {
         match f {
@@ -329,7 +339,8 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             | Finding::Parked { .. }
             | Finding::BlockerCycle { .. }
             | Finding::DanglingRelation { .. }
-            | Finding::DeletedProject { .. } => {}
+            | Finding::DeletedProject { .. }
+            | Finding::BlockedByCanceled { .. } => {}
         }
     }
 

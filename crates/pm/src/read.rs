@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pm_core::{ActorId, Op, Payload, Priority, RelationKind, StateCategory, Ticket};
+use pm_core::{ActorId, Op, Payload, Priority, RelationKind, Ticket};
 use pm_store::TicketFilter;
 use serde_json::{Value, json};
 use ulid::Ulid;
@@ -408,7 +408,8 @@ pub struct GraphArgs {
 }
 
 /// `pm graph [--project P | --ids …]` (AC4; AGT-1380 AC1): tickets not yet
-/// in a `completed`-category state, grouped into readiness waves by their
+/// settled (`pm_core::ready::settled`: archived, tombstoned, or in a
+/// `completed`- or `canceled`-category state), grouped into readiness waves by their
 /// still-pending `blocks` relations, plus a `done` flag (`true` once
 /// nothing in scope is pending — what a build loop's self-retire check
 /// wants). `--ids` scopes exactly like `pm ready --ids`: an unknown id is
@@ -417,17 +418,15 @@ pub struct GraphArgs {
 /// pending node — matching what `--project` already did by never fetching
 /// those rows). Blockers are always resolved through the whole workspace,
 /// whatever the scope: a blocker outside it still counts, it is just never
-/// itself a node. A blocker that sits outside the scope and never
-/// resolves, or a dependency cycle, lands the rest of the graph in one
-/// final, unordered wave rather than looping forever.
+/// itself a node. A blocker resolves as `pm ready`'s does
+/// (`pm_core::ready::resolves_as_blocker`): a canceled blocker, archived
+/// or not, never does (AGT-1572). A blocker that sits outside the scope
+/// and never resolves — a canceled one among them — or a dependency
+/// cycle, lands the rest of the graph in one final, unordered wave rather
+/// than looping forever.
 pub fn graph(ctx: &Ctx<'_>, args: GraphArgs) -> Result<()> {
     let (store, ws) = ctx.open()?;
-    let completed = |state: &str| {
-        ws.state(state)
-            .map(|s| s.category == StateCategory::Completed)
-            .unwrap_or(false)
-    };
-    let is_done = |t: &Ticket| t.deleted || t.archived_at.is_some() || completed(&t.state);
+    let is_done = |t: &Ticket| pm_core::ready::settled(&ws, t);
 
     let ids: Option<BTreeSet<Ulid>> = if args.ids.is_empty() {
         None
@@ -459,7 +458,7 @@ pub fn graph(ctx: &Ctx<'_>, args: GraphArgs) -> Result<()> {
     let pending: Vec<&Ticket> = tickets.iter().filter(|t| !is_done(t)).collect();
     let done = pending.is_empty();
 
-    // Each pending ticket's still-pending blockers (a completed blocker
+    // Each pending ticket's unresolved blockers (a completed blocker
     // never holds anything back, so it is dropped here).
     let mut blockers: BTreeMap<Ulid, Vec<Ulid>> = BTreeMap::new();
     for t in &pending {
@@ -470,9 +469,10 @@ pub fn graph(ctx: &Ctx<'_>, args: GraphArgs) -> Result<()> {
             }
             // Archived counts as done whatever the state says (AGT-1343:
             // the loops went blind once a blocker was swept into the
-            // archive), as does a tombstoned or absent blocker.
+            // archive), as does a tombstoned or absent blocker — but a
+            // canceled one keeps blocking, archived or not (AGT-1572).
             let blocker_done = match store.ticket(r.from)? {
-                Some(b) => is_done(&b),
+                Some(b) => pm_core::ready::resolves_as_blocker(&ws, &b),
                 None => true,
             };
             if !blocker_done {

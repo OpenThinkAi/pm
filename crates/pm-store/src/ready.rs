@@ -226,8 +226,24 @@ mod tests {
         transition(&mut store, &mut seq, a, "done");
         assert_eq!(ready_ids(&store, &query()), vec![b], "one blocker left");
 
-        // A canceled blocker no longer blocks; a tombstoned one neither.
+        // A canceled blocker keeps blocking (AGT-1572), archived or not;
+        // a tombstoned one does not.
         transition(&mut store, &mut seq, b, "canceled");
+        assert!(
+            ready_ids(&store, &query()).is_empty(),
+            "canceled b blocks c"
+        );
+        store
+            .commit(&seq.op(
+                b,
+                Payload::FieldSet(FieldSet::ArchivedAt(Some(Hlc::new(60, 0)))),
+            ))
+            .unwrap();
+        assert!(
+            ready_ids(&store, &query()).is_empty(),
+            "archived-as-canceled"
+        );
+        store.commit(&seq.op(b, Payload::Tombstone)).unwrap();
         assert_eq!(ready_ids(&store, &query()), vec![c]);
 
         let d = create(&mut store, &mut seq, Some("p"));
@@ -380,7 +396,8 @@ mod tests {
     // covered above by `an_archived_blocker_counts_as_done_whatever_its_state`
     // (AGT-1343) — `Store::ready` delegates entirely to
     // `pm_core::ready::frontier`, which treats `archived_at` as done
-    // regardless of state (see that module's `Graph::done`), so there is
+    // whatever the state, bar a canceled one (AGT-1572; see that module's
+    // `resolves_as_blocker`), so there is
     // nothing left for this crate to pin down beyond what AGT-1343 already
     // does. `crates/pm/tests/archive.rs` adds the AC2 proof at the level
     // AGT-1351 owns: `pm archive` (the real command, not a re-derived op)

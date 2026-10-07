@@ -15,11 +15,22 @@
 //! - it is not parked, its project is not parked ([`Rules::parked_projects`],
 //!   AGT-1635), and any `not_before` date has arrived;
 //! - it is not in a blocker cycle;
-//! - every ticket that `blocks` it is **done**: tombstoned, absent,
-//!   **archived**, or in a `completed` / `canceled` state. Archiving is
-//!   how the old loops went blind — a blocker swept into the archive
-//!   stranded its dependents — so `archived_at` counts as done whatever
-//!   the state says.
+//! - every ticket that `blocks` it **resolves** ([`resolves_as_blocker`]):
+//!   tombstoned, absent, in a `completed` state, or **archived** out of
+//!   any state but a `canceled` one. Archiving is how the old loops went
+//!   blind — a blocker swept into the archive stranded its dependents —
+//!   so `archived_at` counts as done whatever the state says, *except*
+//!   for a canceled ticket.
+//!
+//! A **canceled** blocker (a `canceled`-category state, archived or not)
+//! keeps blocking (AGT-1572; Matt, 2026-10-06): retiring a ticket must not
+//! silently unblock its dependents. Whether a dependent still makes sense
+//! without it is a judgement call, so pm surfaces it instead of deciding:
+//! the dependent is [`Reason::BlockedByCanceled`] (and whatever it blocks
+//! [`Reason::TransitivelyBlocked`] with a [`Gate::Canceled`] root) until
+//! someone removes the edge (`pm relate <id> --unblock <canceled>`, with a
+//! comment saying why) or cancels the dependent too. `pm check` reports
+//! the same edges as `blocked-by-canceled` findings.
 //!
 //! Every other candidate gets one [`Reason`], the first that applies in
 //! the order above, so `--explain` can say what a human must do. A
@@ -114,8 +125,12 @@ pub enum Reason {
     /// A direct blocker is not done. `gate` says why the blocker itself
     /// is stuck when a human must act on it (held or gate-labelled).
     BlockedBy { blocker: Ulid, gate: Option<Gate> },
+    /// A direct blocker is canceled (AGT-1572): it will never be built, so
+    /// someone must decide whether this ticket still needs it — remove the
+    /// edge, or cancel this ticket too. `state` is the blocker's state.
+    BlockedByCanceled { blocker: Ulid, state: String },
     /// The blocker chain `via` → … → `root` ends at a ticket a human must
-    /// act on; building cannot unblock this ticket.
+    /// act on (or a canceled one); building cannot unblock this ticket.
     TransitivelyBlocked { via: Ulid, root: Ulid, gate: Gate },
     /// Built on another model than [`Rules::model`] asks for. `labels`
     /// are its `model:` labels (empty means [`DEFAULT_MODEL`]).
@@ -126,8 +141,16 @@ pub enum Reason {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Gate {
-    Held { hold: Hold },
-    Label { label: String },
+    Held {
+        hold: Hold,
+    },
+    Label {
+        label: String,
+    },
+    /// The blocker is in a `canceled`-category `state` (AGT-1572).
+    Canceled {
+        state: String,
+    },
 }
 
 impl Reason {
@@ -143,6 +166,7 @@ impl Reason {
             Reason::NotBefore { .. } => "not-before",
             Reason::Cycle { .. } => "cycle",
             Reason::BlockedBy { .. } => "blocked-by",
+            Reason::BlockedByCanceled { .. } => "blocked-by-canceled",
             Reason::TransitivelyBlocked { .. } => "transitively-blocked",
             Reason::Model { .. } => "model",
         }
@@ -327,6 +351,7 @@ fn own_reason(t: &Ticket, ws: &Workspace, rules: &Rules, today: &str) -> Option<
         return Some(match gate {
             Gate::Held { hold } => Reason::Held { hold },
             Gate::Label { label } => Reason::Label { label },
+            Gate::Canceled { .. } => unreachable!("gate_of never yields a canceled gate"),
         });
     }
     if let Some(parked) = t.parked.as_ref().filter(|p| p.is_active(today)) {
@@ -393,6 +418,43 @@ pub fn ws_model_matches(ws: &Workspace, t: &Ticket, model: &str) -> bool {
     })
 }
 
+/// Whether `t` is settled — no longer work anyone will do, so never a
+/// ready candidate nor a `pm graph` node: tombstoned, archived, or in a
+/// `completed` / `canceled` state.
+pub fn settled(ws: &Workspace, t: &Ticket) -> bool {
+    t.deleted
+        || t.archived_at.is_some()
+        || ws.state(&t.state).is_some_and(|s| {
+            matches!(
+                s.category,
+                StateCategory::Completed | StateCategory::Canceled
+            )
+        })
+}
+
+/// Whether `t` is canceled: live or archived, but in a `canceled`-category
+/// state (AGT-1572). A tombstoned ticket is gone, not canceled.
+pub fn canceled(ws: &Workspace, t: &Ticket) -> bool {
+    !t.deleted && ws.state(&t.state).map(|s| s.category) == Some(StateCategory::Canceled)
+}
+
+/// Whether `t`, as a blocker, no longer holds its dependents back:
+/// tombstoned, in a `completed` state, or archived out of any state but a
+/// canceled one (an archived blocker counts as done whatever its state —
+/// AGT-1343 — unless it was canceled). A [`canceled`] blocker keeps
+/// blocking until the edge is removed (AGT-1572). An absent blocker
+/// resolves too; callers handle that before they have a `Ticket`.
+pub fn resolves_as_blocker(ws: &Workspace, t: &Ticket) -> bool {
+    if t.deleted {
+        return true;
+    }
+    if canceled(ws, t) {
+        return false;
+    }
+    t.archived_at.is_some()
+        || ws.state(&t.state).map(|s| s.category) == Some(StateCategory::Completed)
+}
+
 /// Dependency waves of `nodes`: wave 0 is every node with no pending
 /// blocker, wave n every node whose blockers all sit in earlier waves.
 /// A blocker that is not itself a node never resolves, so its dependents
@@ -432,13 +494,14 @@ pub struct Waves {
 struct Graph<'a> {
     ws: &'a Workspace,
     by_id: BTreeMap<Ulid, &'a Ticket>,
-    /// Live tickets not in a done state, in input order.
+    /// Tickets not [`settled`], in input order.
     pending: Vec<&'a Ticket>,
     /// Position of each ticket in the input, to order blockers.
     order: BTreeMap<Ulid, usize>,
     /// Every `blocks` edge `(from, to)`, deduplicated.
     blocks: BTreeSet<(Ulid, Ulid)>,
-    /// `to` → its not-done blockers, in input order.
+    /// `to` → its blockers that do not resolve (pending or canceled), in
+    /// input order.
     blocked_by: BTreeMap<Ulid, Vec<Ulid>>,
 }
 
@@ -455,7 +518,7 @@ impl<'a> Graph<'a> {
             blocks: BTreeSet::new(),
             blocked_by: BTreeMap::new(),
         };
-        graph.pending = tickets.iter().filter(|t| !graph.done(t.id)).collect();
+        graph.pending = tickets.iter().filter(|t| !settled(ws, t)).collect();
         graph.blocks = relations
             .iter()
             .filter(|r| r.kind == RelationKind::Blocks)
@@ -463,7 +526,7 @@ impl<'a> Graph<'a> {
             .collect();
         let mut blocked_by: BTreeMap<Ulid, Vec<Ulid>> = BTreeMap::new();
         for (from, to) in &graph.blocks {
-            if !graph.done(*from) {
+            if !graph.resolves(*from) {
                 blocked_by.entry(*to).or_default().push(*from);
             }
         }
@@ -478,20 +541,20 @@ impl<'a> Graph<'a> {
         self.ws.state(&t.state).map(|s| s.category)
     }
 
-    /// Done as a blocker: absent, tombstoned, archived, or completed /
-    /// canceled.
-    fn done(&self, id: Ulid) -> bool {
-        match self.by_id.get(&id) {
-            None => true,
-            Some(t) => {
-                t.deleted
-                    || t.archived_at.is_some()
-                    || matches!(
-                        self.category(t),
-                        Some(StateCategory::Completed | StateCategory::Canceled)
-                    )
-            }
-        }
+    /// Resolved as a blocker: absent, or [`resolves_as_blocker`].
+    fn resolves(&self, id: Ulid) -> bool {
+        self.by_id
+            .get(&id)
+            .is_none_or(|t| resolves_as_blocker(self.ws, t))
+    }
+
+    /// The [`Gate::Canceled`] a canceled blocker `id` puts on its
+    /// dependents.
+    fn canceled_gate(&self, id: Ulid) -> Option<Gate> {
+        let t = self.by_id.get(&id)?;
+        canceled(self.ws, t).then(|| Gate::Canceled {
+            state: t.state.clone(),
+        })
     }
 
     fn gate(&self, t: &Ticket, rules: &Rules) -> Option<Gate> {
@@ -508,13 +571,16 @@ impl<'a> Graph<'a> {
     fn blocked_reason(&self, id: Ulid, own: &BTreeMap<Ulid, Option<Reason>>) -> Option<Reason> {
         let direct = self.unresolved_blockers(id);
         let first = *direct.first()?;
+        // A pending ticket's gate is read off its own reason; a blocker
+        // that is not pending but still unresolved is a canceled one.
         let gate_on = |b: Ulid| -> Option<Gate> {
-            match own.get(&b)? {
-                Some(Reason::Held { hold }) => Some(Gate::Held { hold: hold.clone() }),
-                Some(Reason::Label { label }) => Some(Gate::Label {
+            match own.get(&b) {
+                Some(Some(Reason::Held { hold })) => Some(Gate::Held { hold: hold.clone() }),
+                Some(Some(Reason::Label { label })) => Some(Gate::Label {
                     label: label.clone(),
                 }),
-                _ => None,
+                Some(_) => None,
+                None => self.canceled_gate(b),
             }
         };
         // Breadth-first from each direct blocker, so the nearest gated
@@ -527,9 +593,15 @@ impl<'a> Graph<'a> {
             }
             if let Some(gate) = gate_on(node) {
                 return Some(if node == via {
-                    Reason::BlockedBy {
-                        blocker: via,
-                        gate: Some(gate),
+                    match gate {
+                        Gate::Canceled { state } => Reason::BlockedByCanceled {
+                            blocker: via,
+                            state,
+                        },
+                        gate => Reason::BlockedBy {
+                            blocker: via,
+                            gate: Some(gate),
+                        },
                     }
                 } else {
                     Reason::TransitivelyBlocked {
@@ -648,12 +720,10 @@ mod tests {
     }
 
     #[test]
-    fn done_blockers_include_archived_canceled_tombstoned_and_absent() {
+    fn done_blockers_include_archived_tombstoned_and_absent() {
         let mut archived = ticket(1);
         archived.archived_at = Some(Hlc::new(5, 0));
         // Archived while still `triage`: done all the same.
-        let mut canceled = ticket(2);
-        canceled.state = "canceled".into();
         let mut gone = ticket(3);
         gone.deleted = true;
         let mut done = ticket(4);
@@ -661,7 +731,6 @@ mod tests {
         let dependent = ticket(5);
         let rels = [
             blocks(1, 5),
-            blocks(2, 5),
             blocks(3, 5),
             blocks(4, 5),
             Relation {
@@ -672,7 +741,7 @@ mod tests {
         ];
         let f = frontier(
             &ws(),
-            &[archived, canceled, gone, done, dependent],
+            &[archived, gone, done, dependent],
             &rels,
             &Scope::All,
             &rules(),
@@ -681,6 +750,110 @@ mod tests {
         assert_eq!(f.waves, vec![ids(&[5])]);
         // Done tickets are not candidates, so they get no verdict.
         assert_eq!(f.verdicts.len(), 1);
+    }
+
+    #[test]
+    fn a_canceled_blocker_keeps_blocking_archived_or_not() {
+        // AGT-1572: 1 canceled, 2 canceled then archived; 3 blocked by 1,
+        // 4 blocked by 2, 5 blocked by 3 (transitively by 1), 6 blocked by
+        // a pending ticket 7 and canceled 1 (the canceled edge wins: a
+        // decision is owed whatever 7 does).
+        let mut canceled = ticket(1);
+        canceled.state = "canceled".into();
+        let mut archived = ticket(2);
+        archived.state = "canceled".into();
+        archived.archived_at = Some(Hlc::new(5, 0));
+        let rels = [
+            blocks(1, 3),
+            blocks(2, 4),
+            blocks(3, 5),
+            blocks(7, 6),
+            blocks(1, 6),
+        ];
+        let f = frontier(
+            &ws(),
+            &[
+                canceled,
+                archived,
+                ticket(3),
+                ticket(4),
+                ticket(5),
+                ticket(6),
+                ticket(7),
+            ],
+            &rels,
+            &Scope::All,
+            &rules(),
+        );
+        let on_canceled = |blocker| {
+            Verdict::Excluded(Reason::BlockedByCanceled {
+                blocker: id(blocker),
+                state: "canceled".into(),
+            })
+        };
+        assert_eq!(*verdict(&f, 3), on_canceled(1));
+        assert_eq!(*verdict(&f, 4), on_canceled(2));
+        assert_eq!(
+            *verdict(&f, 5),
+            Verdict::Excluded(Reason::TransitivelyBlocked {
+                via: id(3),
+                root: id(1),
+                gate: Gate::Canceled {
+                    state: "canceled".into()
+                },
+            })
+        );
+        assert_eq!(*verdict(&f, 6), on_canceled(1));
+        assert_eq!(f.ready(), ids(&[7]));
+        // Nothing behind a canceled blocker is ever in a wave.
+        assert_eq!(f.waves, vec![ids(&[7])]);
+        // Canceled tickets are not candidates themselves.
+        assert_eq!(f.verdicts.len(), 5);
+        assert_eq!(
+            Reason::BlockedByCanceled {
+                blocker: id(1),
+                state: "canceled".into()
+            }
+            .kind(),
+            "blocked-by-canceled"
+        );
+    }
+
+    #[test]
+    fn removing_the_edge_or_canceling_the_dependent_settles_it() {
+        let mut canceled = ticket(1);
+        canceled.state = "canceled".into();
+        let mut also_canceled = ticket(2);
+        also_canceled.state = "canceled".into();
+        // 3 lost its edge to 1 (pm relate --unblock): ready. 2 is canceled
+        // too: not a candidate, so nothing to report.
+        let f = frontier(
+            &ws(),
+            &[canceled, also_canceled, ticket(3)],
+            &[blocks(1, 2)],
+            &Scope::All,
+            &rules(),
+        );
+        assert_eq!(f.ready(), ids(&[3]));
+        assert_eq!(f.verdicts.len(), 1);
+    }
+
+    #[test]
+    fn blocker_resolution_helpers() {
+        let w = ws();
+        let mut t = ticket(1);
+        assert!(!settled(&w, &t) && !resolves_as_blocker(&w, &t));
+        t.archived_at = Some(Hlc::new(5, 0));
+        assert!(settled(&w, &t) && resolves_as_blocker(&w, &t));
+        t.state = "canceled".into();
+        assert!(settled(&w, &t) && canceled(&w, &t) && !resolves_as_blocker(&w, &t));
+        t.archived_at = None;
+        assert!(settled(&w, &t) && !resolves_as_blocker(&w, &t));
+        t.deleted = true;
+        assert!(!canceled(&w, &t) && resolves_as_blocker(&w, &t));
+        let mut done = ticket(2);
+        done.state = "done".into();
+        assert!(settled(&w, &done) && resolves_as_blocker(&w, &done));
     }
 
     #[test]

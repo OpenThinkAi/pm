@@ -71,8 +71,8 @@ Want a different starting point?
 - `--prefix <PREFIX>` overrides the ticket-id prefix (1–16 uppercase
   letters/digits, starting with a letter).
 - `--preset saltline` seeds this project's own historical workflow
-  instead: prefix `AGT`, states `triage`/`in-progress`/`done`, and a
-  `manual` gate label. Mostly relevant if you're migrating a
+  instead: prefix `AGT`, states `triage`/`in-progress`/`done`/`canceled`,
+  and a `manual` gate label. Mostly relevant if you're migrating a
   saltline-style markdown vault with `pm import vault` — see the `pm
   init` entry in [`docs/cli-contract.md`](./docs/cli-contract.md).
 
