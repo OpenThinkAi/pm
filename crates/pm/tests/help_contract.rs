@@ -370,3 +370,145 @@ fn label_help_documents_trailing_global_flags() {
         "docs/cli-contract.md must document trailing global flags on `pm label`"
     );
 }
+
+/// AGT-1574: the one `--json shape:` line each command's `--help` ends
+/// with (`src/json_shape.rs`). `None` if absent; panics if there are two.
+fn json_shape_line(path: &[&str]) -> Option<String> {
+    let text = help_text(path);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("--json shape: "))
+        .collect();
+    assert!(
+        lines.len() <= 1,
+        "`pm {} --help` has {} `--json shape:` lines",
+        path.join(" "),
+        lines.len()
+    );
+    lines
+        .first()
+        .map(|l| l["--json shape: ".len()..].to_string())
+}
+
+/// AGT-1574 AC1: every command's `--help` states its `--json` top-level
+/// shape in one line, and that line matches what the verb really prints:
+/// each checked-in `tests/json/*.json` fixture is a bare array exactly when
+/// its verb's line says `bare JSON array`, and a `{"schema": 1, ...}`
+/// object exactly when it says `object`. Every fixture must be mapped
+/// below, so a new fixture cannot dodge the check.
+#[test]
+fn every_help_states_its_json_shape_and_it_matches_the_fixtures() {
+    for path in PATHS.iter().filter(|p| !p.is_empty()) {
+        assert!(
+            json_shape_line(path).is_some(),
+            "`pm {} --help` does not state its --json shape",
+            path.join(" ")
+        );
+    }
+
+    // Fixture stem -> the command that printed it (`tests/json_contract.rs`).
+    let fixture_verb = |stem: &str| -> Vec<&'static str> {
+        const LONGEST_FIRST: &[(&str, &[&str])] = &[
+            (
+                "workspace_gate_label_add",
+                &["workspace", "gate-label", "add"],
+            ),
+            (
+                "workspace_gate_label_remove",
+                &["workspace", "gate-label", "remove"],
+            ),
+            (
+                "workspace_gate_label_list",
+                &["workspace", "gate-label", "list"],
+            ),
+            ("workspace_docs_owned_by", &["workspace", "docs-owned-by"]),
+            ("backup_install_timer", &["backup", "install-timer"]),
+            ("backup_status", &["backup", "status"]),
+            ("project_doc_add", &["project", "doc", "add"]),
+            ("project_delete", &["project", "delete"]),
+            ("project_edit", &["project", "edit"]),
+            ("project_list", &["project", "list"]),
+            ("project_new", &["project", "new"]),
+            ("project_set", &["project", "set"]),
+            ("project_show", &["project", "show"]),
+            ("import_vault", &["import", "vault"]),
+            ("export_md", &["export", "md"]),
+            ("hub_login", &["hub", "login"]),
+            ("hub_logout", &["hub", "logout"]),
+            ("hub_status", &["hub", "status"]),
+            ("unarchive", &["unarchive"]),
+            ("archive", &["archive"]),
+            ("backup", &["backup"]),
+            ("check", &["check"]),
+            ("claim", &["claim"]),
+            ("comment", &["comment"]),
+            ("doctor", &["doctor"]),
+            ("done", &["done"]),
+            ("edit", &["edit"]),
+            ("graph", &["graph"]),
+            ("holds", &["holds"]),
+            ("hold", &["hold"]),
+            ("init", &["init"]),
+            ("label", &["label"]),
+            ("list", &["list"]),
+            ("log", &["log"]),
+            ("move", &["move"]),
+            ("new", &["new"]),
+            ("ready", &["ready"]),
+            ("relate", &["relate"]),
+            ("set", &["set"]),
+            ("show", &["show"]),
+            ("status", &["status"]),
+            ("sync", &["sync"]),
+            ("unclaim", &["unclaim"]),
+            ("waive", &["waive"]),
+        ];
+        LONGEST_FIRST
+            .iter()
+            .find(|(prefix, _)| {
+                stem == *prefix
+                    || stem
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('_'))
+            })
+            .unwrap_or_else(|| panic!("fixture `{stem}.json` maps to no command here"))
+            .1
+            .to_vec()
+    };
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("json");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let verb = fixture_verb(&stem);
+        let line = json_shape_line(&verb).unwrap();
+        if value.is_array() {
+            assert!(
+                line.starts_with("bare JSON array"),
+                "{stem}.json is a bare array, but `pm {} --help` says: {line}",
+                verb.join(" ")
+            );
+        } else {
+            assert_eq!(value["schema"], 1, "{stem}.json has no top-level schema");
+            assert!(
+                line.starts_with("object") && line.contains(r#"{"schema": 1"#),
+                "{stem}.json is a {{\"schema\": 1, ...}} object, but `pm {} --help` says: {line}",
+                verb.join(" ")
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked > 40,
+        "only {checked} fixture(s) found under {}",
+        dir.display()
+    );
+}
