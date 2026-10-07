@@ -59,9 +59,8 @@ code runs.
 ## Global flags
 
 Every subcommand accepts these (declared `global = true` on `Cli` in
-`main.rs`, so they can be given anywhere on the command line *except* after
-a subcommand whose own positional arguments can be mistaken for a flag —
-see the `pm label` note below):
+`main.rs`, so they can be given anywhere on the command line, before or
+after the subcommand — see the `pm label` note below):
 
 | Flag | Meaning |
 |---|---|
@@ -76,13 +75,15 @@ ESC sequences, bidi overrides) from ticket and project text, comments, hold
 reasons and hub error bodies, since they arrive from other actors; `--json` is
 exactly the stored text.
 
-**`pm label`'s flag-ordering gotcha.** `pm label <id> +x -y` takes
+**`pm label` and trailing flags (AGT-1577).** `pm label <id> +x -y` takes
 `-y`-shaped tokens as its own positional arguments (`allow_hyphen_values`),
-so a global flag placed *after* `label` can be swallowed by that same
-parsing rule instead of being recognized as a flag. Put global flags
-before the subcommand name: `pm --json label AGT-12 +x -y`, not
-`pm label AGT-12 +x -y --json`. Every other verb accepts global flags in
-either position.
+so clap hands it every token after the id. `main.rs::hoist_label_globals`
+pulls the global flags back out: `--json`, `--as <ACTOR>`/`--as=ACTOR` and
+`--workspace <DIR>`/`--workspace=DIR` after the changes apply exactly as
+before `label` (`pm label AGT-12 +x -y --json` works; a later occurrence
+wins). Any other `--`-prefixed token there is an unknown flag (exit `2`),
+never a removal; single-dash tokens (`-y`) are always removals, and
+`-h`/`--help` print help. A `--` separator is accepted but changes nothing.
 
 ### Workspace resolution
 
@@ -408,11 +409,13 @@ clears an optional field. An unrecognized key is not an error: it lands in
 
 ### `pm label <ID> <+LABEL|-LABEL>...`
 
-No flags beyond the globals (see the `pm label` flag-ordering note under
-**Global flags**). `+x` adds, `-y` removes.
+No flags beyond the globals, which may also follow the changes (see the
+`pm label` note under **Global flags**). `+x` adds, `-y` removes.
 
 - Exit `2`: a token is not `+label` or `-label`, or is empty after the
-  sign.
+  sign; a `--`-prefixed token after the id is not `--json`, `--as` or
+  `--workspace` (or `--as`/`--workspace` has no value); no change is left
+  once the global flags are taken out.
 - `--json`: **Ticket**.
 
 ### `pm relate <ID>`
