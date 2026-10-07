@@ -851,13 +851,20 @@ fn every_verbs_json_output_matches_its_fixture() {
         0,
         &mut failures,
     );
-    // AGT-2 is held, so `pm check` finds exactly that and exits 1.
+    // AGT-2 is held and AGT-1 is parked forever (AGT-1575), so `pm check`
+    // finds exactly those two and exits 1; AGT-1 is unparked afterwards.
+    let park = |value: &str| {
+        let out = sb.run(&["set", "AGT-1", value], &[]);
+        assert_eq!(out.status.code(), Some(0), "pm set AGT-1 {value}: {out:?}");
+    };
+    park("parked=forever");
     cap(
         "check",
         &["check", "--project", "pm", "--json"],
         1,
         &mut failures,
     );
+    park("parked=");
 
     // ---- pm claim/unclaim ----
     cap(

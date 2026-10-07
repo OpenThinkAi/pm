@@ -1,6 +1,15 @@
 {
-  "count": 1,
+  "count": 2,
   "findings": [
+    {
+      "days": 0,
+      "message": "parked forever for 0 days in state 'in-progress'; `pm ready` never surfaces it — unpark it (`pm set <id> parked=`) or say why it stays parked (`pm waive <id> parked \"why\"`)",
+      "rule": "parked",
+      "state": "in-progress",
+      "tickets": [
+        "AGT-1"
+      ]
+    },
     {
       "hold": {
         "at": {

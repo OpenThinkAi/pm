@@ -371,3 +371,35 @@ fn check_is_clean_then_reports_every_finding() {
     // The database is still healthy.
     assert_code(&sb.pm(&["doctor"]), 0);
 }
+
+/// AGT-1575: a ticket parked `forever` is a `parked` finding (with its
+/// age) until it is unparked or waived.
+#[test]
+fn check_reports_parked_forever_until_waived() {
+    let sb = Sandbox::new();
+    let t = sb.new_ticket(&["--project", "pm"]);
+    let dated = sb.new_ticket(&["--project", "pm"]);
+    assert_code(&sb.pm(&["set", &t, "parked=forever"]), 0);
+    assert_code(&sb.pm(&["set", &dated, "parked=2999-01-01"]), 0);
+
+    let out = sb.pm(&["check", "--json"]);
+    assert_code(&out, 1);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["count"], 1, "{report}");
+    let f = &report["findings"][0];
+    assert_eq!(f["rule"], "parked");
+    assert_eq!(f["tickets"], serde_json::json!([t]));
+    assert_eq!(f["days"], 0);
+    assert_eq!(f["state"], "triage");
+
+    let human = sb.pm(&["check", "--project", "pm"]);
+    assert_code(&human, 1);
+    assert!(
+        stdout(&human).contains("parked forever for 0 days"),
+        "{}",
+        stdout(&human)
+    );
+
+    assert_code(&sb.pm(&["waive", &t, "parked", "reference only"]), 0);
+    assert_code(&sb.pm(&["check"]), 0);
+}

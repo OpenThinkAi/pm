@@ -292,6 +292,11 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             assignee: ActorId::new("a"),
             state: "s".into(),
         },
+        Finding::Parked {
+            ticket: id,
+            days: 1,
+            state: "s".into(),
+        },
         Finding::BlockerCycle { tickets: vec![id] },
         Finding::DanglingRelation {
             relation: Relation {
@@ -312,6 +317,7 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             | Finding::Stale { .. }
             | Finding::Held { .. }
             | Finding::AssignedUnstarted { .. }
+            | Finding::Parked { .. }
             | Finding::BlockerCycle { .. }
             | Finding::DanglingRelation { .. }
             | Finding::DeletedProject { .. } => {}

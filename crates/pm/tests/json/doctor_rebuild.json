@@ -5,7 +5,7 @@
   "foreign_keys": [],
   "healthy": true,
   "integrity": [],
-  "op_count": 48,
+  "op_count": 50,
   "quarantine": [],
   "rebuilt": {
     "tables": []
@@ -15,7 +15,7 @@
   "schema_version": 13,
   "sync": {
     "cursor": 0,
-    "outbox": 48,
+    "outbox": 50,
     "parked": 0,
     "pending_numbers": 0,
     "pushed_through": 0,
@@ -27,7 +27,7 @@
     "backup_target": 0,
     "comment": 2,
     "marker": 2,
-    "ops": 48,
+    "ops": 50,
     "pending_number": 0,
     "project": 1,
     "project_doc": 1,

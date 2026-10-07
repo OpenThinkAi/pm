@@ -852,19 +852,23 @@ tickets).
     "count": 1,
     "findings": [
       {
-        "rule": "R1" | "stale" | "held" | "assigned-unstarted" | "blocker-cycle"
-              | "dangling-relation" | "deleted-project",
+        "rule": "R1" | "stale" | "held" | "assigned-unstarted" | "parked"
+              | "blocker-cycle" | "dangling-relation" | "deleted-project",
         "tickets": ["AGT-2", ...],       // refs (ULID while the number is pending)
         "message": "string",
         /* plus rule-specific fields: stale -> {days, stale_days}; held -> {hold};
            assigned-unstarted -> {assignee, state} (an unstarted-or-backlog ticket
            that still carries an assignee: `pm claim` refuses it, `pm ready`
-           excludes it — AGT-1379); dangling-relation ->
+           excludes it — AGT-1379); parked -> {days, state} (a live ticket in a
+           not-done state parked `forever`, which `pm ready` never surfaces;
+           `days` counts from when it was parked — AGT-1575); dangling-relation ->
            {relation: {kind: "blocks" | "parent" | "superseded_by", from, to},
            missing}; deleted-project -> {project} (a live ticket filed in a project
            whose `project.delete` synced in afterwards — AGT-1464: the ticket
            keeps the name, reports no project, and gets this instead of R1).
-           R1 is "no project and no R1/standalone waiver". */
+           R1 is "no project and no R1/standalone waiver". Only R1 and parked
+           findings can be waived: `pm waive <id> R1 "why"` (or `standalone`)
+           and `pm waive <id> parked "why"`. */
       },
       ...
     ]
