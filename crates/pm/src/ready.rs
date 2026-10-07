@@ -248,10 +248,12 @@ fn describe(
     let gate_text = |gate: &Gate| match gate {
         Gate::Held { hold } => format!("held: {}", describe_hold(hold)),
         Gate::Label { label } => format!("label {label}"),
+        Gate::Canceled { state } => format!("canceled: in state '{state}'"),
     };
     let gate_json = |gate: &Gate| match gate {
         Gate::Held { hold } => json!({ "kind": "held", "hold": hold }),
         Gate::Label { label } => json!({ "kind": "label", "label": label }),
+        Gate::Canceled { state } => json!({ "kind": "canceled", "state": state }),
     };
     match reason {
         Reason::State { state } => (format!("in state '{state}'"), json!({ "state": state })),
@@ -286,6 +288,16 @@ fn describe(
             (
                 message,
                 json!({ "blocker": b, "gate": gate.as_ref().map(gate_json) }),
+            )
+        }
+        Reason::BlockedByCanceled { blocker, state } => {
+            let b = name(blocker);
+            (
+                format!(
+                    "blocked by canceled {b} (state '{state}'): remove the edge if the \
+                     cancellation unblocks it, or cancel this ticket too"
+                ),
+                json!({ "blocker": b, "state": state }),
             )
         }
         Reason::TransitivelyBlocked { via, root, gate } => (

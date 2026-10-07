@@ -7,7 +7,7 @@
   "parked": 0,
   "pending_numbers": 0,
   "pulled": 0,
-  "pushed": 51,
+  "pushed": 52,
   "quarantine": {
     "parked": 0,
     "refused": 0
@@ -18,7 +18,7 @@
   "seed": {
     "number_floor": 0,
     "numbered": 0,
-    "pushed": 51,
+    "pushed": 52,
     "resumed": false
   },
   "seeded": true,

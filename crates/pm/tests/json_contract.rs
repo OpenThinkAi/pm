@@ -834,7 +834,12 @@ fn every_verbs_json_output_matches_its_fixture() {
 
     // ---- pm archive/unarchive (single ticket; round-tripped so later
     // steps see AGT-4 in its normal, non-archived state) ----
-    cap("archive", &["archive", "AGT-4", "--json"], 0, &mut failures);
+    cap(
+        "archive",
+        &["archive", "AGT-4", "--force", "--json"],
+        0,
+        &mut failures,
+    );
     cap(
         "unarchive",
         &["unarchive", "AGT-4", "--json"],
@@ -1289,7 +1294,10 @@ fn every_verbs_json_output_matches_its_fixture() {
                 "hold_clear_bulk",
                 &["hold", "--clear", "AGT-1", "AGT-2", "--json"],
             ),
-            ("archive_bulk", &["archive", "AGT-1", "AGT-2", "--json"]),
+            (
+                "archive_bulk",
+                &["archive", "AGT-1", "AGT-2", "--force", "--json"],
+            ),
         ] {
             capture(&bulk, name, args, 0, &mut failures);
         }
@@ -1533,7 +1541,72 @@ fn status_states_is_an_array_in_workflow_order_not_an_alphabetical_map() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     let states = v["states"].as_array().expect("states is an array");
     let names: Vec<&str> = states.iter().map(|s| s["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["triage", "in-progress", "done"]);
+    assert_eq!(names, ["triage", "in-progress", "done", "canceled"]);
     assert_eq!(states[0]["category"], "unstarted");
     assert_eq!(states[0]["count"], 1);
+}
+
+/// AGT-1572: a canceled blocker keeps blocking. `pm ready` excludes the
+/// direct dependent as `blocked-by-canceled` and the one behind it as
+/// `transitively-blocked` with a `canceled` gate; `pm check` reports the
+/// canceled edge (exit 1); `pm graph` keeps both out of the ready wave.
+#[test]
+fn canceled_blockers_json_matches_its_fixtures() {
+    let sb = Sandbox::new();
+    let mut failures: Vec<String> = Vec::new();
+    let ok = |args: &[&str]| {
+        let out = sb.pm(args);
+        assert_eq!(out.status.code(), Some(0), "pm {args:?}: {out:?}");
+    };
+    ok(&[
+        "init",
+        "--prefix",
+        "AGT",
+        "--preset",
+        "saltline",
+        "--workspace",
+        sb.ws_str(),
+    ]);
+    sb.put_project("pm");
+    ok(&["new", "--title", "Dropped", "--project", "pm"]); // AGT-1
+    ok(&[
+        "new",
+        "--title",
+        "Needs dropped",
+        "--project",
+        "pm",
+        "--blocked-by",
+        "AGT-1",
+    ]); // AGT-2
+    ok(&[
+        "new",
+        "--title",
+        "Behind it",
+        "--project",
+        "pm",
+        "--blocked-by",
+        "AGT-2",
+    ]); // AGT-3
+    ok(&["move", "AGT-1", "canceled"]);
+    ok(&["archive", "AGT-1"]);
+    for (name, args, code) in [
+        (
+            "ready_canceled",
+            &["ready", "--project", "pm", "--json"][..],
+            0,
+        ),
+        (
+            "check_canceled",
+            &["check", "--project", "pm", "--json"][..],
+            1,
+        ),
+        (
+            "graph_canceled",
+            &["graph", "--project", "pm", "--json"][..],
+            0,
+        ),
+    ] {
+        capture(&sb, name, args, code, &mut failures);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

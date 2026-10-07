@@ -37,7 +37,7 @@
       "archive": true,
       "default": true,
       "hold": "never",
-      "state": "done",
+      "state": "canceled",
       "tickets": 1,
       "vault": "archived"
     },

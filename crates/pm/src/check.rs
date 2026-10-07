@@ -45,7 +45,7 @@ pub fn check(ctx: &Ctx<'_>, project: Option<&str>) -> Result<()> {
         for f in &findings {
             let ids: Vec<String> = f.tickets().iter().map(&name).collect();
             println!(
-                "{:<18} {:<14} {}",
+                "{:<19} {:<14} {}",
                 f.rule(),
                 ids.join(","),
                 crate::text::inline(&message(f, &ws, &name))
@@ -87,6 +87,9 @@ fn finding_json(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) ->
         }),
         Finding::Parked { days, state, .. } => json!({ "days": days, "state": state }),
         Finding::DeletedProject { project, .. } => json!({ "project": project }),
+        Finding::BlockedByCanceled { blocker, state, .. } => {
+            json!({ "blocker": name(blocker), "state": state })
+        }
         Finding::NoProject { .. } | Finding::BlockerCycle { .. } => json!({}),
     };
     if let (Value::Object(out), Value::Object(extra)) = (&mut out, extra) {
@@ -126,6 +129,18 @@ fn message(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) -> Stri
             "filed in project '{project}', which was deleted; \
              move it (`pm set <id> project=…`)"
         ),
+        Finding::BlockedByCanceled {
+            ticket,
+            blocker,
+            state,
+        } => {
+            let (t, b) = (name(ticket), name(blocker));
+            format!(
+                "blocked by canceled {b} (state '{state}'), which still blocks it; if the \
+                 cancellation unblocks it, `pm relate {t} --unblock {b}` and comment why, \
+                 else cancel {t} too"
+            )
+        }
         Finding::DanglingRelation { relation, missing } => {
             let kind = serde_json::to_value(relation.kind)
                 .ok()

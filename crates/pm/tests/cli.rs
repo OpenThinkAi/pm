@@ -235,6 +235,7 @@ fn init_preset_saltline_reproduces_the_legacy_workspace() {
             ("triage", StateCategory::Unstarted),
             ("in-progress", StateCategory::Started),
             ("done", StateCategory::Completed),
+            ("canceled", StateCategory::Canceled),
         ]
     );
 }

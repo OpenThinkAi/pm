@@ -387,9 +387,11 @@ config-table write left is the allocator floor (`workspace.number_floor`).
   claimable — file into `backlog` to park something below the frontier,
   move it to `todo` to surface it), so `pm new` files a fresh ticket into
   `todo`, not `backlog`.
-- `--preset saltline`: reproduces this repo's own workflow exactly as
-  before this flag existed. Prefix `AGT`. States `triage` (`unstarted`),
-  `in-progress` (`started`), `done` (`completed`). Gate label `manual`.
+- `--preset saltline`: reproduces this repo's own workflow. Prefix
+  `AGT`. States `triage` (`unstarted`), `in-progress` (`started`), `done`
+  (`completed`), `canceled` (`canceled`; AGT-1572 — retire a ticket with
+  `pm move <id> canceled`, which keeps its dependents blocked until
+  someone decides, see `pm ready`). Gate label `manual`.
   Any automation that depended on `pm init --prefix AGT` seeding those
   states must now pass `--preset saltline` explicitly.
 - `--state <NAME:CATEGORY>` (AGT-1518; repeat or comma-separate) seeds
@@ -425,7 +427,7 @@ config-table write left is the allocator floor (`workspace.number_floor`).
   }
   ```
   `--preset saltline --prefix AGT` prints the same shape with `"prefix":
-  "AGT"` and the three saltline states instead; `--join` prints it with
+  "AGT"` and the four saltline states instead; `--join` prints it with
   `"states": []` and `"joined": "<ULID>"`.
 
 ### `pm new`
@@ -911,11 +913,19 @@ whole workspace or project).
     "done": false                                    // true once nothing in scope is pending
   }
   ```
-  Blockers are always resolved through the whole workspace, whatever the
-  scope — a blocker outside the filtered scope (or outside the `--ids` set)
-  still counts as pending, it is just never itself a node. That blocker
-  never resolving, or a dependency cycle, lands the rest of the graph in
-  one final, unordered wave rather than looping forever.
+  Nodes are the tickets not yet settled: settled means archived,
+  tombstoned, or in a `completed`- or `canceled`-category state, so a
+  project whose every ticket is done or canceled reports `done: true`.
+  A blocker resolves exactly as in `pm ready`: tombstoned, absent,
+  `completed`, or archived — except that a **canceled** blocker, archived
+  or not, never resolves (AGT-1572). Blockers are always resolved through
+  the whole workspace, whatever the scope — a blocker outside the
+  filtered scope (or outside the `--ids` set) still counts as pending, it
+  is just never itself a node. A blocker that never resolves (a canceled
+  one, or one outside the scope that stays pending), or a dependency
+  cycle, lands the rest of the graph in one final, unordered wave rather
+  than looping forever; `pm ready --explain` / `pm check` name the
+  canceled blocker.
 
 ### `pm ready`
 
@@ -934,6 +944,19 @@ ticket's own `parked` and before `not-before`. Like a parked ticket, it
 still counts as a pending blocker of tickets elsewhere (`blocked-by`, no
 gate). `pm claim --ready` uses the same frontier.
 
+A blocker no longer holds its dependent back once it is tombstoned (or
+absent), in a `completed`-category state, or archived — archived counts as
+done whatever the state, so a blocker swept into the archive does not
+strand its dependents (AGT-1343). **A canceled blocker is the exception**
+(AGT-1572): one in a `canceled`-category state keeps blocking, archived or
+not, because retiring a ticket must not silently unblock its dependents.
+The dependent is excluded as `blocked-by-canceled` (whatever it blocks in
+turn, `transitively-blocked` with a `canceled` gate) until someone decides:
+if the cancellation really unblocks it, remove the edge (`pm relate <id>
+--unblock <canceled-id>`) and comment why; otherwise cancel the dependent
+too. `pm check` reports the same edges. A ticket archived out of any other
+state (`pm archive --force`) still counts as done.
+
 - Exit `2`: `--limit 0`; empty `--project`/`--model`/`--exclude-label`.
 - Exit `3`: `--project` names a project that does not exist; an `--ids`
   entry does not exist.
@@ -951,17 +974,21 @@ gate). `pm claim --ready` uses the same frontier.
       {
         "id": "AGT-4", "ulid": "<ULID>",  // id is a ref: the ULID while the number is pending
         "reason": "state" | "assigned" | "held" | "label" | "parked" | "project-parked"
-                | "not-before" | "cycle" | "blocked-by" | "transitively-blocked" | "model" | "done",
+                | "not-before" | "cycle" | "blocked-by" | "blocked-by-canceled"
+                | "transitively-blocked" | "model" | "done",
         "message": "string",
         /* plus reason-specific fields:
              state -> {state}; assigned -> {assignee}; held -> {hold}; label -> {label};
              parked -> {until}; project-parked -> {project}; not-before -> {date};
              cycle -> {tickets};
              blocked-by -> {blocker, gate: Gate | null};
+             blocked-by-canceled -> {blocker, state} (the canceled direct blocker and
+               its state; AGT-1572);
              transitively-blocked -> {via, root, gate: Gate};
              model -> {labels, wanted}; done -> {} (only for an --ids entry that is
              done, archived or deleted)
-           where Gate = {"kind": "held", "hold": {...}} | {"kind": "label", "label": "string"} */
+           where Gate = {"kind": "held", "hold": {...}} | {"kind": "label", "label": "string"}
+                      | {"kind": "canceled", "state": "string"} (only as a transitive root) */
       },
       ...
     ],
@@ -1016,7 +1043,8 @@ tickets).
     "findings": [
       {
         "rule": "R1" | "stale" | "held" | "assigned-unstarted" | "parked"
-              | "blocker-cycle" | "dangling-relation" | "deleted-project",
+              | "blocker-cycle" | "dangling-relation" | "deleted-project"
+              | "blocked-by-canceled",
         "tickets": ["AGT-2", ...],       // refs (ULID while the number is pending)
         "message": "string",
         /* plus rule-specific fields: stale -> {days, stale_days}; held -> {hold};
@@ -1028,7 +1056,12 @@ tickets).
            {relation: {kind: "blocks" | "parent" | "superseded_by", from, to},
            missing}; deleted-project -> {project} (a live ticket filed in a project
            whose `project.delete` synced in afterwards — AGT-1464: the ticket
-           keeps the name, reports no project, and gets this instead of R1).
+           keeps the name, reports no project, and gets this instead of R1);
+           blocked-by-canceled -> {blocker, state} (AGT-1572: one per `blocks` edge
+           from a canceled ticket — archived or not — to a live ticket that is not
+           done or canceled; `tickets` is [dependent, blocker]. The canceled
+           blocker keeps blocking until the edge is removed with `pm relate <id>
+           --unblock <blocker>` or the dependent is canceled too).
            R1 is "no project and no R1/standalone waiver". Only R1 and parked
            findings can be waived: `pm waive <id> R1 "why"` (or `standalone`)
            and `pm waive <id> parked "why"`. */
@@ -1104,15 +1137,28 @@ Fields instead of `vault-sweep`'s folder moves: `archived_at` on a ticket,
 `status: complete` on a project. Flags: `--auto` (conflicts with `ID`:
 archive every completed ticket whose completion month has passed and
 retire every idle project, instead of named tickets), `--dry-run` (requires
-`--auto`: report what would change without writing anything). Several
-ids archive in one transaction (see **Bulk forms**).
+`--auto`: report what would change without writing anything), `--force`
+(conflicts with `--auto`: archive the named tickets even if some are
+neither completed nor canceled). Several ids archive in one transaction
+(see **Bulk forms**).
 
-- Exit `2`: neither `ID` nor `--auto` given; an id with `--auto`.
+AGT-1572: `pm archive <ID>...` archives tickets in a `completed`- or
+`canceled`-category state as asked; if any named ticket is in another
+state the whole call is **refused** (exit `2`, nothing written, every
+such ticket named) unless `--force`, because an archived ticket counts as
+done for its dependents unless it was canceled — archiving unfinished
+work is how a dependent used to become ready with no signal. To retire a
+ticket, move it to a canceled state first (`pm move <ID> canceled` in the
+saltline preset), then archive it; its dependents stay blocked
+(`blocked-by-canceled`) until someone decides.
+
+- Exit `2`: neither `ID` nor `--auto` given; an id with `--auto`; a named
+  ticket is neither completed nor canceled and `--force` was not given;
+  `--force` with `--auto`.
 - Exit `3`: any named ticket does not exist (nothing is written).
 - `--json` (named form, `pm archive AGT-N`): **Ticket**, `archived_at`
-  now set to this op's own HLC — regardless of the ticket's current
-  state, unlike `--auto`, which only ever touches completed tickets. For
-  several ids: **Results**, each `result` `"archived"`.
+  now set to this op's own HLC. For several ids: **Results**, each
+  `result` `"archived"`.
 - `--json --auto`:
   ```jsonc
   {
@@ -1174,7 +1220,8 @@ to a workspace state, through one of:
    as fields, not states:
    - `archived` → the workspace's first `canceled` state by position,
      else its first `completed` one, **+archive** (a vault's `archived`
-     folder holds dropped tickets);
+     folder holds dropped tickets). Mapped to a canceled state, such a
+     ticket keeps blocking its dependents (AGT-1572; see `pm ready`);
    - `blocked` → the workspace's initial `unstarted` state (where `pm
      new` files), **+hold only when the file has no `blocked-by`**: its
      blockers are imported as relations and already keep it off the ready

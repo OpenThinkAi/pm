@@ -1,0 +1,17 @@
+{
+  "count": 1,
+  "findings": [
+    {
+      "blocker": "AGT-1",
+      "message": "blocked by canceled AGT-1 (state 'canceled'), which still blocks it; if the cancellation unblocks it, `pm relate AGT-2 --unblock AGT-1` and comment why, else cancel AGT-2 too",
+      "rule": "blocked-by-canceled",
+      "state": "canceled",
+      "tickets": [
+        "AGT-2",
+        "AGT-1"
+      ]
+    }
+  ],
+  "ok": false,
+  "schema": 1
+}

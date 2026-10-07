@@ -151,7 +151,9 @@ fn archive_and_unarchive_round_trip_a_single_ticket() {
     sb.project("pm", "pm");
     assert_code(&sb.pm(&["new", "--title", "t", "--project", "pm"]), 0);
 
-    let v = json(&sb.pm(&["archive", "AGT-1", "--json"]));
+    // AGT-1572 AC4: a `triage` ticket is neither completed nor canceled,
+    // so archiving it needs --force.
+    let v = json(&sb.pm(&["archive", "AGT-1", "--force", "--json"]));
     assert!(v["archived_at"].is_object(), "{v}");
     assert_eq!(
         list_ids(&json(&sb.pm(&["list", "--json"]))),
@@ -308,7 +310,7 @@ fn doctor_stays_clean_through_a_full_archive_workflow() {
     sb.backdate(&old, "ticket.create", AUGUST_CREATE_MS);
     sb.backdate(&old, "state.transition", AUGUST_DONE_MS);
     assert_code(&sb.pm(&["archive", "--auto"]), 0);
-    assert_code(&sb.pm(&["archive", "AGT-2"]), 0);
+    assert_code(&sb.pm(&["archive", "AGT-2", "--force"]), 0);
     assert_code(&sb.pm(&["unarchive", "AGT-2"]), 0);
 
     assert_code(&sb.pm(&["doctor"]), 0);
@@ -319,4 +321,83 @@ fn doctor_stays_clean_through_a_full_archive_workflow() {
         serde_json::json!({ "tables": [] }),
         "the rebuild changes nothing: {v}"
     );
+}
+
+/// AGT-1572 AC4: `pm archive` of a ticket neither completed nor canceled
+/// is refused (exit 2, nothing written) unless `--force`; a done or
+/// canceled one archives as asked. `--force` conflicts with `--auto`.
+#[test]
+fn archiving_an_unfinished_ticket_needs_force() {
+    let sb = Sandbox::new();
+    sb.project("pm", "pm");
+    for title in ["open", "finished", "dropped"] {
+        assert_code(&sb.pm(&["new", "--title", title, "--project", "pm"]), 0);
+    }
+    let out = sb.pm(&["archive", "AGT-1"]);
+    assert_code(&out, 2);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("neither completed nor canceled"), "{err}");
+    assert!(err.contains("pm move AGT-1 canceled"), "{err}");
+    assert!(err.contains("--force"), "{err}");
+    assert_eq!(
+        json(&sb.pm(&["show", "AGT-1", "--json"]))["archived_at"],
+        Value::Null,
+        "nothing archived"
+    );
+
+    assert_code(&sb.pm(&["done", "AGT-2"]), 0);
+    assert_code(&sb.pm(&["move", "AGT-3", "canceled"]), 0);
+    // Bulk: one unfinished id refuses the whole call, naming it.
+    let out = sb.pm(&["archive", "AGT-2,AGT-1", "AGT-3"]);
+    assert_code(&out, 2);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("AGT-1 (state 'triage') is neither"), "{err}");
+    assert!(!err.contains("AGT-2 ("), "{err}");
+    for id in ["AGT-2", "AGT-3"] {
+        assert_eq!(
+            json(&sb.pm(&["show", id, "--json"]))["archived_at"],
+            Value::Null,
+            "nothing archived"
+        );
+    }
+    assert_code(&sb.pm(&["archive", "AGT-2"]), 0);
+    assert_code(&sb.pm(&["archive", "AGT-3"]), 0);
+    assert_code(&sb.pm(&["archive", "AGT-1", "--force"]), 0);
+    assert_code(&sb.pm(&["archive", "--auto", "--force"]), 2);
+}
+
+/// AGT-1572: archiving a canceled blocker does not unblock its dependent
+/// (an archived-as-canceled ticket keeps blocking), while a force-archived
+/// unfinished blocker still counts as done, as before.
+#[test]
+fn an_archived_canceled_blocker_keeps_blocking_pm_ready() {
+    let sb = Sandbox::new();
+    sb.project("pm", "pm");
+    assert_code(&sb.pm(&["new", "--title", "dropped", "--project", "pm"]), 0);
+    assert_code(&sb.pm(&["new", "--title", "plain", "--project", "pm"]), 0);
+    for blocker in ["AGT-1", "AGT-2"] {
+        assert_code(
+            &sb.pm(&[
+                "new",
+                "--title",
+                "dependent",
+                "--project",
+                "pm",
+                "--blocked-by",
+                blocker,
+            ]),
+            0,
+        );
+    }
+    assert_code(&sb.pm(&["move", "AGT-1", "canceled"]), 0);
+    assert_code(&sb.pm(&["archive", "AGT-1"]), 0);
+    assert_code(&sb.pm(&["archive", "AGT-2", "--force"]), 0);
+
+    let v = json(&sb.pm(&["ready", "--json"]));
+    assert_eq!(list_ids(&v["ready"]), ["AGT-4"], "{v}");
+    let excluded = v["excluded"].as_array().unwrap();
+    assert_eq!(excluded.len(), 1, "{v}");
+    assert_eq!(excluded[0]["id"], "AGT-3");
+    assert_eq!(excluded[0]["reason"], "blocked-by-canceled");
+    assert_eq!(excluded[0]["blocker"], "AGT-1");
 }

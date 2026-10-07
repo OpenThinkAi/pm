@@ -223,6 +223,7 @@ fn state_add_is_usable_at_once_and_an_explicit_position_inserts() {
             ("in-progress".into(), "started".into(), 1),
             ("qa".into(), "started".into(), 2),
             ("done".into(), "completed".into(), 3),
+            ("canceled".into(), "canceled".into(), 4),
         ]
     );
     // No --position: after the last state.
@@ -235,7 +236,7 @@ fn state_add_is_usable_at_once_and_an_explicit_position_inserts() {
         "canceled",
         "--json",
     ]));
-    assert_eq!(added["state"]["position"], 4);
+    assert_eq!(added["state"]["position"], 5);
 
     // pm move / list --state / status see it immediately.
     let id = sb.new_ticket(&[]);
@@ -249,7 +250,7 @@ fn state_add_is_usable_at_once_and_an_explicit_position_inserts() {
     let text = stdout(&sb.pm(&["workspace", "state", "list"]));
     assert_eq!(
         text,
-        "triage\tunstarted\t0\nin-progress\tstarted\t1\nqa\tstarted\t2\ndone\tcompleted\t3\ndropped\tcanceled\t4\n"
+        "triage\tunstarted\t0\nin-progress\tstarted\t1\nqa\tstarted\t2\ndone\tcompleted\t3\ncanceled\tcanceled\t4\ndropped\tcanceled\t5\n"
     );
 
     // One state.upsert per state the write changed, in the config log.
@@ -292,7 +293,7 @@ fn state_add_upserts_an_existing_state_and_ready_follows_its_category() {
     ]));
     assert_eq!(changed["created"], false);
     assert_eq!(changed["changed"], true);
-    assert_eq!(changed["state"]["position"], 3);
+    assert_eq!(changed["state"]["position"], 4);
     let ready = json(&sb.pm(&["ready", "--json"]));
     assert_eq!(ready_ids(&ready), vec![id.as_str()]);
     let claimed = sb.pm(&["claim", &id]);

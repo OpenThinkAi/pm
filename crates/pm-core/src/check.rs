@@ -21,6 +21,12 @@
 //! - **blocker cycle** — tickets that (transitively) block each other.
 //! - **dangling relation** — a relation between a live ticket and one that
 //!   is tombstoned or absent.
+//! - **blocked-by-canceled** (AGT-1572) — a live, not-done ticket that a
+//!   canceled ticket (a `canceled`-category state, archived or not)
+//!   `blocks`, one finding per such edge. A canceled blocker keeps
+//!   blocking (`pm ready` excludes the dependent as `blocked-by-canceled`)
+//!   until someone decides: remove the edge if the cancellation really
+//!   unblocks it, or cancel the dependent too.
 //! - **deleted project** (AGT-1464) — a live ticket filed in a project
 //!   that has since been deleted: a `project.delete` synced in while this
 //!   replica still had tickets in it. The store keeps the name in the
@@ -75,6 +81,13 @@ pub enum Finding {
     DanglingRelation { relation: Relation, missing: Ulid },
     /// The ticket is filed in `project`, which was deleted (AGT-1464).
     DeletedProject { ticket: Ulid, project: String },
+    /// `ticket` is live and not done, and `blocker` — in the
+    /// `canceled`-category `state` — blocks it (AGT-1572).
+    BlockedByCanceled {
+        ticket: Ulid,
+        blocker: Ulid,
+        state: String,
+    },
 }
 
 impl Finding {
@@ -89,6 +102,9 @@ impl Finding {
             | Finding::DeletedProject { ticket, .. } => vec![*ticket],
             Finding::BlockerCycle { tickets } => tickets.clone(),
             Finding::DanglingRelation { relation, .. } => vec![relation.from, relation.to],
+            Finding::BlockedByCanceled {
+                ticket, blocker, ..
+            } => vec![*ticket, *blocker],
         }
     }
 
@@ -103,6 +119,7 @@ impl Finding {
             Finding::BlockerCycle { .. } => "blocker-cycle",
             Finding::DanglingRelation { .. } => "dangling-relation",
             Finding::DeletedProject { .. } => "deleted-project",
+            Finding::BlockedByCanceled { .. } => "blocked-by-canceled",
         }
     }
 }
@@ -116,8 +133,8 @@ impl Finding {
 /// Order: R1, stale (each in `tickets` order), then held,
 /// assigned-unstarted and parked interleaved per ticket (each in `tickets`
 /// order),
-/// then cycles, then dangling relations (in relation order: kind, from,
-/// to).
+/// then cycles, then dangling relations, then blocked-by-canceled edges
+/// (both in relation order: kind, from, to).
 pub fn check(
     ws: &Workspace,
     tickets: &[Ticket],
@@ -210,6 +227,19 @@ pub fn check(
                     missing: end,
                 });
             }
+        }
+    }
+
+    for r in relations.iter().filter(|r| r.kind == RelationKind::Blocks) {
+        let (Some(blocker), Some(dependent)) = (by_id.get(&r.from), by_id.get(&r.to)) else {
+            continue;
+        };
+        if crate::ready::canceled(ws, blocker) && !crate::ready::settled(ws, dependent) {
+            findings.push(Finding::BlockedByCanceled {
+                ticket: dependent.id,
+                blocker: blocker.id,
+                state: blocker.state.clone(),
+            });
         }
     }
 
@@ -371,6 +401,7 @@ mod tests {
                 state("triage", StateCategory::Unstarted, 0),
                 state("in-progress", StateCategory::Started, 1),
                 state("done", StateCategory::Completed, 2),
+                state("canceled", StateCategory::Canceled, 3),
             ],
             gate_labels: Default::default(),
             model_labels: Default::default(),
@@ -575,6 +606,69 @@ mod tests {
                     state: "triage".into(),
                 },
             ]
+        );
+    }
+
+    /// AGT-1572: every `blocks` edge from a canceled ticket (archived or
+    /// not) to a live, not-done one is a finding; a dependent that is
+    /// done, canceled, archived or tombstoned is not, nor is a tombstoned
+    /// blocker. The project filter keeps a finding naming either end.
+    #[test]
+    fn a_canceled_blocker_of_a_pending_ticket_is_reported_per_edge() {
+        let mut canceled = ticket(1, Some("pm"));
+        canceled.state = "canceled".into();
+        let mut archived = ticket(2, Some("other"));
+        archived.state = "canceled".into();
+        archived.archived_at = Some(Hlc::new(NOW, 1));
+        let dependent = ticket(3, Some("pm"));
+        let mut started = ticket(4, Some("other"));
+        started.state = "in-progress".into();
+        let mut done = ticket(5, Some("pm"));
+        done.state = "done".into();
+        let mut also_canceled = ticket(6, Some("pm"));
+        also_canceled.state = "canceled".into();
+        let mut gone = ticket(7, Some("pm"));
+        gone.state = "canceled".into();
+        gone.deleted = true;
+        let mut archived_dependent = ticket(8, Some("pm"));
+        archived_dependent.archived_at = Some(Hlc::new(NOW, 1));
+        let rels = [
+            blocks(&canceled, &dependent),
+            blocks(&archived, &started),
+            blocks(&canceled, &done),
+            blocks(&canceled, &also_canceled),
+            blocks(&gone, &dependent),
+            blocks(&canceled, &archived_dependent),
+        ];
+        let tickets = [
+            canceled.clone(),
+            archived.clone(),
+            dependent.clone(),
+            started.clone(),
+            done,
+            also_canceled,
+            gone,
+            archived_dependent,
+        ];
+        // The tombstoned blocker is a dangling relation, not this rule.
+        let found: Vec<Finding> = check(&ws(0), &tickets, &rels, NOW, None)
+            .into_iter()
+            .filter(|f| f.rule() != "dangling-relation")
+            .collect();
+        let edge = |t: &Ticket, b: &Ticket| Finding::BlockedByCanceled {
+            ticket: t.id,
+            blocker: b.id,
+            state: "canceled".into(),
+        };
+        assert_eq!(
+            found,
+            [edge(&dependent, &canceled), edge(&started, &archived)]
+        );
+        assert_eq!(found[0].rule(), "blocked-by-canceled");
+        assert_eq!(found[0].tickets(), [dependent.id, canceled.id]);
+        assert_eq!(
+            check(&ws(0), &tickets, &rels, NOW, Some("other")),
+            [edge(&started, &archived)]
         );
     }
 

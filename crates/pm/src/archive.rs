@@ -34,12 +34,18 @@ use ulid::Ulid;
 use crate::exit::{CliError, Result};
 use crate::verbs::{Ctx, SCHEMA, Stamper, display_id, find, print_json, ref_id, ticket_json};
 
-/// `pm archive AGT-N…` or `pm archive --auto [--dry-run]`; clap's
-/// `conflicts_with`/`requires` rule out the other two combinations
-/// (ids with `--auto`, `--dry-run` without `--auto`).
-pub fn archive(ctx: &Ctx<'_>, ids: &[String], auto: bool, dry_run: bool) -> Result<()> {
+/// `pm archive AGT-N… [--force]` or `pm archive --auto [--dry-run]`;
+/// clap's `conflicts_with`/`requires` rule out the other combinations
+/// (ids or `--force` with `--auto`, `--dry-run` without `--auto`).
+pub fn archive(
+    ctx: &Ctx<'_>,
+    ids: &[String],
+    auto: bool,
+    dry_run: bool,
+    force: bool,
+) -> Result<()> {
     match (ids.is_empty(), auto) {
-        (false, false) => archive_ids(ctx, ids),
+        (false, false) => archive_ids(ctx, ids, force),
         (true, true) => archive_auto(ctx, dry_run),
         (true, false) => Err(CliError::usage("pm archive requires an id or --auto")),
         (false, true) => unreachable!("clap's conflicts_with rules this out"),
@@ -48,15 +54,25 @@ pub fn archive(ctx: &Ctx<'_>, ids: &[String], auto: bool, dry_run: bool) -> Resu
 
 // ------------------------------------------------------------ named tickets
 
-/// `pm archive AGT-N` (AC3): sets `archived_at` to this op's own HLC,
-/// regardless of the ticket's current state — an explicit request, unlike
-/// `--auto`, which only ever touches completed tickets. AGT-1576: several
-/// ids (`pm archive AGT-1 AGT-2`, or `AGT-1,AGT-2`) archive in one
-/// `commit_batch`, every id resolved first (`crate::bulk`).
-fn archive_ids(ctx: &Ctx<'_>, refs: &[String]) -> Result<()> {
+/// `pm archive AGT-N` (AC3): sets `archived_at` to this op's own HLC.
+/// AGT-1576: several ids (`pm archive AGT-1 AGT-2`, or `AGT-1,AGT-2`)
+/// archive in one `commit_batch`, every id resolved first (`crate::bulk`).
+///
+/// AGT-1572 AC4: only tickets in a `completed` or `canceled` state archive
+/// as asked; if any named ticket is in another state the whole call is
+/// refused (exit `2`, nothing written, every such ticket listed) unless
+/// `--force`, because an archived blocker counts as done for its
+/// dependents unless it was canceled — archiving unfinished work is how a
+/// dependent used to become ready with no signal. Retire such a ticket by
+/// moving it to a canceled state instead (which keeps its dependents
+/// blocked until someone decides), then archive it.
+fn archive_ids(ctx: &Ctx<'_>, refs: &[String], force: bool) -> Result<()> {
     let actor = ctx.actor()?;
     let (mut store, ws) = ctx.open()?;
     let targets = crate::bulk::resolve(&store, &ws, refs)?;
+    if !force {
+        refuse_unfinished(&ws, &targets.tickets)?;
+    }
     let mut stamper = Stamper::new(&store, actor)?;
     let ops: Vec<pm_core::Op> = targets
         .tickets
@@ -70,6 +86,48 @@ fn archive_ids(ctx: &Ctx<'_>, refs: &[String]) -> Result<()> {
     store.commit_batch(&ops, &[])?;
     let results: Vec<(Ulid, &str)> = targets.tickets.iter().map(|t| (t.id, "archived")).collect();
     crate::bulk::print_results(ctx, &store, &ws, targets.many, &results)
+}
+
+/// Exit `2` naming every ticket in `tickets` that is neither completed nor
+/// canceled (AGT-1572 AC4), with how to retire it instead.
+fn refuse_unfinished(ws: &Workspace, tickets: &[Ticket]) -> Result<()> {
+    let unfinished: Vec<&Ticket> = tickets
+        .iter()
+        .filter(|t| {
+            !ws.state(&t.state).is_some_and(|s| {
+                matches!(
+                    s.category,
+                    StateCategory::Completed | StateCategory::Canceled
+                )
+            })
+        })
+        .collect();
+    if unfinished.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = unfinished
+        .iter()
+        .map(|t| format!("{} (state '{}')", ref_id(ws, t), t.state))
+        .collect();
+    let retire = match ws
+        .states
+        .iter()
+        .find(|s| s.category == StateCategory::Canceled)
+    {
+        Some(state) => {
+            let first = ref_id(ws, unfinished[0]);
+            format!("cancel it first (`pm move {first} {}`)", state.name)
+        }
+        None => "add a canceled state (`pm workspace state add <NAME> --category canceled`) \
+                 and move it there first"
+            .to_string(),
+    };
+    Err(CliError::usage(format!(
+        "{} neither completed nor canceled: archived, it would count as done and silently \
+         unblock its dependents. To retire a ticket, {retire}, then archive it; pass --force \
+         to archive as it is; nothing was archived",
+        named.join(", ") + if named.len() == 1 { " is" } else { " are" }
+    )))
 }
 
 /// `pm unarchive AGT-N` (AC3): clears `archived_at`.
