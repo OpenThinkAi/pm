@@ -422,6 +422,8 @@ fn every_help_states_its_json_shape_and_it_matches_the_fixtures() {
                 &["workspace", "gate-label", "list"],
             ),
             ("workspace_docs_owned_by", &["workspace", "docs-owned-by"]),
+            ("workspace_state_add", &["workspace", "state", "add"]),
+            ("workspace_state_list", &["workspace", "state", "list"]),
             ("backup_install_timer", &["backup", "install-timer"]),
             ("backup_status", &["backup", "status"]),
             ("project_doc_add", &["project", "doc", "add"]),

@@ -142,6 +142,15 @@ const SHAPES: &[(&[&str], &str)] = &[
         &["workspace", "docs-owned-by"],
         r#"object {"schema": 1, "docs_owned_by": ...}"#,
     ),
+    (&["workspace", "state"], GROUP),
+    (
+        &["workspace", "state", "add"],
+        r#"object {"schema": 1, "state": {"name": ..., "category": ..., ...}, ...}"#,
+    ),
+    (
+        &["workspace", "state", "list"],
+        r#"object {"schema": 1, "states": [...]}"#,
+    ),
     (&["hub"], GROUP),
     (
         &["hub", "login"],
