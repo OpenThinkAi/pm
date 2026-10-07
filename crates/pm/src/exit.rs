@@ -1,6 +1,7 @@
 //! The CLI's exit-code contract (projects/pm/README.md §Surfaces): `0` ok,
-//! `1` error, `2` usage, `3` not found, `75` taken/conflict. Every verb
-//! returns [`Result`]; `main` prints the message and exits with the code.
+//! `1` error, `2` usage, `3` not found, `75` taken/conflict, `141` stdout
+//! closed early. Every verb returns [`Result`]; `main` prints the message
+//! and exits with the code.
 //! Clap's own parse failures already exit `2`.
 
 use std::fmt;
@@ -13,6 +14,9 @@ pub const NOT_FOUND: u8 = 3;
 /// The authority refused a conditional op (`pm claim`: someone else holds
 /// the ticket).
 pub const TAKEN: u8 = 75;
+/// Stdout's reader went away mid-output (`pm list | head -1`): `128 +
+/// SIGPIPE`, exited quietly by [`crate::pipe`] (AGT-1634).
+pub const BROKEN_PIPE: u8 = 141;
 
 #[derive(Debug)]
 pub struct CliError {
