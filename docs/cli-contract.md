@@ -316,7 +316,8 @@ comma-separated), `--description <TEXT>`, `--description-file <PATH|->`
 `--blocked-by <ID>` (repeatable/comma-separated), `--linked-github <URL>`,
 `--source <type=…,url=…,id=…[,fetched-at=…]>`, `--from-file <PATH>`
 (mutually exclusive with every plain flag above and with `--batch`),
-`--batch <PATH>` (same exclusivity).
+`--batch <PATH>` (same exclusivity), `--sync` (any form; AGT-1571 —
+below).
 
 - Exit `2`: `--title` empty or missing (without `--from-file`/`--batch`),
   a flag combined with `--from-file`/`--batch`, both `--from-file` and
@@ -329,7 +330,11 @@ comma-separated), `--description <TEXT>`, `--description-file <PATH|->`
 - Text output: one line per ticket made — its display id (`AGT-12`), or
   `AGT-?  <ULID>` (two spaces) while the number is pending (below); the
   `--batch` form appends `  <title>` to each and, when any entry has a
-  `ref:`, a `refs:` block of `  @name -> <ref>` lines.
+  `ref:`, a `refs:` block of `  @name -> <ref>` lines. When any ticket
+  made is pending, one line on **stderr** says so (`pm: N ticket(s) filed
+  with the number pending: ...`, naming `pm sync` and, unless `--sync` was given, `pm new --sync`);
+  stdout keeps exactly the lines above, so `id=$(pm new ...)` still
+  captures `AGT-?  <ULID>`. Never under `--json`.
 - `--json` (plain and `--from-file` forms): **Ticket**.
 - `--json` (`--batch` form):
   ```jsonc
@@ -362,6 +367,23 @@ creation order. Removing the hub from config (`pm hub logout`) restores
 local numbering for *new* tickets; a ticket already pending stays
 pending — only the hub can number it, and its create is still in the
 outbox for the next sync.
+
+**`--sync` (AGT-1571).** Opt-in, so plain `pm new` stays offline-safe.
+With a hub configured, `pm new --sync` (every form, `--batch` included)
+commits the tickets exactly as above, then runs one `pm sync` round —
+seed if needed, push, pull — and prints the tickets as they stand after
+it: the hub's numbers, so the plain line reads `AGT-12`, **Ticket**'s
+`id`/`number` carry them, and `--batch`'s `refs` map each `@name` to
+`AGT-N` rather than a ULID. The tickets are committed before the hub is
+contacted, so a sync that fails (unreachable, no token, refused) never
+un-files them: it is one `pm: --sync: filed, but the sync failed (...)`
+warning on stderr, the output is the pending shape (`AGT-?`, `"number":
+null`, ULID refs), and the exit is still `0` — check `number`, and
+never retry `pm new` itself, which would file the tickets twice; `pm
+sync` numbers them later. The round may push and pull other ops in the
+outbox and on the hub too, exactly as `pm sync` would; its report is not
+printed. Without a hub configured `--sync` does nothing: the tickets are
+already numbered locally.
 
 ### `pm show <ID>`
 

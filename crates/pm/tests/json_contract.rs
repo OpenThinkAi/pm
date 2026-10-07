@@ -294,8 +294,25 @@ fn normalize(raw: &str, sb: &Sandbox) -> String {
 /// with the client's floor and no stragglers. Serves until the test
 /// process exits; returns its base URL.
 fn fake_hub() -> String {
+    fake_hub_with(false)
+}
+
+/// [`fake_hub`], but `POST …/seeded` numbers every pushed `ticket.create`
+/// that no pushed `field.set number` already numbered, from the client's
+/// floor + 1 in push order — the hub's seed-end straggler numbering
+/// (`docs/hub-api.md` §Ticket numbers) — so `pm new --sync` (AGT-1571)
+/// comes back with real numbers.
+fn fake_numbering_hub() -> String {
+    fake_hub_with(true)
+}
+
+fn fake_hub_with(numbering: bool) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    // (entity, create's wall_ms) of every pushed create, in push order;
+    // and every entity a pushed `field.set number` already numbered.
+    let mut creates: Vec<(String, u64)> = Vec::new();
+    let mut numbered: Vec<String> = Vec::new();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -340,11 +357,43 @@ fn fake_hub() -> String {
             } else if method == "POST" && path.ends_with("/seeded") {
                 let req: Value = serde_json::from_slice(&raw[head_len..head_len + body_len])
                     .unwrap_or(Value::Null);
-                serde_json::json!({ "number_floor": req["number_floor"], "numbers": [] })
-                    .to_string()
+                let floor = req["number_floor"].as_u64().unwrap_or(0);
+                let mut numbers = Vec::new();
+                if numbering {
+                    let stragglers = creates.iter().filter(|(e, _)| !numbered.contains(e));
+                    for (i, (entity, wall_ms)) in stragglers.enumerate() {
+                        let op = pm_core::Op::new(
+                            ulid::Ulid::new(),
+                            pm_core::Hlc {
+                                wall_ms: wall_ms + 1,
+                                counter: 0,
+                            },
+                            pm_core::ActorId::new("hub"),
+                            entity.parse().unwrap(),
+                            pm_core::Payload::FieldSet(pm_core::op::FieldSet::Number(
+                                floor + 1 + i as u64,
+                            )),
+                        );
+                        numbers.push(serde_json::json!({ "op": op }));
+                    }
+                }
+                let adopted = floor + numbers.len() as u64;
+                serde_json::json!({ "number_floor": adopted, "numbers": numbers }).to_string()
             } else if method == "POST" && path.ends_with("/ops") {
                 let batch: Value = serde_json::from_slice(&raw[head_len..head_len + body_len])
                     .unwrap_or(Value::Null);
+                for op in batch["ops"].as_array().into_iter().flatten() {
+                    let entity = op["entity"].as_str().unwrap_or("").to_string();
+                    match op["kind"].as_str() {
+                        Some("ticket.create") => {
+                            creates.push((entity, op["hlc"]["wall_ms"].as_u64().unwrap_or(0)))
+                        }
+                        Some("field.set") if op["payload"]["field"] == "number" => {
+                            numbered.push(entity)
+                        }
+                        _ => {}
+                    }
+                }
                 let acks: Vec<Value> = batch["ops"]
                     .as_array()
                     .map(|ops| {
@@ -459,6 +508,17 @@ fn capture_env(
     check_fixture(name, &text, failures);
     Some(text)
 }
+
+/// Two tickets, the second blocked by the first, no project: filed into
+/// a fresh workspace with a hub configured (AGT-1571).
+const SYNC_BATCH_YAML: &str = "\
+tickets:
+  - ref: one
+    title: \"Batch one\"
+  - ref: two
+    title: \"Batch two\"
+    blocked-by: [\"@one\"]
+";
 
 const BATCH_YAML: &str = "\
 tickets:
@@ -1071,6 +1131,59 @@ fn every_verbs_json_output_matches_its_fixture() {
             0,
             &mut failures,
         );
+    }
+
+    // ---- pm new --batch, pending vs. --sync (AGT-1571) ----
+    // Both `refs` shapes: pending, each `@name` maps to its ULID; with
+    // `--sync` against a hub that numbers the seed's stragglers, to
+    // `AGT-N`, and every Ticket carries its number. Each in a sandbox of
+    // its own, for the reason above.
+    for (name, numbering) in [("new_batch_pending", false), ("new_batch_sync", true)] {
+        let pending = Sandbox::new();
+        let out = pending.pm(&[
+            "init",
+            "--prefix",
+            "AGT",
+            "--preset",
+            "saltline",
+            "--workspace",
+            pending.ws_str(),
+        ]);
+        if !out.status.success() {
+            failures.push(format!("{name} setup: init failed: {}", stderr(&out)));
+        }
+        let hub_url = if numbering {
+            fake_numbering_hub()
+        } else {
+            "http://127.0.0.1:1".to_string()
+        };
+        let config = pending.home.path().join(".config/pm/config.toml");
+        let original = std::fs::read_to_string(&config).unwrap_or_default();
+        std::fs::write(&config, format!("hub = \"{hub_url}\"\n{original}")).unwrap();
+        let batch = pending.fixture_input("batch.yaml", SYNC_BATCH_YAML);
+        let mut args = vec!["new", "--batch", batch.to_str().unwrap(), "--json"];
+        if numbering {
+            args.push("--sync");
+        }
+        let text = capture_env(
+            &pending,
+            name,
+            &args,
+            &[("PM_HUB_TOKEN", "pmh_fixture-token")],
+            0,
+            &mut failures,
+        );
+        if let Some(text) = text {
+            let v: Value = serde_json::from_str(&text).unwrap();
+            let want = if numbering {
+                serde_json::json!({"@one": "AGT-1", "@two": "AGT-2"})
+            } else {
+                serde_json::json!({"@one": "<ULID>", "@two": "<ULID>"})
+            };
+            if v["refs"] != want {
+                failures.push(format!("{name}: refs {} != {want}", v["refs"]));
+            }
+        }
     }
 
     // ---- pm project delete ----

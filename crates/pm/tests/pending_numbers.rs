@@ -206,6 +206,7 @@ fn without_a_hub_pm_new_numbers_locally() {
     let r = Replica::init("alice");
     let out = r.ok(&["new", "--title", "local"]);
     assert_eq!(out_s(&out), "T-1\n");
+    assert_eq!(err(&out), "", "nothing is pending, so no note");
     let t = r.json_ok(&["new", "--title", "second"]);
     assert_eq!(t["id"], "T-2");
     assert_eq!(t["number"], 2);
@@ -220,6 +221,11 @@ fn without_a_hub_pm_new_numbers_locally() {
     let b = r.json_ok(&["new", "--batch", batch.to_str().unwrap()]);
     assert_eq!(b["refs"]["@a"], "T-3");
     assert_eq!(b["tickets"][1]["blocked_by"], serde_json::json!(["T-3"]));
+
+    // `--sync` without a hub (AGT-1571): nothing to sync, already numbered.
+    let out = r.ok(&["new", "--title", "synced", "--sync"]);
+    assert_eq!(out_s(&out), "T-5\n");
+    assert_eq!(err(&out), "");
 
     // `T-?` never names a ticket; the message says what does.
     let out = r.pm(&["show", "T-?"]);
@@ -477,6 +483,39 @@ fn with_a_hub_configured_pm_new_is_pending_and_addressed_by_ulid() {
     assert_eq!(r.sync_state()["pending_numbers"], 9);
 }
 
+/// AGT-1571, hub configured but out of reach: plain `pm new` says on
+/// stderr that the number is pending (stdout stays `T-?  <ULID>`), and
+/// `pm new --sync` still files, stays pending and exits 0.
+#[test]
+fn pending_is_noted_and_an_offline_sync_still_files() {
+    let mut r = Replica::init("alice");
+    r.configure(DEAD_HUB, "pmh_some-token");
+    let ulid = r.new_pending("first pending");
+    assert_eq!(r.show(&ulid)["id"], "T-?");
+    // stderr says the number is pending and how to get it (AGT-1571).
+    let out = r.ok(&["new", "--title", "noted"]);
+    assert!(
+        err(&out).contains("1 ticket(s) filed with the number pending")
+            && err(&out).contains("`pm sync`")
+            && err(&out).contains("--sync"),
+        "{}",
+        err(&out)
+    );
+    // `--sync` with the hub unreachable: still filed, still pending,
+    // exit 0 — a warning, never an error that invites a re-file.
+    let out = r.ok(&["new", "--title", "sync offline", "--sync"]);
+    assert!(out_s(&out).starts_with("T-?  "), "{}", out_s(&out));
+    assert!(
+        err(&out).contains("--sync: filed, but the sync failed"),
+        "{}",
+        err(&out)
+    );
+    let (code, v) = r.json(&["new", "--title", "sync offline json", "--sync"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(v["number"].is_null(), "{v}");
+    assert_eq!(r.sync_state()["pending_numbers"], 4);
+}
+
 // ---------------------------------------------------------- AC3: two replicas
 
 fn create_token(url: &str, name: &str, workspace: &str) -> String {
@@ -685,4 +724,30 @@ fn fifty_offline_tickets_on_each_of_two_replicas_all_get_unique_numbers() {
     alice.sync();
     assert_eq!(alice.show(&late)["id"], format!("T-{}", total + 1));
     assert_eq!(alice.sync_state()["pending_numbers"], 0);
+
+    // ---- `pm new --sync` (AGT-1571): the hub's number in the same call.
+    let out = alice.ok(&["new", "--title", "synced", "--sync"]);
+    assert_eq!(out_s(&out), format!("T-{}\n", total + 2));
+    assert_eq!(err(&out), "", "nothing left pending, so no note");
+    let batch = alice.home.path().join("sync-batch.yaml");
+    std::fs::write(
+        &batch,
+        "tickets:\n  - ref: a\n    title: A\n  - ref: b\n    title: B\n    blocked-by: [\"@a\"]\n",
+    )
+    .unwrap();
+    let b = alice.json_ok(&["new", "--batch", batch.to_str().unwrap(), "--sync"]);
+    let (na, nb) = (format!("T-{}", total + 3), format!("T-{}", total + 4));
+    assert_eq!(b["refs"]["@a"], na, "{b}");
+    assert_eq!(b["refs"]["@b"], nb, "{b}");
+    assert_eq!(b["tickets"][0]["number"], total + 3, "{b}");
+    assert_eq!(
+        b["tickets"][1]["blocked_by"],
+        serde_json::json!([na]),
+        "{b}"
+    );
+    assert_eq!(alice.sync_state()["pending_numbers"], 0);
+    assert_eq!(alice.sync_state()["outbox"], 0);
+    // Bob sees them, numbered, on his next sync.
+    bob.sync();
+    assert_eq!(bob.show(&nb)["title"], "B");
 }

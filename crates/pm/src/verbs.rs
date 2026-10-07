@@ -376,6 +376,9 @@ pub struct NewArgs {
     pub source: Option<String>,
     pub from_file: Option<PathBuf>,
     pub batch: Option<PathBuf>,
+    /// `--sync` (AGT-1571): run one `pm sync` round after filing, so a
+    /// hub-assigned number comes back in this same call.
+    pub sync: bool,
 }
 
 pub(crate) fn non_empty(flag: &str, value: &str) -> Result<String> {
@@ -584,18 +587,111 @@ pub(crate) fn created_line(ws: &Workspace, t: &Ticket) -> String {
     }
 }
 
-fn print_created_ticket(
-    ctx: &Ctx<'_>,
-    store: &Store,
-    ws: &Workspace,
-    ticket: &Ticket,
-) -> Result<()> {
-    if ctx.json {
-        print_json(&ticket_json(ws, store, ticket)?);
-    } else {
-        println!("{}", created_line(ws, ticket));
+/// What one `pm new` filed, before it is printed: the open workspace,
+/// the tickets in creation order, and — for `--batch` — each `ref:` name's
+/// ticket.
+struct Filed {
+    store: Store,
+    ws: Workspace,
+    tickets: Vec<Ticket>,
+    refs: Option<BTreeMap<String, Ulid>>,
+}
+
+impl Filed {
+    fn one(store: Store, ws: Workspace, ticket: Ticket) -> Filed {
+        Filed {
+            store,
+            ws,
+            tickets: vec![ticket],
+            refs: None,
+        }
     }
-    Ok(())
+
+    /// `pm new --sync` (AGT-1571): one `pm sync` round — seed if needed,
+    /// push, pull — right after the commit, then the tickets re-read so
+    /// the hub's numbers show. Only when a hub numbers this machine's
+    /// tickets ([`crate::hub::numbers_are_hub_assigned`]); without one they
+    /// are already numbered and `--sync` does nothing. The tickets are
+    /// committed before the hub is contacted, so a sync that fails never
+    /// un-files them: it is a warning on stderr, the tickets stay pending
+    /// (`number: null`) for the next `pm sync`, and the exit stays `0` — a
+    /// caller that retried `pm new` on failure would file them twice.
+    fn sync(self, ctx: &Ctx<'_>) -> Result<Filed> {
+        if !crate::hub::numbers_are_hub_assigned(ctx.env)? {
+            return Ok(self);
+        }
+        let Filed {
+            mut store,
+            ws,
+            tickets,
+            refs,
+        } = self;
+        let synced =
+            crate::hub::HubClient::resolve(ctx.env, &ws, crate::sync::TIMEOUT).and_then(|hub| {
+                crate::sync::run_once(
+                    ctx,
+                    &mut store,
+                    &hub,
+                    &crate::sync::Limits::from_env(ctx.env),
+                )
+            });
+        if let Err(e) = synced {
+            eprintln!(
+                "pm: --sync: filed, but the sync failed ({}); the number stays pending until \
+                 `pm sync`",
+                crate::text::printable(&format!("{:#}", e.error))
+            );
+        }
+        // Re-open: a pulled `workspace.set` may have changed the prefix,
+        // and the pulled `field.set number` ops are in the log now.
+        drop(store);
+        let (store, ws) = ctx.open()?;
+        let tickets = tickets
+            .iter()
+            .map(|t| {
+                store
+                    .ticket(t.id)?
+                    .ok_or_else(|| CliError::error(format!("ticket {} vanished after sync", t.id)))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Filed {
+            store,
+            ws,
+            tickets,
+            refs,
+        })
+    }
+
+    /// `synced`: `--sync` was given, so the note does not suggest it.
+    fn print(&self, ctx: &Ctx<'_>, synced: bool) -> Result<()> {
+        match &self.refs {
+            Some(refs) => print_batch_result(ctx, &self.store, &self.ws, refs, &self.tickets)?,
+            None => {
+                for t in &self.tickets {
+                    if ctx.json {
+                        print_json(&ticket_json(&self.ws, &self.store, t)?);
+                    } else {
+                        println!("{}", created_line(&self.ws, t));
+                    }
+                }
+            }
+        }
+        // Human output says what `AGT-?` means (AGT-1571) — on stderr, so
+        // stdout stays the bare `AGT-?  <ULID>` line a script captures.
+        let pending = self.tickets.iter().filter(|t| t.number.is_none()).count();
+        if !ctx.json && pending > 0 {
+            let hint = if synced {
+                ""
+            } else {
+                " (or pass `pm new --sync` to number in the same call)"
+            };
+            eprintln!(
+                "pm: {pending} ticket(s) filed with the number pending: `pm sync` gets it from the \
+                 hub{hint}; until then name them by ULID"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Dispatches `pm new` across its three mutually exclusive modes: plain
@@ -611,6 +707,7 @@ pub fn new(ctx: &Ctx<'_>, args: NewArgs) -> Result<()> {
         || !args.blocked_by.is_empty()
         || args.linked_github.is_some()
         || args.source.is_some();
+    let sync = args.sync;
     const CONFLICT: &str = "cannot be combined with --title/--project/--repo/--priority/--label/\
 --description/--description-file/--blocked-by/--linked-github/--source";
     match (&args.from_file, &args.batch) {
@@ -621,19 +718,25 @@ pub fn new(ctx: &Ctx<'_>, args: NewArgs) -> Result<()> {
             if single_flags_set {
                 return Err(CliError::usage(format!("--from-file {CONFLICT}")));
             }
-            new_from_file(ctx, path)
+            finish(ctx, sync, new_from_file(ctx, path)?)
         }
         (None, Some(path)) => {
             if single_flags_set {
                 return Err(CliError::usage(format!("--batch {CONFLICT}")));
             }
-            new_batch(ctx, path)
+            finish(ctx, sync, new_batch(ctx, path)?)
         }
-        (None, None) => new_single(ctx, args),
+        (None, None) => finish(ctx, sync, new_single(ctx, args)?),
     }
 }
 
-fn new_single(ctx: &Ctx<'_>, args: NewArgs) -> Result<()> {
+/// Syncs (when `--sync` asked) and prints what one `pm new` filed.
+fn finish(ctx: &Ctx<'_>, sync: bool, filed: Filed) -> Result<()> {
+    let filed = if sync { filed.sync(ctx)? } else { filed };
+    filed.print(ctx, sync)
+}
+
+fn new_single(ctx: &Ctx<'_>, args: NewArgs) -> Result<Filed> {
     let title = non_empty(
         "--title",
         args.title
@@ -682,7 +785,7 @@ fn new_single(ctx: &Ctx<'_>, args: NewArgs) -> Result<()> {
             linked_github,
         },
     )?;
-    print_created_ticket(ctx, &store, &ws, &ticket)
+    Ok(Filed::one(store, ws, ticket))
 }
 
 /// One ticket to file, its flags already validated (trimmed, non-empty).
@@ -752,7 +855,7 @@ pub(crate) fn file_ticket(
 /// (frontmatter + sections) becomes one create op set. Unknown frontmatter
 /// keys land in `ext`; the body (everything after the frontmatter) becomes
 /// the description verbatim.
-fn new_from_file(ctx: &Ctx<'_>, path: &Path) -> Result<()> {
+fn new_from_file(ctx: &Ctx<'_>, path: &Path) -> Result<Filed> {
     let (fm, body) = batch::load_frontmatter(path)?;
     let title = non_empty("title (frontmatter)", fm.title.as_deref().unwrap_or(""))?;
     let project = fm
@@ -811,7 +914,7 @@ fn new_from_file(ctx: &Ctx<'_>, path: &Path) -> Result<()> {
         .into_iter()
         .next()
         .ok_or_else(|| CliError::error(format!("ticket {id} vanished after create")))?;
-    print_created_ticket(ctx, &store, &ws, &ticket)
+    Ok(Filed::one(store, ws, ticket))
 }
 
 /// One batch entry after every field has been validated and every
@@ -896,7 +999,7 @@ fn validate_batch_entry(
 /// `blocked-by: [@ref]` can point anywhere in the file, validates every
 /// entry (so a bad `@ref` fails before any op is built), then commits the
 /// whole file in one transaction.
-fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<()> {
+fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<Filed> {
     let file = batch::load_batch_file(path)?;
     if file.tickets.is_empty() {
         return Err(CliError::usage(format!(
@@ -966,7 +1069,12 @@ fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<()> {
     // One transaction across every ticket's ops and number allocation (or
     // pending flag) (AC2): a failure here creates nothing.
     let tickets = commit_new(&mut store, ctx.env, &ops, &created, &actor)?;
-    print_batch_result(ctx, &store, &ws, &refs, &tickets)
+    Ok(Filed {
+        store,
+        ws,
+        tickets,
+        refs: Some(refs),
+    })
 }
 
 fn print_batch_result(
