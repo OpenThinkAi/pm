@@ -755,6 +755,11 @@ fn label_takes_global_flags_after_the_changes() {
 
     let v = json(&sb.pm(&["label", "AGT-1", "-c", "--as", "dave", "--json"]));
     assert_eq!(sorted_labels(&v), ["a", "json"]);
+
+    // clap consumes a `--` separator itself, so it never reaches
+    // `hoist_label_globals`: accepted, and it changes nothing.
+    let v = json(&sb.pm(&["label", "AGT-1", "--", "-a", "--json"]));
+    assert_eq!(sorted_labels(&v), ["json"]);
 }
 
 #[test]

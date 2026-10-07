@@ -506,7 +506,8 @@ fn main() -> ExitCode {
 /// and `--workspace <DIR>`/`--workspace=DIR` apply as if given before
 /// `label` (a later occurrence wins, as clap does); any other `--`-prefixed
 /// token is an unknown flag, never a removal. Single-dash tokens stay
-/// removals. `-h`/`--help` never reach here: clap still handles them.
+/// removals. `-h`/`--help` and a bare `--` never reach here: clap consumes
+/// them itself.
 fn hoist_label_globals(cli: &mut Cli) -> exit::Result<()> {
     let Cli {
         workspace,
