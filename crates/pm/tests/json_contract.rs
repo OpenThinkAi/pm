@@ -705,6 +705,51 @@ fn every_verbs_json_output_matches_its_fixture() {
         0,
         &mut failures,
     );
+    // AGT-1573: a conditional write (the version is the content hash
+    // `project_show_doc` just printed), then the same condition, now stale.
+    {
+        let shown = sb.run(&["project", "show", "pm", "--doc", "notes", "--json"], &[]);
+        let shown: serde_json::Value = serde_json::from_str(&stdout(&shown)).unwrap();
+        let version = shown["version"].as_str().unwrap().to_string();
+        let sectioned = sb.fixture_input("sectioned.md", "## Notes\n\nSome project notes.\n");
+        cap(
+            "project_doc_edit",
+            &[
+                "project",
+                "doc",
+                "edit",
+                "pm",
+                "notes",
+                "--from-file",
+                sectioned.to_str().unwrap(),
+                "--if-version",
+                &version,
+                "--json",
+            ],
+            0,
+            &mut failures,
+        );
+        cap(
+            "project_doc_edit_stale",
+            &[
+                "project",
+                "edit",
+                "pm",
+                "--doc",
+                "notes",
+                "--section",
+                "Notes",
+                "--append",
+                "--from-file",
+                sectioned.to_str().unwrap(),
+                "--if-version",
+                &version,
+                "--json",
+            ],
+            4,
+            &mut failures,
+        );
+    }
     // AGT-1489: every value is the one `pm` already has, so this commits
     // nothing and leaves the fixtures after it untouched.
     cap(

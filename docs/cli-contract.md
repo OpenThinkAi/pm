@@ -54,6 +54,7 @@ Defined once, in `crates/pm/src/exit.rs`, and used by every verb:
 | `1` | error | Anything else that failed: an I/O error, a database error, an unhealthy `pm doctor` (no `--rebuild`, or still unhealthy after one), `pm check` finding one or more invariant violations, `pm backup status` reporting unhealthy. |
 | `2` | usage | Bad arguments: clap's own parse failures (missing required flag, unknown flag, conflicting flags), and this crate's own validation (empty `--title`, an unparseable `--priority`, a malformed `key=value`, `pm new --batch` failing to validate any single entry before committing anything). |
 | `3` | not found | A named ticket, project, state, document or backup file does not exist. `pm claim --ready` with no ready ticket also exits `3`. |
+| `4` | stale | A conditional document write (`pm project edit … --if-version`, `pm project doc edit … --if-version`) found the document changed since the version the caller read; nothing is written, and the error names the current version. Only those writes use this code. |
 | `75` | taken | `pm claim`'s conditional op was rejected: the ticket was not `unstarted`-and-unassigned at the moment the authority admitted the winning claim. Only `pm claim` uses this code. |
 | `141` | stdout closed | Stdout's reader went away before pm finished writing (`pm list \| head -1`, quitting `less` early, `grep -q`). pm stops quietly — nothing on stderr — with `128 + SIGPIPE`, the status a shell reports for a writer `SIGPIPE` killed, so `set -o pipefail` sees it as it would for any other early-closed writer. Any verb can exit this way. |
 
@@ -189,7 +190,7 @@ $ pm list --help
 --json shape: bare JSON array of Tickets [{"schema": 1, "id": ..., ...}, ...] with no top-level envelope
 $ pm project show --help
 ...
---json shape: object: a Project {"schema": 1, ..., "documents": {name: body, ...}} (documents is an object, not an array); with --doc, {"schema": 1, "project", "doc", "body"}
+--json shape: object: a Project {"schema": 1, ..., "documents": {name: body, ...}} (documents is an object, not an array), with "doc_version" and "document_versions": {name: version, ...}; with --doc, {"schema": 1, "project", "doc", "body", "version"}
 ```
 
 After `--json shape: ` the line starts with exactly one of:
@@ -328,9 +329,17 @@ A **Project** shape (`project::project_json`), similarly shared by
   "parent": "string" | null,
   "repos": ["owner/name", ...],
   "doc": "string",                 // the design doc's markdown
-  "documents": {"name": "string", ...}  // named documents beyond the design doc, body inline
+  "documents": {"name": "string", ...}, // named documents beyond the design doc, body inline
+  "doc_version": "string",         // the design doc's version (AGT-1573)
+  "document_versions": {"name": "string", ...} // each named document's version
 }
 ```
+
+A document **version** (AGT-1573) is the first 16 hex digits of the
+SHA-256 of its text: every replica holding the same text reports the same
+version, and a write that leaves the text as it was does not move it.
+Treat it as opaque — compare for equality, and hand it back as
+`--if-version`.
 
 ## Verb reference
 
@@ -1346,7 +1355,7 @@ stderr, leaving stdout the bare body. `--json` shapes are unchanged.
   have.
 - `--json` (no `--doc`): **Project**.
 - `--json --doc NAME`:
-  `{"schema": 1, "project": "id", "doc": "NAME", "body": "string"}`.
+  `{"schema": 1, "project": "id", "doc": "NAME", "body": "string", "version": "string"}`.
 
 ### `pm project list`
 
@@ -1362,20 +1371,56 @@ listed, a parked one with `parked` in its status column (text) or
 
 Flags: `--view <VIEW>` (`ui-leaf` or `editor`; default: `edit.view` in
 config.toml, else `ui-leaf` — for an interactive invocation only);
-`--from-file <PATH|->` (conflicts with `--view`); `--doc <NAME>` (requires
-`--from-file`).
+`--from-file <PATH|->` (conflicts with `--view`); `--doc <NAME>`,
+`--if-version <VERSION>` and `--section <HEADING>` (each requires
+`--from-file`); `--append` (requires `--section`).
 
 **`--from-file`** (AGT-1480) is the non-interactive write: it replaces the
 design doc body — or, with `--doc <NAME>`, that named document's — with
 the file's text (`-` = stdin), launching nothing. The file is the document
 **body only**: a design doc has no frontmatter, so what you pass is what is
 stored. Diffed through the line-faithful `Body::diff_from_text` like the
-editor flow, so concurrent edits merge; unchanged text commits nothing.
+editor flow, so edits made on other replicas merge (see **Concurrent writers** below); unchanged text commits nothing.
 Agents use this, never a scripted `$EDITOR`. Exit `3`: unknown project or
 unknown `--doc` name (create it with `pm project doc add`). Text output
 is one line saying which document it touched: `<ID>: design doc updated`
 or `<ID>: named doc '<NAME>' updated` (`unchanged` when nothing
 changed). `--json`: **Project**. Without `--from-file` the paragraphs below apply.
+
+**Concurrent writers** (AGT-1573). Edits made on *different* replicas
+merge: each write is a diff from that replica's history, minted by a fresh
+peer. What a diff cannot save is a stale read-modify-write on the *same*
+replica: an agent reads the doc, another session writes it, and the
+agent's rewrite of its older copy — diffed against the newer text —
+deletes the other session's change. Two flags guard against that:
+
+- **`--if-version <VERSION>`** makes the write conditional on the document
+  (the design doc, or `--doc`'s) still being at `VERSION` — the
+  `doc_version` / `document_versions` entry `pm project show --json`
+  printed (or `version` from `--doc NAME --json`). On a mismatch nothing is
+  written and pm exits `4`, the message naming the current version
+  (`… changed since version V; current version: W …`); with `--json`,
+  stdout also carries `{"schema": 1, "project": "id", "doc": "NAME" |
+  null, "expected_version": "V", "version": "W"}` (`doc` is `null` for the
+  design doc). Re-read, redo the edit, retry with the new version.
+- **`--section <HEADING>`** writes one section instead of the whole
+  document: the file's text replaces the text under that markdown
+  heading, and every byte outside it is unchanged, so a concurrent edit to
+  another section survives even an unconditional write. A section is an
+  ATX heading (`#`..`######`, outside fenced code) and the lines after it
+  up to the next heading of the same or a higher level (it owns its
+  deeper sub-headings). The heading is matched case-insensitively by text
+  (`Goals`, any level) or by level and text (`## Goals`). Its text is those
+  lines less the blank lines at either end — what `pm show --section`
+  prints for a ticket — and the write keeps those separating blank lines:
+  the file's own leading and trailing blank lines are dropped. An empty
+  section gets the text after its first blank line. **`--append`** adds the
+  file's text after the section's last non-blank line instead (trailing
+  blank lines dropped, leading ones kept — start the file with a blank
+  line to begin a new paragraph). Exit `3`: no heading matches (the error
+  lists the document's headings); exit `2`: more than one does (name the
+  level), or an empty heading. `--if-version` still checks the whole
+  document's version.
 
 Chooses its view exactly as `pm edit` does (AGT-1405): `--view`, then
 `edit.view`, else ui-leaf only when stdin and stdout are both terminals —
@@ -1463,6 +1508,23 @@ keep working, so replicas that already hold one still sync.
 
 - Exit `3`: unknown project.
 - `--json`: `{"schema": 1, "project": "id", "doc": "NAME"}`.
+
+### `pm project doc edit <ID> <NAME>`
+
+Flags: `--from-file <PATH|->` (required), `--if-version <VERSION>`,
+`--section <HEADING>`, `--append` (requires `--section`).
+
+The same write as `pm project edit <ID> --doc <NAME> --from-file …`
+(§`pm project edit`, including **Concurrent writers**), so creating a named
+doc and editing it live under one noun. The document must exist (`pm
+project doc add` creates it).
+
+- Exit `2`: an ambiguous or empty `--section`; `--append` without
+  `--section`.
+- Exit `3`: unknown project, unknown document, or no heading matches
+  `--section`.
+- Exit `4`: `--if-version` is not the document's current version.
+- `--json`: **Project** (on exit `4`, the stale shape above).
 
 ### `pm workspace gate-label add|remove|list <LABEL>`
 

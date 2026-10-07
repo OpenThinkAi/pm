@@ -807,6 +807,184 @@ fn text_output_says_design_doc_versus_named_doc() {
     assert!(stderr(&named).contains("pm: named doc 'notes'"));
 }
 
+// --------------------------- AGT-1573: doc versions, --if-version, --section
+
+impl Sandbox {
+    fn versions(&self, id: &str) -> (String, Value) {
+        let v = json(&self.pm(&["project", "show", id, "--json"]));
+        (
+            v["doc_version"].as_str().unwrap().to_string(),
+            v["document_versions"].clone(),
+        )
+    }
+
+    fn write_doc(&self, args: &[&str], body: &str) -> Output {
+        let mut full = vec!["project"];
+        full.extend_from_slice(args);
+        full.extend_from_slice(&["--from-file", "-"]);
+        self.pm_stdin(&full, body)
+    }
+}
+
+const SPEC: &str = "# pm\n\nIntro.\n\n## Goals\n\nShip it.\n\n## Risks\n\nNone.\n";
+
+#[test]
+fn show_json_reports_a_version_per_document_that_moves_with_the_text() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    let f = sb.fixture("n.md", "notes\n");
+    assert_ok(&sb.pm(&[
+        "project",
+        "doc",
+        "add",
+        "pm",
+        "notes",
+        "--from-file",
+        f.to_str().unwrap(),
+    ]));
+    let (design, named) = sb.versions("pm");
+    assert_eq!(design.len(), 16);
+    let notes = named["notes"].as_str().unwrap().to_string();
+    let shown = json(&sb.pm(&["project", "show", "pm", "--doc", "notes", "--json"]));
+    assert_eq!(shown["version"], notes.as_str());
+
+    assert_ok(&sb.write_doc(&["edit", "pm"], SPEC));
+    let (after, named_after) = sb.versions("pm");
+    assert_ne!(after, design, "a design doc write moves its version");
+    assert_eq!(
+        named_after["notes"],
+        notes.as_str(),
+        "other docs keep theirs"
+    );
+    // A content hash: same text, same version, on any replica.
+    assert_eq!(sb.replica().versions("pm").0, after);
+}
+
+#[test]
+fn if_version_refuses_a_stale_read_modify_write_with_exit_4() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    assert_ok(&sb.write_doc(&["edit", "pm"], SPEC));
+    // Agent A reads the doc and its version...
+    let (read, _) = sb.versions("pm");
+    // ...agent B changes it on the same replica...
+    let b = SPEC.replace("None.", "Scope creep.");
+    assert_ok(&sb.write_doc(&["edit", "pm", "--if-version", &read], &b));
+    // ...and A's rewrite of its stale copy is refused, not merged over B's.
+    let a = SPEC.replace("Ship it.", "Ship it soon.");
+    let out = sb.write_doc(&["edit", "pm", "--if-version", &read], &a);
+    assert_code(&out, 4);
+    let (current, _) = sb.versions("pm");
+    assert!(
+        stderr(&out).contains(&format!("current version: {current}")),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(sb.doc_of("pm"), b, "nothing written");
+
+    let out = sb.write_doc(&["edit", "pm", "--if-version", &read, "--json"], &a);
+    assert_code(&out, 4);
+    // Printed on stdout even though it exits 4, like `pm claim`'s 75.
+    let v: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["version"], current.as_str());
+    assert_eq!(v["expected_version"], read.as_str());
+    assert!(v["doc"].is_null());
+}
+
+#[test]
+fn section_writes_leave_the_rest_byte_identical_and_keep_a_concurrent_edit() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    assert_ok(&sb.write_doc(&["edit", "pm"], SPEC));
+    // B rewrites Risks; A, working from its older read, writes only Goals.
+    assert_ok(&sb.write_doc(&["edit", "pm", "--section", "Risks"], "Scope creep.\n"));
+    assert_ok(&sb.write_doc(
+        &["edit", "pm", "--section", "## Goals"],
+        "\nShip it soon.\n\n",
+    ));
+    assert_eq!(
+        sb.doc_of("pm"),
+        "# pm\n\nIntro.\n\n## Goals\n\nShip it soon.\n\n## Risks\n\nScope creep.\n"
+    );
+    assert_ok(&sb.write_doc(
+        &["edit", "pm", "--section", "goals", "--append"],
+        "Then more.\n",
+    ));
+    assert_eq!(
+        sb.doc_of("pm"),
+        "# pm\n\nIntro.\n\n## Goals\n\nShip it soon.\nThen more.\n\n## Risks\n\nScope creep.\n"
+    );
+    // The same text again commits nothing.
+    let doc_id = sb.store().design_doc_id("pm").unwrap().unwrap();
+    let ops = sb.store().ops(doc_id).unwrap().len();
+    let out = sb.write_doc(&["edit", "pm", "--section", "Risks"], "Scope creep.\n");
+    assert_eq!(stdout(&out).trim(), "pm: design doc unchanged");
+    assert_eq!(sb.store().ops(doc_id).unwrap().len(), ops);
+}
+
+#[test]
+fn section_and_version_flags_refuse_bad_input() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    assert_ok(&sb.write_doc(&["edit", "pm"], "# A\n\na\n\n## A\n\nb\n"));
+    let out = sb.write_doc(&["edit", "pm", "--section", "Nope"], "x\n");
+    assert_code(&out, 3);
+    assert!(
+        stderr(&out).contains("headings: # A, ## A"),
+        "{}",
+        stderr(&out)
+    );
+    assert_code(&sb.write_doc(&["edit", "pm", "--section", "A"], "x\n"), 2);
+    assert_ok(&sb.write_doc(&["edit", "pm", "--section", "## A"], "c\n"));
+    assert_eq!(sb.doc_of("pm"), "# A\n\na\n\n## A\n\nc\n");
+    // --append needs --section; --if-version/--section need --from-file.
+    assert_code(&sb.write_doc(&["edit", "pm", "--append"], "x\n"), 2);
+    assert_code(&sb.pm(&["project", "edit", "pm", "--if-version", "abc"]), 2);
+    assert_code(&sb.pm(&["project", "edit", "pm", "--section", "A"]), 2);
+}
+
+#[test]
+fn doc_edit_is_project_edit_doc_and_needs_an_existing_doc() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["project", "new", "pm", "--title", "pm"]));
+    assert_code(&sb.write_doc(&["doc", "edit", "pm", "notes"], "x\n"), 3);
+    let f = sb.fixture("n.md", "## Log\n\none\n");
+    assert_ok(&sb.pm(&[
+        "project",
+        "doc",
+        "add",
+        "pm",
+        "notes",
+        "--from-file",
+        f.to_str().unwrap(),
+    ]));
+    let (_, named) = sb.versions("pm");
+    let v = named["notes"].as_str().unwrap();
+    let out = sb.write_doc(
+        &[
+            "doc",
+            "edit",
+            "pm",
+            "notes",
+            "--section",
+            "Log",
+            "--append",
+            "--if-version",
+            v,
+        ],
+        "two\n",
+    );
+    assert_ok(&out);
+    assert_eq!(stdout(&out).trim(), "pm: named doc 'notes' updated");
+    let shown = json(&sb.pm(&["project", "show", "pm", "--doc", "notes", "--json"]));
+    assert_eq!(shown["body"], "## Log\n\none\ntwo\n");
+    assert_code(
+        &sb.write_doc(&["doc", "edit", "pm", "notes", "--if-version", v], "x\n"),
+        4,
+    );
+    assert_eq!(sb.doc_of("pm"), "", "the design doc is untouched");
+}
+
 // ------------------------------------------------- pm project set (AGT-1489)
 
 /// How many `project.set` ops the workspace log holds.

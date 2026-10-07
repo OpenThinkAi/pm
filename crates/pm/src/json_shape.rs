@@ -105,7 +105,7 @@ const SHAPES: &[(&[&str], &str)] = &[
     ),
     (
         &["project", "show"],
-        r#"object: a Project {"schema": 1, ..., "documents": {name: body, ...}} (documents is an object, not an array); with --doc, {"schema": 1, "project", "doc", "body"}"#,
+        r#"object: a Project {"schema": 1, ..., "documents": {name: body, ...}} (documents is an object, not an array), with "doc_version" and "document_versions": {name: version, ...}; with --doc, {"schema": 1, "project", "doc", "body", "version"}"#,
     ),
     (
         &["project", "list"],
@@ -113,7 +113,7 @@ const SHAPES: &[(&[&str], &str)] = &[
     ),
     (
         &["project", "edit"],
-        r#"object: a Project {"schema": 1, "id": ..., ...}"#,
+        r#"object: a Project {"schema": 1, "id": ..., ...}; on exit 4 (--if-version stale), {"schema": 1, "project", "doc", "expected_version", "version"}"#,
     ),
     (
         &["project", "set"],
@@ -127,6 +127,10 @@ const SHAPES: &[(&[&str], &str)] = &[
     (
         &["project", "doc", "add"],
         r#"object {"schema": 1, "project": ..., "doc": ...}"#,
+    ),
+    (
+        &["project", "doc", "edit"],
+        r#"object: a Project {"schema": 1, "id": ..., ...}; on exit 4 (--if-version stale), {"schema": 1, "project", "doc", "expected_version", "version"}"#,
     ),
     (&["workspace"], GROUP),
     (&["workspace", "gate-label"], GROUP),
