@@ -19,6 +19,10 @@ pub const MARKER: &str = "--json shape:";
 const TICKET: &str = r#"object: a Ticket {"schema": 1, "id": ..., ...}"#;
 
 /// Command groups that do nothing on their own: the shape is per subcommand.
+/// A Ticket echo for one id, the bulk Results envelope for several
+/// (AGT-1576: `pm comment` / `pm hold`).
+const TICKET_OR_RESULTS: &str = r#"object: a Ticket {"schema": 1, "id": ..., ...} for one id; for several ids, {"schema": 1, "results": [{"id", "result", "ticket": Ticket}, ...]}"#;
+
 const GROUP: &str = "none of its own: each subcommand's --help states its shape";
 
 /// `(command path, shape)`: one entry per command and subcommand
@@ -41,7 +45,7 @@ const SHAPES: &[(&[&str], &str)] = &[
     (&["set"], TICKET),
     (&["label"], TICKET),
     (&["relate"], TICKET),
-    (&["comment"], TICKET),
+    (&["comment"], TICKET_OR_RESULTS),
     (&["move"], TICKET),
     (&["done"], TICKET),
     (&["unclaim"], TICKET),
@@ -68,7 +72,7 @@ const SHAPES: &[(&[&str], &str)] = &[
         &["ready"],
         r#"object {"schema": 1, "ready": [Ticket, ...], "excluded": [...], ...}"#,
     ),
-    (&["hold"], TICKET),
+    (&["hold"], TICKET_OR_RESULTS),
     (
         &["holds"],
         r#"object {"schema": 1, "tickets": [Ticket, ...]}"#,
@@ -81,7 +85,7 @@ const SHAPES: &[(&[&str], &str)] = &[
     (&["doctor"], r#"object {"schema": 1, "healthy": ..., ...}"#),
     (
         &["archive"],
-        r#"object: a Ticket {"schema": 1, "id": ..., ...}; with --auto, {"schema": 1, "archived_tickets": [...], ...}"#,
+        r#"object: a Ticket {"schema": 1, "id": ..., ...} for one id; for several ids, {"schema": 1, "results": [{"id", "result", "ticket": Ticket}, ...]}; with --auto, {"schema": 1, "archived_tickets": [...], ...}"#,
     ),
     (&["unarchive"], TICKET),
     (&["import"], GROUP),
