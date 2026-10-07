@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use super::plan::TicketOutcome;
+use super::vault::{HoldRule, StateMap, StateRule, VaultTicket};
 use crate::verbs::{SCHEMA, print_json};
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -17,6 +18,10 @@ pub struct Report {
     /// The workspace's id prefix (`AGT`).
     pub prefix: String,
     pub files: usize,
+    /// How vault states the workspace lacks were imported (AGT-1518):
+    /// every `--map-state` rule, and every built-in default that applied
+    /// to at least one ticket.
+    pub state_map: Vec<StateMapEntry>,
     pub tickets: TicketOutcome,
     /// Tickets under `archive/20*/` (imported with `archived_at`).
     pub archived: usize,
@@ -46,6 +51,28 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parity: Option<super::parity::Summary>,
     pub elapsed_ms: u128,
+}
+
+/// One [`StateRule`] and how many ticket files it rewrote.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StateMapEntry {
+    #[serde(flatten)]
+    pub rule: StateRule,
+    pub tickets: usize,
+}
+
+/// The report's `state_map`: flag rules always, defaults only when used.
+pub fn state_map(map: &StateMap, tickets: &[VaultTicket]) -> Vec<StateMapEntry> {
+    map.rules()
+        .map(|rule| StateMapEntry {
+            rule: rule.clone(),
+            tickets: tickets
+                .iter()
+                .filter(|t| t.mapped_from.as_deref() == Some(rule.vault.as_str()))
+                .count(),
+        })
+        .filter(|e| !e.rule.default || e.tickets > 0)
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -131,6 +158,27 @@ impl Report {
         }
         println!("time:       {} ms", self.elapsed_ms);
 
+        let mapped: Vec<String> = self
+            .state_map
+            .iter()
+            .map(|e| {
+                let mut target = e.rule.state.clone();
+                if e.rule.archive {
+                    target.push_str(" +archive");
+                }
+                match e.rule.hold {
+                    HoldRule::Never => {}
+                    HoldRule::Always => target.push_str(" +hold"),
+                    HoldRule::NoBlockers => target.push_str(" +hold (when no blocked-by)"),
+                }
+                let origin = if e.rule.default { ", default" } else { "" };
+                format!(
+                    "{} → {target} ({} ticket(s){origin})",
+                    e.rule.vault, e.tickets
+                )
+            })
+            .collect();
+        section("state map", &mapped);
         section("non-template values", &flatten(&self.non_template));
         let ext: Vec<String> = self
             .ext_keys

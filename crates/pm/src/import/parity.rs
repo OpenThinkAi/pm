@@ -214,7 +214,14 @@ pub fn run(
             };
             let rendered = export::render_ticket(ws, store, &t, true)?;
             let mut findings = Findings::default();
-            let ex = vault::parse_ticket(&rendered.text, None, &rendered.path, ws, &mut findings)?;
+            let ex = vault::parse_ticket(
+                &rendered.text,
+                None,
+                &rendered.path,
+                ws,
+                &vault::StateMap::default(),
+                &mut findings,
+            )?;
             o.export_path = rendered.path.clone();
             let source_text = fs::read_to_string(snapshot.root.join(&vt.path))
                 .with_context(|| format!("reading {}", vt.path.display()))?;

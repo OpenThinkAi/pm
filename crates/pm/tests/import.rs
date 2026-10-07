@@ -742,7 +742,10 @@ fn a_parse_error_names_the_file_and_line_and_writes_nothing() {
     let out = sb.pm(&["import", "vault", vault.to_str().unwrap()]);
     assert_code(&out, 2);
     assert!(
-        stderr(&out).contains("AGT-99-bad.md:4: state 'qa' is not a workflow state"),
+        // AGT-1518: the pre-flight reports it (every unknown state, with
+        // counts) before any file is read in full.
+        stderr(&out).contains("ticket state(s) this workspace lacks")
+            && stderr(&out).contains("  qa (1 ticket)"),
         "{}",
         stderr(&out)
     );
@@ -1033,4 +1036,146 @@ fn nested_project_docs_import_by_relative_path() {
         "{owned}"
     );
     assert_eq!(sb.project("alpha")["documents"]["sub/x"], "# x\n");
+}
+
+// ------------------------------------------ unknown vault states (AGT-1518)
+
+/// A vault ticket file in `state`, under `tickets/<dir>/`.
+fn state_ticket(vault: &Path, number: u32, state: &str, dir: &str, blocked_by: &str) {
+    let path = vault
+        .join("tickets")
+        .join(dir)
+        .join(format!("AGT-{number}-t.md"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        format!(
+            "---\nid: AGT-{number}\ntitle: T{number}\nstate: {state}\ncreated: 2026-08-01\nupdated: 2026-08-15\nblocked-by: [{blocked_by}]\npriority: medium\nlabels: []\n---\n\n## Problem Statement\n\nx\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// triage 1, refined 2, qa 1, blocked 2 (one with a blocker), archived 1.
+fn seven_state_vault(sb: &Sandbox) -> PathBuf {
+    let vault = sb.home.path().join("states-vault");
+    state_ticket(&vault, 1, "triage", "triage", "");
+    state_ticket(&vault, 2, "refined", "refined", "");
+    state_ticket(&vault, 3, "refined", "refined", "");
+    state_ticket(&vault, 4, "qa", "qa", "");
+    state_ticket(&vault, 5, "blocked", "blocked", "AGT-1");
+    state_ticket(&vault, 6, "blocked", "blocked", "");
+    state_ticket(&vault, 7, "archived", "archive", "");
+    vault
+}
+
+#[test]
+fn unknown_vault_states_fail_a_preflight_that_lists_every_one_with_counts() {
+    let sb = Sandbox::initialized();
+    let vault = seven_state_vault(&sb);
+    let out = sb.pm(&["import", "vault", vault.to_str().unwrap()]);
+    assert_code(&out, 2);
+    let err = stderr(&out);
+    // Every unknown state, with its count — not just the first file's.
+    // `archived` and `blocked` have defaults, so they are not listed.
+    assert!(err.contains("qa (1 ticket)"), "{err}");
+    assert!(err.contains("refined (2 tickets)"), "{err}");
+    assert!(!err.contains("archived ("), "{err}");
+    assert!(!err.contains("blocked ("), "{err}");
+    assert!(err.contains("pm workspace state add"), "{err}");
+    assert!(err.contains("--map-state"), "{err}");
+    // Nothing was written.
+    assert!(sb.store().ticket_by_number(1).unwrap().is_none());
+}
+
+#[test]
+fn map_state_and_the_archived_blocked_defaults_import_and_re_import_idempotently() {
+    let sb = Sandbox::initialized();
+    let vault = seven_state_vault(&sb);
+    assert_ok(&sb.pm(&["workspace", "state", "add", "qa", "--category", "started"]));
+    let args = [
+        "import",
+        "vault",
+        vault.to_str().unwrap(),
+        "--map-state",
+        "refined=triage",
+        "--json",
+    ];
+    let report = json(&sb.pm(&args));
+    assert_eq!(report["tickets"]["created"], 7);
+    assert_eq!(
+        report["state_map"],
+        serde_json::json!([
+            {"vault": "archived", "state": "done", "archive": true, "hold": "never", "default": true, "tickets": 1},
+            {"vault": "blocked", "state": "triage", "archive": false, "hold": "no-blockers", "default": true, "tickets": 2},
+            {"vault": "refined", "state": "triage", "archive": false, "hold": "never", "default": false, "tickets": 2},
+        ])
+    );
+    assert_eq!(sb.show("AGT-2")["state"], "triage");
+    assert_eq!(sb.show("AGT-4")["state"], "qa");
+    // archived → done, archived at the first of its `updated` month.
+    let archived = sb.show("AGT-7");
+    assert_eq!(archived["state"], "done");
+    assert_eq!(archived["archived_at"]["wall_ms"], AUG_1);
+    // blocked with a blocker: not held (the relation keeps it off ready);
+    // blocked with none: held.
+    let with_blocker = sb.show("AGT-5");
+    assert_eq!(with_blocker["state"], "triage");
+    assert!(with_blocker["hold"].is_null());
+    let held = sb.show("AGT-6");
+    assert_eq!(held["hold"]["reason"], "vault state 'blocked'");
+    assert_eq!(held["hold"]["by"], "import");
+
+    // The same flags again: nothing to do.
+    let again = json(&sb.pm(&args));
+    assert_eq!(again["ops"], 0, "{again}");
+    assert_eq!(again["tickets"]["unchanged"], 7);
+
+    // Overriding a default re-imports the affected tickets as changes.
+    let changed = json(&sb.pm(&[
+        "import",
+        "vault",
+        vault.to_str().unwrap(),
+        "--map-state",
+        "refined=triage",
+        "--map-state",
+        "blocked=qa+hold",
+        "--json",
+    ]));
+    assert_eq!(changed["tickets"]["changed"], 2, "{changed}");
+    assert_eq!(sb.show("AGT-5")["state"], "qa");
+    assert_eq!(sb.show("AGT-5")["hold"]["reason"], "vault state 'blocked'");
+}
+
+#[test]
+fn a_bad_map_state_is_a_usage_error() {
+    let sb = Sandbox::initialized();
+    let vault = seven_state_vault(&sb);
+    for bad in [
+        "refined",
+        "refined=",
+        "=triage",
+        "refined=nope",
+        "refined=triage+later",
+    ] {
+        let out = sb.pm(&[
+            "import",
+            "vault",
+            vault.to_str().unwrap(),
+            "--map-state",
+            bad,
+        ]);
+        assert_code(&out, 2);
+    }
+    let out = sb.pm(&[
+        "import",
+        "vault",
+        vault.to_str().unwrap(),
+        "--map-state",
+        "qa=triage",
+        "--map-state",
+        "qa=done",
+    ]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("twice"));
 }

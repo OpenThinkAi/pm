@@ -367,6 +367,39 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// Adds or changes workflow states (AGT-1518: `pm workspace state
+    /// add`) with one `state.upsert` config op per state under `actor`, in
+    /// one transaction, and nothing else. A record the workspace already
+    /// holds is skipped. Returns how many ops were committed. There is no
+    /// remove — see [`Store::init_workspace`].
+    pub fn upsert_states(&mut self, states: &[State], actor: &ActorId) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id: Option<String> = tx
+            .query_row("SELECT workspace FROM workspace_view", [], |r| r.get(0))
+            .optional()?;
+        let Some(id) = id else {
+            return Err(StoreError::NoWorkspace);
+        };
+        let id = ulid("workspace_view.workspace", &id)?;
+        let view = load_workspace_view(&tx, id)?.ok_or(StoreError::NoWorkspace)?;
+        let payloads: Vec<Payload> = states
+            .iter()
+            .filter(|s| view.states.get(&s.name).map(|r| &r.value) != Some(*s))
+            .map(|s| {
+                Payload::StateUpsert(StateUpsert {
+                    name: s.name.clone(),
+                    category: s.category,
+                    position: s.position,
+                })
+            })
+            .collect();
+        let n = commit_payloads(&tx, id, actor, payloads)?;
+        tx.commit()?;
+        Ok(n)
+    }
 }
 
 // ------------------------------------------------------------ commit path

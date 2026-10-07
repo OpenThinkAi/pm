@@ -501,6 +501,23 @@ const MINI_VAULT: &[(&str, &str)] = &[
     ("projects/vaulted/NOTES.md", "# Notes\n"),
 ];
 
+/// A vault whose states the workspace lacks: `review` (mapped by flag),
+/// `archived` and `blocked` (the built-in defaults).
+const MAPPED_VAULT: &[(&str, &str)] = &[
+    (
+        "tickets/review/AGT-910-reviewed.md",
+        "---\nid: AGT-910\ntitle: Reviewed\nstate: review\ncreated: 2026-09-01\nupdated: 2026-09-02\nblocked-by: []\npriority: medium\nlabels: []\n---\n\n## Problem Statement\n\nx\n",
+    ),
+    (
+        "tickets/archive/AGT-911-dropped.md",
+        "---\nid: AGT-911\ntitle: Dropped\nstate: archived\ncreated: 2026-09-01\nupdated: 2026-09-02\nblocked-by: []\npriority: medium\nlabels: []\n---\n\n## Problem Statement\n\nx\n",
+    ),
+    (
+        "tickets/blocked/AGT-912-stuck.md",
+        "---\nid: AGT-912\ntitle: Stuck\nstate: blocked\ncreated: 2026-09-01\nupdated: 2026-09-02\nblocked-by: [AGT-910]\npriority: medium\nlabels: []\n---\n\n## Problem Statement\n\nx\n",
+    ),
+];
+
 /// Drives every `--json`-producing verb once, in dependency order, against
 /// one sandbox — later steps rely on tickets/projects earlier ones
 /// created — and snapshot-compares each output.
@@ -1161,6 +1178,90 @@ fn every_verbs_json_output_matches_its_fixture() {
             "md",
             export_dir.to_str().unwrap(),
             "--legacy-markers",
+            "--json",
+        ],
+        0,
+        &mut failures,
+    );
+
+    // ---- pm workspace state add/list (AGT-1518) ----
+    // After every other fixture: a new state shows in `pm status` and
+    // the init/list shapes above.
+    cap(
+        "workspace_state_add",
+        &[
+            "workspace",
+            "state",
+            "add",
+            "qa",
+            "--category",
+            "started",
+            "--position",
+            "2",
+            "--json",
+        ],
+        0,
+        &mut failures,
+    );
+    cap(
+        "workspace_state_add_existing",
+        &[
+            "workspace",
+            "state",
+            "add",
+            "qa",
+            "--category",
+            "unstarted",
+            "--json",
+        ],
+        0,
+        &mut failures,
+    );
+    cap(
+        "workspace_state_list",
+        &["workspace", "state", "list", "--json"],
+        0,
+        &mut failures,
+    );
+
+    // ---- pm init --state (AGT-1518 AC3) ----
+    {
+        let custom = sb.home.path().join("custom");
+        cap(
+            "init_states",
+            &[
+                "init",
+                "--prefix",
+                "CU",
+                "--state",
+                "triage:unstarted,refined:unstarted,in-progress:started,done:completed",
+                "--state",
+                "dropped:canceled",
+                "--workspace",
+                custom.to_str().unwrap(),
+                "--json",
+            ],
+            0,
+            &mut failures,
+        );
+    }
+
+    // ---- pm import vault --map-state (AGT-1518 AC4) ----
+    let mapped = sb.path("mapped-vault");
+    for (rel, text) in MAPPED_VAULT {
+        let path = mapped.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    cap(
+        "import_vault_map_state",
+        &[
+            "import",
+            "vault",
+            mapped.to_str().unwrap(),
+            "--map-state",
+            "review=in-progress+hold",
+            "--dry-run",
             "--json",
         ],
         0,

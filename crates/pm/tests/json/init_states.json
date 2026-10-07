@@ -1,0 +1,36 @@
+{
+  "config": "<HOME>/.config/pm/config.toml",
+  "config_written": false,
+  "db": "<HOME>/custom/pm.sqlite",
+  "joined": null,
+  "prefix": "CU",
+  "schema": 1,
+  "states": [
+    {
+      "category": "unstarted",
+      "name": "triage",
+      "position": 0
+    },
+    {
+      "category": "unstarted",
+      "name": "refined",
+      "position": 1
+    },
+    {
+      "category": "started",
+      "name": "in-progress",
+      "position": 2
+    },
+    {
+      "category": "completed",
+      "name": "done",
+      "position": 3
+    },
+    {
+      "category": "canceled",
+      "name": "dropped",
+      "position": 4
+    }
+  ],
+  "workspace": "<HOME>/custom"
+}

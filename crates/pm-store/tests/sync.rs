@@ -1057,3 +1057,67 @@ fn join_workspace_makes_an_empty_replica_and_refuses_a_used_database() {
         StoreError::NotEmpty { ops: 1 }
     ));
 }
+
+// ------------------------------------------- workflow states (AGT-1518)
+
+/// `upsert_states` is ordinary config: its `state.upsert` ops sit in the
+/// outbox's config pass, and a replica that pulls them gets the state —
+/// category and position included — and can move a ticket into it.
+#[test]
+fn an_upserted_state_is_config_that_reaches_another_replica() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Store::open(dir.path().join("a.sqlite")).unwrap();
+    let ws = workspace();
+    a.init_workspace(&ws, &ActorId::new("matt")).unwrap();
+    let qa = State {
+        name: "qa".into(),
+        category: StateCategory::Started,
+        position: 2,
+    };
+    assert_eq!(
+        a.upsert_states(std::slice::from_ref(&qa), &ActorId::new("matt"))
+            .unwrap(),
+        1
+    );
+    // The same record again commits nothing.
+    assert_eq!(
+        a.upsert_states(std::slice::from_ref(&qa), &ActorId::new("matt"))
+            .unwrap(),
+        0
+    );
+    assert!(
+        a.outbox_config(100)
+            .unwrap()
+            .iter()
+            .any(|(_, o)| o.kind() == "state.upsert"
+                && matches!(&o.payload, Payload::StateUpsert(s) if s.name == "qa"))
+    );
+
+    let mut b = Store::open(dir.path().join("b.sqlite")).unwrap();
+    b.join_workspace(ws.id, "AGT").unwrap();
+    let ops: Vec<Op> = a
+        .ops_since(0)
+        .unwrap()
+        .into_iter()
+        .map(|(_, o)| o)
+        .collect();
+    b.apply_pulled(&ops).unwrap();
+    let got = b.workspace().unwrap().unwrap();
+    assert_eq!(got.state("qa"), Some(&qa));
+
+    // Re-categorised on b; a pulls it back.
+    let review = State {
+        category: StateCategory::Unstarted,
+        ..qa.clone()
+    };
+    b.upsert_states(std::slice::from_ref(&review), &ActorId::new("matt"))
+        .unwrap();
+    let back: Vec<Op> = b
+        .ops_since(0)
+        .unwrap()
+        .into_iter()
+        .map(|(_, o)| o)
+        .collect();
+    a.apply_pulled(&back).unwrap();
+    assert_eq!(a.workspace().unwrap().unwrap().state("qa"), Some(&review));
+}
