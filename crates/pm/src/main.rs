@@ -325,7 +325,7 @@ enum Cmd {
         /// Why
         reason: String,
     },
-    /// Report invariant findings: R1, stale, held, blocker cycles, dangling relations (exit 1 if any)
+    /// Report invariant findings: R1, stale, held, parked forever, blocker cycles, dangling relations (exit 1 if any)
     Check {
         /// Only findings touching this project's tickets
         #[arg(long)]

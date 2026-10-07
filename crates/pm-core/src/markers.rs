@@ -91,9 +91,14 @@ impl Parked {
 /// waived by a waiver naming `R1`, or the vault's `waived: standalone`
 /// spelling, which import records as rule `standalone`.
 pub fn waives_r1(waivers: &[Waiver]) -> bool {
-    waivers
-        .iter()
-        .any(|w| w.rule.eq_ignore_ascii_case("R1") || w.rule.eq_ignore_ascii_case("standalone"))
+    waives(waivers, "R1") || waives(waivers, "standalone")
+}
+
+/// Whether `waivers` holds one for `rule` (compared ignoring ASCII case).
+/// `pm check` honours waivers for R1 (via [`waives_r1`]) and `parked`
+/// (AGT-1575); other findings are not waivable.
+pub fn waives(waivers: &[Waiver], rule: &str) -> bool {
+    waivers.iter().any(|w| w.rule.eq_ignore_ascii_case(rule))
 }
 
 /// Normalizes a rule name: trimmed, and `r1` → `R1` so the hygiene rules

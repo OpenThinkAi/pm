@@ -13,6 +13,11 @@
 //!   `pm ready` excludes it and `pm claim` refuses it, so it is stranded
 //!   until the assignee is cleared (`pm unclaim` now does this in place,
 //!   without a state change, when it finds one already in this shape).
+//! - **parked** (AGT-1575) — a live, not-done ticket parked `forever`
+//!   with no `parked` waiver: `pm ready` never surfaces it, so without
+//!   this nothing points at it. Its age is days since it was parked
+//!   (refined by [`with_parked_since`]; days since its last update until
+//!   then).
 //! - **blocker cycle** — tickets that (transitively) block each other.
 //! - **dangling relation** — a relation between a live ticket and one that
 //!   is tombstoned or absent.
@@ -31,7 +36,7 @@ use serde::Serialize;
 use ulid::Ulid;
 
 use crate::domain::{ActorId, Hold, Relation, RelationKind, StateCategory, Ticket, Workspace};
-use crate::markers::{date_from_ms, waives_r1};
+use crate::markers::{PARKED_FOREVER, date_from_ms, waives, waives_r1};
 
 const DAY_MS: u64 = 86_400_000;
 
@@ -56,6 +61,13 @@ pub enum Finding {
         assignee: ActorId,
         state: String,
     },
+    /// Parked `forever`, not done, and not waived (AGT-1575): `days` since
+    /// it was parked; `state` is its current state.
+    Parked {
+        ticket: Ulid,
+        days: u64,
+        state: String,
+    },
     /// Every ticket in one strongly connected component of the `blocks`
     /// graph, sorted.
     BlockerCycle { tickets: Vec<Ulid> },
@@ -73,6 +85,7 @@ impl Finding {
             | Finding::Stale { ticket, .. }
             | Finding::Held { ticket, .. }
             | Finding::AssignedUnstarted { ticket, .. }
+            | Finding::Parked { ticket, .. }
             | Finding::DeletedProject { ticket, .. } => vec![*ticket],
             Finding::BlockerCycle { tickets } => tickets.clone(),
             Finding::DanglingRelation { relation, .. } => vec![relation.from, relation.to],
@@ -86,6 +99,7 @@ impl Finding {
             Finding::Stale { .. } => "stale",
             Finding::Held { .. } => "held",
             Finding::AssignedUnstarted { .. } => "assigned-unstarted",
+            Finding::Parked { .. } => "parked",
             Finding::BlockerCycle { .. } => "blocker-cycle",
             Finding::DanglingRelation { .. } => "dangling-relation",
             Finding::DeletedProject { .. } => "deleted-project",
@@ -99,8 +113,9 @@ impl Finding {
 /// `project`, only findings naming at least one ticket in that project are
 /// kept (so R1 findings, which have no project, never appear).
 ///
-/// Order: R1, stale (each in `tickets` order), then held and
-/// assigned-unstarted interleaved per ticket (each in `tickets` order),
+/// Order: R1, stale (each in `tickets` order), then held,
+/// assigned-unstarted and parked interleaved per ticket (each in `tickets`
+/// order),
 /// then cycles, then dangling relations (in relation order: kind, from,
 /// to).
 pub fn check(
@@ -152,6 +167,20 @@ pub fn check(
                     state: t.state.clone(),
                 });
             }
+        }
+        let forever = t.parked.as_ref().is_some_and(|p| p.until == PARKED_FOREVER);
+        let done = ws.state(&t.state).is_some_and(|s| {
+            matches!(
+                s.category,
+                StateCategory::Completed | StateCategory::Canceled
+            )
+        });
+        if forever && !done && !waives(&t.waivers, "parked") {
+            findings.push(Finding::Parked {
+                ticket: t.id,
+                days: now_ms.saturating_sub(t.updated.wall_ms) / DAY_MS,
+                state: t.state.clone(),
+            });
         }
     }
 
@@ -220,6 +249,22 @@ pub fn with_deleted_projects(
                 project: project.clone(),
             }),
     );
+}
+
+/// Replaces each `parked` finding's age in `findings` (from [`check`]:
+/// days since the ticket's last update) with days since it was parked,
+/// for every ticket `parked_ms` (ticket → wall-clock ms its `parked`
+/// register was last written) knows (AGT-1575). Its last update can be
+/// any later edit — a comment, a retitle — which would make a ticket
+/// parked for months read as fresh.
+pub fn with_parked_since(findings: &mut [Finding], parked_ms: &BTreeMap<Ulid, u64>, now_ms: u64) {
+    for f in findings {
+        if let Finding::Parked { ticket, days, .. } = f
+            && let Some(ms) = parked_ms.get(ticket)
+        {
+            *days = now_ms.saturating_sub(*ms) / DAY_MS;
+        }
+    }
 }
 
 /// The cycles of a directed graph given as edges: each strongly connected
@@ -429,6 +474,11 @@ mod tests {
         parked.parked = Some(crate::Parked {
             until: "forever".into(),
         });
+        // Waived, so only staleness is under test (parked is AGT-1575's).
+        parked.waivers = vec![Waiver {
+            rule: "parked".into(),
+            reason: "x".into(),
+        }];
         let mut park_expired = old(5);
         park_expired.parked = Some(crate::Parked {
             until: "2026-01-01".into(),
@@ -526,6 +576,73 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// AGT-1575: parked `forever` and not done is a finding, aged from
+    /// the last update until [`with_parked_since`] knows better; a dated
+    /// park, a done ticket, an archived one or a `parked` waiver is not.
+    #[test]
+    fn parked_forever_is_reported_unless_done_or_waived() {
+        let forever = || {
+            Some(crate::Parked {
+                until: PARKED_FOREVER.into(),
+            })
+        };
+        let mut parked = ticket(1, Some("pm"));
+        parked.parked = forever();
+        parked.updated = Hlc::new(NOW - 40 * DAY_MS, 0);
+        let mut started = ticket(2, Some("pm"));
+        started.parked = forever();
+        started.state = "in-progress".into();
+        let mut done = ticket(3, Some("pm"));
+        done.parked = forever();
+        done.state = "done".into();
+        let mut dated = ticket(4, Some("pm"));
+        dated.parked = Some(crate::Parked {
+            until: "2027-01-01".into(),
+        });
+        let mut waived = ticket(5, Some("pm"));
+        waived.parked = forever();
+        waived.waivers = vec![Waiver {
+            rule: "Parked".into(),
+            reason: "kept for reference".into(),
+        }];
+        let mut archived = ticket(6, Some("pm"));
+        archived.parked = forever();
+        archived.archived_at = Some(Hlc::new(NOW, 1));
+        let tickets = [
+            parked.clone(),
+            started.clone(),
+            done,
+            dated,
+            waived,
+            archived,
+        ];
+        let mut found = check(&ws(0), &tickets, &[], NOW, None);
+        assert_eq!(
+            found,
+            [
+                Finding::Parked {
+                    ticket: parked.id,
+                    days: 40,
+                    state: "triage".into()
+                },
+                Finding::Parked {
+                    ticket: started.id,
+                    days: 0,
+                    state: "in-progress".into()
+                },
+            ]
+        );
+        assert_eq!(found[0].rule(), "parked");
+        assert_eq!(serde_json::to_value(&found[0]).unwrap()["rule"], "parked");
+        assert_eq!(found[0].tickets(), [parked.id]);
+
+        let since = BTreeMap::from([(started.id, NOW - 90 * DAY_MS)]);
+        with_parked_since(&mut found, &since, NOW);
+        assert!(matches!(found[0], Finding::Parked { days: 40, .. }));
+        assert!(matches!(found[1], Finding::Parked { days: 90, .. }));
+        assert_eq!(check(&ws(0), &tickets, &[], NOW, Some("other")), []);
     }
 
     #[test]

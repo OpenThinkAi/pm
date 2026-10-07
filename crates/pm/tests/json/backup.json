@@ -1,8 +1,8 @@
 {
   "committed": true,
-  "last_seq": 48,
+  "last_seq": 50,
   "legacy_migrated": null,
-  "ops_appended": 48,
+  "ops_appended": 50,
   "pushed": false,
   "remote": null,
   "schema": 1,

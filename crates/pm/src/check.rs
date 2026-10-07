@@ -23,9 +23,10 @@ pub fn check(ctx: &Ctx<'_>, project: Option<&str>) -> Result<()> {
     // finding names tickets to act on (`pm set <id> …`), so a ticket still
     // awaiting its hub number is named by ULID (`ref_id`), not `AGT-?`.
     let tickets = store.all_tickets()?;
-    let mut findings =
-        pm_core::check::check(&ws, &tickets, &store.all_relations()?, now_ms(), project);
+    let now = now_ms();
+    let mut findings = pm_core::check::check(&ws, &tickets, &store.all_relations()?, now, project);
     pm_core::check::with_deleted_projects(&mut findings, &store.deleted_project_refs()?, project);
+    pm_core::check::with_parked_since(&mut findings, &store.parked_since()?, now);
     let names: BTreeMap<Ulid, String> = tickets.iter().map(|t| (t.id, ref_id(&ws, t))).collect();
     let name = |id: &Ulid| names.get(id).cloned().unwrap_or_else(|| id.to_string());
 
@@ -84,6 +85,7 @@ fn finding_json(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) ->
             },
             "missing": name(missing),
         }),
+        Finding::Parked { days, state, .. } => json!({ "days": days, "state": state }),
         Finding::DeletedProject { project, .. } => json!({ "project": project }),
         Finding::NoProject { .. } | Finding::BlockerCycle { .. } => json!({}),
     };
@@ -110,6 +112,11 @@ fn message(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) -> Stri
             "assigned to {assignee} but in unstarted state '{state}'; \
              `pm claim` refuses it and `pm ready` excludes it — run \
              `pm unclaim <id>` to clear the stray assignee"
+        ),
+        Finding::Parked { days, state, .. } => format!(
+            "parked forever for {days} days in state '{state}'; `pm ready` never \
+             surfaces it — unpark it (`pm set <id> parked=`) or say why it stays \
+             parked (`pm waive <id> parked \"why\"`)"
         ),
         Finding::BlockerCycle { tickets } => {
             let ids: Vec<String> = tickets.iter().map(name).collect();
