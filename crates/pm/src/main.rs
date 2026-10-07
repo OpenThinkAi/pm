@@ -110,6 +110,10 @@ enum Cmd {
         /// Create every ticket in a YAML batch spec, in one transaction
         #[arg(long, value_name = "PATH")]
         batch: Option<PathBuf>,
+        /// With a hub configured, sync right after filing so the hub's number comes back in
+        /// this call (a failed sync only warns: the ticket stays filed, number pending)
+        #[arg(long)]
+        sync: bool,
     },
     /// Print a ticket
     Show {
@@ -589,6 +593,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             source,
             from_file,
             batch,
+            sync,
         } => verbs::new(
             ctx,
             verbs::NewArgs {
@@ -604,6 +609,7 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
                 source,
                 from_file,
                 batch,
+                sync,
             },
         ),
         Cmd::Show { id, field, section } => {
