@@ -31,6 +31,11 @@ honest:
 
   then diff `crates/pm/tests/json/*.json`, update this document to match,
   and commit both together.
+- `help_contract.rs` also checks every command's `--help` carries its
+  one-line `--json shape:` statement (see **Top-level shape per verb**)
+  and that the line agrees with that verb's fixtures: a fixture that is a
+  bare array belongs to a verb whose line says `bare JSON array`, every
+  other fixture to one whose line says `object` with `{"schema": 1`.
 - `help_contract.rs` runs `pm --help` and every subcommand's `--help`,
   extracts every double-dash-prefixed option token clap prints, and
   asserts each one appears somewhere in this document — and, the other
@@ -66,7 +71,7 @@ after the subcommand — see the `pm label` note below):
 |---|---|
 | `--workspace <DIR>` | The workspace directory for this command. See **Workspace resolution** below. |
 | `--as <ACTOR>` | The actor recorded on every op this command writes. See **Actor resolution** below. Ignored by verbs that only read (`show`, `list`, `log`, `status`, `graph`, `ready`, `holds`, `check`, `doctor`, `project show`/`list`) since they never call `Ctx::actor()`. |
-| `--json` | Machine-readable output: `{"schema": 1, ...}` (or a bare JSON array/value for a few verbs — see each verb below) instead of the human-readable text. |
+| `--json` | Machine-readable output instead of the human-readable text: one `{"schema": 1, ...}` object for every verb except `pm list` and `pm log`, which print a bare JSON array. Every command's `--help` ends with a `--json shape:` line naming its top-level shape — see **Top-level shape per verb**. |
 | `-h`, `--help` | Print help for the command or subcommand and exit `0`. |
 | `-V`, `--version` | Print `pm`'s version and exit `0` (top-level only). |
 
@@ -171,6 +176,64 @@ log` rows. UTC, never local time, to match every date pm already prints
 (comment dates in `pm show`, hold dates in `pm show`/`pm holds`, `pm export
 md`); pm reads no timezone. The HLC counter is dropped; for the precise
 stamp use `--json`.
+
+## Top-level shape per verb
+
+A caller should never have to learn a payload's top level by a parse
+failure (AGT-1574). Every command's `--help` ends with one line, from the
+single table in `crates/pm/src/json_shape.rs`:
+
+```text
+$ pm list --help
+...
+--json shape: bare JSON array of Tickets [{"schema": 1, "id": ..., ...}, ...] with no top-level envelope
+$ pm project show --help
+...
+--json shape: object: a Project {"schema": 1, ..., "documents": {name: body, ...}} (documents is an object, not an array); with --doc, {"schema": 1, "project", "doc", "body"}
+```
+
+After `--json shape: ` the line starts with exactly one of:
+
+- `object` — the verb prints one `{"schema": 1, ...}` object (the rest of
+  the line names the shared shape or the keys worth knowing, and any
+  flag that swaps in a different object). Every verb but two.
+- `bare JSON array` — the verb prints a JSON array with no top-level
+  `schema` key; each element carries its own `"schema": 1`. Only
+  `pm list` and `pm log`.
+- `none` — command groups (`pm project`, `pm hub`, …), which point at
+  their subcommands, and `pm ticket list`/`show`, which ignore `--json`.
+
+`grep '^--json shape:'` on a command's help is the supported way for a
+script to discover its shape; the verb reference below has the full
+fields.
+
+### Schema 2: every payload enveloped (direction)
+
+The two bare arrays are the only payloads without a top-level `schema`, and
+the only ones a caller cannot extend without breaking (no room for a
+`count`, a cursor, or a warning). **The direction is to envelope them**,
+as the next breaking change to either verb's `--json`:
+
+- `pm list --json` becomes `{"schema": 2, "tickets": [Ticket, ...]}` —
+  the key and element shape `pm holds` and `pm ready` already use.
+- `pm log --json` becomes `{"schema": 2, "ops": [{op}, ...]}`, each
+  element unchanged (it keeps its own `"schema": 1`).
+- `schema` stays per payload: only these two move to `2`. Every other
+  verb is already an envelope; bumping all of them to `2` would change
+  nothing but break every `.schema == 1` check.
+- No dual-output flag or transition window: an opt-in v2 switch would be
+  one more contract to keep. The change ships in one release, called out
+  in its notes, with the in-repo callers (the build-loop skills' `pm list
+  --json` / `pm log --json` reads) updated at the same time. A reader
+  that must span the change uses `if type == "array" then . else .tickets
+  end` (jq; `.ops` for `pm log`).
+- `docs/app-api.md`'s `GET /tickets`, which mirrors `pm list --json`, moves with it,
+  so the HTTP API and the CLI keep one Ticket-list shape.
+- On that release this section, the two verbs' `--json shape:` lines, and
+  their fixtures change together; `help_contract.rs` fails until they do.
+
+Not yet scheduled: AGT-1574 makes the shape discoverable; the envelope
+change itself is a separate ticket.
 
 ## Shared `--json` shapes
 
@@ -708,6 +771,8 @@ across flags; `--held` (only tickets with a hold set); `--search <TEXT>`
   the only list-shaped verb besides `pm log` that does not carry its own
   top-level `schema` key; each array element does, as Ticket always
   does).
+  Slated to become `{"schema": 2, "tickets": [...]}` — see **Schema 2:
+  every payload enveloped (direction)**.
 
 ### `pm log [<ID>]`
 
@@ -724,7 +789,9 @@ first, in the same shape; a `project.set` / `project.delete` /
 `project.doc_add` summary names the project by its slug (from its
 `project.create` in the same listing).
 
-- `--json`: a bare JSON array, oldest op first:
+- `--json`: a bare JSON array, oldest op first (slated to become
+  `{"schema": 2, "ops": [...]}` — see **Schema 2: every payload enveloped
+  (direction)**):
   ```jsonc
   [
     {

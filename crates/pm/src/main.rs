@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::cmp::Reverse;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -17,6 +17,7 @@ mod fromfile;
 mod hub;
 mod ids;
 mod import;
+mod json_shape;
 mod markers;
 mod mutate;
 mod pipe;
@@ -46,7 +47,7 @@ struct Cli {
     /// Actor recorded on every op (PM_ACTOR wins over this; $USER is the fallback)
     #[arg(long = "as", global = true, value_name = "ACTOR")]
     as_actor: Option<String>,
-    /// Machine-readable output (`{"schema": 1, ...}`)
+    /// Machine-readable output (each command's --help ends with its top-level JSON shape)
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -494,8 +495,11 @@ fn main() -> ExitCode {
 }
 
 fn cli_main() -> ExitCode {
-    // Clap exits 2 on usage errors and 0 for --help/--version.
-    let mut cli = Cli::parse();
+    // Clap exits 2 on usage errors and 0 for --help/--version. `Cli::parse()`
+    // plus every command's `--json shape:` help line (AGT-1574).
+    let mut cmd = json_shape::annotate(Cli::command());
+    let mut cli = Cli::from_arg_matches_mut(&mut cmd.get_matches_mut())
+        .unwrap_or_else(|e| e.format(&mut cmd).exit());
     if let Err(e) = hoist_label_globals(&mut cli) {
         eprintln!("pm: {}", text::printable(&format!("{:#}", e.error)));
         return ExitCode::from(e.code);
