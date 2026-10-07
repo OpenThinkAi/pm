@@ -242,7 +242,7 @@ where it applies). `pm --help` and `pm <verb> --help` are the flags'
 authoritative source; this section names every one but does not repeat
 clap's per-flag help text verbatim.
 
-### `pm init [--prefix <PREFIX>] [--preset <PRESET>] [--join <WORKSPACE-ULID>]`
+### `pm init [--prefix <PREFIX>] [--preset <PRESET>] [--state <NAME:CATEGORY>]... [--join <WORKSPACE-ULID>]`
 
 Creates a workspace database. Presets are data, not flavors of code path —
 `--preset` picks the seed, `--prefix` (still 1-16 uppercase letters/digits,
@@ -266,6 +266,7 @@ commits `workspace.set` / `state.upsert` ops, `pm project new` a
 `project.create` carrying the design doc's `doc_id` (+ `project.set
 repo_add`), `pm project doc add` a `project.doc_add` binding the new
 document's `doc_id`, `pm workspace gate-label` a `workspace.set`, `pm
+workspace state add` one `state.upsert` per state it changes, `pm
 archive --auto`'s project retire a `project.set status`, `pm project set`
 one `project.set` per changed `title`/`status`/`parent`, and `pm project
 delete` a `project.delete`; `pm log` (no id) lists them. The only direct
@@ -284,6 +285,18 @@ config-table write left is the allocator floor (`workspace.number_floor`).
   `in-progress` (`started`), `done` (`completed`). Gate label `manual`.
   Any automation that depended on `pm init --prefix AGT` seeding those
   states must now pass `--preset saltline` explicitly.
+- `--state <NAME:CATEGORY>` (AGT-1518; repeat or comma-separate) seeds
+  exactly this workflow instead of the preset's, positions `0, 1, …` in
+  the order given — so a workspace needs no init-then-patch. The preset
+  still supplies the default prefix and gate labels. `CATEGORY` is one of
+  `backlog`, `unstarted`, `started`, `completed`, `canceled`. E.g. the
+  work vault's workflow: `--preset saltline --state
+  triage:unstarted,refined:unstarted,in-progress:started,qa:started,done:completed`.
+  Exit `2`: a value that is not `NAME:CATEGORY`, an unknown category, a
+  name that is not path-safe, a name given twice, or a list with no
+  `unstarted` state (where `pm new` files) or no `completed` state (where
+  `pm done` moves). Conflicts with `--join` (exit `2`). `--json` prints
+  the shape below with these states.
 
 - Exit `1` if the resolved directory is already a workspace.
 - `--json` (`--preset default`, no `--prefix`):
@@ -977,7 +990,8 @@ metadata + the README verbatim as the design doc), sibling `.md` files and
 author). Keyed on the vault id, never the path: an unchanged file is zero
 ops; a changed one yields only the matching ops. The vault is only read.
 Flags: `--dry-run` (read and plan everything, print the report, write
-nothing), `--recover <PATH=REV>` (repeatable: read a vault file that lost
+nothing), `--map-state <VAULT=STATE[+archive][+hold]>` (repeatable,
+AGT-1518; see **Vault states** below), `--recover <PATH=REV>` (repeatable: read a vault file that lost
 its frontmatter from `git show REV:PATH` instead, appending whatever
 comment entries the working-tree file still holds; AGT-806's `82a9982` is
 built in), `--report <FILE>` (AGT-1348: after the import — or, with
@@ -991,6 +1005,52 @@ are not diffs; each remaining difference is either an *explained* class
 listed in the report header with its rationale, or *unexplained*, listed
 with both values; a source file with no ticket in pm is an unexplained
 `missing`).
+
+**Vault states** (AGT-1518). Every ticket's vault `state:` must resolve
+to a workspace state, through one of:
+
+1. a `--map-state VAULT=STATE` rule: tickets in vault state `VAULT` are
+   imported in workspace state `STATE` (which must exist — exit `2`
+   otherwise; add it first with `pm workspace state add`). `+archive`
+   also archives them (`archived_at` = the first of the month of the
+   file's `updated`, unless the file already lives under `archive/20*/`,
+   whose month wins); `+hold` also puts them on hold (reason `vault state
+   '<VAULT>'`, by `import`) unless the file already carries a hold marker.
+   A rule wins over a workspace state of the same name. Mapping the same
+   vault state twice is exit `2`.
+2. a **built-in default**, only for a vault state the workspace has no
+   state of that name for and no flag maps — pm models archive and holds
+   as fields, not states:
+   - `archived` → the workspace's first `canceled` state by position,
+     else its first `completed` one, **+archive** (a vault's `archived`
+     folder holds dropped tickets);
+   - `blocked` → the workspace's initial `unstarted` state (where `pm
+     new` files), **+hold only when the file has no `blocked-by`**: its
+     blockers are imported as relations and already keep it off the ready
+     frontier; a blocked ticket with no recorded blocker is held rather
+     than made claimable. `--map-state blocked=<STATE>[+hold]` overrides
+     this (e.g. `blocked=blocked` after `pm workspace state add blocked
+     --category started` keeps it a state).
+3. a workspace state of the same name.
+
+Before any file is parsed in full (so before anything is written), a
+**pre-flight** reads every ticket file's `state:` and, if any resolves to
+none of these, fails with exit `2` listing **every** such state with its
+ticket count — not just the first file's — and how to add or map them:
+
+```
+pm: the vault uses 2 ticket state(s) this workspace lacks (it has triage, in-progress, done):
+  qa (1 ticket)
+  refined (47 tickets)
+add each with `pm workspace state add <NAME> --category <CATEGORY>`, or map it with `--map-state <VAULT>=<STATE>[+archive][+hold]`; nothing was imported
+```
+
+Mapping is applied on every run, so a re-import with the same flags is
+idempotent; changing a rule re-imports the affected tickets as changes
+(`state`, `archived_at`, an `import` hold). The report's `state_map`
+lists every flag rule and every default that applied, with ticket counts;
+the parity report (`--report`) compares the export against the mapped
+values.
 
 **Who owns project docs** (AGT-1406): the workspace setting
 `docs_owned_by` (`vault`, the default, or `pm`; set with `pm workspace
@@ -1016,8 +1076,11 @@ a comment.
 - Exit `2`: `PATH` has no `tickets/` directory; a file that does not
   parse — the message names `path:line` (no frontmatter, unparseable
   YAML, missing `id`/`title`/`state`/`created`/`updated`, an id that is
-  not `<PREFIX>-<n>`, a state this workspace lacks, a bad date); a
-  `--recover` value that is not `PATH=REV`. Nothing is written.
+  not `<PREFIX>-<n>`, a bad date); the vault-state pre-flight (states
+  neither the workspace nor a mapping knows, all listed with counts); a
+  `--recover` value that is not `PATH=REV`; a `--map-state` value that is
+  not `VAULT=STATE[+archive][+hold]`, names a state the workspace lacks,
+  or maps a vault state twice. Nothing is written.
 - `--json` (the report, with or without `--dry-run`):
   ```jsonc
   {
@@ -1026,8 +1089,13 @@ a comment.
     "vault": "/path/given",
     "prefix": "AGT",
     "files": 1373,                           // ticket files read
+    "state_map": [                           // AGT-1518: every --map-state rule, and each default that applied
+      {"vault": "archived", "state": "done", "archive": true, "hold": "never", "default": true, "tickets": 38},
+      {"vault": "blocked", "state": "triage", "archive": false, "hold": "no-blockers", "default": true, "tickets": 10},
+      {"vault": "qa", "state": "in-progress", "archive": false, "hold": "never", "default": false, "tickets": 1}
+    ],                                       // hold: "never" | "always" (+hold) | "no-blockers" (the blocked default)
     "tickets": {"created": 0, "changed": 0, "unchanged": 0, "skipped": 0},
-    "archived": 1137,                        // files under archive/20*/
+    "archived": 1137,                        // tickets imported archived: files under archive/20*/, plus +archive mappings
     "projects": 69,                          // READMEs read (live + retired)
     "project_stubs": ["id", ...],            // projects a ticket names that have no README; created empty, abandoned
     "docs": {"created": 0, "updated": 0, "unchanged": 0, "skipped": []},  // skipped: doc paths left alone because docs_owned_by = pm
@@ -1266,6 +1334,49 @@ dedicated backup-side code.
 - `add`/`remove`: Exit `2`: empty `<LABEL>`.
 - `--json` (all three): `{"schema": 1, "gate_labels": ["manual", ...]}` —
   the full set after the write (`list`: the current set).
+
+### `pm workspace state add <NAME> [--category <CATEGORY>] [--position <N>]` / `pm workspace state list`
+
+The workspace's workflow states after `pm init` (AGT-1518). `add` is an
+**upsert**: for a new state it commits a `state.upsert` config op (the
+kind `pm init` writes) and `--category` (`backlog`, `unstarted`,
+`started`, `completed`, `canceled`) is required; for an existing state it
+changes the category and/or position, keeping whatever is not given.
+`--position N` defaults to after the last state for a new one; an explicit
+`N` that another state already holds inserts there — that state and every
+later one shift down by one (one more `state.upsert` each, same
+transaction). Upserting the record the workspace already has commits
+nothing (`changed: false`).
+
+Being config ops, states sync to the hub and to other replicas, replay
+under `pm doctor --rebuild`, and travel in `pm backup`, like any other
+config op. Every reader takes the workspace's states fresh on each call,
+so a new state is usable at once by `pm move`, `pm list --state`, `pm
+status`, `pm import vault` and the `pm app` board, and a re-categorised
+one changes `pm ready`/`pm claim` (only `unstarted` is claimable) and `pm
+new`/`pm done` (first `unstarted` / `completed` state) immediately.
+`state.upsert`'s payload (`name`, `category`, `position`) is unchanged
+and already carried all five categories, so **`OP_VERSION` is
+unchanged**.
+
+**States are add-only** (AC5, decided): there is no `state.remove` op
+kind and tickets reference a state by name (a foreign key), so a remove
+would need a new op kind (an `OP_VERSION` bump) and a refusal while any
+replica's ticket — including ones not yet pulled — still names the state.
+A state no longer wanted is re-categorised or moved to the end instead.
+
+`list` prints `name<TAB>category<TAB>position`, in workflow order.
+
+- `add`: Exit `2`: a new state without `--category`; an unknown category;
+  an empty or non-path-safe name (state names become `tickets/<state>/`
+  folders in `pm export md`); re-categorising the workspace's only
+  `unstarted` or only `completed` state.
+- `--json` (`add`): `{"schema": 1, "state": {"name": "qa", "category":
+  "started", "position": 2}, "created": true, "changed": true, "states":
+  [<every state after the write, in order>]}` — `created` is whether the
+  name was new, `changed` whether any op was committed.
+- `--json` (`list`): `{"schema": 1, "states": [{"name": "triage",
+  "category": "unstarted", "position": 0}, ...]}`.
 
 ### `pm workspace docs-owned-by [vault|pm]`
 

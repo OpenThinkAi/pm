@@ -227,14 +227,99 @@ pub fn parse_preset(s: &str) -> std::result::Result<Preset, String> {
     }
 }
 
+/// Clap value parser for a state category (`--category`, `pm init
+/// --state NAME:CATEGORY`): the five Linear categories, lowercase.
+pub fn parse_category(s: &str) -> std::result::Result<StateCategory, String> {
+    match s {
+        "backlog" => Ok(StateCategory::Backlog),
+        "unstarted" => Ok(StateCategory::Unstarted),
+        "started" => Ok(StateCategory::Started),
+        "completed" => Ok(StateCategory::Completed),
+        "canceled" => Ok(StateCategory::Canceled),
+        other => Err(format!(
+            "unknown category '{other}': expected one of backlog, unstarted, started, completed, canceled"
+        )),
+    }
+}
+
+/// A category as `--json` and `--category` spell it.
+pub fn category_name(c: StateCategory) -> &'static str {
+    match c {
+        StateCategory::Backlog => "backlog",
+        StateCategory::Unstarted => "unstarted",
+        StateCategory::Started => "started",
+        StateCategory::Completed => "completed",
+        StateCategory::Canceled => "canceled",
+    }
+}
+
+/// Clap value parser for `pm init --state NAME:CATEGORY` (AGT-1518 AC3).
+pub fn parse_state_spec(s: &str) -> std::result::Result<(String, StateCategory), String> {
+    let (name, category) = s
+        .split_once(':')
+        .ok_or_else(|| format!("--state '{s}' is not NAME:CATEGORY (e.g. qa:started)"))?;
+    let name = name.trim();
+    if !pm_core::ids::is_safe_component(name) {
+        return Err(format!(
+            "state name '{}' is not safe to use in a file path (letters, digits, `-`, `_`, `.`)",
+            name.escape_default()
+        ));
+    }
+    Ok((name.to_string(), parse_category(category.trim())?))
+}
+
+/// The workflow `pm init --state …` seeds instead of the preset's, in the
+/// order given (positions 0, 1, …). It needs an `unstarted` state (where
+/// `pm new` files) and a `completed` one (where `pm done` moves), and no
+/// name twice; exit `2` otherwise.
+fn custom_states(specs: &[(String, StateCategory)]) -> Result<Vec<State>> {
+    let mut seen = BTreeSet::new();
+    for (name, _) in specs {
+        if !seen.insert(name.as_str()) {
+            return Err(CliError::usage(format!("--state '{name}' is given twice")));
+        }
+    }
+    for required in [StateCategory::Unstarted, StateCategory::Completed] {
+        if !specs.iter().any(|(_, c)| *c == required) {
+            return Err(CliError::usage(format!(
+                "--state: the workflow needs at least one {} state",
+                category_name(required)
+            )));
+        }
+    }
+    Ok(specs
+        .iter()
+        .enumerate()
+        .map(|(position, (name, category))| State {
+            name: name.clone(),
+            category: *category,
+            position: position as u32,
+        })
+        .collect())
+}
+
 /// `pm init`. With `join` (AGT-1396, `--join <WORKSPACE-ULID>`) the new
 /// database is an empty replica of that workspace — its id, no ops —
 /// for a second machine: `pm hub login` and `pm sync` then pull the whole
 /// log, config included, from the hub. The prefix and states the row
 /// starts with are placeholders the first pull overwrites.
-pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>, join: Option<Ulid>) -> Result<()> {
+/// `states` (AGT-1518 AC3, `--state NAME:CATEGORY`…), when non-empty,
+/// replaces the preset's workflow; the preset still supplies the prefix
+/// default and gate labels.
+pub fn init(
+    ctx: &Ctx<'_>,
+    preset: Preset,
+    prefix: Option<&str>,
+    join: Option<Ulid>,
+    states: &[(String, StateCategory)],
+) -> Result<()> {
     let prefix = prefix.unwrap_or_else(|| preset.default_prefix());
     crate::ids::validate_prefix(prefix)?;
+    let custom = if states.is_empty() {
+        None
+    } else {
+        Some(custom_states(states)?)
+    };
     let dir = match ctx.workspace.or(ctx.env.pm_workspace.as_deref()) {
         Some(dir) => dir.to_path_buf(),
         None => ctx.env.default_workspace_dir(prefix)?,
@@ -273,7 +358,7 @@ pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>, join: Option<Ul
             let ws = Workspace {
                 id: Ulid::new(),
                 prefix: prefix.to_string(),
-                states: preset.states(),
+                states: custom.unwrap_or_else(|| preset.states()),
                 gate_labels: preset.gate_labels(),
                 model_labels: Default::default(),
                 template_sections: vec!["Problem Statement".into(), "Acceptance Criteria".into()],
@@ -340,11 +425,10 @@ pub fn init(ctx: &Ctx<'_>, preset: Preset, prefix: Option<&str>, join: Option<Ul
             .states
             .iter()
             .map(|s| {
-                let category = serde_json::to_value(s.category).expect("a category serializes");
                 format!(
                     "{} ({})",
                     crate::text::inline(&s.name),
-                    category.as_str().unwrap_or_default()
+                    category_name(s.category)
                 )
             })
             .collect();

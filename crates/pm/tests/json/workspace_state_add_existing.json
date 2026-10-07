@@ -1,0 +1,32 @@
+{
+  "changed": true,
+  "created": false,
+  "schema": 1,
+  "state": {
+    "category": "unstarted",
+    "name": "qa",
+    "position": 2
+  },
+  "states": [
+    {
+      "category": "unstarted",
+      "name": "triage",
+      "position": 0
+    },
+    {
+      "category": "started",
+      "name": "in-progress",
+      "position": 1
+    },
+    {
+      "category": "unstarted",
+      "name": "qa",
+      "position": 2
+    },
+    {
+      "category": "completed",
+      "name": "done",
+      "position": 3
+    }
+  ]
+}
