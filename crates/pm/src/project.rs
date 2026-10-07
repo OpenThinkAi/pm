@@ -83,6 +83,8 @@ pub enum ProjectCmd {
         /// With --from-file: write this named document instead of the design doc
         #[arg(long, value_name = "NAME", requires = "from_file")]
         doc: Option<String>,
+        #[command(flatten)]
+        write: DocWriteFlags,
     },
     /// Change a project's title, status or parent: title=… status=in-progress|complete|abandoned parent=<id|->
     Set {
@@ -109,6 +111,32 @@ pub enum ProjectDocCmd {
         #[arg(long = "from-file", value_name = "PATH")]
         from_file: PathBuf,
     },
+    /// Write an existing named document from a file (same as `pm project edit <ID> --doc <NAME> --from-file`)
+    Edit {
+        id: String,
+        name: String,
+        /// The document body (`-` = stdin); with --section, the section's text
+        #[arg(long = "from-file", value_name = "PATH|-")]
+        from_file: String,
+        #[command(flatten)]
+        write: DocWriteFlags,
+    },
+}
+
+/// The `--from-file` write's condition and scope (AGT-1573), shared by
+/// `pm project edit` and `pm project doc edit`; both name their file arg
+/// `from_file`, which is what `requires` points at.
+#[derive(clap::Args, Debug)]
+pub struct DocWriteFlags {
+    /// Refuse the write (exit 4, printing the current version) unless the document is still at this version, as `pm project show --json` reported it (`doc_version` / `document_versions`)
+    #[arg(long = "if-version", value_name = "VERSION", requires = "from_file")]
+    if_version: Option<String>,
+    /// Write only the section under this markdown heading (text, case-insensitive; `## Text` pins the level), leaving the rest of the document byte-identical
+    #[arg(long, value_name = "HEADING", requires = "from_file")]
+    section: Option<String>,
+    /// With --section: add the file's text to the end of the section instead of replacing it
+    #[arg(long, requires = "section")]
+    append: bool,
 }
 
 pub fn run(ctx: &Ctx<'_>, cmd: ProjectCmd) -> Result<()> {
@@ -133,8 +161,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: ProjectCmd) -> Result<()> {
             id,
             from_file: Some(src),
             doc,
+            write,
             ..
-        } => edit_from_file(ctx, &id, doc.as_deref(), &src),
+        } => edit_from_file(ctx, &id, doc.as_deref(), &src, &write),
         ProjectCmd::Edit { id, view, .. } => edit(ctx, &id, view),
         ProjectCmd::Set { id, assignments } => set(ctx, &id, &assignments),
         ProjectCmd::Delete { id } => delete(ctx, &id),
@@ -144,6 +173,12 @@ pub fn run(ctx: &Ctx<'_>, cmd: ProjectCmd) -> Result<()> {
                 name,
                 from_file,
             } => doc_add(ctx, &id, &name, &from_file),
+            ProjectDocCmd::Edit {
+                id,
+                name,
+                from_file,
+                write,
+            } => edit_from_file(ctx, &id, Some(&name), &from_file, &write),
         },
     }
 }
@@ -207,7 +242,13 @@ fn show(ctx: &Ctx<'_>, id: &str, doc: Option<&str>) -> Result<()> {
                 CliError::not_found(format!("project '{id}' has no document '{name}'"))
             })?;
             if ctx.json {
-                print_json(&json!({"schema": SCHEMA, "project": id, "doc": name, "body": body}));
+                print_json(&json!({
+                    "schema": SCHEMA,
+                    "project": id,
+                    "doc": name,
+                    "body": body,
+                    "version": doc_version(body),
+                }));
             } else {
                 // stderr, so the body on stdout stays pipeable.
                 eprintln!("{id}: named doc '{}'", crate::text::inline(name));
@@ -329,17 +370,15 @@ fn edit_in_editor(ctx: &Ctx<'_>, id: &str) -> Result<()> {
     print_project(ctx, &project)
 }
 
-/// Diffs `new_text` against a document's replica history and commits the
-/// `body.edit` (shared by the `$EDITOR` and `--from-file` paths).
-fn commit_doc_text(store: &mut Store, actor: ActorId, doc_id: Ulid, new_text: &str) -> Result<()> {
-    // Continue this document's causal history rather than diffing from an
-    // empty replica: import whatever this replica already knows (the
-    // cached snapshot, if any body.edit has ever landed) before diffing to
-    // the editor's text, so the update is a minimal, correctly-merging
-    // edit rather than a from-scratch replacement (pm-core::Body docs).
-    // The session gets its own Loro peer (crate::edit::session_peer) so two
-    // concurrent `pm project edit`s by the same actor never collide the way
-    // a shared peer would (crate::edit module docs, AGT-1345).
+/// A document's replica history, restored into a fresh session [`Body`]
+/// ready to diff the next edit from: whatever this replica already knows
+/// (the cached snapshot, if any `body.edit` has ever landed), so the update
+/// is a minimal, correctly-merging edit rather than a from-scratch
+/// replacement (pm-core::Body docs). The session gets its own Loro peer
+/// (crate::edit::session_peer) so two concurrent `pm project edit`s by the
+/// same actor never collide the way a shared peer would (crate::edit
+/// module docs, AGT-1345).
+fn doc_session(store: &Store, doc_id: Ulid) -> Result<Body> {
     let mut body = Body::with_peer(edit::session_peer(Ulid::new()))
         .map_err(|e| CliError::error(format!("starting project doc session: {e}")))?;
     if let Some(view) = store.doc_view(doc_id)? {
@@ -350,10 +389,21 @@ fn commit_doc_text(store: &mut Store, actor: ActorId, doc_id: Ulid, new_text: &s
         body.apply(&snapshot)
             .map_err(|e| CliError::error(format!("restoring project doc history: {e}")))?;
     }
+    Ok(body)
+}
+
+/// Diffs `new_text` against `body` (a [`doc_session`]) and commits the
+/// `body.edit` (shared by the `$EDITOR` and `--from-file` paths).
+fn commit_doc_diff(
+    store: &mut Store,
+    actor: ActorId,
+    doc_id: Ulid,
+    body: &mut Body,
+    new_text: &str,
+) -> Result<()> {
     let update = body
         .diff_from_text(new_text)
         .map_err(|e| CliError::error(format!("diffing project doc: {e}")))?;
-
     let mut stamper = Stamper::new(store, actor)?;
     let op = stamper.op(
         doc_id,
@@ -365,16 +415,55 @@ fn commit_doc_text(store: &mut Store, actor: ActorId, doc_id: Ulid, new_text: &s
     Ok(())
 }
 
-/// `pm project edit <id> [--doc <name>] --from-file <path|->` (AGT-1480):
-/// the non-interactive write. The file is the document BODY (a design doc
-/// has no frontmatter), diffed line-faithfully through `Body::diff_from_text`
-/// like the editor flow, so a concurrent edit merges; unchanged text
-/// commits nothing.
-fn edit_from_file(ctx: &Ctx<'_>, id: &str, doc: Option<&str>, src: &str) -> Result<()> {
+fn commit_doc_text(store: &mut Store, actor: ActorId, doc_id: Ulid, new_text: &str) -> Result<()> {
+    let mut body = doc_session(store, doc_id)?;
+    commit_doc_diff(store, actor, doc_id, &mut body, new_text)
+}
+
+/// A document's **version** (AGT-1573): the first 16 hex digits of the
+/// SHA-256 of its text. A content hash rather than an op id, so every
+/// replica holding the same text reports the same version, and a write
+/// that leaves the text as it was does not move it. Opaque to callers:
+/// compare for equality, nothing else.
+pub(crate) fn doc_version(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .take(8)
+        .fold(String::new(), |mut hex, b| {
+            let _ = write!(hex, "{b:02x}");
+            hex
+        })
+}
+
+/// `pm project edit <id> [--doc <name>] --from-file <path|->` (AGT-1480),
+/// and `pm project doc edit <id> <name>` (AGT-1573): the non-interactive
+/// write. The file is the document BODY (a design doc has no frontmatter)
+/// — or, with `--section`, one section's text ([`crate::section`]) —
+/// diffed line-faithfully through `Body::diff_from_text` like the editor
+/// flow; unchanged text commits nothing.
+///
+/// Edits made on different replicas merge (each is a diff from that
+/// replica's history). What a diff cannot save is a stale read-modify-write
+/// on ONE replica: the caller's text was built from an older read, so the
+/// diff — run against the newer text — deletes whatever landed in between.
+/// `--if-version` refuses that write (exit 4) and `--section` narrows what
+/// the write can touch. The version check, the section splice and the
+/// diff all read the same restored history, so the text checked is the
+/// text diffed from; an edit committed after that read is concurrent to
+/// this one and merges.
+fn edit_from_file(
+    ctx: &Ctx<'_>,
+    id: &str,
+    doc: Option<&str>,
+    src: &str,
+    write: &DocWriteFlags,
+) -> Result<()> {
     let actor = ctx.actor()?;
     let (mut store, _ws) = ctx.open()?;
     let project = store.project(id)?.ok_or_else(|| not_found(id))?;
-    let (doc_id, current) = match doc {
+    let (doc_id, materialized) = match doc {
         None => {
             let doc_id = store.design_doc_id(id)?.ok_or_else(|| {
                 CliError::error(format!(
@@ -394,19 +483,63 @@ fn edit_from_file(ctx: &Ctx<'_>, id: &str, doc: Option<&str>, src: &str) -> Resu
             (doc_id, current)
         }
     };
-    let text = crate::fromfile::read_source(src)?;
+    let file = crate::fromfile::read_source(src)?;
     let label = match doc {
         None => "design doc".to_string(),
         Some(name) => format!("named doc '{}'", crate::text::inline(name)),
     };
-    if text == *current {
+
+    let mut body = doc_session(&store, doc_id)?;
+    // A document that has never had a body.edit has no history to restore:
+    // its text is the row's (empty for every CLI-created document).
+    let current = if store.doc_view(doc_id)?.is_some() {
+        body.text()
+    } else {
+        materialized.clone()
+    };
+    if let Some(want) = write.if_version.as_deref() {
+        let have = doc_version(&current);
+        if want.trim() != have {
+            if ctx.json {
+                print_json(&json!({
+                    "schema": SCHEMA,
+                    "project": id,
+                    "doc": doc,
+                    "expected_version": want.trim(),
+                    "version": have,
+                }));
+            }
+            return Err(CliError {
+                code: crate::exit::STALE,
+                error: anyhow::anyhow!(
+                    "{}: {label} changed since version {}; current version: {have} \
+                     (re-read it with `pm project show {} --json` and redo the edit)",
+                    crate::text::inline(id),
+                    crate::text::inline(want.trim()),
+                    crate::text::inline(id),
+                ),
+            });
+        }
+    }
+    let text = match write.section.as_deref() {
+        None => file,
+        Some(heading) => {
+            let mode = if write.append {
+                crate::section::Mode::Append
+            } else {
+                crate::section::Mode::Replace
+            };
+            crate::section::write(&current, heading, &file, mode)?
+        }
+    };
+    if text == current {
         if ctx.json {
             return print_project(ctx, &project);
         }
         println!("{}: {label} unchanged", crate::text::inline(id));
         return Ok(());
     }
-    commit_doc_text(&mut store, actor, doc_id, &text)?;
+    commit_doc_diff(&mut store, actor, doc_id, &mut body, &text)?;
     if ctx.json {
         let project = store
             .project(id)?
@@ -597,6 +730,14 @@ pub(crate) fn project_json(p: &Project) -> Value {
     let mut out = Map::new();
     out.insert("schema".into(), json!(SCHEMA));
     out.extend(fields);
+    // AGT-1573: what `--if-version` takes, per document.
+    out.insert("doc_version".into(), json!(doc_version(&p.doc)));
+    let versions: Map<String, Value> = p
+        .documents
+        .iter()
+        .map(|(name, body)| (name.clone(), json!(doc_version(body))))
+        .collect();
+    out.insert("document_versions".into(), Value::Object(versions));
     Value::Object(out)
 }
 

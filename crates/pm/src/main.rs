@@ -24,6 +24,7 @@ mod pipe;
 mod project;
 mod read;
 mod ready;
+mod section;
 mod seed;
 mod sync;
 mod text;
@@ -37,7 +38,8 @@ use ticket::{Filter, State, Ticket};
 /// pm - local-first ticketing for agents and humans
 ///
 /// Exit codes: 0 ok, 1 error (or an unhealthy database, for doctor; findings, for check), 2 usage,
-/// 3 not found, 75 taken (claim), 141 stdout closed early (e.g. `| head`).
+/// 3 not found, 4 stale (a doc write's --if-version), 75 taken (claim), 141 stdout closed early
+/// (e.g. `| head`).
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Cli {

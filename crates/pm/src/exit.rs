@@ -1,7 +1,7 @@
 //! The CLI's exit-code contract (projects/pm/README.md §Surfaces): `0` ok,
-//! `1` error, `2` usage, `3` not found, `75` taken/conflict, `141` stdout
-//! closed early. Every verb returns [`Result`]; `main` prints the message
-//! and exits with the code.
+//! `1` error, `2` usage, `3` not found, `4` stale, `75` taken/conflict,
+//! `141` stdout closed early. Every verb returns [`Result`]; `main` prints
+//! the message and exits with the code.
 //! Clap's own parse failures already exit `2`.
 
 use std::fmt;
@@ -11,6 +11,9 @@ use pm_store::StoreError;
 pub const ERROR: u8 = 1;
 pub const USAGE: u8 = 2;
 pub const NOT_FOUND: u8 = 3;
+/// A conditional document write found the document changed since the
+/// version the caller read (`pm project edit --if-version`, AGT-1573).
+pub const STALE: u8 = 4;
 /// The authority refused a conditional op (`pm claim`: someone else holds
 /// the ticket).
 pub const TAKEN: u8 = 75;
