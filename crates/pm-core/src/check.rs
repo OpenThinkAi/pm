@@ -140,8 +140,8 @@ impl Finding {
             Finding::DanglingRelation { .. } => "dangling-relation",
             Finding::DeletedProject { .. } => "deleted-project",
             Finding::BlockedByCanceled { .. } => "blocked-by-canceled",
-            Finding::DecisionUncited { .. } => "decision-uncited",
-            Finding::DecisionUnknown { .. } => "decision-unknown",
+            Finding::DecisionUncited { .. } => DECISION_UNCITED,
+            Finding::DecisionUnknown { .. } => DECISION_UNKNOWN,
         }
     }
 }
