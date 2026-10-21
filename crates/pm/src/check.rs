@@ -27,6 +27,13 @@ pub fn check(ctx: &Ctx<'_>, project: Option<&str>) -> Result<()> {
     let mut findings = pm_core::check::check(&ws, &tickets, &store.all_relations()?, now, project);
     pm_core::check::with_deleted_projects(&mut findings, &store.deleted_project_refs()?, project);
     pm_core::check::with_parked_since(&mut findings, &store.parked_since()?, now);
+    pm_core::check::with_decisions(
+        &mut findings,
+        &ws,
+        &tickets,
+        &store.decision_ids()?,
+        project,
+    );
     let names: BTreeMap<Ulid, String> = tickets.iter().map(|t| (t.id, ref_id(&ws, t))).collect();
     let name = |id: &Ulid| names.get(id).cloned().unwrap_or_else(|| id.to_string());
 
@@ -90,6 +97,10 @@ fn finding_json(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) ->
         Finding::BlockedByCanceled { blocker, state, .. } => {
             json!({ "blocker": name(blocker), "state": state })
         }
+        Finding::DecisionUncited { project, .. } => json!({ "project": project }),
+        Finding::DecisionUnknown {
+            project, decision, ..
+        } => json!({ "project": project, "decision": decision }),
         Finding::NoProject { .. } | Finding::BlockerCycle { .. } => json!({}),
     };
     if let (Value::Object(out), Value::Object(extra)) = (&mut out, extra) {
@@ -141,6 +152,18 @@ fn message(f: &Finding, ws: &Workspace, name: &impl Fn(&Ulid) -> String) -> Stri
                  else cancel {t} too"
             )
         }
+        Finding::DecisionUncited { project, .. } => format!(
+            "cites no decision from the `decisions` doc of project '{project}'; add a \
+             `Decisions: D-NN, …` line to its description or say why it needs none \
+             (`pm waive <id> decision-uncited \"why\"`)"
+        ),
+        Finding::DecisionUnknown {
+            project, decision, ..
+        } => format!(
+            "cites {decision}, which the `decisions` doc of project '{project}' does \
+             not define; fix the `Decisions:` line or add a `## {decision}` heading \
+             (`pm waive <id> decision-unknown \"why\"` to exempt it)"
+        ),
         Finding::DanglingRelation { relation, missing } => {
             let kind = serde_json::to_value(relation.kind)
                 .ok()

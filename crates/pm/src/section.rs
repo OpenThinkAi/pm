@@ -16,6 +16,8 @@
 //! one. No match is "not found" (exit 3); more than one is a usage error
 //! (exit 2) — the write never guesses.
 
+use pm_core::markdown::{Heading, headings, parse_heading};
+
 use crate::exit::{CliError, Result};
 
 /// How the file's text lands in the section.
@@ -28,87 +30,6 @@ pub(crate) enum Mode {
     /// so a leading blank line starts a new paragraph) goes after the
     /// section's last non-blank line.
     Append,
-}
-
-/// One heading line: its index, level and text.
-struct Heading {
-    line: usize,
-    level: usize,
-    text: String,
-}
-
-/// `(level, text)` for an ATX heading line, else `None`: up to three
-/// spaces of indent, 1-6 `#`, then a space, a tab or the end of the line;
-/// an optional closing run of `#` is not part of the text.
-fn parse_heading(line: &str) -> Option<(usize, String)> {
-    let line = line.trim_end_matches(['\n', '\r']);
-    let indent = line.len() - line.trim_start_matches(' ').len();
-    if indent > 3 {
-        return None;
-    }
-    let rest = &line[indent..];
-    let level = rest.len() - rest.trim_start_matches('#').len();
-    if !(1..=6).contains(&level) {
-        return None;
-    }
-    let after = &rest[level..];
-    if !(after.is_empty() || after.starts_with([' ', '\t'])) {
-        return None;
-    }
-    let mut text = after.trim();
-    // A closing sequence: `## Goals ##` reads as "Goals"; `## C#` keeps
-    // its `#` (the run must follow a space).
-    let stripped = text.trim_end_matches('#');
-    if stripped.is_empty() {
-        text = "";
-    } else if stripped.len() < text.len() && stripped.ends_with([' ', '\t']) {
-        text = stripped.trim_end();
-    }
-    Some((level, text.to_string()))
-}
-
-/// The opening fence of a fenced code block: up to three spaces, then at
-/// least three backticks or tildes. Returns the fence char and its length.
-fn fence(line: &str) -> Option<(char, usize)> {
-    let line = line.trim_end_matches(['\n', '\r']);
-    let indent = line.len() - line.trim_start_matches(' ').len();
-    if indent > 3 {
-        return None;
-    }
-    let rest = &line[indent..];
-    let ch = rest.chars().next().filter(|c| *c == '`' || *c == '~')?;
-    let n = rest.len() - rest.trim_start_matches(ch).len();
-    (n >= 3).then_some((ch, n))
-}
-
-/// Every heading outside a fenced code block, in document order.
-fn headings(lines: &[&str]) -> Vec<Heading> {
-    let mut out = Vec::new();
-    let mut open: Option<(char, usize)> = None;
-    for (i, line) in lines.iter().enumerate() {
-        if let Some((ch, n)) = open {
-            // A closing fence: the same char, at least as long, nothing after.
-            if let Some((c, m)) = fence(line) {
-                let rest = line.trim().trim_start_matches(c);
-                if c == ch && m >= n && rest.is_empty() {
-                    open = None;
-                }
-            }
-            continue;
-        }
-        if let Some(f) = fence(line) {
-            open = Some(f);
-            continue;
-        }
-        if let Some((level, text)) = parse_heading(line) {
-            out.push(Heading {
-                line: i,
-                level,
-                text,
-            });
-        }
-    }
-    out
 }
 
 fn is_blank(line: &str) -> bool {
@@ -335,14 +256,5 @@ mod tests {
             write(doc, "  ", "x", Mode::Replace).unwrap_err().code,
             crate::exit::USAGE
         );
-    }
-
-    #[test]
-    fn heading_parsing() {
-        assert_eq!(parse_heading("## Goals ##\n"), Some((2, "Goals".into())));
-        assert_eq!(parse_heading("## C#"), Some((2, "C#".into())));
-        assert_eq!(parse_heading("#hashtag"), None);
-        assert_eq!(parse_heading("    # code"), None);
-        assert_eq!(parse_heading("####### seven"), None);
     }
 }

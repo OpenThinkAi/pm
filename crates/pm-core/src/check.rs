@@ -32,6 +32,14 @@
 //!   replica still had tickets in it. The store keeps the name in the
 //!   ticket's view and `NULL` on its row, so it is reported here (by
 //!   [`with_deleted_projects`]) instead of as R1.
+//! - **decision-uncited** / **decision-unknown** (AGT-1992) — only in a
+//!   project with a `decisions` named document: a live ticket that is not
+//!   done or canceled and cites no decision on a `Decisions:` line of its
+//!   description, or cites an id ([`decision_ids`]) the document does not
+//!   define. Folded in by [`with_decisions`], since the documents are not
+//!   part of the ticket snapshot. Report-only, like every rule here;
+//!   `pm waive <id> decision-uncited|decision-unknown "why"` exempts a
+//!   ticket.
 //!
 //! "Live" means neither tombstoned nor archived.
 
@@ -88,6 +96,16 @@ pub enum Finding {
         blocker: Ulid,
         state: String,
     },
+    /// `ticket`, in `project` (which has a `decisions` document), cites no
+    /// decision on a `Decisions:` line (AGT-1992).
+    DecisionUncited { ticket: Ulid, project: String },
+    /// `ticket` cites `decision`, which `project`'s `decisions` document
+    /// does not define (AGT-1992). One finding per unknown id.
+    DecisionUnknown {
+        ticket: Ulid,
+        project: String,
+        decision: String,
+    },
 }
 
 impl Finding {
@@ -99,7 +117,9 @@ impl Finding {
             | Finding::Held { ticket, .. }
             | Finding::AssignedUnstarted { ticket, .. }
             | Finding::Parked { ticket, .. }
-            | Finding::DeletedProject { ticket, .. } => vec![*ticket],
+            | Finding::DeletedProject { ticket, .. }
+            | Finding::DecisionUncited { ticket, .. }
+            | Finding::DecisionUnknown { ticket, .. } => vec![*ticket],
             Finding::BlockerCycle { tickets } => tickets.clone(),
             Finding::DanglingRelation { relation, .. } => vec![relation.from, relation.to],
             Finding::BlockedByCanceled {
@@ -120,6 +140,8 @@ impl Finding {
             Finding::DanglingRelation { .. } => "dangling-relation",
             Finding::DeletedProject { .. } => "deleted-project",
             Finding::BlockedByCanceled { .. } => "blocked-by-canceled",
+            Finding::DecisionUncited { .. } => DECISION_UNCITED,
+            Finding::DecisionUnknown { .. } => DECISION_UNKNOWN,
         }
     }
 }
@@ -134,7 +156,9 @@ impl Finding {
 /// assigned-unstarted and parked interleaved per ticket (each in `tickets`
 /// order),
 /// then cycles, then dangling relations, then blocked-by-canceled edges
-/// (both in relation order: kind, from, to).
+/// (both in relation order: kind, from, to). The store's folds append
+/// deleted-project findings ([`with_deleted_projects`]) and then decision
+/// findings ([`with_decisions`]) after these.
 pub fn check(
     ws: &Workspace,
     tickets: &[Ticket],
@@ -293,6 +317,97 @@ pub fn with_parked_since(findings: &mut [Finding], parked_ms: &BTreeMap<Ulid, u6
             && let Some(ms) = parked_ms.get(ticket)
         {
             *days = now_ms.saturating_sub(*ms) / DAY_MS;
+        }
+    }
+}
+
+/// The rule names of the two decision findings (AGT-1992), which are also
+/// what `pm waive` takes to exempt a ticket from each.
+pub const DECISION_UNCITED: &str = "decision-uncited";
+pub const DECISION_UNKNOWN: &str = "decision-unknown";
+
+/// The decision ids a project's `decisions` document defines (AGT-1992):
+/// the text of every ATX heading, at any level and outside fenced code
+/// ([`crate::markdown::headings`]), that is exactly `D-` followed by one
+/// or more ASCII digits. Ids compare as written: `D-3` and `D-03` differ.
+pub fn decision_ids(doc: &str) -> BTreeSet<String> {
+    let lines: Vec<&str> = doc.lines().collect();
+    crate::markdown::headings(&lines)
+        .into_iter()
+        .map(|h| h.text)
+        .filter(|text| is_decision_id(text))
+        .collect()
+}
+
+/// The decision ids a ticket description cites (AGT-1992): every
+/// `D-<digits>` token on each line that starts (after leading whitespace)
+/// with `Decisions:`, in order, each once. Tokens are split on anything
+/// but ASCII letters, digits and `-`, so `D-03, D-07.` cites two.
+pub fn cited_decisions(description: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in description.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("Decisions:") else {
+            continue;
+        };
+        for token in rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+            if is_decision_id(token) && !out.iter().any(|d| d == token) {
+                out.push(token.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn is_decision_id(text: &str) -> bool {
+    text.strip_prefix("D-")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Appends the decision findings (AGT-1992) to `findings` from [`check`].
+/// `decisions` maps each project that has a `decisions` named document to
+/// the ids it defines ([`decision_ids`]); a project absent from it gets
+/// neither finding. For every live ticket (not tombstoned, not archived)
+/// in such a project whose state is not `completed` or `canceled`: no
+/// citation ([`cited_decisions`]) is `decision-uncited`, and each cited id
+/// the document does not define is `decision-unknown`, unless the ticket
+/// waives that rule. In `tickets` order, then citation order. With
+/// `project`, only that project's tickets are considered.
+pub fn with_decisions(
+    findings: &mut Vec<Finding>,
+    ws: &Workspace,
+    tickets: &[Ticket],
+    decisions: &BTreeMap<String, BTreeSet<String>>,
+    project: Option<&str>,
+) {
+    for t in tickets {
+        let Some(p) = t.project.as_deref() else {
+            continue;
+        };
+        let Some(defined) = decisions.get(p) else {
+            continue;
+        };
+        if project.is_some_and(|f| f != p) || crate::ready::settled(ws, t) {
+            continue;
+        }
+        let cited = cited_decisions(&t.description);
+        if cited.is_empty() {
+            if !waives(&t.waivers, DECISION_UNCITED) {
+                findings.push(Finding::DecisionUncited {
+                    ticket: t.id,
+                    project: p.to_string(),
+                });
+            }
+            continue;
+        }
+        if waives(&t.waivers, DECISION_UNKNOWN) {
+            continue;
+        }
+        for decision in cited.into_iter().filter(|d| !defined.contains(d)) {
+            findings.push(Finding::DecisionUnknown {
+                ticket: t.id,
+                project: p.to_string(),
+                decision,
+            });
         }
     }
 }
@@ -867,6 +982,145 @@ mod tests {
         let mut filtered = Vec::new();
         with_deleted_projects(&mut filtered, &deleted, Some("pm"));
         assert!(filtered.is_empty());
+    }
+
+    /// AGT-1992: decision ids are exactly-`D-<digits>` ATX headings at any
+    /// level, outside fenced code.
+    #[test]
+    fn decision_ids_are_d_digit_headings() {
+        let doc = "# Decisions\n\n## D-01\ntext\n### D-2 ###\n#### D-03 extra\n\
+                   ## d-04\n##D-05\n    ## D-06\n```\n## D-07\n```\nD-08\n## D-\n\
+                   ###### D-10\n## D-1x\n";
+        assert_eq!(
+            decision_ids(doc),
+            BTreeSet::from(["D-01".into(), "D-10".into(), "D-2".into()])
+        );
+        assert!(decision_ids("").is_empty());
+    }
+
+    /// AGT-1992: every `D-<digits>` token on a `Decisions:` line is a
+    /// citation; other lines and other tokens are not.
+    #[test]
+    fn cited_decisions_come_from_decisions_lines() {
+        let desc = "Cites D-99 in prose.\n\nDecisions: D-03, D-04,D-10.\n  Decisions: D-03 (again) and D-7\n\
+                    decisions: D-11\nNot Decisions: D-12\nDecisions: none, XD-13, D-14a, D-\n";
+        assert_eq!(cited_decisions(desc), ["D-03", "D-04", "D-10", "D-7"]);
+        assert!(cited_decisions("Decisions:").is_empty());
+        assert!(cited_decisions("").is_empty());
+    }
+
+    /// AGT-1992: in a project with a `decisions` doc, a live, not-done
+    /// ticket citing nothing is `decision-uncited` and each unknown cited
+    /// id is `decision-unknown`; done, canceled, archived and tombstoned
+    /// tickets, projects without the doc, and waived rules are not.
+    #[test]
+    fn decision_findings_only_in_projects_with_a_decisions_doc() {
+        let cite = |n, project, line: &str| {
+            let mut t = ticket(n, Some(project));
+            t.description = format!("Intro.\n\n{line}\n");
+            t
+        };
+        let waive = |t: &mut Ticket, rule: &str| {
+            t.waivers.push(Waiver {
+                rule: rule.into(),
+                reason: "why".into(),
+            })
+        };
+        let uncited = cite(1, "pm", "No citation here.");
+        let good = cite(2, "pm", "Decisions: D-01, D-02");
+        let unknown = cite(3, "pm", "Decisions: D-01, D-09, D-08");
+        let other_project = cite(4, "other", "nothing");
+        let mut done = cite(5, "pm", "");
+        done.state = "done".into();
+        let mut canceled = cite(6, "pm", "Decisions: D-77");
+        canceled.state = "canceled".into();
+        let mut archived = cite(7, "pm", "");
+        archived.archived_at = Some(Hlc::new(NOW, 1));
+        let mut gone = cite(8, "pm", "");
+        gone.deleted = true;
+        let mut waived_uncited = cite(9, "pm", "");
+        waive(&mut waived_uncited, "Decision-Uncited");
+        let mut waived_unknown = cite(10, "pm", "Decisions: D-66");
+        waive(&mut waived_unknown, DECISION_UNKNOWN);
+        // Waiving decision-unknown does not excuse citing nothing.
+        let mut wrong_waiver = cite(11, "pm", "");
+        waive(&mut wrong_waiver, DECISION_UNKNOWN);
+        let mut started = cite(12, "pm", "Decisions: D-5");
+        started.state = "in-progress".into();
+        let no_project = ticket(13, None);
+        let tickets = [
+            uncited.clone(),
+            good,
+            unknown.clone(),
+            other_project,
+            done,
+            canceled,
+            archived,
+            gone,
+            waived_uncited,
+            waived_unknown,
+            wrong_waiver.clone(),
+            started.clone(),
+            no_project,
+        ];
+        let decisions = BTreeMap::from([(
+            "pm".to_string(),
+            BTreeSet::from(["D-01".to_string(), "D-02".to_string()]),
+        )]);
+        let uncited_f = |t: &Ticket| Finding::DecisionUncited {
+            ticket: t.id,
+            project: "pm".into(),
+        };
+        let unknown_f = |t: &Ticket, d: &str| Finding::DecisionUnknown {
+            ticket: t.id,
+            project: "pm".into(),
+            decision: d.into(),
+        };
+
+        let mut found = Vec::new();
+        with_decisions(&mut found, &ws(0), &tickets, &decisions, None);
+        assert_eq!(
+            found,
+            [
+                uncited_f(&uncited),
+                unknown_f(&unknown, "D-09"),
+                unknown_f(&unknown, "D-08"),
+                uncited_f(&wrong_waiver),
+                unknown_f(&started, "D-5"),
+            ]
+        );
+        assert_eq!(found[0].rule(), DECISION_UNCITED);
+        assert_eq!(found[1].rule(), DECISION_UNKNOWN);
+        let json = serde_json::to_value(&found[1]).unwrap();
+        assert_eq!(json["rule"], "decision-unknown");
+        assert_eq!(json["decision"], "D-09");
+        assert_eq!(
+            serde_json::to_value(&found[0]).unwrap()["rule"],
+            "decision-uncited"
+        );
+        assert_eq!(found[1].tickets(), [unknown.id]);
+
+        // The project filter, and a project without the doc.
+        let mut filtered = Vec::new();
+        with_decisions(&mut filtered, &ws(0), &tickets, &decisions, Some("other"));
+        assert_eq!(filtered, []);
+        with_decisions(&mut filtered, &ws(0), &tickets, &decisions, Some("pm"));
+        assert_eq!(filtered, found);
+        let mut none = Vec::new();
+        with_decisions(&mut none, &ws(0), &tickets, &BTreeMap::new(), None);
+        assert_eq!(none, []);
+
+        // An empty `decisions` doc defines nothing: every citation is unknown.
+        let empty = BTreeMap::from([("pm".to_string(), BTreeSet::new())]);
+        let mut all = Vec::new();
+        with_decisions(&mut all, &ws(0), &tickets[1..2], &empty, None);
+        assert_eq!(
+            all,
+            [
+                unknown_f(&tickets[1], "D-01"),
+                unknown_f(&tickets[1], "D-02")
+            ]
+        );
     }
 
     #[test]

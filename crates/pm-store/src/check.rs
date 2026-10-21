@@ -1,7 +1,7 @@
 //! The snapshot `pm check` runs over (AGT-1342). The invariants themselves
 //! are pure, in [`pm_core::check`]; this module only reads what they need.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pm_core::{Finding, Relation, Ticket, Workspace};
 use rusqlite::params;
@@ -82,11 +82,30 @@ impl Store {
         .collect()
     }
 
+    /// The decision ids each project's `decisions` named document defines
+    /// (AGT-1992), keyed by project id, for
+    /// [`pm_core::check::with_decisions`]: only projects that have the
+    /// document appear (an empty one maps to no ids, so every citation in
+    /// it is unknown).
+    pub fn decision_ids(&self) -> Result<BTreeMap<String, BTreeSet<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT project, body FROM project_doc WHERE name = 'decisions'")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.map(|row| {
+            let (project, body) = row?;
+            Ok((project, pm_core::check::decision_ids(&body)))
+        })
+        .collect()
+    }
+
     /// [`pm_core::check::check`] over this database, with its
     /// deleted-project references folded in
     /// ([`pm_core::check::with_deleted_projects`]) and parked ages taken
     /// from when each ticket was parked
-    /// ([`pm_core::check::with_parked_since`]). `now_ms` is the
+    /// ([`pm_core::check::with_parked_since`]), then the decision findings
+    /// for projects with a `decisions` document
+    /// ([`pm_core::check::with_decisions`], AGT-1992). `now_ms` is the
     /// caller's clock reading (staleness is measured against it).
     pub fn check(
         &self,
@@ -94,19 +113,16 @@ impl Store {
         now_ms: u64,
         project: Option<&str>,
     ) -> Result<Vec<Finding>> {
-        let mut findings = pm_core::check::check(
-            ws,
-            &self.all_tickets()?,
-            &self.all_relations()?,
-            now_ms,
-            project,
-        );
+        let tickets = self.all_tickets()?;
+        let mut findings =
+            pm_core::check::check(ws, &tickets, &self.all_relations()?, now_ms, project);
         pm_core::check::with_deleted_projects(
             &mut findings,
             &self.deleted_project_refs()?,
             project,
         );
         pm_core::check::with_parked_since(&mut findings, &self.parked_since()?, now_ms);
+        pm_core::check::with_decisions(&mut findings, ws, &tickets, &self.decision_ids()?, project);
         Ok(findings)
     }
 }

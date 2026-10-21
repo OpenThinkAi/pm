@@ -130,3 +130,65 @@ fn check_sees_cycles_across_owners_and_relations_to_tombstones() {
     );
     assert_eq!(store.check(&ws, NOW + 20, Some("other")).unwrap(), []);
 }
+
+/// AGT-1992: `Store::decision_ids` reads only projects with a `decisions`
+/// named document, and `Store::check` folds the decision findings in for
+/// their tickets.
+#[test]
+fn check_reports_uncited_tickets_only_in_projects_with_a_decisions_doc() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path().join("pm.sqlite")).unwrap();
+    let ws = workspace();
+    let matt = pm_core::ActorId::new("matt");
+    store.init_workspace(&ws, &matt).unwrap();
+    let project = |id: &str, docs: &[(&str, &str)]| Project {
+        kind: Default::default(),
+        id: id.into(),
+        title: id.into(),
+        status: ProjectStatus::InProgress,
+        parent: None,
+        repos: Default::default(),
+        doc: "## D-09\n".into(),
+        documents: docs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    store
+        .put_project(
+            &project(
+                "pm",
+                &[("decisions", "# Decisions\n\n## D-01\n\n### D-02\n")],
+            ),
+            &matt,
+        )
+        .unwrap();
+    store
+        .put_project(&project("plain", &[("sources", "## D-03\n")]), &matt)
+        .unwrap();
+    assert_eq!(
+        store.decision_ids().unwrap(),
+        std::collections::BTreeMap::from([(
+            "pm".to_string(),
+            std::collections::BTreeSet::from(["D-01".to_string(), "D-02".to_string()])
+        )])
+    );
+
+    let a = Ulid::new();
+    store.commit(&create(a, 0)).unwrap();
+    let mut other = create(Ulid::new(), 1);
+    if let Payload::TicketCreate(c) = &mut other.payload {
+        c.project = Some("plain".into());
+    }
+    store.commit(&other).unwrap();
+    let uncited = Finding::DecisionUncited {
+        ticket: a,
+        project: "pm".into(),
+    };
+    assert_eq!(
+        store.check(&ws, NOW + 10, None).unwrap(),
+        std::slice::from_ref(&uncited)
+    );
+    assert_eq!(store.check(&ws, NOW + 10, Some("pm")).unwrap(), [uncited]);
+    assert_eq!(store.check(&ws, NOW + 10, Some("plain")).unwrap(), []);
+}

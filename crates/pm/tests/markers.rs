@@ -404,6 +404,89 @@ fn check_reports_parked_forever_until_waived() {
     assert_code(&sb.pm(&["check"]), 0);
 }
 
+/// AGT-1992: in a project with a `decisions` named doc, `pm check`
+/// reports a ticket citing no decision and each cited id the doc does not
+/// define, in text and `--json`, under `--project`, until waived; a
+/// project without the doc reports neither, and nothing else blocks.
+#[test]
+fn check_reports_uncited_and_unknown_decisions() {
+    let sb = Sandbox::new();
+    sb.put_project("other");
+    let uncited = sb.new_ticket(&["--project", "pm", "--description", "No line."]);
+    let good = sb.new_ticket(&[
+        "--project",
+        "pm",
+        "--description",
+        "Intro.\n\nDecisions: D-01, D-02\n",
+    ]);
+    let unknown = sb.new_ticket(&["--project", "pm", "--description", "Decisions: D-01, D-09"]);
+    let elsewhere = sb.new_ticket(&["--project", "other"]);
+    let done = sb.new_ticket(&["--project", "pm"]);
+    assert_code(&sb.pm(&["done", &done]), 0);
+    // No `decisions` doc yet: clean.
+    assert_code(&sb.pm(&["check"]), 0);
+
+    let doc = sb.home.path().join("decisions.md");
+    std::fs::write(&doc, "# Decisions\n\n## D-01\nOne.\n\n## D-02\nTwo.\n").unwrap();
+    let doc = doc.to_str().unwrap();
+    assert_code(
+        &sb.pm(&[
+            "project",
+            "doc",
+            "add",
+            "pm",
+            "decisions",
+            "--from-file",
+            doc,
+        ]),
+        0,
+    );
+
+    let out = sb.pm(&["check", "--json"]);
+    assert_code(&out, 1);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["count"], 2, "{report}");
+    let (f0, f1) = (&report["findings"][0], &report["findings"][1]);
+    assert_eq!(f0["rule"], "decision-uncited");
+    assert_eq!(f0["tickets"], serde_json::json!([uncited]));
+    assert_eq!(f0["project"], "pm");
+    assert_eq!(f1["rule"], "decision-unknown");
+    assert_eq!(f1["tickets"], serde_json::json!([unknown]));
+    assert_eq!(f1["decision"], "D-09");
+    assert!(f1["message"].as_str().unwrap().contains("D-09"), "{f1}");
+    for id in [&good, &elsewhere, &done] {
+        assert!(!report.to_string().contains(id.as_str()), "{report}");
+    }
+
+    let human = sb.pm(&["check", "--project", "pm"]);
+    assert_code(&human, 1);
+    let text = stdout(&human);
+    assert!(
+        text.contains("decision-uncited") && text.contains("decision-unknown"),
+        "{text}"
+    );
+    assert!(text.contains("cites D-09"), "{text}");
+    assert_code(&sb.pm(&["check", "--project", "other"]), 0);
+
+    // Report-only: the uncited ticket is still ready and claimable.
+    let ready = json(&sb.pm(&["ready", "--project", "pm", "--json"]));
+    assert!(
+        ready["ready"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == uncited.as_str()),
+        "{ready}"
+    );
+
+    assert_code(&sb.pm(&["waive", &uncited, "decision-uncited", "spike"]), 0);
+    assert_code(
+        &sb.pm(&["waive", &unknown, "decision-unknown", "pending"]),
+        0,
+    );
+    assert_code(&sb.pm(&["check"]), 0);
+}
+
 // ------------------------------------------- AGT-1576: bulk comment/hold/archive
 
 fn comment_count(sb: &Sandbox, id: &str) -> usize {
