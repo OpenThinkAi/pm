@@ -335,12 +335,12 @@ enum Cmd {
     Waive {
         /// Ticket id (e.g. PM-12) or ULID
         id: String,
-        /// The rule waived (R1, …)
+        /// The rule waived (R1, parked, decision-uncited, decision-unknown, …)
         rule: String,
         /// Why
         reason: String,
     },
-    /// Report invariant findings: R1, stale, held, parked forever, blocker cycles, dangling relations (exit 1 if any)
+    /// Report invariant findings: R1, stale, held, parked forever, blocker cycles, dangling relations, and tickets citing no or an unknown decision in a project with a `decisions` doc (exit 1 if any)
     Check {
         /// Only findings touching this project's tickets
         #[arg(long)]

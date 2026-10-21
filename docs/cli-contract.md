@@ -1044,7 +1044,7 @@ tickets).
       {
         "rule": "R1" | "stale" | "held" | "assigned-unstarted" | "parked"
               | "blocker-cycle" | "dangling-relation" | "deleted-project"
-              | "blocked-by-canceled",
+              | "blocked-by-canceled" | "decision-uncited" | "decision-unknown",
         "tickets": ["AGT-2", ...],       // refs (ULID while the number is pending)
         "message": "string",
         /* plus rule-specific fields: stale -> {days, stale_days}; held -> {hold};
@@ -1061,15 +1061,39 @@ tickets).
            from a canceled ticket — archived or not — to a live ticket that is not
            done or canceled; `tickets` is [dependent, blocker]. The canceled
            blocker keeps blocking until the edge is removed with `pm relate <id>
-           --unblock <blocker>` or the dependent is canceled too).
-           R1 is "no project and no R1/standalone waiver". Only R1 and parked
-           findings can be waived: `pm waive <id> R1 "why"` (or `standalone`)
-           and `pm waive <id> parked "why"`. */
+           --unblock <blocker>` or the dependent is canceled too);
+           decision-uncited -> {project}; decision-unknown -> {project, decision}
+           (AGT-1992, see "Decision citations" below).
+           R1 is "no project and no R1/standalone waiver". Only R1, parked and
+           the two decision findings can be waived: `pm waive <id> R1 "why"` (or
+           `standalone`), `pm waive <id> parked "why"`, `pm waive <id>
+           decision-uncited "why"` and `pm waive <id> decision-unknown "why"`. */
       },
       ...
     ]
   }
   ```
+
+**Decision citations (AGT-1992).** Only in a project that has a named
+document called `decisions` (`pm project doc add <project> decisions
+--from-file <path>`):
+
+- The document defines a decision id with every ATX heading (any level,
+  outside fenced code) whose text is exactly `D-<digits>` — `## D-04`.
+  Ids compare as written, so `D-4` and `D-04` are different ids.
+- A ticket cites decisions with a description line starting
+  `Decisions:`; every `D-<digits>` token on that line is a citation
+  (`Decisions: D-03, D-07`).
+- Every live (not archived, not tombstoned) ticket in the project whose
+  state is not in the `completed` or `canceled` category is checked: no
+  citation is one `decision-uncited` finding; each cited id the document
+  does not define is one `decision-unknown` finding naming it
+  (`decision`). A ticket that cites nothing gets only `decision-uncited`.
+- Projects without a `decisions` document produce neither finding.
+
+These findings come after every other rule's. Like the rest of `pm
+check` they only report: no other command refuses or blocks because of
+them.
 
 ### `pm doctor`
 

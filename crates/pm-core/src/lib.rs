@@ -18,6 +18,7 @@
 //! - [`doc`] — [`DocView`], the same text CRDT keyed for a project document
 //!   rather than a ticket (AGT-1344)
 //! - [`domain`] — entity types (`Ticket`, `Project`, markers, …)
+//! - [`markdown`] — ATX headings outside fenced code (AGT-1573, AGT-1992)
 //! - [`markers`] — strict marker dates, waiver rules (AGT-1342)
 //! - [`hlc`] — hybrid logical clock and the `(hlc, actor)` [`Stamp`]
 //! - [`ids`] — path-safety of prefixes and project ids ops carry (AGT-1450)
@@ -36,6 +37,7 @@ pub mod doc;
 pub mod domain;
 pub mod hlc;
 pub mod ids;
+pub mod markdown;
 pub mod markers;
 pub mod merge;
 pub mod op;

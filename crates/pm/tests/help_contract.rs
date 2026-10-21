@@ -329,6 +329,15 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             blocker: id,
             state: "canceled".into(),
         },
+        Finding::DecisionUncited {
+            ticket: id,
+            project: "p".into(),
+        },
+        Finding::DecisionUnknown {
+            ticket: id,
+            project: "p".into(),
+            decision: "D-1".into(),
+        },
     ];
     for f in &findings {
         match f {
@@ -340,7 +349,9 @@ fn documented_ready_reasons_and_check_rules_match_the_binary() {
             | Finding::BlockerCycle { .. }
             | Finding::DanglingRelation { .. }
             | Finding::DeletedProject { .. }
-            | Finding::BlockedByCanceled { .. } => {}
+            | Finding::BlockedByCanceled { .. }
+            | Finding::DecisionUncited { .. }
+            | Finding::DecisionUnknown { .. } => {}
         }
     }
 
