@@ -1429,6 +1429,107 @@ fn batch_rejects_duplicate_refs_and_missing_projects_without_creating_anything()
     assert!(sb.store().tickets(&Default::default()).unwrap().is_empty());
 }
 
+// AGT-2250 (OpenThinkAi/pm#1): a `blocked-by` `@ref` may name an entry
+// defined later in the file; the relation must land pointing at that id.
+#[test]
+fn batch_resolves_forward_refs_to_entries_defined_later() {
+    let sb = Sandbox::initialized();
+    let fixture = sb.fixture(
+        "forward.yaml",
+        r#"
+tickets:
+  - ref: first
+    title: "First, blocked by a later entry"
+    project: pm
+    blocked-by: ["@second"]
+  - ref: second
+    title: "Second"
+    project: pm
+"#,
+    );
+    let v = json(&sb.pm(&["new", "--batch", fixture.to_str().unwrap(), "--json"]));
+    assert_eq!(
+        v["refs"],
+        serde_json::json!({"@first": "AGT-1", "@second": "AGT-2"})
+    );
+    let tickets = v["tickets"].as_array().unwrap();
+    assert_eq!(sorted_strings(&tickets[0]["blocked_by"]), ["AGT-2"]);
+    assert!(sorted_strings(&tickets[1]["blocked_by"]).is_empty());
+    let shown = json(&sb.pm(&["show", "AGT-1", "--json"]));
+    assert_eq!(sorted_strings(&shown["blocked_by"]), ["AGT-2"]);
+}
+
+/// AGT-2250 AC3: a cycle-free batch whose refs point both backward and
+/// forward, mixed with a blocker that already exists in the store.
+#[test]
+fn batch_resolves_mixed_order_refs_and_existing_ids() {
+    let sb = Sandbox::initialized();
+    sb.pm(&["new", "--title", "Existing", "--project", "pm"]);
+    let fixture = sb.fixture(
+        "mixed.yaml",
+        r#"
+tickets:
+  - ref: a
+    title: "A"
+    project: pm
+    blocked-by: ["@c", "AGT-1"]
+  - ref: b
+    title: "B"
+    project: pm
+    blocked-by: ["@a", "@d"]
+  - ref: c
+    title: "C"
+    project: pm
+  - ref: d
+    title: "D"
+    project: pm
+    blocked-by: ["@c"]
+"#,
+    );
+    let v = json(&sb.pm(&["new", "--batch", fixture.to_str().unwrap(), "--json"]));
+    assert_eq!(
+        v["refs"],
+        serde_json::json!({"@a": "AGT-2", "@b": "AGT-3", "@c": "AGT-4", "@d": "AGT-5"})
+    );
+    let tickets = v["tickets"].as_array().unwrap();
+    assert_eq!(
+        sorted_strings(&tickets[0]["blocked_by"]),
+        ["AGT-1", "AGT-4"]
+    );
+    assert_eq!(
+        sorted_strings(&tickets[1]["blocked_by"]),
+        ["AGT-2", "AGT-5"]
+    );
+    assert!(sorted_strings(&tickets[2]["blocked_by"]).is_empty());
+    assert_eq!(sorted_strings(&tickets[3]["blocked_by"]), ["AGT-4"]);
+}
+
+/// AGT-2250 AC2: forward resolution does not loosen the existence check —
+/// a ref that names nothing in the batch, after a valid forward ref, still
+/// fails and the batch stays all-or-nothing.
+#[test]
+fn batch_with_forward_ref_and_unknown_ref_creates_nothing() {
+    let sb = Sandbox::initialized();
+    let fixture = sb.fixture(
+        "forward-bad.yaml",
+        r#"
+tickets:
+  - ref: first
+    title: "First"
+    project: pm
+    blocked-by: ["@second"]
+  - ref: second
+    title: "Second"
+    project: pm
+    blocked-by: ["@third"]
+"#,
+    );
+    let out = sb.pm(&["new", "--batch", fixture.to_str().unwrap()]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("@third"), "{}", stderr(&out));
+    assert!(sb.store().tickets(&Default::default()).unwrap().is_empty());
+}
+
 #[test]
 fn batch_with_no_tickets_is_a_usage_error() {
     let sb = Sandbox::initialized();

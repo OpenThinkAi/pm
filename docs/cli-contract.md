@@ -443,6 +443,10 @@ comma-separated), `--description <TEXT>`, `--description-file <PATH|->`
 `--batch <PATH>` (same exclusivity), `--sync` (any form; AGT-1571 —
 below).
 
+A batch entry's `blocked-by: ["@name"]` may name any entry in the file,
+defined before or after it (AGT-2250): every id is minted up front and
+every relation lands after every ticket in the batch exists.
+
 - Exit `2`: `--title` empty or missing (without `--from-file`/`--batch`),
   a flag combined with `--from-file`/`--batch`, both `--from-file` and
   `--batch` given, an unparseable `--priority`/`--source`, a `--batch`

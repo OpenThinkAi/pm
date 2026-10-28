@@ -602,21 +602,7 @@ fn build_create_ops(
     for label in labels {
         ops.push(stamper.op(id, Payload::LabelAdd(LabelAdd { label })));
     }
-    // `blocked-by` reads "this ticket is blocked by <blocker>": the
-    // relation's `from` is the blocker, `to` is the ticket being created
-    // (RelationKind::Blocks: "from blocks to").
-    for blocker in blocked_by {
-        ops.push(stamper.op(
-            id,
-            Payload::RelationAdd(RelationAdd {
-                relation: Relation {
-                    kind: RelationKind::Blocks,
-                    from: blocker,
-                    to: id,
-                },
-            }),
-        ));
-    }
+    ops.extend(blocked_by_ops(stamper, id, blocked_by));
     if let Some(github) = linked_github {
         ops.push(stamper.op(id, Payload::FieldSet(FieldSet::LinkedGithub(Some(github)))));
     }
@@ -639,6 +625,28 @@ fn build_create_ops(
         ));
     }
     Ok(ops)
+}
+
+/// The `relation.add` ops for `id`'s `blocked-by` list. `blocked-by`
+/// reads "this ticket is blocked by <blocker>": the relation's `from` is
+/// the blocker, `to` is the ticket being created (RelationKind::Blocks:
+/// "from blocks to").
+fn blocked_by_ops(stamper: &mut Stamper, id: Ulid, blocked_by: Vec<Ulid>) -> Vec<Op> {
+    blocked_by
+        .into_iter()
+        .map(|blocker| {
+            stamper.op(
+                id,
+                Payload::RelationAdd(RelationAdd {
+                    relation: Relation {
+                        kind: RelationKind::Blocks,
+                        from: blocker,
+                        to: id,
+                    },
+                }),
+            )
+        })
+        .collect()
 }
 
 /// Commits one `pm new` invocation's ops — every ticket's create set in
@@ -1082,7 +1090,8 @@ fn validate_batch_entry(
 }
 
 /// `pm new --batch <path>` (AC2-4): mints every id up front so
-/// `blocked-by: [@ref]` can point anywhere in the file, validates every
+/// `blocked-by: [@ref]` can point anywhere in the file — earlier or later
+/// (AGT-2250) — validates every
 /// entry (so a bad `@ref` fails before any op is built), then commits the
 /// whole file in one transaction.
 fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<Filed> {
@@ -1129,11 +1138,18 @@ fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<Filed> {
         })
         .collect::<Result<_>>()?;
 
+    // Relations go after every entry's `ticket.create` (AGT-2250): an
+    // entry may be blocked by an `@ref` defined later in the file, and the
+    // store's R4 check needs both endpoints to exist when the relation
+    // lands. Stamping them last also keeps the log's HLC order valid for
+    // any replica that replays it.
     let mut stamper = Stamper::new(&store, actor.clone())?;
     let mut ops = Vec::new();
     let mut created = Vec::with_capacity(validated.len());
+    let mut relations = Vec::with_capacity(validated.len());
     for v in validated {
         created.push(v.id);
+        relations.push((v.id, v.blocked_by));
         ops.extend(build_create_ops(
             &mut stamper,
             v.id,
@@ -1145,11 +1161,14 @@ fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<Filed> {
             v.source,
             v.ext,
             v.labels,
-            v.blocked_by,
+            Vec::new(),
             v.description,
             v.linked_github,
             v.linked_pr,
         )?);
+    }
+    for (id, blocked_by) in relations {
+        ops.extend(blocked_by_ops(&mut stamper, id, blocked_by));
     }
 
     // One transaction across every ticket's ops and number allocation (or
