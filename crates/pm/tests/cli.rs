@@ -1530,6 +1530,30 @@ tickets:
     assert!(sb.store().tickets(&Default::default()).unwrap().is_empty());
 }
 
+/// AGT-2250: forward refs make an in-file cycle writable; it is refused
+/// (exit 2, like `pm block`) and nothing is created. A self-block too.
+#[test]
+fn batch_with_a_blocker_cycle_or_self_block_creates_nothing() {
+    let sb = Sandbox::initialized();
+    let cycle = sb.fixture(
+        "cycle.yaml",
+        "tickets:\n  - ref: a\n    title: A\n    project: pm\n    blocked-by: ['@b']\n  - ref: b\n    title: B\n    project: pm\n    blocked-by: ['@a']\n",
+    );
+    let out = sb.pm(&["new", "--batch", cycle.to_str().unwrap()]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("cycle"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("@a") && stderr(&out).contains("@b"));
+
+    let selfblock = sb.fixture(
+        "self.yaml",
+        "tickets:\n  - ref: a\n    title: A\n    project: pm\n    blocked-by: ['@a']\n",
+    );
+    let out = sb.pm(&["new", "--batch", selfblock.to_str().unwrap()]);
+    assert_code(&out, 2);
+    assert!(stderr(&out).contains("cycle"), "{}", stderr(&out));
+    assert!(sb.store().tickets(&Default::default()).unwrap().is_empty());
+}
+
 #[test]
 fn batch_with_no_tickets_is_a_usage_error() {
     let sb = Sandbox::initialized();

@@ -451,7 +451,8 @@ every relation lands after every ticket in the batch exists.
   a flag combined with `--from-file`/`--batch`, both `--from-file` and
   `--batch` given, an unparseable `--priority`/`--source`, a `--batch`
   file with no `tickets`, a duplicate or unresolvable `@ref` in a batch,
-  or any single batch entry failing validation (the whole batch commits
+  a batch whose `blocked-by` refs form a blocker cycle (a self-block
+  included), or any single batch entry failing validation (the whole batch commits
   nothing — AC2 all-or-nothing).
 - Exit `3`: `--project`/a frontmatter `project:` names a project that does
   not exist; a `--blocked-by`/frontmatter `blocked-by:` id does not exist.

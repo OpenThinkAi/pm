@@ -1090,10 +1090,10 @@ fn validate_batch_entry(
 }
 
 /// `pm new --batch <path>` (AC2-4): mints every id up front so
-/// `blocked-by: [@ref]` can point anywhere in the file — earlier or later
-/// (AGT-2250) — validates every
-/// entry (so a bad `@ref` fails before any op is built), then commits the
-/// whole file in one transaction.
+/// `blocked-by: [@ref]` can point at any entry in the file, earlier or
+/// later (AGT-2250); validates every entry (so a bad `@ref` or a blocker
+/// cycle fails before any op is built), then commits the whole file in
+/// one transaction.
 fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<Filed> {
     let file = batch::load_batch_file(path)?;
     if file.tickets.is_empty() {
@@ -1137,6 +1137,29 @@ fn new_batch(ctx: &Ctx<'_>, path: &Path) -> Result<Filed> {
             validate_batch_entry(&store, &ws, &refs, *id, &label, entry)
         })
         .collect::<Result<_>>()?;
+
+    // Forward refs (AGT-2250) make a blocker cycle — or a self-block —
+    // writable inside one file. Refuse it the way `pm block` does. A new
+    // ticket can only be blocked by existing ones, never block them, so
+    // any cycle lies entirely within the batch's own edges.
+    let edges: Vec<(Ulid, Ulid)> = validated
+        .iter()
+        .flat_map(|v| v.blocked_by.iter().map(move |b| (*b, v.id)))
+        .collect();
+    if let Some(cycle) = pm_core::check::blocker_cycles(&edges).into_iter().next() {
+        let label = |id: &Ulid| {
+            ids.iter()
+                .position(|x| x == id)
+                .map(|i| batch_entry_label(i, &file.tickets[i]))
+                .unwrap_or_else(|| id.to_string())
+        };
+        let names: Vec<String> = cycle.iter().map(label).collect();
+        return Err(CliError::usage(format!(
+            "blocked-by in {} would create a blocker cycle ({})",
+            path.display(),
+            names.join(", ")
+        )));
+    }
 
     // Relations go after every entry's `ticket.create` (AGT-2250): an
     // entry may be blocked by an `@ref` defined later in the file, and the
