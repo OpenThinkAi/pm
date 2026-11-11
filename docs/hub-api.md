@@ -387,7 +387,7 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 | `400` | `duplicate_number` | `index`, `op_id` | in seed mode, a `field.set number` whose number another ticket already holds, or whose ticket is already numbered |
 | `413` | `too_large` | — | the body exceeds 64 MiB (by `Content-Length`, answered before reading; or discovered while reading) |
 | `408` | `body_timeout` | — | the body did not arrive within 5 minutes (`pm_hub::ops::BODY_READ_TIMEOUT`, AGT-2430); nothing was stored |
-| `503` | `busy` | — | the hub's in-flight push budget cannot fit this body right now (AGT-2430, see Limits); answered before reading the body, with `Retry-After: 1`; nothing was stored, retry |
+| `503` | `busy` | — | the hub's in-flight push budget, or this token's 128 MiB share of it, cannot fit this body right now (AGT-2430, see Limits); answered before reading the body, with `Retry-After: 1`; nothing was stored, retry |
 
 Limits: **1000 ops per batch, 64 MiB per request body**
 (`pm_hub::ops::{MAX_BATCH_OPS, MAX_BODY_BYTES}`), **32 MiB per
@@ -404,9 +404,15 @@ workspace, share **256 MiB of request body**
 (rounded up to 1 MiB; the full 64 MiB when it announces none) before its
 body is read and holds it until it is answered, so the memory the hub
 spends buffering and parsing bodies stays bounded however many pushes
-arrive. A push that does not fit is `503 busy` at once. Reading a body is
-limited to 5 minutes (`408 body_timeout`), so a stalled upload releases
-its share.
+arrive. A push that does not fit is `503 busy` at once. One token's
+pushes may hold at most **128 MiB** of it
+(`pm_hub::ops::TOKEN_PUSH_BUDGET_BYTES`, two pushes at the limit), so a
+single client cannot fill the budget and keep every other client out; a
+push past its token's share is also `503 busy`, with a `reason` naming
+the token's share. Reading a body is limited to 5 minutes (`408
+body_timeout`), so a stalled upload releases its share. `pm sync`
+reports a `503 busy` as the hub being busy (retry; nothing was lost),
+not as a database outage.
 
 ## `GET /w/{workspace}/ops?since=<seq>&limit=<n>` — pull (AGT-1390)
 

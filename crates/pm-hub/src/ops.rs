@@ -134,13 +134,15 @@
 //! no length is announced) before reading a byte, and holds it until the
 //! response, so the bodies the hub buffers and parses at once stay bounded
 //! however many pushes arrive. A push that does not fit is `503 busy`,
-//! straight away, with `Retry-After`. Reading the body is bounded by
+//! straight away, with `Retry-After`. One token may hold at most
+//! [`TOKEN_PUSH_BUDGET_BYTES`] of that budget, so a single client cannot
+//! keep every other client out (also `503 busy`). Reading the body is bounded by
 //! [`BODY_READ_TIMEOUT`] (`408 body_timeout`), so a stalled upload cannot
 //! keep its share forever.
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Json;
@@ -169,15 +171,51 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Request body all in-flight pushes may hold at once (256 MiB: four
 /// pushes at the limit, or hundreds of ordinary ones), across workspaces.
 pub const PUSH_BUDGET_BYTES: usize = 4 * MAX_BODY_BYTES;
+/// The share of [`PUSH_BUDGET_BYTES`] the pushes of one token may hold at
+/// once (128 MiB: two pushes at the limit), so one client cannot fill the
+/// whole budget and keep every other client out.
+pub const TOKEN_PUSH_BUDGET_BYTES: usize = 2 * MAX_BODY_BYTES;
 /// The budget's unit: a push reserves its body size rounded up to this.
 const PUSH_BUDGET_UNIT: usize = 1024 * 1024;
 /// Longest a push may take to deliver its body (5 minutes: the 23 MB
 /// seed op at under 100 KB/s).
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// A fresh [`PUSH_BUDGET_BYTES`] budget, shared by every push.
-pub fn push_budget() -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(PUSH_BUDGET_BYTES / PUSH_BUDGET_UNIT))
+/// The in-flight push budget (see the module doc): [`PUSH_BUDGET_BYTES`]
+/// shared by every push, and per token at most [`TOKEN_PUSH_BUDGET_BYTES`].
+pub struct PushBudget {
+    global: Arc<Semaphore>,
+    /// Units each token's in-flight pushes hold; a token holding none has
+    /// no entry.
+    tokens: Mutex<HashMap<i64, u32>>,
+}
+
+/// A fresh budget, shared by every push.
+pub fn push_budget() -> Arc<PushBudget> {
+    Arc::new(PushBudget {
+        global: Arc::new(Semaphore::new(PUSH_BUDGET_BYTES / PUSH_BUDGET_UNIT)),
+        tokens: Mutex::new(HashMap::new()),
+    })
+}
+
+/// One push's share of the budget, given back when dropped.
+pub struct Reservation {
+    _global: OwnedSemaphorePermit,
+    budget: Arc<PushBudget>,
+    token: i64,
+    units: u32,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut tokens = self.budget.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = tokens.get_mut(&self.token) {
+            *held = held.saturating_sub(self.units);
+            if *held == 0 {
+                tokens.remove(&self.token);
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -246,8 +284,11 @@ impl ErrorBody {
 #[derive(Debug)]
 enum PushError {
     TooLarge,
-    /// The in-flight push budget cannot fit this body right now.
-    Busy,
+    /// The in-flight push budget cannot fit this body right now: the
+    /// whole budget, or (`token`) the caller's token's share of it.
+    Busy {
+        token: bool,
+    },
     /// The body did not arrive within [`BODY_READ_TIMEOUT`].
     BodyTimeout,
     Batch(String),
@@ -345,13 +386,15 @@ impl IntoResponse for PushError {
                     op_id: None,
                 },
             ),
-            PushError::Busy => {
-                let body = ErrorBody::new(
-                    "busy",
+            PushError::Busy { token } => {
+                let reason = if token {
+                    "this token's pushes already hold as much request body as one token \
+                     may at once; retry once they are answered"
+                } else {
                     "the hub is holding as many push bodies as it buffers at once; \
                      retry shortly"
-                        .to_string(),
-                );
+                };
+                let body = ErrorBody::new("busy", reason.to_string());
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     [(RETRY_AFTER, "1")],
@@ -690,8 +733,9 @@ fn parse_op(index: usize, raw: &RawValue, now_ms: u64) -> Result<Parsed<'_>, Pus
 /// budget: keep it until the push is answered.
 async fn body(
     req: Request,
-    budget: &Arc<Semaphore>,
-) -> Result<(Bytes, OwnedSemaphorePermit), PushError> {
+    budget: &Arc<PushBudget>,
+    token: i64,
+) -> Result<(Bytes, Reservation), PushError> {
     let announced = req
         .headers()
         .get(CONTENT_LENGTH)
@@ -700,7 +744,7 @@ async fn body(
     if announced.is_some_and(|n| n > MAX_BODY_BYTES) {
         return Err(PushError::TooLarge);
     }
-    let permit = reserve(budget, announced)?;
+    let permit = reserve(budget, token, announced)?;
     let bytes = within(BODY_READ_TIMEOUT, Bytes::from_request(req, &()))
         .await?
         .map_err(|e| match e {
@@ -713,19 +757,36 @@ async fn body(
 }
 
 /// Reserves `announced` bytes (at most [`MAX_BODY_BYTES`], checked by the
-/// caller; all of it when unannounced) of the push budget, or `Busy`.
-/// The body cannot outgrow an announced length: the server refuses a body
+/// caller; all of it when unannounced) of the push budget for `token`, or
+/// `Busy` when the token's share or the whole budget cannot fit it. The
+/// body cannot outgrow an announced length: the server refuses a body
 /// longer than its `Content-Length`.
 fn reserve(
-    budget: &Arc<Semaphore>,
+    budget: &Arc<PushBudget>,
+    token: i64,
     announced: Option<usize>,
-) -> Result<OwnedSemaphorePermit, PushError> {
+) -> Result<Reservation, PushError> {
     let bytes = announced.unwrap_or(MAX_BODY_BYTES).min(MAX_BODY_BYTES);
     let units = bytes.div_ceil(PUSH_BUDGET_UNIT).max(1) as u32;
-    budget
+    let cap = (TOKEN_PUSH_BUDGET_BYTES / PUSH_BUDGET_UNIT) as u32;
+    let mut tokens = budget.tokens.lock().unwrap_or_else(|e| e.into_inner());
+    let held = tokens.get(&token).copied().unwrap_or(0);
+    if held + units > cap {
+        return Err(PushError::Busy { token: true });
+    }
+    let global = budget
+        .global
         .clone()
         .try_acquire_many_owned(units)
-        .map_err(|_| PushError::Busy)
+        .map_err(|_| PushError::Busy { token: false })?;
+    tokens.insert(token, held + units);
+    drop(tokens);
+    Ok(Reservation {
+        _global: global,
+        budget: budget.clone(),
+        token,
+        units,
+    })
 }
 
 /// `fut`'s output, or `BodyTimeout` once `limit` passes.
@@ -746,7 +807,7 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
     let workspace = caller.workspace.as_str();
     // `_permit` is held until the push is answered: the body and what is
     // parsed from it stay buffered until then.
-    let (body, _permit) = body(req, &db.push_budget).await?;
+    let (body, _permit) = body(req, &db.push_budget, caller.token_id).await?;
     let text = std::str::from_utf8(&body)
         .map_err(|_| PushError::Batch("body is not UTF-8".to_string()))?;
     let batch: Batch =
@@ -1135,33 +1196,61 @@ mod tests {
     #[test]
     fn the_push_budget_bounds_in_flight_bodies() {
         let budget = push_budget();
+        let global_busy = |r| matches!(r, Err(PushError::Busy { token: false }));
         let full: Vec<_> = (0..4)
-            .map(|_| reserve(&budget, Some(MAX_BODY_BYTES)).unwrap())
+            .map(|i| reserve(&budget, i / 2, Some(MAX_BODY_BYTES)).unwrap())
             .collect();
-        assert!(matches!(reserve(&budget, Some(1)), Err(PushError::Busy)));
-        assert!(matches!(reserve(&budget, Some(0)), Err(PushError::Busy)));
+        assert!(global_busy(reserve(&budget, 9, Some(1))));
+        assert!(global_busy(reserve(&budget, 9, Some(0))));
         drop(full);
 
         // An unannounced length reserves the whole limit.
-        let unannounced: Vec<_> = (0..4).map(|_| reserve(&budget, None).unwrap()).collect();
-        assert!(matches!(reserve(&budget, Some(10)), Err(PushError::Busy)));
+        let unannounced: Vec<_> = (0..4)
+            .map(|i| reserve(&budget, i / 2, None).unwrap())
+            .collect();
+        assert!(global_busy(reserve(&budget, 9, Some(10))));
         drop(unannounced);
 
         // Small bodies take one unit each.
+        let per_token = TOKEN_PUSH_BUDGET_BYTES / PUSH_BUDGET_UNIT;
         let small: Vec<_> = (0..PUSH_BUDGET_BYTES / PUSH_BUDGET_UNIT)
-            .map(|_| reserve(&budget, Some(2_000)).unwrap())
+            .map(|i| reserve(&budget, (i / per_token) as i64, Some(2_000)).unwrap())
             .collect();
-        assert!(matches!(reserve(&budget, Some(1)), Err(PushError::Busy)));
+        assert!(global_busy(reserve(&budget, 9, Some(1))));
         drop(small);
         assert_eq!(
-            budget.available_permits(),
+            budget.global.available_permits(),
+            PUSH_BUDGET_BYTES / PUSH_BUDGET_UNIT
+        );
+        assert!(budget.tokens.lock().unwrap().is_empty());
+    }
+
+    /// One token holds at most its share; others still get theirs, and a
+    /// released share is the token's again (AGT-2434).
+    #[test]
+    fn one_token_cannot_fill_the_push_budget() {
+        let budget = push_budget();
+        let mine: Vec<_> = (0..2)
+            .map(|_| reserve(&budget, 1, Some(MAX_BODY_BYTES)).unwrap())
+            .collect();
+        assert!(matches!(
+            reserve(&budget, 1, Some(1)),
+            Err(PushError::Busy { token: true })
+        ));
+        let theirs = reserve(&budget, 2, Some(MAX_BODY_BYTES)).unwrap();
+        drop(mine);
+        let again = reserve(&budget, 1, Some(MAX_BODY_BYTES)).unwrap();
+        drop((theirs, again));
+        assert!(budget.tokens.lock().unwrap().is_empty());
+        assert_eq!(
+            budget.global.available_permits(),
             PUSH_BUDGET_BYTES / PUSH_BUDGET_UNIT
         );
     }
 
     #[tokio::test]
     async fn busy_and_body_timeout_are_structured_errors() {
-        let busy = PushError::Busy.into_response();
+        let busy = PushError::Busy { token: false }.into_response();
         assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(busy.headers()[RETRY_AFTER], "1");
         let body = axum::body::to_bytes(busy.into_body(), 4096).await.unwrap();
