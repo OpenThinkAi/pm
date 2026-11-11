@@ -9,8 +9,10 @@
 mod common;
 
 use common::*;
-use pm_core::op::{ActorUpsert, Claim, FieldSet, HoldSet, LabelAdd, TicketCreate};
-use pm_core::{ActorId, ActorKind, Hlc, Hold, MAX_FUTURE_SKEW_MS, Op, Payload, Priority};
+use pm_core::op::{ActorUpsert, Claim, FieldSet, HoldSet, LabelAdd, StateUpsert, TicketCreate};
+use pm_core::{
+    ActorId, ActorKind, Hlc, Hold, MAX_FUTURE_SKEW_MS, Op, Payload, Priority, StateCategory,
+};
 use serde_json::{Value, json};
 use ulid::Ulid;
 
@@ -888,4 +890,76 @@ fn a_backdated_doc_add_as_the_creator_needs_a_token_for_the_creator() {
     let (status, body) = push(port, &studio, &[&backdated("migrate", Some("notes"))]);
     assert_eq!((status, stored(&body)), (200, vec![true]), "{body}");
     assert_eq!(count_ops(&url), 4);
+}
+
+/// AGT-2429: the first config op pins the workspace's Ulid, so while the
+/// workspace is seeding (or has no config) a bound token may not push
+/// one — otherwise it could pin a random Ulid and leave the real seed's
+/// config `foreign_workspace` for good. Once seeded with config, bound
+/// tokens push config ops as before.
+#[test]
+fn only_an_unrestricted_token_pushes_config_before_the_seed() {
+    let Some((_container, url)) =
+        postgres_for("only_an_unrestricted_token_pushes_config_before_the_seed")
+    else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    wait_for_health(&mut hub, port);
+    let (studio, _, _) = mint(&url, "studio", &["--any"]);
+    let (agent, _, _) = mint(&url, "agent", &["--actor", "claude:*"]);
+    let state = |ws: Ulid, wall_ms: u64, actor: &str, name: &str| {
+        Op::new(
+            Ulid::new(),
+            Hlc::new(wall_ms, 0),
+            ActorId::new(actor),
+            ws,
+            Payload::StateUpsert(StateUpsert {
+                name: name.into(),
+                category: StateCategory::Unstarted,
+                position: 0,
+            }),
+        )
+    };
+    let real = Ulid::new();
+
+    // No config yet: a bound token's config op (under any Ulid) is
+    // refused whole, with the batch, and nothing is stored or pinned.
+    for ws in [Ulid::new(), real] {
+        let fine = label_as("claude:x", Hlc::new(1_000, 0));
+        let poison = state(ws, 1_001, "claude:x", "triage");
+        let (status, err) = push(port, &agent, &[&fine, &poison]);
+        assert_eq!(status, 400, "{err}");
+        assert_eq!(err["error"], "config_not_allowed", "{err}");
+        assert_eq!(err["index"], 1);
+        assert_eq!(err["op_id"], poison.op_id.to_string());
+        let reason = err["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("(agent)") && reason.contains("state.upsert"),
+            "{reason}"
+        );
+        assert_eq!(count_ops(&url), 0);
+    }
+    let pinned = query_rows(&url, "SELECT count(*) FROM workspace_views").unwrap();
+    assert_eq!(pinned[0][0].as_deref(), Some("0"));
+
+    // The owner seeds the config; while still seeding, bound tokens stay out.
+    let (status, body) = push(port, &studio, &[&state(real, 1_002, "matt", "triage")]);
+    assert_eq!(status, 200, "{body}");
+    let (status, err) = push(port, &agent, &[&state(real, 1_003, "claude:x", "todo")]);
+    assert_eq!(status, 400, "{err}");
+    assert_eq!(err["error"], "config_not_allowed", "{err}");
+
+    // Seeded with config: a bound token's config op lands as before.
+    let (status, body) = post(
+        port,
+        &studio,
+        "/w/saltline/seeded",
+        &json!({ "number_floor": 0 }).to_string(),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = push(port, &agent, &[&state(real, recent(), "claude:x", "todo")]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored(&body), [true]);
 }

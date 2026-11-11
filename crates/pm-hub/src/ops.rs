@@ -93,6 +93,15 @@
 //! otherwise): the largest seeded number becomes the floor, and a number
 //! taken now is refused to the real seed.
 //!
+//! **Config before the seed (AGT-2429).** The first config op
+//! (`workspace.set`, `state.upsert`, `actor.upsert`) fixes the workspace
+//! Ulid every later config op must match, so while the workspace is
+//! seeding, or has no config yet, only an unrestricted token may push one
+//! (`400 config_not_allowed` otherwise, the batch refused whole): a bound
+//! token could otherwise pin a random Ulid and leave the real seed's
+//! config `foreign_workspace` for good. Once seeded with config, bound
+//! tokens push config ops as before.
+//!
 //! **Stamps (oaudit 2026-09-30).** Every op's HLC must be storable and
 //! leave its counter room to advance (`pm_core::Hlc::check_range`:
 //! `wall_ms <= i64::MAX`, `counter < u32::MAX`; else `400
@@ -259,6 +268,14 @@ enum PushError {
         op_id: String,
         reason: String,
     },
+    /// A config op (`workspace.set`, `state.upsert`, `actor.upsert`)
+    /// pushed by an actor-bound token while the workspace is seeding or
+    /// has no config (AGT-2429).
+    ConfigNotAllowed {
+        index: usize,
+        op_id: String,
+        reason: String,
+    },
     /// A seeded `field.set number` that collides with a number already
     /// issued, or re-numbers a ticket.
     DuplicateNumber {
@@ -394,6 +411,19 @@ impl IntoResponse for PushError {
                 StatusCode::BAD_REQUEST,
                 ErrorBody {
                     error: "number_not_allowed",
+                    reason,
+                    index: Some(index),
+                    op_id: Some(op_id),
+                },
+            ),
+            PushError::ConfigNotAllowed {
+                index,
+                op_id,
+                reason,
+            } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "config_not_allowed",
                     reason,
                     index: Some(index),
                     op_id: Some(op_id),
@@ -823,6 +853,24 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
                 first_at[&p.op_id],
                 views.assignee(p.op.entity),
             )?;
+            // AGT-2429: the first config op pins the workspace's identity
+            // (`views`), so while the workspace is seeding or has no
+            // config yet only a token that may end the seed may push one.
+            if is_config(&p.op)
+                && (!allocator.seeded || !views.has_config())
+                && !caller.actors.unrestricted()
+            {
+                return Err(PushError::ConfigNotAllowed {
+                    index: first_at[&p.op_id],
+                    op_id: p.op_id.clone(),
+                    reason: format!(
+                        "token {} ({}) is bound to actors; while the workspace is seeding \
+                         or has no config, only an unrestricted token (legacy, or minted \
+                         with --any / bound to '*') may push a {} op",
+                        caller.token_id, caller.token_label, p.kind
+                    ),
+                });
+            }
             // AGT-1482: once seeded, an actor-bound token's assignee
             // write is held to the claim rule; an unrestricted token
             // (the operator, who may author as anyone) reassigns freely.
@@ -961,6 +1009,15 @@ fn check_actor_value(
         });
     }
     Ok(())
+}
+
+/// Whether `op` is a workspace config op: the kinds whose first fold
+/// pins the workspace's identity (`views`).
+fn is_config(op: &Op) -> bool {
+    matches!(
+        op.payload,
+        Payload::WorkspaceSet(_) | Payload::StateUpsert(_) | Payload::ActorUpsert(_)
+    )
 }
 
 /// The actors an op's payload names, by field (see the module doc).

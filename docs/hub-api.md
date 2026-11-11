@@ -171,6 +171,17 @@ to the real seed as `duplicate_number`. A bound token's number op while
 seeding is `400 number_not_allowed` (its `reason` names the token), and
 the batch is refused whole.
 
+**Config before the seed (AGT-2429).** The first config op
+(`workspace.set`, `state.upsert`, `actor.upsert`) fixes the workspace
+Ulid every later config op must match (`400 foreign_workspace`
+otherwise), so while the workspace is seeding, or has no config yet,
+only an unrestricted token may push one. A bound token's config op then
+is `400 config_not_allowed` (its `reason` names the token and the op's
+kind), and the batch is refused whole. Without this, a bound token on a
+fresh workspace could pin a random Ulid and leave every batch of the
+real seed that carries config refused for good. Once the workspace is
+seeded and has config, bound tokens push config ops as before.
+
 **Rollout (AGT-1450).** Deploying this hub runs migration 4 (`ALTER TABLE tokens
 ADD COLUMN IF NOT EXISTS actors text[]`), which only adds a nullable
 column: every existing token, including the Studio's `studio` token,
@@ -371,6 +382,7 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 | `400` | `reserved_actor` | `index`, `op_id` | a fresh op authored as `hub`, or naming `hub` in one of those payload fields — from any token once the workspace is seeded, from a bound token while seeding |
 | `400` | `foreign_workspace` | `index`, `op_id` | a config op (`workspace.set`, `state.upsert`, `actor.upsert`) for a workspace Ulid other than the one this hub workspace's config already belongs to |
 | `400` | `invalid_batch` | — | the body is not UTF-8 / not JSON / not `{"ops": [...]}`, or the batch has more than 1000 ops |
+| `400` | `config_not_allowed` | `index`, `op_id` | a `workspace.set`, `state.upsert` or `actor.upsert` pushed by an actor-bound token while the workspace is seeding or has no config yet (AGT-2429; only an unrestricted token may fix the workspace's identity) |
 | `400` | `number_not_allowed` | `index`, `op_id` | a `field.set number` pushed to a seeded workspace (only the hub numbers tickets then, whatever the op's `actor`), or pushed while seeding by an actor-bound token (only an unrestricted token seeds numbers, AGT-1482) |
 | `400` | `duplicate_number` | `index`, `op_id` | in seed mode, a `field.set number` whose number another ticket already holds, or whose ticket is already numbered |
 | `413` | `too_large` | — | the body exceeds 64 MiB (by `Content-Length`, answered before reading; or discovered while reading) |

@@ -228,6 +228,12 @@ impl Views {
             .unwrap_or_default()
     }
 
+    /// Whether the workspace has a config view (some config op has
+    /// pinned its identity).
+    pub fn has_config(&self) -> bool {
+        self.workspace.is_some()
+    }
+
     /// The ticket's assignee as folded so far (`None` for a ticket the
     /// hub has no view of yet, or one nobody is assigned).
     pub fn assignee(&self, ticket: Ulid) -> Option<&ActorId> {
