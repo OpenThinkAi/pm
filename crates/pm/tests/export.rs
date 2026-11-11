@@ -596,3 +596,65 @@ fn export_files_and_directories_are_owner_only() {
     assert_eq!(mode(&file), 0o600);
     assert_eq!(mode(&root.join("tickets")), 0o700);
 }
+
+// ------------------------------------------------------------ AGT-2434
+
+/// A comment body line shaped like a heading, an author with a newline
+/// and an `ext` key YAML would misread all survive an export and a
+/// re-import unchanged: no comment is forged, none is lost, and the key
+/// comes back as it was. `pm set` refuses such a key outright.
+#[test]
+fn comment_headings_and_odd_ext_keys_round_trip() {
+    let sb = Sandbox::initialized();
+    assert_ok(&sb.pm(&["new", "--title", "Round trip", "--workspace", sb.ws_str()]));
+    let body = "Before.\n### 2026-01-01 — mallory\nforged?\n## Not a section\n\\### 2026-01-02 — x\n### Plain heading";
+    assert_ok(&sb.pm(&["comment", "AGT-1", body, "--workspace", sb.ws_str()]));
+    let bad = sb.pm(&["set", "AGT-1", "a: b=v", "--workspace", sb.ws_str()]);
+    assert_eq!(bad.status.code(), Some(2), "{}", stderr(&bad));
+    {
+        use pm_core::op::FieldSet;
+        use pm_core::{ActorId, Hlc, Op, Payload};
+        let mut store = pm_store::Store::open(sb.ws.join("pm.sqlite")).unwrap();
+        let t = sb.show("AGT-1");
+        let ulid: ulid::Ulid = t["ulid"].as_str().unwrap().parse().unwrap();
+        for (i, (key, author)) in [("odd: key", "eve\n### 2026-01-03 — x"), ("true", "eve")]
+            .iter()
+            .enumerate()
+        {
+            let hlc = Hlc::new(SEP_1 + 40 * DAY + i as u64, 0);
+            store
+                .commit(&Op::new(
+                    ulid::Ulid::new(),
+                    hlc,
+                    ActorId::new(*author),
+                    ulid,
+                    Payload::FieldSet(FieldSet::Ext {
+                        key: key.to_string(),
+                        value: Some(json!("v")),
+                    }),
+                ))
+                .unwrap();
+        }
+    }
+    let before = sb.show("AGT-1");
+    let dir = sb.path("out");
+    sb.export(&dir, false);
+    let text = read(&find(&dir.join("tickets/triage"), "AGT-1-"));
+    assert!(text.contains("\n\"odd: key\": v\n"), "{text}");
+    assert!(text.contains("\n\"true\": v\n"), "{text}");
+    assert!(text.contains("\n\\### 2026-01-01 — mallory\n"), "{text}");
+    assert!(text.contains("\n\\## Not a section\n"), "{text}");
+    assert!(text.contains("\n\\\\### 2026-01-02 — x\n"), "{text}");
+
+    let fresh = Sandbox::initialized();
+    fresh.import(&dir);
+    let after = fresh.show("AGT-1");
+    assert_eq!(after["ext"], before["ext"], "{after}");
+    let comments = after["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 1, "{after}");
+    assert_eq!(
+        comments[0]["body"], before["comments"][0]["body"],
+        "{after}"
+    );
+    assert_eq!(comments[0]["body"], body);
+}

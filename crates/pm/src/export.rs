@@ -347,7 +347,7 @@ pub(crate) fn render_ticket(
         if legacy_markers && key == PARKED_REASON {
             continue;
         }
-        put(key, yaml_value(value));
+        put(&frontmatter_key(key), yaml_value(value));
     }
 
     let mut body = t.description.trim().to_string();
@@ -368,8 +368,8 @@ pub(crate) fn render_ticket(
             body.push_str(&format!(
                 "\n\n### {} — {}\n{}",
                 date_from_ms(c.hlc.wall_ms),
-                c.author,
-                c.body.trim()
+                comment_author(c.author.as_str()),
+                escape_comment_body(c.body.trim())
             ));
         }
     }
@@ -413,6 +413,50 @@ fn waiver_text(w: &pm_core::Waiver) -> String {
     } else {
         format!("{} — {}", w.rule, w.reason)
     }
+}
+
+/// An `ext` key as a frontmatter key (AGT-2434): bare when it is a plain
+/// field name YAML reads back as that string, quoted otherwise — an op
+/// from another replica can carry any key, and an unquoted `a: b` or
+/// `"x` would change what the frontmatter says.
+fn frontmatter_key(key: &str) -> String {
+    if crate::verbs::is_field_key(key) && !key.starts_with('-') && !looks_like_non_string(key) {
+        key.to_string()
+    } else {
+        quoted(key)
+    }
+}
+
+/// A comment's author on its `### date — author` heading line (AGT-2434):
+/// one line, no terminal controls, never empty — an author with a
+/// newline would end the heading and start body text.
+fn comment_author(author: &str) -> String {
+    let flat = crate::text::inline(author);
+    let flat = flat.trim();
+    if flat.is_empty() {
+        "unknown".to_string()
+    } else {
+        flat.to_string()
+    }
+}
+
+/// Escapes the lines of a comment body that a re-import would read as
+/// structure (AGT-2434): a `## ` heading (ends the Comments section) or a
+/// dated `### date — author` entry heading (forges a comment by someone
+/// else). Such a line — and one that already starts with `\` before
+/// such a shape, so the escape is reversible — gets one more leading
+/// `\`; `import::prose::unescape_comment_line` takes it off again.
+fn escape_comment_body(body: &str) -> String {
+    body.lines()
+        .map(|line| {
+            if crate::import::prose::is_structural_comment_line(line) {
+                format!("\\{line}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether the last `## ` heading of `body` is `## Comments` — a
@@ -659,6 +703,35 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// AGT-2434: ext keys are bare only when YAML reads them back as
+    /// themselves; comment authors are one line; structural comment lines
+    /// are escaped and the escape reverses.
+    #[test]
+    fn ext_keys_authors_and_comment_lines_cannot_forge_structure() {
+        assert_eq!(frontmatter_key("parked-reason"), "parked-reason");
+        assert_eq!(frontmatter_key("a.b_c"), "a.b_c");
+        for odd in ["a: b", "x\ny", "true", "1", "-x", "\"q", "", "é"] {
+            assert!(frontmatter_key(odd).starts_with('"'), "{odd:?}");
+        }
+        assert_eq!(comment_author("matt"), "matt");
+        assert_eq!(
+            comment_author("eve\n### 2026-01-01 — x"),
+            "eve ### 2026-01-01 — x"
+        );
+        assert_eq!(comment_author(" \n"), "unknown");
+        let body = "a\n### 2026-01-01 — mallory\n## H\n\\## H\n### Notes\n#### deep";
+        let escaped = escape_comment_body(body);
+        assert_eq!(
+            escaped,
+            "a\n\\### 2026-01-01 — mallory\n\\## H\n\\\\## H\n### Notes\n#### deep"
+        );
+        let back: Vec<&str> = escaped
+            .lines()
+            .map(crate::import::prose::unescape_comment_line)
+            .collect();
+        assert_eq!(back.join("\n"), body);
     }
 
     #[test]
