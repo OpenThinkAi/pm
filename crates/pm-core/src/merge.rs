@@ -113,17 +113,26 @@ impl<T: Ord> OrSet<T> {
         self.entries.entry(value).or_default().insert(tag);
     }
 
-    /// Drop the `observed` tags; the value disappears once no tag is left.
-    pub fn remove(&mut self, value: &T, observed: &[Ulid]) {
+    /// Drop the `observed` tags; a value disappears once no tag is left.
+    ///
+    /// A removed tag is gone from every value, not only `value` (AGT-2434):
+    /// [`add`](Self::add) refuses a removed tag for any value, so a remove
+    /// citing a tag that was added under a different value (a buggy or
+    /// hostile op) must strip it there too, or the result would depend on
+    /// whether the add or the remove arrived first. An honest remove cites
+    /// only `value`'s own tags, and then this is the same as stripping
+    /// `value` alone.
+    pub fn remove(&mut self, _value: &T, observed: &[Ulid]) {
+        if observed.is_empty() {
+            return;
+        }
         self.removed.extend(observed.iter().copied());
-        if let Some(tags) = self.entries.get_mut(value) {
+        self.entries.retain(|_, tags| {
             for tag in observed {
                 tags.remove(tag);
             }
-            if tags.is_empty() {
-                self.entries.remove(value);
-            }
-        }
+            !tags.is_empty()
+        });
     }
 
     pub fn contains(&self, value: &T) -> bool {
@@ -319,6 +328,76 @@ mod tests {
         assert_eq!(s, removed);
         s.remove(&"never-there", &[t]);
         assert!(s.is_empty());
+    }
+
+    /// AGT-2434: any mix of adds and removes — including removes citing a
+    /// tag added under another value — folds to the same set in every
+    /// order, and replaying it changes nothing.
+    mod orset_order {
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Clone, Debug)]
+        enum Step {
+            Add(u8, usize),
+            Remove(u8, Vec<usize>),
+        }
+
+        fn steps() -> impl Strategy<Value = (Vec<Step>, Vec<usize>)> {
+            let step = prop_oneof![
+                (0u8..3, 0usize..4).prop_map(|(v, t)| Step::Add(v, t)),
+                (0u8..3, proptest::collection::vec(0usize..4, 0..3))
+                    .prop_map(|(v, ts)| Step::Remove(v, ts)),
+            ];
+            proptest::collection::vec(step, 0..10).prop_flat_map(|steps| {
+                let n = steps.len();
+                (Just(steps), Just((0..n).collect::<Vec<_>>()).prop_shuffle())
+            })
+        }
+
+        fn fold(set: &mut OrSet<u8>, step: &Step, tags: &[Ulid]) {
+            match step {
+                Step::Add(v, t) => set.add(*v, tags[*t]),
+                Step::Remove(v, ts) => {
+                    let cited: Vec<Ulid> = ts.iter().map(|t| tags[*t]).collect();
+                    set.remove(v, &cited);
+                }
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn orset_folds_are_order_independent((steps, perm) in steps()) {
+                let tags: Vec<Ulid> = (0..4).map(|_| Ulid::new()).collect();
+                let mut forward = OrSet::default();
+                for s in &steps {
+                    fold(&mut forward, s, &tags);
+                }
+                let mut shuffled = OrSet::default();
+                for &i in &perm {
+                    fold(&mut shuffled, &steps[i], &tags);
+                }
+                let mut twice = shuffled.clone();
+                for s in steps.iter().rev() {
+                    fold(&mut twice, s, &tags);
+                }
+                prop_assert_eq!(&forward, &shuffled);
+                prop_assert_eq!(&forward, &twice);
+            }
+        }
+    }
+
+    #[test]
+    fn orset_remove_citing_another_values_tag_strips_it_in_any_order() {
+        let t = Ulid::new();
+        let mut add_first = OrSet::default();
+        add_first.add("b", t);
+        add_first.remove(&"a", &[t]);
+        let mut remove_first = OrSet::default();
+        remove_first.remove(&"a", &[t]);
+        remove_first.add("b", t);
+        assert_eq!(add_first, remove_first);
+        assert!(!add_first.contains(&"b"));
     }
 
     // ---- comments ----
