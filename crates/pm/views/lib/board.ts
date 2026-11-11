@@ -234,6 +234,7 @@ export function filtersKey(workspaceId: string): string {
 export interface KeyValue {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+  removeItem(key: string): void;
 }
 
 /**
@@ -255,7 +256,10 @@ export function loadFilters(storage: KeyValue | null | undefined, key: string): 
 
 export function saveFilters(storage: KeyValue | null | undefined, key: string, f: Filters): void {
   try {
-    storage?.setItem(key, JSON.stringify(f));
+    // No filter set: forget the key rather than store an empty one, so
+    // nothing about this board lingers in the browser (AGT-2434).
+    if (!f.project && !f.label && !f.assignee) storage?.removeItem(key);
+    else storage?.setItem(key, JSON.stringify(f));
   } catch {
     // Not persisting is fine: filters are a per-viewer convenience.
   }
