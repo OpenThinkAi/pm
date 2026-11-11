@@ -357,6 +357,8 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 | `400` | `number_not_allowed` | `index`, `op_id` | a `field.set number` pushed to a seeded workspace (only the hub numbers tickets then, whatever the op's `actor`), or pushed while seeding by an actor-bound token (only an unrestricted token seeds numbers, AGT-1482) |
 | `400` | `duplicate_number` | `index`, `op_id` | in seed mode, a `field.set number` whose number another ticket already holds, or whose ticket is already numbered |
 | `413` | `too_large` | — | the body exceeds 64 MiB (by `Content-Length`, answered before reading; or discovered while reading) |
+| `408` | `body_timeout` | — | the body did not arrive within 5 minutes (`pm_hub::ops::BODY_READ_TIMEOUT`, AGT-2430); nothing was stored |
+| `503` | `busy` | — | the hub's in-flight push budget cannot fit this body right now (AGT-2430, see Limits); answered before reading the body, with `Retry-After: 1`; nothing was stored, retry |
 
 Limits: **1000 ops per batch, 64 MiB per request body**
 (`pm_hub::ops::{MAX_BATCH_OPS, MAX_BODY_BYTES}`), **32 MiB per
@@ -366,6 +368,16 @@ and **1 MiB per payload of any other kind** (its JSON;
 The byte limit leaves room for a single large op — the Studio's seed log
 holds one 23 MB `body.edit` (about 17 MiB decoded) — plus a batch around
 it; a client should size batches by both count and bytes.
+
+**In-flight bound (AGT-2430).** All pushes in flight, across every
+workspace, share **256 MiB of request body**
+(`pm_hub::ops::PUSH_BUDGET_BYTES`). A push reserves its `Content-Length`
+(rounded up to 1 MiB; the full 64 MiB when it announces none) before its
+body is read and holds it until it is answered, so the memory the hub
+spends buffering and parsing bodies stays bounded however many pushes
+arrive. A push that does not fit is `503 busy` at once. Reading a body is
+limited to 5 minutes (`408 body_timeout`), so a stalled upload releases
+its share.
 
 ## `GET /w/{workspace}/ops?since=<seq>&limit=<n>` — pull (AGT-1390)
 
@@ -450,7 +462,8 @@ never parks every connection on its row lock, and pushes to different
 workspaces run side by side (`crates/pm-hub/tests/ops.rs`
 `a_stalled_workspace_never_blocks_another`). Reads, auth and pulls use
 another connection and never wait for a push. Request bodies are still
-buffered before the lock (up to 64 MiB each).
+buffered before the lock (up to 64 MiB each), within the in-flight budget
+(Limits above, AGT-2430).
 
 ## Ticket numbers (AGT-1391)
 

@@ -105,6 +105,10 @@ same checks on pull, local commit and `pm backup --restore`).
   (always at least one op), cut in the database, so neither the hub nor a
   client buffers an unbounded page. A replica's pull loop tries each op
   at most 33 times however adversarially the page is ordered.
+  Push bodies in flight at the hub share a 256 MiB budget (a push that
+  does not fit is `503 busy`) and must arrive within 5 minutes
+  (AGT-2430), so concurrent large or stalled pushes cannot exhaust its
+  memory.
 - **No wedged replicas (AGT-1467).** A pulled op a replica cannot apply
   is parked or refused into a local quarantine (`pm doctor` lists it)
   instead of failing every later `pm sync`; the decision depends only on
