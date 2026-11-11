@@ -1075,7 +1075,12 @@ fn symlinks_in_a_vault_are_never_followed_and_are_reported() {
             "projects/alpha/ideation/IDEA-002-leak.md",
         ),
         (vault.join("projects/alpha"), "projects/delta"),
+        (
+            vault.join("projects/alpha/README.md"),
+            "projects/beta/README.md",
+        ),
     ];
+    std::fs::remove_file(vault.join("projects/beta/README.md")).unwrap();
     for (target, rel) in &links {
         symlink(target, vault.join(rel)).unwrap();
     }
@@ -1088,7 +1093,11 @@ fn symlinks_in_a_vault_are_never_followed_and_are_reported() {
         .map(|a| a.as_str().unwrap().to_string())
         .collect();
     for (_, rel) in &links {
-        let want = format!("{rel}: symbolic link; not followed, not imported");
+        let want = if rel.ends_with("README.md") {
+            format!("{rel}: symbolic link; not followed, project not imported")
+        } else {
+            format!("{rel}: symbolic link; not followed, not imported")
+        };
         assert!(
             anomalies.contains(&want),
             "missing {want:?} in {anomalies:?}"
@@ -1106,6 +1115,85 @@ fn symlinks_in_a_vault_are_never_followed_and_are_reported() {
     assert!(
         !delta.status.success(),
         "the linked project folder was imported"
+    );
+    let beta = sb.pm(&["project", "show", "beta", "--json"]);
+    assert!(
+        !beta.status.success(),
+        "a project with a linked README was imported"
+    );
+}
+
+/// The top-level vault folders are not followed either: a linked
+/// tickets/ refuses the import, a linked projects/ or archive/ is
+/// skipped and reported once.
+#[cfg(unix)]
+#[test]
+fn linked_top_level_vault_folders_are_never_followed() {
+    use std::os::unix::fs::symlink;
+    let sb = Sandbox::initialized();
+    let vault = sb.vault_copy();
+    let outside = sb.home.path().join("outside");
+    std::fs::rename(vault.join("projects"), &outside).unwrap();
+    symlink(&outside, vault.join("projects")).unwrap();
+    let elsewhere = sb.home.path().join("elsewhere");
+    std::fs::rename(vault.join("archive"), &elsewhere).unwrap();
+    symlink(&elsewhere, vault.join("archive")).unwrap();
+    // With no projects imported, a ticket naming one would fail R2.
+    for dir in ["triage", "in-progress", "done"] {
+        for entry in std::fs::read_dir(vault.join("tickets").join(dir)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "md") {
+                let text: Vec<String> = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .lines()
+                    .map(|l| {
+                        if l.starts_with("project:") {
+                            "project: ".to_string()
+                        } else {
+                            l.to_string()
+                        }
+                    })
+                    .collect();
+                std::fs::write(&path, text.join("\n") + "\n").unwrap();
+            }
+        }
+    }
+    let report = sb.import(&vault);
+    let anomalies: Vec<&str> = report["anomalies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    for rel in ["projects", "archive"] {
+        let want = format!("{rel}: symbolic link; not followed, not imported");
+        assert!(anomalies.contains(&want.as_str()), "{anomalies:?}");
+    }
+    assert_eq!(
+        anomalies
+            .iter()
+            .filter(|a| a.starts_with("archive"))
+            .count(),
+        1,
+        "{anomalies:?}"
+    );
+    assert!(
+        !sb.pm(&["project", "show", "alpha", "--json"])
+            .status
+            .success()
+    );
+    assert!(!sb.pm(&["show", "AGT-13", "--json"]).status.success());
+
+    // A linked tickets/ refuses the import outright.
+    let linked = sb.home.path().join("linked-vault");
+    std::fs::create_dir_all(&linked).unwrap();
+    symlink(vault.join("tickets"), linked.join("tickets")).unwrap();
+    let out = sb.pm(&["import", "vault", linked.to_str().unwrap(), "--json"]);
+    assert_code(&out, 2);
+    assert!(
+        stderr(&out).contains("tickets/ is a symbolic link"),
+        "{}",
+        stderr(&out)
     );
 }
 
