@@ -326,7 +326,9 @@ pub fn init(
         Some(dir) => dir.to_path_buf(),
         None => ctx.env.default_workspace_dir(prefix)?,
     };
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Owner-only (AGT-2434): the workspace holds the database and its
+    // WAL. A directory that already exists is left as it is.
+    crate::export::create_private_dirs(&dir)?;
     let dir = fs::canonicalize(&dir).with_context(|| format!("resolving {}", dir.display()))?;
     let db = dir.join(DB_FILE);
 

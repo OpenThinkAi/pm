@@ -255,7 +255,8 @@ impl Config {
 
     pub fn write(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            // Owner-only when pm creates it (AGT-2434).
+            crate::export::create_private_dirs(dir)?;
         }
         let text = toml::to_string(self).context("serializing config.toml")?;
         fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;

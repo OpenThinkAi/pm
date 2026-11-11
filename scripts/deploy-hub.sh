@@ -43,7 +43,16 @@ if [[ -n "$(git status --porcelain)" ]]; then
   die "working tree is not clean; commit or stash first"
 fi
 sha="$(git rev-parse HEAD)"
+
+# Ship only what main is (AGT-2434): every commit on main is a stamp-
+# signed merge, so a local commit or a stale checkout never reaches the hub.
+git fetch --quiet origin main || die "git fetch origin main failed"
+origin_main="$(git rev-parse origin/main)"
+[[ "$sha" == "$origin_main" ]] ||
+  die "HEAD ${sha:0:12} is not origin/main ${origin_main:0:12}; check out and pull main first"
+
 echo "deploy-hub: deploying ${sha:0:12} to service $SERVICE"
+echo "deploy-hub: $(railway --version)"
 
 # Fail fast locally before uploading anything.
 cargo build --locked --release -p pm-hub
