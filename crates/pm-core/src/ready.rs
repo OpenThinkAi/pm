@@ -247,6 +247,9 @@ pub fn frontier(
         }
     }
 
+    // Each ticket's nearest gated ancestor, for every blocker chain at once.
+    let nearest = graph.nearest_gates(&own);
+
     // Pass 2: the verdict before the model filter.
     let mut pre_model: BTreeMap<Ulid, Verdict> = BTreeMap::new();
     for t in graph.pending.iter().copied() {
@@ -257,7 +260,7 @@ pub fn frontier(
                 tickets: tickets.clone(),
             })
         } else {
-            match graph.blocked_reason(t.id, &own) {
+            match graph.blocked_reason(t.id, &own, &nearest) {
                 Some(reason) => Verdict::Excluded(reason),
                 None => Verdict::Ready,
             }
@@ -461,25 +464,45 @@ pub fn resolves_as_blocker(ws: &Workspace, t: &Ticket) -> bool {
 /// end up in `stuck` (in `nodes` order) — a cycle, or a blocker outside
 /// the node set. Each wave keeps `nodes` order. Shared by `pm graph`.
 pub fn waves(nodes: &[Ulid], blockers: &BTreeMap<Ulid, Vec<Ulid>>) -> Waves {
-    let mut waves: Vec<Vec<Ulid>> = Vec::new();
-    let mut resolved: BTreeSet<Ulid> = BTreeSet::new();
-    let mut remaining: Vec<Ulid> = nodes.to_vec();
-    loop {
-        let (ready, unready): (Vec<Ulid>, Vec<Ulid>) = remaining.iter().partition(|id| {
-            blockers
-                .get(id)
-                .is_none_or(|b| b.iter().all(|d| resolved.contains(d)))
-        });
-        if ready.is_empty() {
-            return Waves {
-                waves,
-                stuck: unready,
-            };
+    // Kahn's algorithm, level by level (AGT-2434): each node counts its
+    // blocker entries; a wave's nodes release their dependents' counts,
+    // and a dependent whose count reaches zero joins the next wave. Linear
+    // in nodes + edges, where re-partitioning every remaining node per
+    // wave was quadratic on a long chain.
+    let index: BTreeMap<Ulid, usize> = nodes.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let mut pending: Vec<usize> = vec![0; nodes.len()];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (i, id) in nodes.iter().enumerate() {
+        for b in blockers.get(id).into_iter().flatten() {
+            pending[i] += 1;
+            if let Some(&from) = index.get(b) {
+                dependents[from].push(i);
+            }
         }
-        resolved.extend(ready.iter().copied());
-        waves.push(ready);
-        remaining = unready;
     }
+    let mut placed = vec![false; nodes.len()];
+    let mut wave: Vec<usize> = (0..nodes.len()).filter(|i| pending[*i] == 0).collect();
+    let mut waves: Vec<Vec<Ulid>> = Vec::new();
+    while !wave.is_empty() {
+        let mut next: Vec<usize> = Vec::new();
+        for &i in &wave {
+            placed[i] = true;
+            for &d in &dependents[i] {
+                pending[d] -= 1;
+                if pending[d] == 0 {
+                    next.push(d);
+                }
+            }
+        }
+        waves.push(wave.iter().map(|i| nodes[*i]).collect());
+        next.sort_unstable();
+        wave = next;
+    }
+    let stuck = (0..nodes.len())
+        .filter(|i| !placed[*i])
+        .map(|i| nodes[i])
+        .collect();
+    Waves { waves, stuck }
 }
 
 /// [`waves`]'s result.
@@ -565,24 +588,138 @@ impl<'a> Graph<'a> {
         self.blocked_by.get(&id).cloned().unwrap_or_default()
     }
 
+    /// The gate `b` puts on what it blocks, if any: a pending ticket's is
+    /// read off its own reason (`own`); a blocker that is not pending but
+    /// still unresolved is a canceled one.
+    fn gate_on(&self, b: Ulid, own: &BTreeMap<Ulid, Option<Reason>>) -> Option<Gate> {
+        match own.get(&b) {
+            Some(Some(Reason::Held { hold })) => Some(Gate::Held { hold: hold.clone() }),
+            Some(Some(Reason::Label { label })) => Some(Gate::Label {
+                label: label.clone(),
+            }),
+            Some(_) => None,
+            None => self.canceled_gate(b),
+        }
+    }
+
+    /// For every ticket on a blocker chain, the nearest gated ancestor and
+    /// the direct blocker it sits behind — what [`Graph::blocked_reason_bfs`]
+    /// finds for one ticket, for all of them in linear time (AGT-2434).
+    ///
+    /// `hops[x]` is the length of the shortest chain from `x` through its
+    /// unresolved blockers to a gated ticket (never passing through a gated
+    /// one): a multi-source breadth-first search backwards from the gated
+    /// tickets. The breadth-first search from one ticket reports the first
+    /// gated ticket it pops, which is the end of the shortest chain that is
+    /// least in blocker order hop by hop; so `x`'s step is its first direct
+    /// blocker that starts such a chain, and its root is that blocker if
+    /// gated, else that blocker's root. Steps shorten the chain, so roots
+    /// fill in order of `hops`.
+    fn nearest_gates(&self, own: &BTreeMap<Ulid, Option<Reason>>) -> NearestGates {
+        let mut dependents: BTreeMap<Ulid, Vec<Ulid>> = BTreeMap::new();
+        let mut gated: BTreeMap<Ulid, bool> = BTreeMap::new();
+        for (to, froms) in &self.blocked_by {
+            for from in froms {
+                dependents.entry(*from).or_default().push(*to);
+                gated
+                    .entry(*from)
+                    .or_insert_with(|| self.gate_on(*from, own).is_some());
+            }
+        }
+        let is_gated = |id: &Ulid| gated.get(id).copied().unwrap_or(false);
+        let mut hops: BTreeMap<Ulid, usize> = BTreeMap::new();
+        let mut queue: VecDeque<Ulid> = VecDeque::new();
+        for (g, _) in gated.iter().filter(|(_, g)| **g) {
+            for d in dependents.get(g).into_iter().flatten() {
+                if !hops.contains_key(d) {
+                    hops.insert(*d, 1);
+                    queue.push_back(*d);
+                }
+            }
+        }
+        let mut order: Vec<Ulid> = Vec::with_capacity(queue.len());
+        while let Some(x) = queue.pop_front() {
+            order.push(x);
+            if is_gated(&x) {
+                continue;
+            }
+            let next = hops[&x] + 1;
+            for d in dependents.get(&x).into_iter().flatten() {
+                if !hops.contains_key(d) {
+                    hops.insert(*d, next);
+                    queue.push_back(*d);
+                }
+            }
+        }
+        let mut found: BTreeMap<Ulid, (Ulid, Ulid)> = BTreeMap::new();
+        for x in order {
+            let h = hops[&x];
+            let via = self
+                .blocked_by
+                .get(&x)
+                .into_iter()
+                .flatten()
+                .copied()
+                .find(|c| {
+                    if is_gated(c) {
+                        h == 1
+                    } else {
+                        hops.get(c).is_some_and(|hc| hc + 1 == h)
+                    }
+                })
+                .expect("a ticket with hops has a blocker one hop nearer");
+            let root = if is_gated(&via) { via } else { found[&via].1 };
+            found.insert(x, (via, root));
+        }
+        NearestGates { found }
+    }
+
     /// The blocker reason for `id`, if any: a chain to a human-gated
     /// ticket wins over a plain pending blocker. `own` holds each pending
-    /// ticket's own reason, so a gate is read off it rather than recomputed.
-    fn blocked_reason(&self, id: Ulid, own: &BTreeMap<Ulid, Option<Reason>>) -> Option<Reason> {
+    /// ticket's own reason, so a gate is read off it rather than recomputed;
+    /// `nearest` is [`Graph::nearest_gates`] over the same `own`.
+    fn blocked_reason(
+        &self,
+        id: Ulid,
+        own: &BTreeMap<Ulid, Option<Reason>>,
+        nearest: &NearestGates,
+    ) -> Option<Reason> {
+        let first = *self.blocked_by.get(&id)?.first()?;
+        let Some(&(via, root)) = nearest.found.get(&id) else {
+            return Some(Reason::BlockedBy {
+                blocker: first,
+                gate: None,
+            });
+        };
+        if root == id {
+            // A gated ticket whose nearest gate is itself, round a cycle:
+            // the search from it never revisits it, so ask it directly.
+            return self.blocked_reason_bfs(id, own);
+        }
+        let gate = self.gate_on(root, own).expect("a nearest gate is gated");
+        Some(if root == via {
+            match gate {
+                Gate::Canceled { state } => Reason::BlockedByCanceled {
+                    blocker: via,
+                    state,
+                },
+                gate => Reason::BlockedBy {
+                    blocker: via,
+                    gate: Some(gate),
+                },
+            }
+        } else {
+            Reason::TransitivelyBlocked { via, root, gate }
+        })
+    }
+
+    /// [`Graph::blocked_reason`] for one ticket by breadth-first search
+    /// from it: the definition the precomputed answer must match, and the
+    /// answer for the one case it cannot give (a gated ticket round a
+    /// cycle back to itself).
+    fn blocked_reason_bfs(&self, id: Ulid, own: &BTreeMap<Ulid, Option<Reason>>) -> Option<Reason> {
         let direct = self.unresolved_blockers(id);
         let first = *direct.first()?;
-        // A pending ticket's gate is read off its own reason; a blocker
-        // that is not pending but still unresolved is a canceled one.
-        let gate_on = |b: Ulid| -> Option<Gate> {
-            match own.get(&b) {
-                Some(Some(Reason::Held { hold })) => Some(Gate::Held { hold: hold.clone() }),
-                Some(Some(Reason::Label { label })) => Some(Gate::Label {
-                    label: label.clone(),
-                }),
-                Some(_) => None,
-                None => self.canceled_gate(b),
-            }
-        };
         // Breadth-first from each direct blocker, so the nearest gated
         // ancestor (and the direct blocker it sits behind) is reported.
         let mut seen: BTreeSet<Ulid> = [id].into();
@@ -591,7 +728,7 @@ impl<'a> Graph<'a> {
             if !seen.insert(node) {
                 continue;
             }
-            if let Some(gate) = gate_on(node) {
+            if let Some(gate) = self.gate_on(node, own) {
                 return Some(if node == via {
                     match gate {
                         Gate::Canceled { state } => Reason::BlockedByCanceled {
@@ -620,6 +757,13 @@ impl<'a> Graph<'a> {
             gate: None,
         })
     }
+}
+
+/// [`Graph::nearest_gates`]: ticket → (the direct blocker its nearest
+/// gated ancestor sits behind, that ancestor), for every ticket a gated
+/// one transitively blocks.
+struct NearestGates {
+    found: BTreeMap<Ulid, (Ulid, Ulid)>,
 }
 
 #[cfg(test)]
@@ -1242,6 +1386,140 @@ mod tests {
         );
         assert!(scoped.ready().is_empty());
         assert_eq!(f.ready(), ids(&[4]));
+    }
+
+    /// The partition-per-wave definition [`waves`] replaced (AGT-2434),
+    /// kept as the reference its output must match.
+    fn waves_reference(nodes: &[Ulid], blockers: &BTreeMap<Ulid, Vec<Ulid>>) -> Waves {
+        let mut waves: Vec<Vec<Ulid>> = Vec::new();
+        let mut resolved: BTreeSet<Ulid> = BTreeSet::new();
+        let mut remaining: Vec<Ulid> = nodes.to_vec();
+        loop {
+            let (ready, unready): (Vec<Ulid>, Vec<Ulid>) = remaining.iter().partition(|id| {
+                blockers
+                    .get(id)
+                    .is_none_or(|b| b.iter().all(|d| resolved.contains(d)))
+            });
+            if ready.is_empty() {
+                return Waves {
+                    waves,
+                    stuck: unready,
+                };
+            }
+            resolved.extend(ready.iter().copied());
+            waves.push(ready);
+            remaining = unready;
+        }
+    }
+
+    mod linear_parity {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Per ticket: 0 plain, 1 held, 2 manual, 3 canceled, 4 done,
+        /// 5 in flight, 6 archived; plus `blocks` edges among 1..=n.
+        fn graph() -> impl Strategy<Value = (Vec<u8>, Vec<(u64, u64)>)> {
+            (2u64..14).prop_flat_map(|n| {
+                (
+                    proptest::collection::vec(prop_oneof![4 => Just(0u8), 1 => 1u8..7], n as usize),
+                    proptest::collection::vec((1..=n, 1..=n), 0..(3 * n as usize)),
+                )
+            })
+        }
+
+        fn build(kinds: &[u8], edges: &[(u64, u64)]) -> (Vec<Ticket>, Vec<Relation>) {
+            let tickets = kinds
+                .iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let mut t = ticket(i as u64 + 1);
+                    match k {
+                        1 => t.hold = Some(hold()),
+                        2 => {
+                            t.labels.insert("manual".into());
+                        }
+                        3 => t.state = "canceled".into(),
+                        4 => t.state = "done".into(),
+                        5 => {
+                            t.state = "in-progress".into();
+                            t.assignee = Some(ActorId::new("claude:x"));
+                        }
+                        6 => t.archived_at = Some(Hlc::new(1, 0)),
+                        _ => {}
+                    }
+                    t
+                })
+                .collect();
+            let rels = edges.iter().map(|(f, t)| blocks(*f, *t)).collect();
+            (tickets, rels)
+        }
+
+        proptest! {
+            /// The precomputed nearest gate gives every ticket the reason
+            /// the per-ticket breadth-first search gives it.
+            #[test]
+            fn blocked_reasons_match_the_search((kinds, edges) in graph()) {
+                let (tickets, rels) = build(&kinds, &edges);
+                let ws = ws();
+                let rules = rules();
+                let graph = Graph::new(&ws, &tickets, &rels);
+                let mut own = BTreeMap::new();
+                for t in graph.pending.iter().copied() {
+                    own.insert(t.id, own_reason(t, &ws, &rules, TODAY));
+                }
+                let nearest = graph.nearest_gates(&own);
+                for t in &tickets {
+                    prop_assert_eq!(
+                        graph.blocked_reason(t.id, &own, &nearest),
+                        graph.blocked_reason_bfs(t.id, &own),
+                        "ticket {}", t.title
+                    );
+                }
+            }
+
+            /// Kahn's waves are the partition-per-wave waves, stuck nodes
+            /// included, blockers outside the node set and repeats too.
+            #[test]
+            fn waves_match_the_reference(
+                n in 1u64..16,
+                edges in proptest::collection::vec((1u64..20, 1u64..16), 0..40),
+            ) {
+                let nodes = ids(&(1..=n).collect::<Vec<_>>());
+                let mut blockers: BTreeMap<Ulid, Vec<Ulid>> = BTreeMap::new();
+                for (from, to) in edges {
+                    blockers.entry(id(to)).or_default().push(id(from));
+                }
+                prop_assert_eq!(waves(&nodes, &blockers), waves_reference(&nodes, &blockers));
+            }
+        }
+    }
+
+    /// A long chain behind one gate, and a long plain chain: both fold in
+    /// well under a second (the per-ticket search was quadratic).
+    #[test]
+    fn long_blocker_chains_are_linear() {
+        let n = 20_000u64;
+        let mut tickets: Vec<Ticket> = (1..=n).map(ticket).collect();
+        tickets[0].hold = Some(hold());
+        let rels: Vec<Relation> = (1..n).map(|i| blocks(i, i + 1)).collect();
+        let start = std::time::Instant::now();
+        let f = frontier(&ws(), &tickets, &rels, &Scope::All, &rules());
+        assert_eq!(
+            verdict(&f, n),
+            &Verdict::Excluded(Reason::TransitivelyBlocked {
+                via: id(n - 1),
+                root: id(1),
+                gate: Gate::Held { hold: hold() },
+            })
+        );
+        tickets[0].hold = None;
+        let f = frontier(&ws(), &tickets, &rels, &Scope::All, &rules());
+        assert_eq!(f.waves.len(), n as usize);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
