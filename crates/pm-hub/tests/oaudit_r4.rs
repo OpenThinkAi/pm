@@ -429,3 +429,122 @@ fn a_bound_tokens_assignee_write_cannot_bypass_claim_arbitration() {
     .unwrap();
     assert_eq!(view[0][0].as_deref(), Some("claude:z"));
 }
+
+/// AGT-2428: once seeded, a bound token cannot free a ticket held by an
+/// actor outside its binding — the unassign, the transition back to an
+/// unstarted state and the claim riding behind them are all refused, and
+/// nothing is stored — but a `claude:*` token still releases and
+/// re-claims a ticket another `claude:` actor holds.
+#[test]
+fn a_bound_token_cannot_unassign_and_reclaim_a_won_ticket() {
+    let Some((_container, url)) =
+        postgres_for("a_bound_token_cannot_unassign_and_reclaim_a_won_ticket")
+    else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    wait_for_health(&mut hub, port);
+    let studio = mint(&url, "studio", &["--any"]);
+    let agent = mint(&url, "agent", &["--actor", "claude:*"]);
+    let ws = Ulid::new();
+    push_ok(
+        port,
+        &studio,
+        &[
+            &state_upsert(ws, 1, "triage", StateCategory::Unstarted, 0),
+            &state_upsert(ws, 2, "in-progress", StateCategory::Started, 1),
+        ],
+    );
+    let (status, body) = post(
+        port,
+        &studio,
+        "/w/saltline/seeded",
+        &json!({ "number_floor": 0 }).to_string(),
+    );
+    assert_eq!(status, 200, "{body}");
+
+    let t = recent();
+    let mine = Ulid::new();
+    push_ok(port, &studio, &[&create(mine, t, "matt")]);
+    push_ok(port, &studio, &[&claim(mine, t + 1, "matt", "in-progress")]);
+
+    // The takeover in one batch: every step refused, nothing stored.
+    let before = count_ops(&url);
+    let back = |at: u64| {
+        op(
+            mine,
+            at,
+            "claude:b",
+            Payload::StateTransition(StateTransition {
+                state: "triage".into(),
+            }),
+        )
+    };
+    let (status, body) = push(
+        port,
+        &agent,
+        &[
+            &assign(mine, t + 2, "claude:b", None),
+            &back(t + 3),
+            &claim(mine, t + 4, "claude:b", "in-progress"),
+        ],
+    );
+    assert_eq!(status, 200, "{body}");
+    let acks = body["ops"].as_array().unwrap();
+    for ack in &acks[..2] {
+        assert_eq!(ack["stored"], false, "{body}");
+        assert_eq!(ack["rejected"]["code"], "held_by_another", "{body}");
+        assert_eq!(ack["rejected"]["taken_by"], "matt", "{body}");
+        assert_eq!(ack["rejected"]["state"], "in-progress", "{body}");
+    }
+    assert_eq!(acks[2]["rejected"]["code"], "not_unstarted", "{body}");
+    assert_eq!(count_ops(&url), before);
+    let view = query_rows(
+        &url,
+        &format!(
+            "SELECT view::json->'assignee'->>'value', view::json->'state'->>'value' \
+             FROM ticket_views WHERE entity = '{mine}'"
+        ),
+    )
+    .unwrap();
+    assert_eq!(view[0][0].as_deref(), Some("matt"));
+    assert_eq!(view[0][1].as_deref(), Some("in-progress"));
+
+    // A claude: actor's ticket: the claude:* token releases and recovers it.
+    let stuck = Ulid::new();
+    push_ok(port, &studio, &[&create(stuck, t + 10, "matt")]);
+    push_ok(
+        port,
+        &agent,
+        &[&claim(stuck, t + 11, "claude:a", "in-progress")],
+    );
+    let release = op(
+        stuck,
+        t + 12,
+        "claude:b",
+        Payload::StateTransition(StateTransition {
+            state: "triage".into(),
+        }),
+    );
+    push_ok(
+        port,
+        &agent,
+        &[
+            &release,
+            &assign(stuck, t + 13, "claude:b", None),
+            &claim(stuck, t + 14, "claude:b", "in-progress"),
+        ],
+    );
+    let view = query_rows(
+        &url,
+        &format!(
+            "SELECT view::json->'assignee'->>'value' FROM ticket_views WHERE entity = '{stuck}'"
+        ),
+    )
+    .unwrap();
+    assert_eq!(view[0][0].as_deref(), Some("claude:b"));
+
+    // The operator's unrestricted token still frees anyone's ticket.
+    push_ok(port, &studio, &[&assign(mine, t + 20, "matt", None)]);
+}
