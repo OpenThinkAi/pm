@@ -28,7 +28,7 @@
 
 mod parity;
 mod plan;
-mod prose;
+pub(crate) mod prose;
 mod report;
 mod vault;
 

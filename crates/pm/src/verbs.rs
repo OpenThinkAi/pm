@@ -1568,6 +1568,12 @@ pub(crate) fn parse_assignment(assignment: &str) -> Result<FieldSet> {
                 .transpose()?,
         )),
         other => {
+            if !is_field_key(other) {
+                return Err(CliError::usage(format!(
+                    "'{}' is not a field name: use letters, digits, '_', '.' and '-' only",
+                    crate::text::inline(other)
+                )));
+            }
             eprintln!("pm: warning: unknown field '{other}'; stored under ext.{other}");
             Ok(FieldSet::Ext {
                 key: other.to_string(),
@@ -1575,6 +1581,17 @@ pub(crate) fn parse_assignment(assignment: &str) -> Result<FieldSet> {
             })
         }
     }
+}
+
+/// Whether `key` may name a field (AGT-2434): ASCII letters, digits, `_`,
+/// `.` and `-`, at least one. Every known field qualifies; an unknown one
+/// lands in `ext` and becomes a frontmatter key on `pm export md`, so
+/// nothing that YAML (or a terminal) would read as more than a name.
+pub(crate) fn is_field_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 pub fn set(ctx: &Ctx<'_>, reference: &str, assignments: &[String]) -> Result<()> {

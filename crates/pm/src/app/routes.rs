@@ -536,6 +536,15 @@ async fn fields(
     }
     let mut sets: Vec<FieldSet> = Vec::with_capacity(object.len());
     for (key, value) in object {
+        // AGT-2434: checked before `key=value` is formed, so a key holding
+        // `=` cannot shift text into the value.
+        if !crate::verbs::is_field_key(&key) {
+            return Err(CliError::usage(format!(
+                "'{}' is not a field name: use letters, digits, '_', '.' and '-' only",
+                crate::text::inline(&key)
+            ))
+            .into());
+        }
         let text = match value {
             Value::Null => String::new(),
             Value::String(s) => s,

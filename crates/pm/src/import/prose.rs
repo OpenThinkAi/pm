@@ -90,7 +90,7 @@ pub fn split_body(body: &str) -> SplitBody {
         }
         match &mut current {
             Some(entry) => {
-                entry.body.push_str(line);
+                entry.body.push_str(unescape_comment_line(line));
                 entry.body.push('\n');
             }
             None => {
@@ -108,6 +108,25 @@ pub fn split_body(body: &str) -> SplitBody {
     SplitBody {
         description: tidy(&description),
         comments,
+    }
+}
+
+/// Whether `line`, once any leading `\` are dropped, is one a Comments
+/// section reads as structure: a `## ` heading or a dated entry heading.
+/// `pm export md` escapes such lines in a comment body with one more
+/// leading `\` (AGT-2434); [`unescape_comment_line`] reverses it.
+pub(crate) fn is_structural_comment_line(line: &str) -> bool {
+    let core = line.trim_start_matches('\\');
+    core.starts_with("## ") || comment_header(core).is_some()
+}
+
+/// Drops the one leading `\` that `pm export md` added to an escaped
+/// comment line ([`is_structural_comment_line`]); any other line is
+/// returned as it is.
+pub(crate) fn unescape_comment_line(line: &str) -> &str {
+    match line.strip_prefix('\\') {
+        Some(rest) if is_structural_comment_line(line) => rest,
+        _ => line,
     }
 }
 

@@ -547,10 +547,12 @@ No flags beyond the globals. Keys: `title`, `priority`, `project`, `repo`,
 `assignee`, `linked-github`, `linked-pr`, `linear`, `not_before`
 (`YYYY-MM-DD`), `parked` (`YYYY-MM-DD` or `forever`). An empty value
 clears an optional field. An unrecognized key is not an error: it lands in
-`ext.<key>` with a warning on stderr.
+`ext.<key>` with a warning on stderr. A key must be ASCII letters, digits,
+`_`, `.` and `-` (AGT-2434; `pm app`'s field endpoint holds keys to the
+same rule).
 
-- Exit `2`: an assignment is not `key=value`, `title=` is empty, an
-  unparseable `priority=`/`not_before=`/`parked=`.
+- Exit `2`: an assignment is not `key=value`, a key outside that set,
+  `title=` is empty, an unparseable `priority=`/`not_before=`/`parked=`.
 - Exit `3`: `project=` names a project that does not exist.
 - `--json`: **Ticket** (as it reads after every assignment lands — one
   `field.set` op per key, none of them partial: a bad assignment fails
@@ -1360,9 +1362,13 @@ archived (the month of its `archived_at`); its frontmatter is the
 template's keys in the template's order (`id, title, state, created,
 updated, project, repo, blocked-by, linked-github, linked-pr, priority,
 labels, source`), then `assignee`/`linear`/`not-before` when set, then
-every `ext` key sorted; values are quoted only when YAML needs it; the
-body is the description followed by `## Comments` with one
-`### <YYYY-MM-DD> — <author>` entry per comment. A project is
+every `ext` key sorted; values (and `ext` keys) are quoted only when YAML
+needs it; the body is the description followed by `## Comments` with one
+`### <YYYY-MM-DD> — <author>` entry per comment (the author on one line).
+A comment line that would read as structure on re-import — a `## `
+heading or a dated `### ` entry heading — is written with one extra
+leading `\`, which `pm import vault` takes off again (AGT-2434), so a
+comment cannot forge another comment or end the section. A project is
 `projects/<id>/README.md` (the design doc verbatim), or
 `archive/projects/<id>/` when its status is complete or abandoned (a
 parked project may come back, so it stays under `projects/`), with
