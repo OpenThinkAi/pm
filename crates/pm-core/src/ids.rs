@@ -29,6 +29,13 @@
 //! Windows maps `nul.txt` to the device too ([`is_windows_reserved`]).
 //! On Unix these names are harmless, but a hub op reaches every platform.
 //! Every id and name in the live workspace passed on 2026-09-30.
+//!
+//! **Edges (AGT-2434).** Both rules also refuse a name starting with `-`
+//! (a flag to any command it is passed to) or ending with `.` (and, for
+//! free-form names, a space: Windows drops both, so `notes.` and `notes`
+//! collide), and free-form names refuse Unicode format characters
+//! ([`is_format_char`]). Every id and name in the live workspace (115
+//! projects, 2455 tickets, states, document names) passed on 2026-11-11.
 
 use crate::op::{FieldSet, Op, Payload, ProjectSet, WorkspaceSet};
 
@@ -37,11 +44,15 @@ pub const ID_MAX: usize = 64;
 
 /// Whether `value` is safe as one path component: ASCII letters, digits,
 /// `-`, `_` and `.`, 1 to [`ID_MAX`] bytes, not starting with `.` (so
-/// never `.` or `..`). No separators, NUL or other control characters.
+/// never `.` or `..`) or `-` (read as a flag when passed to a command),
+/// not ending with `.` (Windows drops it, so `a.` and `a` collide). No
+/// separators, NUL or other control characters.
 pub fn is_safe_component(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= ID_MAX
         && !value.starts_with('.')
+        && !value.starts_with('-')
+        && !value.ends_with('.')
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -81,17 +92,55 @@ pub const NAME_MAX: usize = 255;
 /// Whether `value` is safe as one path segment of a free-form name (a
 /// workflow state, one `/`-separated part of a document name): 1 to
 /// [`NAME_MAX`] bytes, not starting with `.` (so never `.` or `..`, and
-/// never a hidden file), no `/`, `\`, `:` or control character (NUL
-/// included), and not a Windows device name ([`is_windows_reserved`],
-/// AGT-1467). Spaces and non-ASCII letters are fine.
+/// never a hidden file) or `-`, not ending with `.` or a space (Windows
+/// drops them, so `notes.` would collide with `notes`), no `/`, `\`, `:`,
+/// control character (NUL included) or Unicode format character
+/// ([`is_format_char`]: invisible, or reorders the text around it), and
+/// not a Windows device name ([`is_windows_reserved`], AGT-1467). Inner
+/// spaces and non-ASCII letters are fine.
 pub fn is_safe_segment(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= NAME_MAX
         && !value.starts_with('.')
+        && !value.starts_with('-')
+        && !value.ends_with('.')
+        && !value.ends_with(' ')
         && !value
             .chars()
-            .any(|c| matches!(c, '/' | '\\' | ':') || c.is_control())
+            .any(|c| matches!(c, '/' | '\\' | ':') || c.is_control() || is_format_char(c))
         && !is_windows_reserved(value)
+}
+
+/// Whether `c` is a Unicode format character (general category `Cf`, as
+/// of Unicode 16): zero-width spaces and joiners, bidirectional controls
+/// (`U+202E` makes `gpj.exe` display as `exe.jpg`), the BOM, soft hyphen,
+/// tag characters and the like. Each is invisible or changes how the text
+/// around it displays, so two names that look the same could differ.
+pub fn is_format_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
 }
 
 /// Whether `name` is a safe project document name: at most [`NAME_MAX`]
@@ -112,9 +161,9 @@ pub struct IdError {
     pub rule: &'static str,
 }
 
-const ID_RULE: &str = "letters, digits, '-', '_', '.'; at most 64 characters; not starting with '.'; not a Windows device name (CON, NUL, COM1, ...)";
-const SEGMENT_RULE: &str = "at most 255 bytes; not starting with '.'; no '/', '\\', ':' or control characters; not a Windows device name (CON, NUL, COM1, ...)";
-const DOC_NAME_RULE: &str = "'/'-separated names, each non-empty, not starting with '.' (no '.' or '..'), no '\\', ':' or control characters, not a Windows device name (CON, NUL, COM1, ...); at most 255 bytes";
+const ID_RULE: &str = "letters, digits, '-', '_', '.'; at most 64 characters; not starting with '.' or '-'; not ending with '.'; not a Windows device name (CON, NUL, COM1, ...)";
+const SEGMENT_RULE: &str = "at most 255 bytes; not starting with '.' or '-'; not ending with '.' or a space; no '/', '\\', ':', control or Unicode format characters; not a Windows device name (CON, NUL, COM1, ...)";
+const DOC_NAME_RULE: &str = "'/'-separated names, each non-empty, not starting with '.' (no '.' or '..') or '-', not ending with '.' or a space, no '\\', ':', control or Unicode format characters, not a Windows device name (CON, NUL, COM1, ...); at most 255 bytes";
 
 /// [`is_safe_component`] as a typed check: `what` names the field in the
 /// error (`"workspace prefix"`, `"project id"`).
@@ -212,7 +261,8 @@ mod tests {
     }
 
     const BAD: &[&str] = &[
-        "", ".", "..", "../x", "a/b", "a\\b", "/abs", "a\0b", "a\nb", "a b", ".hidden", "é",
+        "", ".", "..", "../x", "a/b", "a\\b", "/abs", "a\0b", "a\nb", "a b", ".hidden", "é", "-x",
+        "--help", "a.", "a..", "pm.",
     ];
 
     #[test]
@@ -303,6 +353,42 @@ mod tests {
         assert!(is_safe_segment("in review"));
         for bad in ["", ".", "..", "a/b", "a\\b", ".x", "a\tb"] {
             assert!(!is_safe_segment(bad), "{bad:?}");
+        }
+    }
+
+    /// AGT-2434: leading `-`, trailing `.` or space, and Unicode format
+    /// characters are refused in free-form names; inner ones are fine
+    /// where they always were.
+    #[test]
+    fn segment_edges_and_format_characters() {
+        for bad in [
+            "-x",
+            "--help",
+            "notes.",
+            "notes ",
+            "in review ",
+            "a\u{200B}b",
+            "\u{202E}gpj.exe",
+            "x\u{FEFF}",
+            "soft\u{AD}hyphen",
+            "tag\u{E0041}",
+            "\u{2066}x",
+        ] {
+            assert!(!is_safe_segment(bad), "{bad:?}");
+            assert!(!is_safe_doc_name(bad), "{bad:?}");
+            assert!(!is_safe_doc_name(&format!("ideation/{bad}")), "{bad:?}");
+        }
+        for fine in ["in review", "a-b", "x.md", "v1.2", "é", "a - b", "日本"] {
+            assert!(is_safe_segment(fine), "{fine:?}");
+        }
+        let upsert = op(Payload::StateUpsert(StateUpsert {
+            name: "done.".into(),
+            category: StateCategory::Completed,
+            position: 0,
+        }));
+        assert_eq!(check_op_ids(&upsert).unwrap_err().what, "state name");
+        for fine in ["a-", "a_", "x.y", "think-3"] {
+            assert!(is_safe_component(fine), "{fine:?}");
         }
     }
 
