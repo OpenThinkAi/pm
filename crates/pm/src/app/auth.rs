@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::extract::{Request, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_MAX_AGE, AUTHORIZATION, HOST, ORIGIN, VARY, WWW_AUTHENTICATE,
+    ACCESS_CONTROL_MAX_AGE, AUTHORIZATION, CACHE_CONTROL, HOST, ORIGIN, VARY, WWW_AUTHENTICATE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -72,12 +72,22 @@ fn cors_headers(response: &mut Response, origin: &str) {
     headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
 }
 
-/// The guard every route runs behind.
+/// The guard every route runs behind. Every response it lets out, a
+/// refusal included, is `Cache-Control: no-store`: the API serves
+/// workspace data, which no browser or proxy cache should keep (AGT-2434).
 pub(crate) async fn guard(
     State(state): State<Arc<AppState>>,
     request: Request,
     next: Next,
 ) -> Response {
+    let mut response = check(state, request, next).await;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn check(state: Arc<AppState>, request: Request, next: Next) -> Response {
     let headers = request.headers();
     if !host_is_self(headers.get(HOST), state.port) {
         return error_response(

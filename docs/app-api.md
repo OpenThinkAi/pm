@@ -63,6 +63,9 @@ never reaches a handler.
 
 There are no cookies and no sessions: the token is the session.
 
+Every response, a refusal included, carries `Cache-Control: no-store`, so
+no browser or proxy cache keeps workspace data (AGT-2434).
+
 ## Errors
 
 Every error body is `{"schema": 1, "error": "<message>"}`. The status is

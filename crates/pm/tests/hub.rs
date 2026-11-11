@@ -133,6 +133,11 @@ struct FakeHub {
 
 impl FakeHub {
     fn start(token: &'static str) -> Self {
+        Self::start_with_health(token, HEALTH)
+    }
+
+    /// [`FakeHub::start`], answering `/health` with `health`.
+    fn start_with_health(token: &'static str, health: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -144,7 +149,7 @@ impl FakeHub {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         a.fetch_add(1, Ordering::SeqCst);
-                        serve(stream, token);
+                        serve(stream, token, health);
                     }
                     Err(_) => thread::sleep(Duration::from_millis(5)),
                 }
@@ -168,7 +173,9 @@ impl Drop for FakeHub {
     }
 }
 
-fn serve(mut stream: TcpStream, token: &str) {
+const HEALTH: &str = r#"{"status":"ok","schema_version":1,"op_version":5}"#;
+
+fn serve(mut stream: TcpStream, token: &str, health: &str) {
     stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -182,10 +189,7 @@ fn serve(mut stream: TcpStream, token: &str) {
         token.to_ascii_lowercase()
     ));
     let (status, body) = if path == "/health" {
-        (
-            "200 OK",
-            r#"{"status":"ok","schema_version":1,"op_version":5}"#.to_string(),
-        )
+        ("200 OK", health.to_string())
     } else if path.starts_with("/w/") && path.ends_with("/whoami") && authed {
         (
             "200 OK",
@@ -421,4 +425,35 @@ fn reads_never_contact_the_hub() {
     let out = sb.pm(&["hub", "status"], &[("PM_HUB_TOKEN", TOKEN)], None);
     assert!(out.status.success(), "{}", err(&out));
     assert!(hub.hits() >= 2);
+}
+
+/// `pm hub status` prints the hub's `schema_version` and `op_version`
+/// flattened like every other hub-supplied field: a hostile hub cannot
+/// put a bidi override or a line break on the operator's terminal
+/// (AGT-2434). `--json` keeps the values as sent.
+#[test]
+fn hub_status_flattens_hub_supplied_versions() {
+    let hub = FakeHub::start_with_health(
+        TOKEN,
+        "{\"status\":\"ok\",\"schema_version\":\"1\u{202e}2\",\"op_version\":[\"a\\nb\"]}",
+    );
+    let sb = Sandbox::new();
+    let login = sb.pm(
+        &["hub", "login", &hub.url],
+        &[("PM_HUB_TOKEN", TOKEN)],
+        None,
+    );
+    assert!(login.status.success(), "{}", err(&login));
+
+    let text = out_s(&sb.pm(&["hub", "status"], &[("PM_HUB_TOKEN", TOKEN)], None));
+    let schema = text.lines().find(|l| l.starts_with("hub schema:")).unwrap();
+    assert!(!schema.contains('\u{202e}'), "{schema:?}");
+    assert!(schema.contains('1') && schema.contains('2'), "{schema:?}");
+    let op = text.lines().find(|l| l.starts_with("op version:")).unwrap();
+    assert!(op.contains('a') && op.contains('b'), "{text:?}");
+
+    let (code, v) = sb.json(&["hub", "status"], &[("PM_HUB_TOKEN", TOKEN)]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["health"]["schema_version"], "1\u{202e}2");
+    let _ = sb.pm(&["hub", "logout"], &[], None);
 }

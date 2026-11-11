@@ -435,6 +435,34 @@ fn every_request_needs_the_token() {
     assert!(body["error"].is_string());
 }
 
+/// Every API response, a refusal included, is `Cache-Control: no-store`
+/// (AGT-2434): no browser or proxy cache keeps workspace data.
+#[test]
+fn every_response_is_no_store() {
+    let sb = Sandbox::new();
+    let app = App::start(&sb, &["--idle", "0"]);
+    let host = format!("Host: 127.0.0.1:{}", app.port());
+    let cases: [(&str, Vec<String>, u16); 4] = [
+        ("/workspace", vec![host.clone(), app.bearer()], 200),
+        ("/nope", vec![host.clone(), app.bearer()], 404),
+        ("/workspace", vec![host.clone()], 401),
+        (
+            "/workspace",
+            vec!["Host: evil.example".into(), app.bearer()],
+            403,
+        ),
+    ];
+    for (path, headers, want) in cases {
+        let (code, text) = app.raw("GET", path, &headers);
+        assert_eq!(code, want, "{text}");
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("cache-control: no-store"),
+            "{text}"
+        );
+    }
+}
+
 #[test]
 fn a_foreign_host_or_origin_is_refused() {
     let sb = Sandbox::new();
