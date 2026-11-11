@@ -1368,7 +1368,9 @@ needs it; the body is the description followed by `## Comments` with one
 A comment line that would read as structure on re-import — a `## `
 heading or a dated `### ` entry heading — is written with one extra
 leading `\`, which `pm import vault` takes off again (AGT-2434), so a
-comment cannot forge another comment or end the section. A project is
+comment cannot forge another comment or end the section. (The import
+takes one `\` off any such line in a comment entry, hand-written vault
+files included.) A project is
 `projects/<id>/README.md` (the design doc verbatim), or
 `archive/projects/<id>/` when its status is complete or abandoned (a
 parked project may come back, so it stays under `projects/`), with

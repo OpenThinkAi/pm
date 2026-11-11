@@ -415,9 +415,6 @@ fn waiver_text(w: &pm_core::Waiver) -> String {
     }
 }
 
-/// Whether the last `## ` heading of `body` is `## Comments` — a
-/// template's comment preamble the import kept — so entries belong under
-/// it rather than under a second heading.
 /// An `ext` key as a frontmatter key (AGT-2434): bare when it is a plain
 /// field name YAML reads back as that string, quoted otherwise — an op
 /// from another replica can carry any key, and an unquoted `a: b` or
@@ -462,6 +459,9 @@ fn escape_comment_body(body: &str) -> String {
         .join("\n")
 }
 
+/// Whether the last `## ` heading of `body` is `## Comments` — a
+/// template's comment preamble the import kept — so entries belong under
+/// it rather than under a second heading.
 fn ends_with_comments_section(body: &str) -> bool {
     body.lines()
         .rfind(|l| l.starts_with("## "))
