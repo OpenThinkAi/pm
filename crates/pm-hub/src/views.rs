@@ -78,13 +78,14 @@ use std::collections::{HashMap, HashSet};
 
 use pm_core::op::FieldSet;
 use pm_core::{
-    ActorId, ApplyError, ClaimRejected, ConfigApplyError, Hlc, Op, Payload, State, TicketView,
-    WorkspaceView, apply, apply_workspace,
+    ActorId, ApplyError, ClaimRejected, ConfigApplyError, Hlc, Op, Payload, State, StateCategory,
+    TicketView, WorkspaceView, apply, apply_workspace,
 };
 use serde::Serialize;
 use tokio_postgres::Transaction;
 use ulid::Ulid;
 
+use crate::auth::ActorBinding;
 use crate::numbers::Numbered;
 
 /// What a push answers for a claim the hub refused: who holds the ticket
@@ -101,7 +102,10 @@ pub struct Rejection {
     pub at: Hlc,
     /// The ticket's state at the hub.
     pub state: String,
-    /// `not_unstarted`, `already_assigned` or `deleted`.
+    /// `not_unstarted`, `already_assigned` or `deleted` for a claim (or a
+    /// bound token's assignment); `held_by_another` for a bound token's
+    /// unassign or transition out of a started state on a ticket held by
+    /// an actor it may not act as (AGT-2428).
     pub code: &'static str,
     /// [`ClaimRejected`]'s message, as `pm claim --json` reports it.
     pub reason: String,
@@ -236,21 +240,29 @@ impl Views {
     /// (seed mode, rebuild) every claim folds as a plain write. Pure:
     /// no IO. [`Views::fold_judging`] also arbitrates assignee writes.
     pub fn fold(&mut self, op: &Op, arbitrate: bool) -> Result<Verdict, FoldError> {
-        self.fold_judging(op, arbitrate, false)
+        self.fold_judging(op, arbitrate, None)
     }
 
-    /// [`Views::fold`], and with `arbitrate_assignee` (a push from an
-    /// actor-bound token, once seeded; AGT-1482) a `field.set assignee`
-    /// naming an actor is judged exactly like a `claim` — unless it
-    /// restates the ticket's current assignee, which changes nothing (and
-    /// is how a client reconciles after a refusal, AGT-1463). Without
-    /// this, a bound token could skip the `claim` and write itself in as
-    /// the assignee of a ticket someone else had won.
+    /// [`Views::fold`], and with `bound` (the binding of an actor-bound
+    /// token pushing to a seeded workspace; AGT-1482) a `field.set
+    /// assignee` naming an actor is judged exactly like a `claim` —
+    /// unless it restates the ticket's current assignee, which changes
+    /// nothing (and is how a client reconciles after a refusal,
+    /// AGT-1463). Without this, a bound token could skip the `claim` and
+    /// write itself in as the assignee of a ticket someone else had won.
+    ///
+    /// With `bound`, the two writes that free a won ticket are judged too
+    /// (AGT-2428): unassigning (`field.set assignee null`) and a
+    /// `state.transition` out of a started state. Each is admitted only
+    /// if the ticket has no assignee or `bound` permits its current one
+    /// ([`release_admissible`]); otherwise the ticket stays held. Without
+    /// this, a bound token could unassign another actor's ticket, move it
+    /// back to an unstarted state and claim it, all in one batch.
     pub fn fold_judging(
         &mut self,
         op: &Op,
         arbitrate: bool,
-        arbitrate_assignee: bool,
+        bound: Option<&ActorBinding>,
     ) -> Result<Verdict, FoldError> {
         if let Some(admission) = &mut self.admission {
             admission.admit(op)?;
@@ -284,12 +296,17 @@ impl Views {
                 let judged = match &op.payload {
                     Payload::Claim(_) => arbitrate,
                     Payload::FieldSet(FieldSet::Assignee(Some(to))) => {
-                        arbitrate_assignee && view.assignee.value.as_ref() != Some(to)
+                        bound.is_some() && view.assignee.value.as_ref() != Some(to)
                     }
                     _ => false,
                 };
                 if judged && let Err(reason) = view.claim_admissible(&states) {
                     return Ok(Verdict::Rejected(rejection(view, reason)));
+                }
+                if let Some(binding) = bound
+                    && let Err(rejected) = release_admissible(view, &states, op, binding)
+                {
+                    return Ok(Verdict::Rejected(rejected));
                 }
                 apply(view, op)?;
                 self.dirty.insert(op.entity);
@@ -408,6 +425,53 @@ impl Views {
         self.dirty.clear();
         Ok(())
     }
+}
+
+/// Whether a bound token's `op` may free `view` (AGT-2428): an unassign,
+/// or a `state.transition` from a started state to another state, is
+/// admitted only when the ticket has no assignee or `binding` permits the
+/// current one. Every other op is not a release and passes. Refused, the
+/// answer is a claim's rejection (`held_by_another`), so `pm sync`
+/// reconciles to the ticket's state and holder at the hub.
+fn release_admissible(
+    view: &TicketView,
+    states: &[State],
+    op: &Op,
+    binding: &ActorBinding,
+) -> Result<(), Rejection> {
+    let releases = match &op.payload {
+        Payload::FieldSet(FieldSet::Assignee(None)) => true,
+        Payload::StateTransition(t) => {
+            t.state != view.state.value
+                && states
+                    .iter()
+                    .any(|s| s.name == view.state.value && s.category == StateCategory::Started)
+        }
+        _ => false,
+    };
+    let Some(holder) = view.assignee.value.as_ref() else {
+        return Ok(());
+    };
+    if !releases || binding.permits(holder.as_str()) {
+        return Ok(());
+    }
+    Err(Rejection {
+        taken_by: Some(holder.clone()),
+        at: view
+            .assignee
+            .stamp
+            .as_ref()
+            .or(view.updated.as_ref())
+            .map_or(Hlc::ZERO, |s| s.hlc),
+        state: view.state.value.clone(),
+        code: "held_by_another",
+        reason: format!(
+            "ticket is assigned to {holder}, whom this token may not act as; \
+             only a token bound to {holder}, or an unrestricted token, may unassign it or \
+             move it out of '{}'",
+            view.state.value
+        ),
+    })
 }
 
 /// A stored entity id; the push path wrote only valid ones.
@@ -690,6 +754,120 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn transition(ticket: Ulid, wall_ms: u64, actor: &str, to: &str) -> Op {
+        op(
+            ticket,
+            wall_ms,
+            actor,
+            Payload::StateTransition(StateTransition { state: to.into() }),
+        )
+    }
+
+    fn unassign(ticket: Ulid, wall_ms: u64, actor: &str) -> Op {
+        op(
+            ticket,
+            wall_ms,
+            actor,
+            Payload::FieldSet(FieldSet::Assignee(None)),
+        )
+    }
+
+    /// AGT-2428: a bound token may not free a ticket held by an actor
+    /// outside its binding (unassign, transition out of started), so the
+    /// unassign + transition + claim takeover fails at every step.
+    #[test]
+    fn a_bound_token_cannot_free_a_ticket_another_actor_holds() {
+        let (mut views, _) = configured();
+        let agents = ActorBinding::Patterns(vec!["claude:*".into()]);
+        let t = Ulid::new();
+        views.fold(&create(t, 10, "triage"), true).unwrap();
+        views.fold(&claim(t, 20, "matt"), true).unwrap();
+        for o in [
+            unassign(t, 30, "claude:b"),
+            transition(t, 31, "claude:b", "triage"),
+            transition(t, 32, "claude:b", "done"),
+        ] {
+            match views.fold_judging(&o, true, Some(&agents)).unwrap() {
+                Verdict::Rejected(r) => {
+                    assert_eq!(r.code, "held_by_another");
+                    assert_eq!(r.taken_by, Some(ActorId::new("matt")));
+                    assert_eq!(r.state, "in-progress");
+                    assert_eq!(r.at, Hlc::new(20, 0));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(matches!(
+            views
+                .fold_judging(&claim(t, 33, "claude:b"), true, Some(&agents))
+                .unwrap(),
+            Verdict::Rejected(Rejection {
+                code: "not_unstarted",
+                ..
+            })
+        ));
+        let view = views.tickets.get(&t).unwrap();
+        assert_eq!(view.assignee.value, Some(ActorId::new("matt")));
+        assert_eq!(view.state.value, "in-progress");
+        // Not a release: restating the state, or any other write, lands.
+        for o in [
+            transition(t, 40, "claude:b", "in-progress"),
+            op(
+                t,
+                41,
+                "claude:b",
+                Payload::FieldSet(FieldSet::Title("retitled".into())),
+            ),
+        ] {
+            assert_eq!(
+                views.fold_judging(&o, true, Some(&agents)).unwrap(),
+                Verdict::Folded
+            );
+        }
+        // Without a binding (unrestricted token, seed mode) nothing is judged.
+        assert_eq!(
+            views.fold(&unassign(t, 50, "matt"), true).unwrap(),
+            Verdict::Folded
+        );
+    }
+
+    /// AGT-2428: a token bound to `claude:*` still releases and recovers a
+    /// ticket another `claude:` actor holds (build loops rely on it), and
+    /// anyone may move an unassigned ticket.
+    #[test]
+    fn a_bound_token_releases_a_ticket_its_binding_covers() {
+        let (mut views, _) = configured();
+        let agents = ActorBinding::Patterns(vec!["claude:*".into()]);
+        let t = Ulid::new();
+        views.fold(&create(t, 10, "triage"), true).unwrap();
+        views.fold(&claim(t, 20, "claude:a"), true).unwrap();
+        for o in [
+            transition(t, 30, "claude:b", "triage"),
+            unassign(t, 31, "claude:b"),
+            claim(t, 32, "claude:b"),
+        ] {
+            assert_eq!(
+                views.fold_judging(&o, true, Some(&agents)).unwrap(),
+                Verdict::Folded
+            );
+        }
+        let view = views.tickets.get(&t).unwrap();
+        assert_eq!(view.assignee.value, Some(ActorId::new("claude:b")));
+        // An unassigned started ticket is anyone's to move.
+        let free = Ulid::new();
+        views.fold(&create(free, 10, "in-progress"), true).unwrap();
+        assert_eq!(
+            views
+                .fold_judging(
+                    &transition(free, 11, "claude:b", "triage"),
+                    true,
+                    Some(&agents)
+                )
+                .unwrap(),
+            Verdict::Folded
+        );
     }
 
     #[test]

@@ -71,7 +71,8 @@
 //! hub (at that point in the batch) is accepted from any token — it
 //! changes nothing, and it is what a client logs to reconcile after the
 //! hub refused its claim (`rejected.taken_by`). Unassigning
-//! (`field.set assignee null`) names nobody and is always accepted.
+//! (`field.set assignee null`) names nobody and passes this check (but
+//! see AGT-2428 below).
 //!
 //! **Assignments are arbitrated (AGT-1482).** Once seeded, a fresh
 //! `field.set assignee` naming an actor, from an actor-bound token, is
@@ -79,6 +80,13 @@
 //! an unstarted, unassigned ticket, else answered with a claim's
 //! `rejected` ack and not stored. The restating write above is exempt;
 //! so are unrestricted tokens (the operator reassigns deliberately).
+//!
+//! **Releases are guarded (AGT-2428).** Once seeded, an actor-bound
+//! token's unassign and its `state.transition` out of a started state are
+//! admitted only if the ticket is unassigned or held by an actor the
+//! binding permits; otherwise they are answered `rejected`
+//! (`held_by_another`) and not stored, so a bound token cannot free a
+//! ticket someone else won and then claim it.
 //!
 //! **Seeded numbers (AGT-1482).** While seeding, only an unrestricted
 //! token may push `field.set number` ops (`400 number_not_allowed`
@@ -818,8 +826,11 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
             // AGT-1482: once seeded, an actor-bound token's assignee
             // write is held to the claim rule; an unrestricted token
             // (the operator, who may author as anyone) reassigns freely.
-            let judge_assignee = allocator.seeded && !caller.actors.unrestricted();
-            match views.fold_judging(&p.op, allocator.seeded, judge_assignee) {
+            // AGT-2428: so are its unassigns and transitions out of a
+            // started state, on a ticket held by an actor it is not bound to.
+            let bound =
+                (allocator.seeded && !caller.actors.unrestricted()).then_some(&caller.actors);
+            match views.fold_judging(&p.op, allocator.seeded, bound) {
                 Ok(Verdict::Folded) => admitted.push(p),
                 Ok(Verdict::Rejected(rejection)) => {
                     outcome.insert(p.op_id.clone(), Outcome::Rejected(rejection));

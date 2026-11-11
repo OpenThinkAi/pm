@@ -99,12 +99,14 @@ every payload field of a fresh op that names an actor:
 A bound token therefore cannot claim, hold or assign a ticket in
 another actor's name, nor register an actor it could not act as (`400
 actor_not_allowed`, `reason` naming the kind and field; `400
-reserved_actor` for `hub`). Two cases pass from any token: unassigning
-(`field.set assignee null` names nobody), and a `field.set assignee`
-whose value is the ticket's **current** assignee at the hub at that
-point in the batch — it changes nothing, and it is what a client logs
-to reconcile after the hub refused its claim (`field.set assignee` to
-`rejected.taken_by`, see [Claims](#claims-agt-1392)). An assignment to a
+reserved_actor` for `hub`). Two cases pass this check from any token:
+unassigning (`field.set assignee null` names nobody; once seeded it is
+still judged against the current holder, see AGT-2428 below), and a
+`field.set assignee` whose value is the ticket's **current** assignee
+at the hub at that point in the batch — it changes nothing, and it is
+what a client logs to reconcile after the hub refused its claim
+(`field.set assignee` to `rejected.taken_by`, see
+[Claims](#claims-agt-1392)). An assignment to a
 third actor made on a bound token's machine is refused whole with the
 rest of its batch, so bind a machine's token to every actor it assigns
 work to (or use `--any`).
@@ -125,6 +127,21 @@ as anyone and reassigns work deliberately). `pm sync` treats such a
 refusal as it treats a refused claim: acknowledged, reconciled to
 `rejected.state` / `rejected.taken_by`, and reported with the op's
 `kind`.
+
+**Releasing a held ticket (AGT-2428).** Once seeded, a bound token's
+unassign (`field.set assignee null`) and its `state.transition` out of a
+started state (to any other state) are admitted only if the ticket has
+no assignee or the token's binding permits the current one. Otherwise
+the op is refused like a losing claim — `rejected` with `code:
+held_by_another`, `taken_by` the holder, `at` the stamp of the write that
+set the assignee, nothing stored — and the ticket stays held. Without
+this a bound token could unassign another actor's ticket, move it back
+to an unstarted state and claim it, all in one batch. A token bound to
+`claude:*` still releases and re-claims a ticket another `claude:` actor
+holds (build loops recover abandoned work this way); a ticket held by an
+actor outside the binding is freed by that actor's own token or an
+unrestricted one. Restating the current state, seed mode and unrestricted
+tokens are not judged.
 
 **Why document identity relies on this (AGT-1467).** A project's
 design doc and named documents go to the *earliest* binding
@@ -569,7 +586,8 @@ claim is stored and folded. A refused one is **not stored** (no seq, no
 - `code`: `not_unstarted` | `already_assigned` | `deleted`, in
   `claim_admissible`'s order of precedence (a deleted ticket is
   `deleted` whatever else holds; a claimed ticket is `not_unstarted`,
-  since the claim moved it to a started state).
+  since the claim moved it to a started state). A bound token's refused
+  unassign or transition is `held_by_another` (AGT-2428, below).
 - `reason`: `pm_core::ClaimRejected`'s message, the string `pm claim
   --json` puts in `reason`.
 
@@ -590,8 +608,11 @@ and lose the LWW register everywhere.
 assignee` naming an actor, pushed by an actor-bound token, is judged by
 the same `claim_admissible` and refused with the same ack — unless it
 restates the ticket's current assignee (see [Token actor
-bindings](#token-actor-bindings-agt-1450)). Unrestricted tokens, and
-unassigning, are not arbitrated.
+bindings](#token-actor-bindings-agt-1450)). Unrestricted tokens are not
+arbitrated. A bound token's unassign, and its transition out of a
+started state, are refused with `code: held_by_another` when the ticket
+is held by an actor its binding does not permit (AGT-2428, see [Token
+actor bindings](#token-actor-bindings-agt-1450)).
 
 **Seeding workspace.** Every claim in a seeding push is stored and folded
 as a plain write, never arbitrated. The seed is history: each claim in it

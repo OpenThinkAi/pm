@@ -411,7 +411,8 @@ pub(crate) struct Ack {
     #[serde(default)]
     pub stored: bool,
     /// Present only on a refused `claim` (or, AGT-1482, an actor-bound
-    /// token's `field.set assignee`).
+    /// token's `field.set assignee`; AGT-2428, its unassign or transition
+    /// out of a started state on a ticket another actor holds).
     #[serde(default)]
     pub rejected: Option<Rejected>,
 }
@@ -436,7 +437,8 @@ pub(crate) struct Rejected {
     pub at: Hlc,
     /// The ticket's state at the hub.
     pub state: String,
-    /// `not_unstarted` | `already_assigned` | `deleted`.
+    /// `not_unstarted` | `already_assigned` | `deleted`, or
+    /// `held_by_another` (AGT-2428).
     pub code: String,
     /// `pm_core::ClaimRejected`'s message.
     pub reason: String,
@@ -447,7 +449,9 @@ pub(crate) struct Rejected {
 pub(crate) struct RejectedClaim {
     pub op_id: Ulid,
     /// `claim`, or (AGT-1482) `field.set`: an assignee write from an
-    /// actor-bound token, which the hub judges like a claim.
+    /// actor-bound token, which the hub judges like a claim; or
+    /// (AGT-2428) that token's unassign or `state.transition` out of a
+    /// started state on a ticket held by an actor it is not bound to.
     pub kind: &'static str,
     pub ticket: Ulid,
     #[serde(flatten)]
@@ -464,10 +468,11 @@ impl std::fmt::Display for RejectedClaim {
             f,
             "the hub refused {} {} on ticket {}: {holder} since {} ({}); \
              reconciled locally to the hub's answer",
-            if self.kind == "claim" {
-                "claim"
-            } else {
-                "assignee write"
+            match (self.kind, self.rejected.code.as_str()) {
+                ("claim", _) => "claim",
+                ("state.transition", _) => "state transition",
+                (_, "held_by_another") => "unassign",
+                _ => "assignee write",
             },
             self.op_id,
             self.ticket,
