@@ -155,6 +155,11 @@ const SESSION: &str = "session";
 pub(crate) struct Runtime {
     pub path: PathBuf,
     pub version: String,
+    /// The pinned digest `path` was verified against (a `PATH` hit), so
+    /// every spawn re-checks it immediately before running the file
+    /// (AGT-2434); `None` for a configured `ui_leaf.path`, which is run
+    /// as the operator named it.
+    pub digest: Option<String>,
 }
 
 /// Why there is no runtime to launch. `Display` is the one-line note pm
@@ -325,11 +330,17 @@ fn locate(
     path_var: Option<&OsStr>,
 ) -> std::result::Result<PathBuf, Missing> {
     if let Some(path) = configured {
-        return if is_executable(&path) {
-            Ok(native_binary(&path))
+        if !is_executable(&path) {
+            return Err(Missing::NotExecutable(path));
+        }
+        // Only the npm package's shim is swapped for the native binary
+        // beside it (AGT-2434): a configured file is otherwise run as
+        // named, whatever happens to sit next to it.
+        return Ok(if verify_npm_package(&path).is_ok() {
+            native_binary(&path)
         } else {
-            Err(Missing::NotExecutable(path))
-        };
+            path
+        });
     }
     let found = path_var.and_then(search_path).ok_or(Missing::NotFound)?;
     verify_npm_package(&found).map_err(|why| Missing::Untrusted {
@@ -360,15 +371,16 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     }))
 }
 
-/// Checks that `path` hashes to one of `trusted` (AGT-1482).
-fn verify_digest(path: &Path, trusted: &[&str]) -> std::result::Result<(), Missing> {
+/// Checks that `path` hashes to one of `trusted` (AGT-1482); the digest
+/// it has.
+fn verify_digest(path: &Path, trusted: &[&str]) -> std::result::Result<String, Missing> {
     let unverified = |why: String| Missing::Unverified {
         path: path.to_path_buf(),
         why,
     };
     let digest = sha256_file(path).map_err(|e| unverified(format!("cannot hash it: {e}")))?;
     if trusted.iter().any(|t| t.eq_ignore_ascii_case(&digest)) {
-        Ok(())
+        Ok(digest)
     } else {
         Err(unverified(format!(
             "sha256 {digest} is not a pinned {}.{}.x build",
@@ -391,18 +403,37 @@ fn trusted_digests(env: &Env) -> Vec<&str> {
 }
 
 /// [`locate`], then — for a `PATH` hit, never for `ui_leaf.path` — the
-/// digest check.
+/// digest check; the path, and the digest it was verified at.
 fn resolve(
     configured: Option<PathBuf>,
     path_var: Option<&OsStr>,
     trusted: &[&str],
-) -> std::result::Result<PathBuf, Missing> {
+) -> std::result::Result<(PathBuf, Option<String>), Missing> {
     let explicit = configured.is_some();
     let path = locate(configured, path_var)?;
-    if !explicit {
-        verify_digest(&path, trusted)?;
+    let digest = if explicit {
+        None
+    } else {
+        Some(verify_digest(&path, trusted)?)
+    };
+    Ok((path, digest))
+}
+
+/// Re-hashes a verified runtime's file immediately before it is spawned
+/// (AGT-2434): it was hashed when found and is run by path, so a file
+/// swapped in between would otherwise run unverified.
+fn recheck(path: &Path, digest: Option<&str>) -> std::result::Result<(), String> {
+    let Some(want) = digest else {
+        return Ok(());
+    };
+    match sha256_file(path) {
+        Ok(have) if have.eq_ignore_ascii_case(want) => Ok(()),
+        Ok(have) => Err(format!(
+            "{} changed since it was verified (sha256 {have}, expected {want}); not running it",
+            path.display()
+        )),
+        Err(e) => Err(format!("cannot re-hash {}: {e}", path.display())),
     }
-    Ok(path)
 }
 
 /// `<path> --version`'s stdout, bounded by [`VERSION_TIMEOUT`].
@@ -434,12 +465,14 @@ fn run_version(path: &Path) -> std::result::Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Checks the pin on `path`.
-fn probe(path: PathBuf) -> std::result::Result<Runtime, Missing> {
-    let output = run_version(&path).map_err(|why| Missing::Unrunnable {
-        path: path.clone(),
-        why,
-    })?;
+/// Checks the pin on `path` (verified at `digest`, when it was).
+fn probe((path, digest): (PathBuf, Option<String>)) -> std::result::Result<Runtime, Missing> {
+    let output = recheck(&path, digest.as_deref())
+        .and_then(|()| run_version(&path))
+        .map_err(|why| Missing::Unrunnable {
+            path: path.clone(),
+            why,
+        })?;
     let Some(version) = parse_version(&output) else {
         return Err(Missing::Unrunnable {
             path,
@@ -456,6 +489,7 @@ fn probe(path: PathBuf) -> std::result::Result<Runtime, Missing> {
     Ok(Runtime {
         path,
         version: shown,
+        digest,
     })
 }
 
@@ -637,6 +671,7 @@ pub(crate) async fn drive(
     state: Arc<AppState>,
     stop: impl Future<Output = ()>,
 ) -> Result<Ended> {
+    recheck(&runtime.path, runtime.digest.as_deref()).map_err(crate::exit::CliError::error)?;
     let mut child = tokio::process::Command::new(&runtime.path)
         .arg("mount")
         .stdin(Stdio::piped())
@@ -828,7 +863,24 @@ mod tests {
         let configured = script(tmp.path(), "custom-ui-leaf", "echo 1.6.0");
         assert_eq!(
             locate(Some(configured.clone()), Some(&path_var)),
+            Ok(configured.clone())
+        );
+        // AGT-2434: a configured file that is not the npm shim runs as
+        // named, even with a `ui-leaf-bin` beside it; the shim itself is
+        // still swapped for its native binary.
+        script(tmp.path(), "ui-leaf-bin", "echo sibling 1.6.0");
+        assert_eq!(
+            locate(Some(configured.clone()), Some(&path_var)),
             Ok(configured)
+        );
+        let shim_dir = tmp.path().join("shim-bin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = npm_install(tmp.path(), "cfg", NPM_PACKAGE, &shim_dir);
+        let real = std::fs::canonicalize(&shim).unwrap();
+        let native = script(real.parent().unwrap(), "ui-leaf-bin", "echo native 1.6.0");
+        assert_eq!(
+            locate(Some(shim), None),
+            Ok(std::fs::canonicalize(native).unwrap())
         );
         // A configured path that is wrong is reported, not skipped.
         let wrong = tmp.path().join("nope");
@@ -872,9 +924,15 @@ mod tests {
         assert!(note.contains("ui_leaf.path"), "{note}");
 
         // Trusted by digest (either case): launched.
-        assert_eq!(resolve(None, Some(&path_var), &[&digest]), Ok(link.clone()));
+        assert_eq!(
+            resolve(None, Some(&path_var), &[&digest]),
+            Ok((link.clone(), Some(digest.clone())))
+        );
         let upper = digest.to_uppercase();
-        assert_eq!(resolve(None, Some(&path_var), &[&upper]), Ok(link));
+        assert_eq!(
+            resolve(None, Some(&path_var), &[&upper]),
+            Ok((link, Some(digest.clone())))
+        );
 
         // With a native sibling, the sibling is what is hashed: the shim's
         // digest no longer vouches for it.
@@ -887,12 +945,12 @@ mod tests {
         let native_digest = sha256_file(&native).unwrap();
         assert_eq!(
             resolve(None, Some(&path_var), &[&native_digest]),
-            Ok(native)
+            Ok((native, Some(native_digest)))
         );
 
         // ui_leaf.path: trusted as given, whatever it hashes to.
         let mine = script(tmp.path(), "mine", "echo 1.6.0");
-        assert_eq!(resolve(Some(mine.clone()), None, &[]), Ok(mine));
+        assert_eq!(resolve(Some(mine.clone()), None, &[]), Ok((mine, None)));
     }
 
     #[test]
@@ -968,20 +1026,41 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let good = script(tmp.path(), "good", "echo 1.6.0");
         assert_eq!(
-            probe(good.clone()),
+            probe((good.clone(), None)),
             Ok(Runtime {
-                path: good,
-                version: "1.6.0".into()
+                path: good.clone(),
+                version: "1.6.0".into(),
+                digest: None,
             })
         );
         let old = script(tmp.path(), "old", "echo 1.5.1");
-        assert!(matches!(probe(old), Err(Missing::Unpinned { version, .. }) if version == "1.5.1"));
+        assert!(
+            matches!(probe((old, None)), Err(Missing::Unpinned { version, .. }) if version == "1.5.1")
+        );
         let next = script(tmp.path(), "next", "echo 1.7.0");
-        assert!(matches!(probe(next), Err(Missing::Unpinned { .. })));
+        assert!(matches!(probe((next, None)), Err(Missing::Unpinned { .. })));
+        // AGT-2434: a verified file is re-hashed before it runs; one that
+        // changed since is not run at all.
+        let digest = sha256_file(&good).unwrap();
+        assert_eq!(
+            probe((good.clone(), Some(digest.clone()))).unwrap().digest,
+            Some(digest.clone())
+        );
+        std::fs::write(&good, "#!/bin/sh\necho 1.6.0 swapped\n").unwrap();
+        assert!(matches!(
+            probe((good.clone(), Some(digest))),
+            Err(Missing::Unrunnable { why, .. }) if why.contains("changed since it was verified")
+        ));
         let garbage = script(tmp.path(), "garbage", "echo hello");
-        assert!(matches!(probe(garbage), Err(Missing::Unrunnable { .. })));
+        assert!(matches!(
+            probe((garbage, None)),
+            Err(Missing::Unrunnable { .. })
+        ));
         let failing = script(tmp.path(), "failing", "exit 3");
-        assert!(matches!(probe(failing), Err(Missing::Unrunnable { .. })));
+        assert!(matches!(
+            probe((failing, None)),
+            Err(Missing::Unrunnable { .. })
+        ));
     }
 
     #[test]
@@ -1022,6 +1101,7 @@ mod tests {
         Runtime {
             path: "/x/ui-leaf".into(),
             version: "1.6.0".into(),
+            digest: None,
         }
     }
 

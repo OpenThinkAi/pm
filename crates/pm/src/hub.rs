@@ -415,6 +415,11 @@ fn is_loopback_host(url: &str) -> bool {
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url);
     let authority = rest.split(['/']).next().unwrap_or("");
+    // Credentials in the authority (`http://127.0.0.1:1@evil`) put the
+    // real host after the `@`: never loopback (AGT-2434).
+    if authority.contains('@') {
+        return false;
+    }
     let host = match authority.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => authority.split(':').next().unwrap_or(""),
@@ -442,8 +447,22 @@ fn check_transport(url: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// [`check_transport`] for a URL read back from config.toml.
+/// [`check_transport`] for a URL read back from config.toml — after
+/// [`normalize_url`], which it must already be (AGT-2434): `pm hub login`
+/// only ever stores a normalized URL, so one that is not (credentials, a
+/// query, whitespace) was edited in by hand and is refused.
 fn check_configured(url: &str) -> Result<()> {
+    match normalize_url(url) {
+        Ok(normal) if normal == url => {}
+        _ => {
+            return Err(CliError::error(format!(
+                "the hub URL in config.toml ({}) is not one `pm hub login` would store \
+                 (http(s)://host[:port][/path], no credentials, query or fragment); \
+                 re-run `pm hub login`",
+                crate::text::inline(url)
+            )));
+        }
+    }
     check_transport(url).map_err(|e| {
         CliError::error(format!(
             "{e}; re-run `pm hub login https://...` with an https URL (config.toml still holds the http one)"
@@ -703,6 +722,33 @@ mod tests {
         ] {
             let e = check_transport(bad).unwrap_err();
             assert!(e.contains("https://"), "{bad}: {e}");
+        }
+    }
+
+    /// AGT-2434: credentials in the authority hide the real host, and a
+    /// URL in config.toml must be exactly what `pm hub login` stores.
+    #[test]
+    fn configured_urls_must_be_normalized_and_credential_free() {
+        assert!(!is_loopback_host("http://127.0.0.1:1@evil.example"));
+        assert!(!is_loopback_host("http://localhost@evil.example/x"));
+        assert!(check_transport("http://127.0.0.1:1@evil.example").is_err());
+        for ok in [
+            "https://hub-production-8a91.up.railway.app",
+            "http://127.0.0.1:8080",
+            "https://h.example/base",
+        ] {
+            assert!(check_configured(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://127.0.0.1:1@evil.example",
+            "https://user:pw@h.example",
+            "https://h.example/",
+            "https://h.example?x=1",
+            " https://h.example",
+            "h.example",
+        ] {
+            let e = check_configured(bad).unwrap_err().error.to_string();
+            assert!(e.contains("pm hub login"), "{bad}: {e}");
         }
     }
 

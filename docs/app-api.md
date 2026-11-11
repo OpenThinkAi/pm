@@ -394,7 +394,9 @@ package (AGT-1465): pm resolves the shim's symlink and requires the
 named `@openthink/ui-leaf`; anything else — a stray executable, another
 package's shim — is not launched, pm says so on stderr, and the editor flow
 runs until the binary is named in `ui_leaf.path`. When that is the npm
-package's Node shim, pm runs the native `ui-leaf-bin` beside it. **Integrity
+package's Node shim, pm runs the native `ui-leaf-bin` beside it (a
+configured `ui_leaf.path` gets the same swap only when it is the npm shim,
+AGT-2434; any other configured file runs as named). **Integrity
 (AGT-1482):** that binary (or the shim, when there is no native sibling)
 must also hash to one of `PINNED_BUILDS` in `crates/pm/src/app/launch.rs` —
 the SHA-256 of every published build of the supported releases, per
@@ -402,7 +404,9 @@ platform (1.6.0 on darwin-arm64, darwin-x64, linux-arm64, linux-x64 and
 win32-x64). A package that passes the name check but carries any other
 binary — a tampered npm release or GitHub asset, a write to the npm prefix,
 an unpinned 1.6.x patch — is not launched; pm says so (with the digest it
-saw) and the editor flow runs. `ui_leaf.path` is the explicit opt-in: a
+saw) and the editor flow runs. The verified binary is hashed again
+immediately before each spawn (`--version` and `mount`, AGT-2434), and is
+not run if it changed since. `ui_leaf.path` is the explicit opt-in: a
 configured binary is trusted as given and never hashed (a local build, or a
 release pm has not pinned yet). It must report (`--version`) a version in
 `>=1.6.0, <1.7.0` — exactly the minor the views were built and verified
@@ -501,7 +505,8 @@ They ship inside the `pm` binary (`include_str!`, listed in
 `crates/pm/views/` is missing from that list) and are unpacked on launch
 into `$XDG_CACHE_HOME/pm/views/<fingerprint>/` (else `~/.cache/…`),
 reused until the sources change. `PM_VIEWS_DIR=<dir>` mounts `<dir>`
-instead, for developing a view without rebuilding pm.
+instead, for developing a view without rebuilding pm; pm prints one
+stderr line naming the directory whenever it does (AGT-2434).
 
 | View | Opened by | Today (AGT-1402) | Becomes |
 |---|---|---|---|

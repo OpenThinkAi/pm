@@ -132,6 +132,12 @@ pub(crate) fn root(env: &Env) -> Result<PathBuf> {
                 dir.display()
             )));
         }
+        // AGT-2434: the views run with the API token, so say whenever they
+        // come from somewhere other than this binary.
+        eprintln!(
+            "pm: PM_VIEWS_DIR is set: mounting views from {}",
+            crate::text::inline(&dir.display().to_string())
+        );
         return Ok(dir);
     }
     let base = env.cache_dir()?.join("views");
