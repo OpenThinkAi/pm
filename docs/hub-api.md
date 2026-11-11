@@ -17,6 +17,9 @@ same bare `404` an unknown route gets, so a caller without a grant learns
 nothing (think-hub precedent). A wrong method on a real route is that
 404 too.
 
+A revoked token's row is kept, with its `revoked_at`, as an audit trail;
+`pm-hub` never purges revoked tokens (AGT-2434).
+
 ### Transport security
 
 - **Client to hub.** The bearer token rides every request, so `pm hub
@@ -57,6 +60,10 @@ author ops as (`tokens.actors`, schema version 4):
 | `matt` | exactly the actor `matt` |
 | `claude:*` | any actor starting `claude:` (a trailing `*` is a prefix match; `*` may appear only at the end) |
 | `*` | any actor |
+
+A binding limits what a token may **write**, not what it may read: any
+token for the workspace, whatever its patterns, can pull the full op log
+(AGT-2434).
 
 - `pm-hub token create <name> --workspace <id> --actor <pattern> …`
   (repeat `--actor` or comma-separate) mints a bound token;
