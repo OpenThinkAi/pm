@@ -72,6 +72,12 @@
 //! valid and new ops simply append to the last shard. `--restore` reads
 //! either layout (the legacy file, when present, wins: it is the source an
 //! interrupted migration's shards were derived from).
+//!
+//! Shards and the config snapshot hold every ticket, comment and document,
+//! so they are written owner-only (0600) and the directories `pm backup`
+//! creates 0700, as `pm export md` does (AGT-2434); shards an older binary
+//! left world-readable are narrowed on the next run. Git records only the
+//! executable bit, so the modes never show up as changes in the repo.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -87,6 +93,7 @@ use serde_json::json;
 use ulid::Ulid;
 
 use crate::exit::{CliError, Result};
+use crate::export::{create_private_dirs, open_private, restrict_private, write_private};
 use crate::verbs::{Ctx, SCHEMA, print_json};
 use crate::workspace::{self, DB_FILE};
 
@@ -193,7 +200,7 @@ fn git_ok(dir: &Path, args: &[&str]) -> Result<bool> {
 /// tests and smoke run this against a bare local "remote" without hitting
 /// the network or a real GitHub repo.
 fn ensure_git_dir(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    create_private_dirs(dir)?;
     if !dir.join(".git").is_dir() {
         run_git(dir, &["init", "--quiet"])?;
     }
@@ -299,8 +306,14 @@ impl ShardWriter {
     /// Continues the newest existing shard under `dir` (or starts
     /// `000001.jsonl`).
     fn open(dir: &Path, rotate_at: u64) -> Result<Self> {
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let (current, size) = match list_shards(dir)?.last() {
+        create_private_dirs(dir)?;
+        let shards = list_shards(dir)?;
+        // Shards a pre-AGT-2434 binary wrote with the umask's mode are
+        // narrowed too, not only the one appended to next.
+        for (_, path) in &shards {
+            restrict_private(path)?;
+        }
+        let (current, size) = match shards.last() {
             Some((n, path)) => (
                 *n,
                 fs::metadata(path)
@@ -340,11 +353,7 @@ impl ShardWriter {
             return Ok(());
         }
         let path = self.path();
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let mut file = open_private(&path, fs::OpenOptions::new().create(true).append(true))?;
         file.write_all(self.buffer.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
         self.buffer.clear();
@@ -424,7 +433,7 @@ pub fn run(ctx: &Ctx<'_>, to: Option<PathBuf>) -> Result<()> {
     let target = dir.to_string_lossy().into_owned();
 
     let ops_dir = dir.join("ops");
-    fs::create_dir_all(&ops_dir).with_context(|| format!("creating {}", ops_dir.display()))?;
+    create_private_dirs(&ops_dir)?;
     crate::ids::safe_component(&ws.prefix, "workspace prefix")?;
     let layout = Layout::new(&dir, &ws.prefix.to_ascii_lowercase());
 
@@ -451,11 +460,12 @@ pub fn run(ctx: &Ctx<'_>, to: Option<PathBuf>) -> Result<()> {
     // changes independently of the op count, and a restore of a backup
     // whose log predates config ops learns its workspace from it.
     let snapshot = config_snapshot(&store, &ws)?;
-    fs::write(
+    write_private(
         &layout.config,
-        serde_json::to_string_pretty(&snapshot).expect("a snapshot serializes"),
-    )
-    .with_context(|| format!("writing {}", layout.config.display()))?;
+        serde_json::to_string_pretty(&snapshot)
+            .expect("a snapshot serializes")
+            .as_bytes(),
+    )?;
 
     // `-A` so a migrated-away legacy file is staged as a removal too.
     run_git(&dir, &["add", "-A", "--", "ops/"])?;
