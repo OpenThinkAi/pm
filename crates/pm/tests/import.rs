@@ -1365,3 +1365,30 @@ fn a_parked_vault_project_imports_as_parked() {
     sb.import(&vault);
     assert_eq!(sb.store().doctor().unwrap().op_count, before);
 }
+
+/// AGT-2434: `pm init` creates its workspace directory (and the database
+/// in it) owner-only, and the parity report is written 0600 — narrowing
+/// one an earlier run left world-readable.
+#[cfg(unix)]
+#[test]
+fn the_workspace_and_the_parity_report_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let sb = Sandbox::initialized();
+    assert_eq!(mode(&sb.ws), 0o700);
+    assert_eq!(mode(&sb.ws.join("pm.sqlite")), 0o600);
+    let report = sb.home.path().join("parity.md");
+    std::fs::write(&report, "old").unwrap();
+    std::fs::set_permissions(&report, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let vault = sb.vault_copy();
+    assert_ok(&sb.pm(&[
+        "import",
+        "vault",
+        vault.to_str().unwrap(),
+        "--report",
+        report.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(mode(&report), 0o600);
+    assert!(std::fs::read_to_string(&report).unwrap().len() > 3);
+}

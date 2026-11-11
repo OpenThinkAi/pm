@@ -35,7 +35,6 @@ mod vault;
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::Context;
 use pm_core::op::BodyEdit;
 use pm_core::{ActorId, Body, Clock, Payload, ProjectStatus};
 use pm_store::Store;
@@ -321,8 +320,9 @@ fn write_parity(
         &report.non_template,
         path,
     )?;
-    std::fs::write(path, &parity.markdown)
-        .with_context(|| format!("writing {}", path.display()))?;
+    // Owner-only, like every other file pm writes ticket content to
+    // (AGT-2434).
+    crate::export::write_private(path, parity.markdown.as_bytes())?;
     report.parity = Some(parity.summary);
     Ok(())
 }

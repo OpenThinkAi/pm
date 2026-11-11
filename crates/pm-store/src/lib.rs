@@ -151,6 +151,8 @@ impl Store {
     /// with foreign keys enforced and a busy timeout, so concurrent
     /// writers queue instead of failing.
     pub fn open(path: impl AsRef<Path>) -> Result<Store> {
+        let path = path.as_ref();
+        owner_only(path)?;
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -237,9 +239,79 @@ impl Store {
     }
 }
 
+/// Makes the database at `path` owner-only (AGT-2434): created `0600` if
+/// it is not there yet — SQLite then creates its `-wal` and `-shm` files
+/// with the same mode — and, if it already exists, narrowed to `0600`
+/// along with any `-wal` / `-shm` beside it (a database an older pm
+/// created under the default umask). Narrowing is best effort: a file
+/// this user cannot chmod is left for SQLite to open or refuse.
+fn owner_only(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if path.as_os_str() == ":memory:" || path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // No directory, no permission: SQLite reports it properly.
+            Err(_) => return Ok(()),
+        }
+        let mut sidecars = vec![path.to_path_buf()];
+        for suffix in ["-wal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            sidecars.push(name.into());
+        }
+        for file in sidecars {
+            if let Ok(meta) = std::fs::metadata(&file)
+                && meta.is_file()
+                && meta.permissions().mode() & 0o077 != 0
+            {
+                let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AGT-2434: a new database is created owner-only, and an existing
+    /// world-readable one (and its WAL) is narrowed on open.
+    #[cfg(unix)]
+    #[test]
+    fn the_database_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let fresh = dir.path().join("fresh.sqlite");
+        drop(Store::open(&fresh).unwrap());
+        assert_eq!(mode(&fresh), 0o600);
+
+        let old = dir.path().join("old.sqlite");
+        drop(Store::open(&old).unwrap());
+        let wal = dir.path().join("old.sqlite-wal");
+        std::fs::write(&wal, b"").unwrap();
+        for p in [&old, &wal] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        // Checked while open: SQLite removes the WAL on a clean close.
+        let store = Store::open(&old).unwrap();
+        assert_eq!(mode(&old), 0o600);
+        assert_eq!(mode(&wal), 0o600);
+        drop(store);
+    }
 
     #[test]
     fn migrations_are_ordered_and_end_at_the_supported_version() {

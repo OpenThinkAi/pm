@@ -19,7 +19,7 @@ previous value stays in the history.
 
 | Place | What it holds |
 | --- | --- |
-| The op log (`pm.sqlite` on every replica) | Every op ever written: titles, comments, hold reasons, field values, including those of deleted records and superseded values. |
+| The op log (`pm.sqlite` on every replica) | Every op ever written: titles, comments, hold reasons, field values, including those of deleted records and superseded values. The database (and its `-wal`/`-shm`) is owner-only (`0600`; an older one is narrowed when opened), in a `0700` directory when `pm init` creates it (AGT-2434). |
 | Loro body history (same database) | Ticket bodies and project docs are Loro documents. Text you removed from a body is still in the document's causal history and in every replica's copy of it. |
 | The hub (Postgres `ops` table) | The same ops, for every workspace synced to it. Hub-side admin deletes of tokens or workspaces are separate from op content. |
 | Git backups (`pm backup`) | Op shards (`ops/<prefix>/*.jsonl`) committed to the backup repo, so git history keeps every version of every shard, for as long as that repo and its clones exist. |
