@@ -940,3 +940,53 @@ fn restore_of_a_pre_agt_1413_backup_binds_documents_from_the_snapshot() {
     assert_eq!(rebound, 3, "pm's and pm-hub's design docs, and notes");
     assert_ok(&restored.pm(&["doctor", "--rebuild", "--workspace", ws]));
 }
+
+/// Shards and the config snapshot are owner-only, the directories
+/// `pm backup` creates are 0700, a shard an older binary left
+/// world-readable is narrowed, and git still commits and pushes as before
+/// (AGT-2434).
+#[cfg(unix)]
+#[test]
+fn backup_files_are_owner_only_and_git_still_works() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let sb = Sandbox::initialized();
+    sb.new_ticket("first");
+
+    // A target pm creates itself.
+    let fresh = tempfile::tempdir().unwrap();
+    let target = fresh.path().join("backup");
+    let out = json(&sb.pm(&["backup", "--to", target.to_str().unwrap(), "--json"]));
+    assert_eq!(out["committed"], true, "{out}");
+    for dir in [&target, &target.join("ops"), &target.join("ops/agt")] {
+        assert_eq!(mode(dir), 0o700, "{}", dir.display());
+    }
+    for file in ["ops/agt/000001.jsonl", "ops/agt.config.json"] {
+        assert_eq!(mode(&target.join(file)), 0o600, "{file}");
+    }
+    let clean = git(&target, &["status", "--porcelain"]);
+    assert!(clean.status.success());
+    assert_eq!(stdout(&clean), "", "the backup left changes behind");
+
+    // A shard and snapshot left 0644 by an older binary are narrowed,
+    // and the next backup still commits and pushes.
+    let remote = RemoteBackup::new();
+    let first = json(&sb.pm(&["backup", "--to", remote.work.to_str().unwrap(), "--json"]));
+    assert_eq!(first["pushed"], true, "{first}");
+    let shard = remote.work.join("ops/agt/000001.jsonl");
+    let config = remote.work.join("ops/agt.config.json");
+    for file in [&shard, &config] {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    sb.new_ticket("second");
+    let second = json(&sb.pm(&["backup", "--to", remote.work.to_str().unwrap(), "--json"]));
+    assert_eq!(second["committed"], true, "{second}");
+    assert_eq!(second["pushed"], true, "{second}");
+    assert_eq!(mode(&shard), 0o600);
+    assert_eq!(mode(&config), 0o600);
+    let clean = git(&remote.work, &["status", "--porcelain"]);
+    assert_eq!(stdout(&clean), "", "the backup left changes behind");
+    // Git stores the files as plain 100644 blobs either way.
+    let tree = stdout(&git(&remote.work, &["ls-tree", "-r", "HEAD"]));
+    assert!(tree.lines().all(|l| l.starts_with("100644 ")), "{tree}");
+}

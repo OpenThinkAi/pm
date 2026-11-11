@@ -125,30 +125,51 @@ fn write(root: &Path, r: &Rendered) -> Result<()> {
     if let Some(parent) = path.parent() {
         create_private_dirs(parent)?;
     }
+    write_private(&path, r.text.as_bytes())
+}
+
+/// Replaces `path`'s contents with `bytes`, the file owner-only (0600)
+/// whether this creates it or not. Shared with `pm backup` (AGT-2434).
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
+    let mut file = open_private(path, &mut options)?;
+    std::io::Write::write_all(&mut file, bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Opens `path` with `options`, created 0600 and, if it already existed,
+/// narrowed to 0600 before anything is written to it.
+pub(crate) fn open_private(path: &Path, options: &mut fs::OpenOptions) -> Result<fs::File> {
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options
-        .open(&path)
+    std::os::unix::fs::OpenOptionsExt::mode(options, 0o600);
+    let file = options
+        .open(path)
         .with_context(|| format!("writing {}", path.display()))?;
     // `mode` applies only to a file this call creates; a file an earlier
-    // export (or anyone) left behind is narrowed too.
+    // run (or anyone) left behind is narrowed too.
+    restrict_private(path)?;
+    Ok(file)
+}
+
+/// Narrows an existing file to owner-only (0600); a no-op off unix.
+pub(crate) fn restrict_private(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("restricting {}", path.display()))?;
     }
-    std::io::Write::write_all(&mut file, r.text.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
 /// `create_dir_all`, with every directory it creates 0700 (AGT-1482). A
 /// directory that already exists — the export root the operator named,
 /// say, or their home — is left as it is.
-fn create_private_dirs(dir: &Path) -> Result<()> {
+pub(crate) fn create_private_dirs(dir: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
