@@ -467,7 +467,8 @@ fn release_admissible(
         code: "held_by_another",
         reason: format!(
             "ticket is assigned to {holder}, whom this token may not act as; \
-             only a token bound to {holder} may unassign it or move it out of '{}'",
+             only a token bound to {holder}, or an unrestricted token, may unassign it or \
+             move it out of '{}'",
             view.state.value
         ),
     })

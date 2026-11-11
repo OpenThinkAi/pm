@@ -101,11 +101,12 @@ another actor's name, nor register an actor it could not act as (`400
 actor_not_allowed`, `reason` naming the kind and field; `400
 reserved_actor` for `hub`). Two cases pass this check from any token:
 unassigning (`field.set assignee null` names nobody; once seeded it is
-still judged against the current holder, see AGT-2428 below), and a `field.set assignee`
-whose value is the ticket's **current** assignee at the hub at that
-point in the batch — it changes nothing, and it is what a client logs
-to reconcile after the hub refused its claim (`field.set assignee` to
-`rejected.taken_by`, see [Claims](#claims-agt-1392)). An assignment to a
+still judged against the current holder, see AGT-2428 below), and a
+`field.set assignee` whose value is the ticket's **current** assignee
+at the hub at that point in the batch — it changes nothing, and it is
+what a client logs to reconcile after the hub refused its claim
+(`field.set assignee` to `rejected.taken_by`, see
+[Claims](#claims-agt-1392)). An assignment to a
 third actor made on a bound token's machine is refused whole with the
 rest of its batch, so bind a machine's token to every actor it assigns
 work to (or use `--any`).
