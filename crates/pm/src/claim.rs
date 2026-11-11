@@ -177,7 +177,7 @@ fn authority(ctx: &Ctx<'_>, ws: &Workspace) -> Result<Authority> {
     match status {
         200 => {}
         404 => return Err(hub_required(sync::unauthorized(&hub))),
-        503 => return Err(hub_required(sync::unavailable())),
+        503 => return Err(hub_required(sync::unavailable(&body))),
         other => return Err(hub_required(sync::unexpected(other, "whoami"))),
     }
     let seeded = serde_json::from_str::<Value>(&body)

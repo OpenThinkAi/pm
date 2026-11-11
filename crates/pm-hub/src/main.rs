@@ -115,7 +115,7 @@ struct Db {
     reader: Arc<Client>,
     writer: Arc<writer::Writers>,
     /// The in-flight push body budget (`ops::push_budget`, AGT-2430).
-    push_budget: Arc<tokio::sync::Semaphore>,
+    push_budget: Arc<ops::PushBudget>,
 }
 
 impl FromRef<Db> for Arc<Client> {

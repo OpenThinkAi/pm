@@ -563,7 +563,9 @@ fn push_until(port: u16, token: &str, want: u16) -> (u16, Value) {
 
 /// Pushes share a bounded budget of in-flight body bytes (AGT-2430): with
 /// it full of stalled 64 MiB uploads, a push is `503 busy` straight away,
-/// for every workspace; once one upload goes away its share is back.
+/// for every workspace; once one upload goes away its share is back. One
+/// token holds at most two such uploads (AGT-2434), so the budget fills
+/// from two tokens.
 #[test]
 fn in_flight_push_bodies_are_bounded() {
     let Some((_container, url)) = postgres_for("in_flight_push_bodies_are_bounded") else {
@@ -573,27 +575,40 @@ fn in_flight_push_bodies_are_bounded() {
     let mut hub = spawn_hub(&url, port);
     wait_for_health(&mut hub, port);
     let token = create_token(&url, "studio", "saltline");
+    let second = create_token(&url, "laptop", "saltline");
+    let third = create_token(&url, "phone", "saltline");
     let other = create_token(&url, "elsewhere", "other");
 
-    // Uploads that announce 64 MiB and send nothing fill the budget: each
-    // either holds its share (no answer yet) or, once it is full, is
-    // turned away at once without its body.
-    let mut stalled: Vec<TcpStream> = Vec::new();
-    let busy = loop {
-        assert!(stalled.len() <= 4, "more than four 64 MiB uploads held");
-        let mut stream = stalled_push(port, &token, 64 * 1024 * 1024);
+    // Uploads that announce 64 MiB and send nothing: each either holds its
+    // share (no answer yet) or, once its token's share or the whole budget
+    // is full, is turned away at once without its body.
+    let try_stall = |token: &str| -> Result<TcpStream, String> {
+        let mut stream = stalled_push(port, token, 64 * 1024 * 1024);
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let mut raw = String::new();
         match stream.read_to_string(&mut raw) {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => stalled.push(stream),
-            _ => break raw,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(stream),
+            _ => Err(raw),
         }
     };
-    assert_eq!(stalled.len(), 4);
+    let mut stalled: Vec<TcpStream> = Vec::new();
+    for _ in 0..2 {
+        stalled.push(try_stall(&token).expect("within the token's share"));
+    }
+    // The token's share is full; the hub still has room for others.
+    let refused = try_stall(&token).expect_err("past the token's share");
+    assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+    assert!(refused.contains(r#""error":"busy""#), "{refused}");
+    assert!(refused.contains("this token"), "{refused}");
+    for _ in 0..2 {
+        stalled.push(try_stall(&second).expect("within the budget"));
+    }
+    let busy = try_stall(&third).expect_err("past the whole budget");
     assert!(busy.starts_with("HTTP/1.1 503"), "{busy}");
     assert!(busy.contains(r#""error":"busy""#), "{busy}");
+    assert!(busy.contains("buffers at once"), "{busy}");
 
     let (status, body) = push(port, &token, &[serde_json::to_value(label("b")).unwrap()]);
     assert_eq!(status, 503, "{body}");
@@ -607,9 +622,10 @@ fn in_flight_push_bodies_are_bounded() {
         "{resp:?}"
     );
 
-    // One upload gives up: its share is released and pushes land again.
+    // One upload gives up: its share is released and pushes land again
+    // (from its token: the first token is still at its own share).
     drop(stalled.pop());
-    let (status, body) = push_until(port, &token, 200);
+    let (status, body) = push_until(port, &second, 200);
     assert_eq!(status, 200, "{body}");
     assert_eq!(count_ops(&url), 1);
     drop(stalled);

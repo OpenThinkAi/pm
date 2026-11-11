@@ -218,7 +218,7 @@ fn whoami_seeded(hub: &HubClient) -> Result<bool> {
     match status {
         200 => {}
         404 => return Err(sync::unauthorized(hub)),
-        503 => return Err(sync::unavailable()),
+        503 => return Err(sync::unavailable(&body)),
         other => return Err(sync::unexpected(other, "whoami")),
     }
     let v: Value = serde_json::from_str(&body).context("the hub's whoami is not JSON")?;
@@ -271,7 +271,7 @@ fn end_seed(store: &mut Store, hub: &HubClient, floor: u64) -> Result<Ended> {
         }
         404 => return Err(sync::unauthorized(hub)),
         400 => return Err(sync::refused(status, &body)),
-        503 => return Err(sync::unavailable()),
+        503 => return Err(sync::unavailable(&body)),
         other => return Err(sync::unexpected(other, "the seed end")),
     }
     let seeded: Seeded = serde_json::from_str(&body)

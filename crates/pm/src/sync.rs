@@ -345,7 +345,7 @@ fn post_batch(hub: &HubClient, batch: &Batch) -> Result<Vec<Ack>> {
         200 => {}
         404 => return Err(unauthorized(hub)),
         400 | 413 => return Err(refused(status, &body)),
-        503 => return Err(unavailable()),
+        503 => return Err(unavailable(&body)),
         other => return Err(unexpected(other, "the push")),
     }
     let acks = batch.acknowledged(&body)?;
@@ -569,7 +569,7 @@ pub(crate) fn pull_page(hub: &HubClient, since: i64) -> Result<Page> {
         200 => {}
         404 => return Err(unauthorized(hub)),
         400 => return Err(refused(status, &body)),
-        503 => return Err(unavailable()),
+        503 => return Err(unavailable(&body)),
         other => return Err(unexpected(other, "the pull")),
     }
     let page: Page =
@@ -667,7 +667,21 @@ pub(crate) fn refused(status: u16, body: &str) -> CliError {
     CliError::error(msg)
 }
 
-pub(crate) fn unavailable() -> CliError {
+/// The hub's `503`: its in-flight push budget is full (`busy`, AGT-2430:
+/// nothing was stored, retry shortly), or it cannot reach its database.
+pub(crate) fn unavailable(body: &str) -> CliError {
+    let detail: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    if detail.get("error").and_then(Value::as_str) == Some("busy") {
+        let reason = detail
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(crate::text::inline)
+            .unwrap_or_default();
+        return CliError::error(format!(
+            "the hub is busy and did not take the push (HTTP 503 busy: {reason}); \
+             nothing was lost, retry in a moment"
+        ));
+    }
     CliError::error("the hub cannot reach its database right now (HTTP 503); try again")
 }
 
@@ -885,6 +899,24 @@ mod tests {
     /// A refused claim's ack has `seq: null` (`docs/hub-api.md` §Claims);
     /// it must not break the parse of the whole response (AGT-1392 shape,
     /// which AGT-1395's `seq: i64` could not read).
+    /// AGT-2434: the hub's in-flight push limit answers `503 busy`; the
+    /// client says so (and to retry) rather than blaming the database.
+    #[test]
+    fn a_busy_503_reads_as_busy_not_a_database_outage() {
+        let busy = unavailable(
+            r#"{"error":"busy","reason":"the hub is holding as many push bodies as it buffers at once; retry shortly"}"#,
+        )
+        .error
+        .to_string();
+        assert!(busy.contains("busy") && busy.contains("retry"), "{busy}");
+        assert!(busy.contains("buffers at once"), "{busy}");
+        assert!(!busy.contains("database"), "{busy}");
+        for other in ["", "{}", r#"{"error":"db"}"#] {
+            let msg = unavailable(other).error.to_string();
+            assert!(msg.contains("database"), "{other}: {msg}");
+        }
+    }
+
     #[test]
     fn a_rejected_claim_ack_parses_alongside_the_rest() {
         let outbox = [comment("a"), comment("b")];
