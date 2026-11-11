@@ -355,6 +355,14 @@ pub fn read(
     map: &StateMap,
 ) -> Result<Snapshot> {
     let root = fs::canonicalize(root).with_context(|| format!("resolving {}", root.display()))?;
+    // The vault root is the operator's own argument and is resolved; no
+    // link below it is followed, the top-level folders included (AGT-2432).
+    if is_link(&root.join("tickets")) {
+        return Err(CliError::usage(format!(
+            "{}: tickets/ is a symbolic link; a vault's folders are never followed",
+            root.display()
+        )));
+    }
     if !root.join("tickets").is_dir() {
         return Err(CliError::usage(format!(
             "{} is not a vault: no tickets/ directory",
@@ -370,7 +378,7 @@ pub fn read(
         root: root.clone(),
         ..Snapshot::default()
     };
-    let files = ticket_files(&root)?;
+    let files = ticket_files(&root, &mut snapshot.findings)?;
     preflight_states(&files, ws, map)?;
     for path in files {
         let rel = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
@@ -378,7 +386,7 @@ pub fn read(
         snapshot.tickets.push(ticket);
     }
     merge_recovered(&mut snapshot, &ws.prefix);
-    for dir in project_dirs(&root)? {
+    for dir in project_dirs(&root, &mut snapshot.findings)? {
         let rel = dir.strip_prefix(&root).unwrap_or(&dir).to_path_buf();
         snapshot
             .projects
@@ -390,16 +398,28 @@ pub fn read(
 // ------------------------------------------------------------ discovery
 
 /// `tickets/**/*.md` and `archive/20*/**/*.md`, sorted; `assets/`
-/// folders (screenshots) are skipped.
-fn ticket_files(root: &Path) -> Result<Vec<PathBuf>> {
+/// folders (screenshots) are skipped. A symbolic link is never followed
+/// or read: each one is skipped and reported as an anomaly (AGT-2432).
+fn ticket_files(root: &Path, findings: &mut Findings) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    walk_md(&root.join("tickets"), &mut files)?;
-    if let Ok(entries) = fs::read_dir(root.join("archive")) {
+    walk_md(root, &root.join("tickets"), &mut files, findings)?;
+    let archive = root.join("archive");
+    if fs::symlink_metadata(&archive).is_ok() && skip_symlink(root, &archive, findings)? {
+        files.sort();
+        return Ok(files);
+    }
+    if let Ok(entries) = fs::read_dir(&archive) {
         for entry in entries {
             let path = entry.context("listing archive/")?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if path.is_dir() && name.starts_with("20") {
-                walk_md(&path, &mut files)?;
+            if !name.starts_with("20") {
+                continue;
+            }
+            if skip_symlink(root, &path, findings)? {
+                continue;
+            }
+            if path.is_dir() {
+                walk_md(root, &path, &mut files, findings)?;
             }
         }
     }
@@ -407,16 +427,21 @@ fn ticket_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn walk_md(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn walk_md(root: &Path, dir: &Path, out: &mut Vec<PathBuf>, findings: &mut Findings) -> Result<()> {
     let entries = fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))?;
     for entry in entries {
         let path = entry
             .with_context(|| format!("listing {}", dir.display()))?
             .path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        // Neither a linked folder (a cycle would recurse forever) nor a
+        // linked file (it could point outside the vault) is followed.
+        if skip_symlink(root, &path, findings)? {
+            continue;
+        }
         if path.is_dir() {
             if name != "assets" && !name.starts_with('.') {
-                walk_md(&path, out)?;
+                walk_md(root, &path, out, findings)?;
             }
         } else if path.extension().is_some_and(|e| e == "md") {
             out.push(path);
@@ -425,14 +450,48 @@ fn walk_md(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Whether `path` exists and is itself a symbolic link; reports nothing.
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Whether `path` is itself a symbolic link (not followed); if so, an
+/// anomaly naming it relative to the vault `root` is recorded, so the
+/// report shows what stayed behind. Nothing a link points at is read:
+/// a vault from elsewhere could otherwise pull any readable file on this
+/// machine into a synced document (AGT-2432).
+fn skip_symlink(root: &Path, path: &Path, findings: &mut Findings) -> Result<bool> {
+    let linked = fs::symlink_metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .file_type()
+        .is_symlink();
+    if linked {
+        let shown = path.strip_prefix(root).unwrap_or(path);
+        findings.anomalies.push(format!(
+            "{}: symbolic link; not followed, not imported",
+            shown.display()
+        ));
+    }
+    Ok(linked)
+}
+
 /// `projects/*/` then `archive/projects/*/`, each with a README.md —
 /// retired projects are imported too, since archived tickets still name
 /// them (R2: a ticket's project must exist). A live project shadows a
 /// retired one of the same id.
-fn project_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+fn project_dirs(root: &Path, findings: &mut Findings) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     let mut seen = BTreeSet::new();
+    // A linked `archive/` was already reported by [`ticket_files`].
+    let archive_linked = is_link(&root.join("archive"));
     for base in [root.join("projects"), root.join("archive").join("projects")] {
+        if base.starts_with(root.join("archive")) && archive_linked {
+            continue;
+        }
+        if is_link(&base) {
+            skip_symlink(root, &base, findings)?;
+            continue;
+        }
         let Ok(entries) = fs::read_dir(&base) else {
             continue;
         };
@@ -443,11 +502,18 @@ fn project_dirs(root: &Path) -> Result<Vec<PathBuf>> {
         found.sort();
         for dir in found {
             let id = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if dir.is_dir()
-                && !id.starts_with('.')
-                && dir.join("README.md").is_file()
-                && seen.insert(id.to_string())
-            {
+            if id.starts_with('.') || skip_symlink(root, &dir, findings)? {
+                continue;
+            }
+            let readme = dir.join("README.md");
+            if is_link(&readme) {
+                findings.anomalies.push(format!(
+                    "{}: symbolic link; not followed, project not imported",
+                    readme.strip_prefix(root).unwrap_or(&readme).display()
+                ));
+                continue;
+            }
+            if dir.is_dir() && readme.is_file() && seen.insert(id.to_string()) {
                 dirs.push(dir);
             }
         }
@@ -962,7 +1028,7 @@ fn read_project(root: &Path, rel: &Path, findings: &mut Findings) -> Result<Vaul
         })
         .unwrap_or_else(|| id.clone());
 
-    let documents = project_documents(&dir, rel, findings)?;
+    let documents = project_documents(root, rel, findings)?;
 
     Ok(VaultProject {
         id,
@@ -989,18 +1055,19 @@ const RESOURCE_SUBTREES: [&str; 3] = ["research", "assets", "design-qa"];
 /// the folder minus `.md` (`EXECUTION`, `cutover/README`,
 /// `blog-drafts/AGT-679-preview`; AGT-1485). `ideation/` keeps its rule —
 /// only the `IDEA-*.md` directly in it, as `ideation/IDEA-…` — and the
-/// [`RESOURCE_SUBTREES`] are skipped whole. Hidden entries and symlinked
-/// folders are skipped.
+/// [`RESOURCE_SUBTREES`] are skipped whole. Hidden entries are skipped;
+/// a symbolic link (file or folder) is skipped and reported (AGT-2432).
 /// A non-markdown file is never imported; each project's are listed in
 /// one anomaly so the report shows what stayed behind, as is a markdown
 /// file whose path is not a safe document name.
 fn project_documents(
-    dir: &Path,
+    vault: &Path,
     rel: &Path,
     findings: &mut Findings,
 ) -> Result<BTreeMap<String, (String, u64)>> {
+    let dir = &vault.join(rel);
     let mut files = Vec::new();
-    walk_project(dir, dir, &mut files)?;
+    walk_project(vault, dir, dir, &mut files, findings)?;
     files.sort();
     let mut documents = BTreeMap::new();
     let mut not_markdown = Vec::new();
@@ -1044,11 +1111,17 @@ fn project_documents(
     Ok(documents)
 }
 
-/// The candidate files under project folder `root`, from `dir` down:
+/// The candidate files under `project` (a folder in `vault`), from `dir` down:
 /// see [`project_documents`] for what is skipped.
-fn walk_project(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn walk_project(
+    vault: &Path,
+    project: &Path,
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    findings: &mut Findings,
+) -> Result<()> {
     let entries = fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))?;
-    let top = dir == root;
+    let top = dir == project;
     for entry in entries {
         let path = entry
             .with_context(|| format!("listing {}", dir.display()))?
@@ -1057,19 +1130,15 @@ fn walk_project(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         if name.starts_with('.') {
             continue;
         }
-        // A symlinked folder is not followed, so a link cycle cannot
-        // recurse forever and nothing outside the project is read.
-        let linked = fs::symlink_metadata(&path)
-            .with_context(|| format!("reading {}", path.display()))?
-            .file_type()
-            .is_symlink();
+        // No symbolic link is followed, file or folder: a link cycle
+        // cannot recurse forever and nothing outside the project is read.
+        if top && RESOURCE_SUBTREES.contains(&name) {
+            continue;
+        }
+        if skip_symlink(vault, &path, findings)? {
+            continue;
+        }
         if path.is_dir() {
-            if linked {
-                continue;
-            }
-            if top && RESOURCE_SUBTREES.contains(&name) {
-                continue;
-            }
             if top && name == "ideation" {
                 for idea in
                     fs::read_dir(&path).with_context(|| format!("listing {}", path.display()))?
@@ -1078,16 +1147,19 @@ fn walk_project(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                         .with_context(|| format!("listing {}", path.display()))?
                         .path();
                     let n = idea.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if idea.is_file()
-                        && n.starts_with("IDEA-")
-                        && idea.extension().is_some_and(|e| e == "md")
-                    {
+                    if !(n.starts_with("IDEA-") && idea.extension().is_some_and(|e| e == "md")) {
+                        continue;
+                    }
+                    if skip_symlink(vault, &idea, findings)? {
+                        continue;
+                    }
+                    if idea.is_file() {
                         out.push(idea);
                     }
                 }
                 continue;
             }
-            walk_project(root, &path, out)?;
+            walk_project(vault, project, &path, out, findings)?;
         } else if path.is_file() && !(top && name == "README.md") {
             out.push(path);
         }
