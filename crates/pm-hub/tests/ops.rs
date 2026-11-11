@@ -534,3 +534,83 @@ fn a_stalled_workspace_never_blocks_another() {
     .collect();
     assert_eq!(saltline.len(), QUEUED * 5);
 }
+
+/// Opens a push that announces `len` bytes of body and sends none, so it
+/// holds its share of the in-flight budget until the stream is dropped.
+fn stalled_push(port: u16, token: &str, len: usize) -> TcpStream {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        stream,
+        "POST /w/saltline/ops HTTP/1.1\r\nHost: localhost\r\n\
+         Authorization: Bearer {token}\r\nContent-Length: {len}\r\n\r\n{{"
+    )
+    .unwrap();
+    stream
+}
+
+/// Pushes one label until `want` comes back (a dropped upload's share is
+/// released asynchronously): the last response.
+fn push_until(port: u16, token: &str, want: u16) -> (u16, Value) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = push(port, token, &[serde_json::to_value(label("b")).unwrap()]);
+        if got.0 == want || Instant::now() > deadline {
+            return got;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Pushes share a bounded budget of in-flight body bytes (AGT-2430): with
+/// it full of stalled 64 MiB uploads, a push is `503 busy` straight away,
+/// for every workspace; once one upload goes away its share is back.
+#[test]
+fn in_flight_push_bodies_are_bounded() {
+    let Some((_container, url)) = postgres_for("in_flight_push_bodies_are_bounded") else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    wait_for_health(&mut hub, port);
+    let token = create_token(&url, "studio", "saltline");
+    let other = create_token(&url, "elsewhere", "other");
+
+    // Uploads that announce 64 MiB and send nothing fill the budget: each
+    // either holds its share (no answer yet) or, once it is full, is
+    // turned away at once without its body.
+    let mut stalled: Vec<TcpStream> = Vec::new();
+    let busy = loop {
+        assert!(stalled.len() <= 4, "more than four 64 MiB uploads held");
+        let mut stream = stalled_push(port, &token, 64 * 1024 * 1024);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut raw = String::new();
+        match stream.read_to_string(&mut raw) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => stalled.push(stream),
+            _ => break raw,
+        }
+    };
+    assert_eq!(stalled.len(), 4);
+    assert!(busy.starts_with("HTTP/1.1 503"), "{busy}");
+    assert!(busy.contains(r#""error":"busy""#), "{busy}");
+
+    let (status, body) = push(port, &token, &[serde_json::to_value(label("b")).unwrap()]);
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "busy", "{body}");
+    let resp = push_raw_to(port, "other", &other, r#"{"ops": []}"#);
+    assert_eq!(resp.status, 503, "{resp:?}");
+    assert!(
+        resp.headers
+            .iter()
+            .any(|(k, v)| k == "retry-after" && v == "1"),
+        "{resp:?}"
+    );
+
+    // One upload gives up: its share is released and pushes land again.
+    drop(stalled.pop());
+    let (status, body) = push_until(port, &token, 200);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(count_ops(&url), 1);
+    drop(stalled);
+}

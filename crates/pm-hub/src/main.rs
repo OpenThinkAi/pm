@@ -114,6 +114,8 @@ enum TokenCmd {
 struct Db {
     reader: Arc<Client>,
     writer: Arc<writer::Writers>,
+    /// The in-flight push body budget (`ops::push_budget`, AGT-2430).
+    push_budget: Arc<tokio::sync::Semaphore>,
 }
 
 impl FromRef<Db> for Arc<Client> {
@@ -223,6 +225,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let app = app(Db {
         reader: Arc::new(reader),
         writer: Arc::new(writer::Writers::new(writers)),
+        push_budget: ops::push_budget(),
     });
     // `::` is dual-stack on Linux, so this serves both Railway's public
     // (IPv4) proxy and its private (IPv6) network.
