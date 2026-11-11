@@ -651,11 +651,10 @@ fn status(ctx: &Ctx<'_>) -> Result<()> {
             println!("reachable:  {r}");
         }
         if health.is_some() {
-            println!(
-                "hub schema: {}",
-                field("schema_version").unwrap_or(Value::Null)
-            );
-            println!("op version: {}", field("op_version").unwrap_or(Value::Null));
+            // Hub-supplied, so flattened like the other fields (AGT-2434).
+            let shown = |k: &str| crate::text::inline(&field(k).unwrap_or(Value::Null).to_string());
+            println!("hub schema: {}", shown("schema_version"));
+            println!("op version: {}", shown("op_version"));
         }
         match (token_accepted, &token_name) {
             (Some(true), Some(n)) => {

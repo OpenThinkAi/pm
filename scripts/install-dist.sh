@@ -4,7 +4,7 @@
 # release.yml job that runs `dist`, so no job executes an unverified
 # downloaded installer or reuses a binary built by another job.
 #
-# To bump: change VERSION, refresh the four hashes from the release's
+# To bump: change VERSION, refresh the three hashes from the release's
 # `sha256.sum` (and cross-check by hashing the downloads yourself), and keep
 # `cargo-dist-version` in Cargo.toml in step.
 set -euo pipefail

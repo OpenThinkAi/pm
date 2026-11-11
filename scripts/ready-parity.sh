@@ -122,7 +122,9 @@ done
 [ "$ALL" = 1 ] && PY_ARGS+=("--all")
 [ -n "$JSON_OUT" ] && PY_ARGS+=("--json" "$JSON_OUT")
 
-python3 - "${PY_ARGS[@]}" <<'PY'
+# -I: isolated mode, so nothing in the working directory or PYTHON* env
+# vars is imported in place of the stdlib modules the script uses.
+python3 -I - "${PY_ARGS[@]}" <<'PY'
 """The loops' ready frontier, transcribed from prose, diffed against pm.
 
 Every rule below cites the prose it transcribes:
