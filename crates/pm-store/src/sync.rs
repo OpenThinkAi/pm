@@ -436,6 +436,13 @@ impl Store {
         let cursor: i64 = tx.query_row("SELECT pulled_seq FROM sync_state", [], |r| r.get(0))?;
         let mut page: Vec<&(i64, Op)> = ops.iter().collect();
         page.sort_by_key(|(seq, _)| *seq);
+        // AGT-2434: the cursor may not jump past the ops this page carries,
+        // or every op in between would be skipped for good.
+        if let Some(&&(highest, _)) = page.last()
+            && next > highest
+        {
+            return Err(StoreError::PageCursor { next, highest });
+        }
         let mut engine = Engine::new(&tx, Mode::Quarantine)?;
         let mut last = cursor;
         for (seq, op) in page {
@@ -777,6 +784,7 @@ fn disposition(e: &StoreError, op: &Op) -> Disposition {
         | E::NotAConfigOp { .. }
         | E::Corrupt { .. }
         | E::Replay { .. }
+        | E::PageCursor { .. }
         | E::Pull { .. } => Disposition::Fail,
     }
 }
@@ -1015,13 +1023,23 @@ impl<'a, 'c> Engine<'a, 'c> {
             return Err(pull_error(op, e));
         }
         let recorded_ms = now_ms();
+        // AGT-2434: an op refused for its size is not kept at all — storing
+        // it would keep the very bytes the limit exists to refuse. Its id,
+        // seq, kind, entity and reason are enough for `pm doctor`.
+        let pruned = matches!(e, StoreError::OpTooLarge(_));
+        let content = if pruned {
+            String::new()
+        } else {
+            serde_json::to_string(op).expect("an op serializes")
+        };
         self.tx.execute(
             "INSERT INTO sync_quarantine
                  (op_id, hub_seq, kind, entity, status, wake, attempts, reason, recorded_ms, op)
              VALUES (?1, ?2, ?3, ?4, 'refused', NULL, ?5, ?6, ?7, ?8)
              ON CONFLICT(op_id) DO UPDATE SET
                  status = 'refused', wake = NULL, attempts = excluded.attempts,
-                 reason = excluded.reason, recorded_ms = excluded.recorded_ms",
+                 reason = excluded.reason, recorded_ms = excluded.recorded_ms,
+                 op = CASE WHEN excluded.op = '' THEN '' ELSE sync_quarantine.op END",
             params![
                 op.op_id.to_string(),
                 order,
@@ -1030,7 +1048,7 @@ impl<'a, 'c> Engine<'a, 'c> {
                 attempts,
                 reason,
                 recorded_ms as i64,
-                serde_json::to_string(op).expect("an op serializes"),
+                content,
             ],
         )?;
         self.pulled.refused.push(Quarantined {
@@ -1042,7 +1060,7 @@ impl<'a, 'c> Engine<'a, 'c> {
             attempts,
             reason,
             recorded_ms,
-            pruned: false,
+            pruned,
         });
         Ok(())
     }

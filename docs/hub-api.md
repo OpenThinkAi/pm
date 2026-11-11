@@ -453,7 +453,9 @@ Response `200`:
   the same snapshot as the page. `next < head` means more ops were
   already waiting (the page hit `limit` or the byte cap); `next >= head`
   means the client had everything as of that snapshot. A client pages
-  `since = next` until `next >= head`.
+  `since = next` until `next >= head`. `pm sync` refuses a page whose
+  `next` moves the cursor past `head`, or past the page's highest `seq`
+  when it has ops (AGT-2434): either would skip ops for good.
 - The cursor is gap-safe: seqs are handed out and committed in order
   per workspace (see "How the order is kept"), so every seq at or below
   `head` is committed when `head` is read, and no op with a seq at or

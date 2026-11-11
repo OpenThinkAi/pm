@@ -156,6 +156,13 @@ pub enum StoreError {
         #[source]
         source: Box<StoreError>,
     },
+    /// A pulled page's `next` is beyond the highest seq it carries
+    /// (AGT-2434): applying it would move the cursor past ops this replica
+    /// never received. Nothing was applied.
+    #[error(
+        "a pulled page's next ({next}) is beyond its highest seq ({highest}); refusing to skip ops"
+    )]
+    PageCursor { next: i64, highest: i64 },
     /// [`crate::Store::apply_pulled`] could not commit a foreign op; the
     /// whole pulled batch was rolled back. A dependency error (an unknown
     /// ticket, relation target, document, project, project entity or
