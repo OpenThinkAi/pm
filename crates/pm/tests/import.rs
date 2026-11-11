@@ -1038,6 +1038,77 @@ fn nested_project_docs_import_by_relative_path() {
     assert_eq!(sb.project("alpha")["documents"]["sub/x"], "# x\n");
 }
 
+// ------------------------------------------------------------ AGT-2432
+
+/// No symbolic link in a vault is followed or read — a linked file, a
+/// linked folder or a link cycle, under tickets/, a project folder or its
+/// ideation/ — and each one skipped is reported as an anomaly.
+#[cfg(unix)]
+#[test]
+fn symlinks_in_a_vault_are_never_followed_and_are_reported() {
+    use std::os::unix::fs::symlink;
+    let sb = Sandbox::initialized();
+    let vault = sb.vault_copy();
+    // Private files outside the vault, ticket-shaped and doc-shaped.
+    let outside = sb.home.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let ticket = std::fs::read_to_string(vault.join("tickets/triage/AGT-10-auto-drain-inbox.md"))
+        .unwrap()
+        .replace("id: AGT-10", "id: AGT-99")
+        .replace("Auto-drain", "SECRET");
+    std::fs::write(outside.join("AGT-99-secret.md"), &ticket).unwrap();
+    std::fs::write(outside.join("secret.md"), "# SECRET\n").unwrap();
+
+    let links = [
+        (
+            outside.join("AGT-99-secret.md"),
+            "tickets/triage/AGT-99-leak.md",
+        ),
+        (outside.clone(), "tickets/elsewhere"),
+        (vault.join("tickets"), "tickets/loop"),
+        (outside.clone(), "archive/2026-09"),
+        (outside.join("secret.md"), "projects/alpha/notes.md"),
+        (outside.clone(), "projects/alpha/linked"),
+        (vault.join("projects/alpha"), "projects/alpha/cycle"),
+        (
+            outside.join("secret.md"),
+            "projects/alpha/ideation/IDEA-002-leak.md",
+        ),
+        (vault.join("projects/alpha"), "projects/delta"),
+    ];
+    for (target, rel) in &links {
+        symlink(target, vault.join(rel)).unwrap();
+    }
+
+    let report = sb.import(&vault);
+    let anomalies: Vec<String> = report["anomalies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect();
+    for (_, rel) in &links {
+        let want = format!("{rel}: symbolic link; not followed, not imported");
+        assert!(
+            anomalies.contains(&want),
+            "missing {want:?} in {anomalies:?}"
+        );
+    }
+
+    // Nothing behind a link was imported.
+    let missing = sb.pm(&["show", "AGT-99", "--json"]);
+    assert!(!missing.status.success(), "AGT-99 was imported");
+    let alpha = sb.project("alpha");
+    let names: Vec<&String> = alpha["documents"].as_object().unwrap().keys().collect();
+    assert_eq!(names, ["EXECUTION", "ideation/IDEA-001-first-idea"]);
+    assert!(!alpha.to_string().contains("SECRET"), "{alpha}");
+    let delta = sb.pm(&["project", "show", "delta", "--json"]);
+    assert!(
+        !delta.status.success(),
+        "the linked project folder was imported"
+    );
+}
+
 // ------------------------------------------ unknown vault states (AGT-1518)
 
 /// A vault ticket file in `state`, under `tickets/<dir>/`.
