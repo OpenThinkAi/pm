@@ -155,6 +155,10 @@ impl Store {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // AGT-2434: overwrite deleted content instead of leaving it in free
+        // pages, so a pruned quarantine body or a deleted row does not
+        // linger in the database file.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         let mut store = Store { conn };
         store.migrate()?;
         Ok(store)
@@ -242,5 +246,17 @@ mod tests {
         let versions: Vec<u32> = MIGRATIONS.iter().map(|(v, _)| *v).collect();
         assert!(versions.windows(2).all(|w| w[0] < w[1]), "{versions:?}");
         assert_eq!(versions.last(), Some(&SCHEMA_VERSION));
+    }
+
+    /// AGT-2434: every connection overwrites deleted content.
+    #[test]
+    fn the_connection_runs_with_secure_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("pm.sqlite")).unwrap();
+        let on: i64 = store
+            .conn
+            .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(on, 1);
     }
 }

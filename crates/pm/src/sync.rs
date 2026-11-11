@@ -580,7 +580,31 @@ pub(crate) fn pull_page(hub: &HubClient, since: i64) -> Result<Page> {
             page.next
         )));
     }
+    check_page_next(&page, since)?;
     Ok(page)
+}
+
+/// A page's `next` may move the cursor only as far as what the hub served
+/// (AGT-2434): never past the hub's own `head`, and never past the page's
+/// highest seq when the page has ops (`docs/hub-api.md`: `next` is the
+/// last seq served, or `since` for an empty page). A cursor moved further
+/// would skip every op in between for good. An empty page that answers
+/// `next = since` is fine even past `head` (a hub restored from an older
+/// backup); nothing moves.
+fn check_page_next(page: &Page, since: i64) -> Result<()> {
+    let highest = page.ops.iter().map(|item| item.seq).max();
+    let past_head = page.next > since && page.next > page.head;
+    let past_page = highest.is_some_and(|h| page.next > h);
+    if past_head || past_page {
+        return Err(CliError::error(format!(
+            "the hub answered a pull since {since} with next = {} beyond what it served \
+             (head {}, highest seq on the page {}); refusing to skip ops",
+            page.next,
+            page.head,
+            highest.map_or_else(|| "none".to_string(), |h| h.to_string())
+        )));
+    }
+    Ok(())
 }
 
 /// Pulls from the cursor to the hub's head, a page per transaction, and
@@ -899,6 +923,46 @@ mod tests {
     /// A refused claim's ack has `seq: null` (`docs/hub-api.md` §Claims);
     /// it must not break the parse of the whole response (AGT-1392 shape,
     /// which AGT-1395's `seq: i64` could not read).
+    /// AGT-2434: a page's `next` may not run past the hub's head, nor past
+    /// the page's highest seq when it carries ops.
+    #[test]
+    fn a_page_next_past_what_was_served_is_refused() {
+        let page = |seqs: &[i64], next: i64, head: i64| Page {
+            ops: seqs
+                .iter()
+                .map(|seq| Item {
+                    seq: *seq,
+                    op: Value::Null,
+                })
+                .collect(),
+            next,
+            head,
+        };
+        for (p, since) in [
+            (page(&[11, 12], 12, 20), 10),
+            (page(&[11, 12], 12, 12), 10),
+            (page(&[], 10, 20), 10),
+            // A hub restored behind this replica: nothing moves.
+            (page(&[], 30, 20), 30),
+        ] {
+            assert!(
+                check_page_next(&p, since).is_ok(),
+                "next {} head {}",
+                p.next,
+                p.head
+            );
+        }
+        for (p, since) in [
+            (page(&[11, 12], 15, 20), 10),
+            (page(&[11, 12], 25, 25), 10),
+            (page(&[], 11, 10), 5),
+            (page(&[], 50, 20), 10),
+        ] {
+            let err = check_page_next(&p, since).unwrap_err().error.to_string();
+            assert!(err.contains("refusing to skip ops"), "{err}");
+        }
+    }
+
     /// AGT-2434: the hub's in-flight push limit answers `503 busy`; the
     /// client says so (and to retry) rather than blaming the database.
     #[test]

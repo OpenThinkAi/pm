@@ -626,6 +626,37 @@ fn an_oversized_body_edit_is_refused_on_pull() {
         pulled.refused[0]
     );
     assert!(store.ticket(t).unwrap().is_some());
+    // AGT-2434: refused for its size, the op's content is not kept.
+    assert!(pulled.refused[0].pruned, "{:?}", pulled.refused[0]);
+    let q = store.quarantine().unwrap();
+    assert_eq!(q.len(), 1);
+    assert!(q[0].pruned, "{:?}", q[0]);
+}
+
+/// AGT-2434: a page whose `next` runs past the highest seq it carries
+/// would skip the ops in between: the page is refused whole, nothing is
+/// applied and the cursor stays.
+#[test]
+fn a_page_next_beyond_its_ops_is_refused() {
+    let log = log_head();
+    let (_d, mut store) = replica(&log);
+    let n = log.config.len() as i64;
+    let t = Ulid::new();
+    let mut ops = log.config.clone();
+    ops.push(create(t, 10, "pm"));
+    store.apply_pulled_page(&seqd(1, &ops), n + 1).unwrap();
+    let page = seqd(n + 2, &[comment(t, 11, "hi")]);
+    let err = store.apply_pulled_page(&page, n + 50).unwrap_err();
+    assert!(
+        matches!(err, StoreError::PageCursor { next, highest } if next == n + 50 && highest == n + 2),
+        "{err:?}"
+    );
+    assert_eq!(store.cursor().unwrap(), n + 1);
+    // At the page's highest seq it applies; an empty page moves nothing
+    // the store can check, as before.
+    let pulled = store.apply_pulled_page(&page, n + 2).unwrap();
+    assert_eq!(pulled.applied, 1);
+    assert_eq!(store.cursor().unwrap(), n + 2);
 }
 
 // ------------------------------------------------------------ AGT-1482
