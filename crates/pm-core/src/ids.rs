@@ -17,8 +17,9 @@
 //! document names. They were never restricted to id characters — a vault
 //! document can be `run notes`, a document name is `/`-separated
 //! (`ideation/IDEA-1`) — so they get their own, looser rules
-//! ([`is_safe_segment`], [`is_safe_doc_name`], AGT-1464) that refuse only
-//! dot-segments, hidden names, separators and control characters.
+//! ([`is_safe_segment`], [`is_safe_doc_name`], AGT-1464) that refuse
+//! dot-segments, hidden names, separators and control characters, plus the
+//! Windows and edge cases below.
 //!
 //! **Windows (AGT-1467).** Both rules also refuse what only Windows reads
 //! as more than a name: a `:` (`C:x` joined onto a directory is a
