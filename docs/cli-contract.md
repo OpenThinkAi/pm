@@ -1675,11 +1675,12 @@ A state no longer wanted is re-categorised or moved to the end instead.
 
 - `add`: Exit `2`: a new state without `--category`; an unknown category;
   an empty or non-path-safe name (state names become `tickets/<state>/`
-  folders in `pm export md`; since AGT-2434 a name may not start with `.`
-  or `-`, end with `.` or a space, or hold `/`, `\`, `:`, control or
-  Unicode format characters — `docs/hub-api.md`'s `invalid_id` row has
-  the whole rule, which a pull and `pm backup --restore` apply too); re-categorising the workspace's only
+  folders in `pm export md`); re-categorising the workspace's only
   `unstarted` or only `completed` state.
+  - Path-safe (AGT-2434): a name may not start with `.` or `-`, end with
+    `.` or a space, or hold `/`, `\`, `:`, control or Unicode format
+    characters. `docs/hub-api.md`'s `invalid_id` row has the whole rule,
+    which a pull and `pm backup --restore` apply too.
 - `--json` (`add`): `{"schema": 1, "state": {"name": "qa", "category":
   "started", "position": 2}, "created": true, "changed": true, "states":
   [<every state after the write, in order>]}` — `created` is whether the
@@ -2037,14 +2038,15 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
   answer for a rejected token or an unknown workspace; the message says to
   run `pm hub status`); the hub refuses a batch or query with a structured
   `400`/`413` (`error` and `reason` are quoted, with the op's index and id
-  when given); `503` (a `503 busy` — the hub's in-flight push budget, or
-  this token's 128 MiB share of it, is full, AGT-2430 — is reported as
-  the hub being busy: nothing was stored or lost, retry shortly; any other
-  `503` as the hub being unable to reach its database); a pulled op this build cannot parse, or one stamped
-  far in the future (see Quarantine); or the local database fails. Local state stays
-  exactly as it was apart from what had already been committed — every
-  batch the hub acknowledged is marked, every page applied has advanced
-  the cursor.
+  when given); `503` (see below); a pulled op this build cannot parse, or
+  one stamped far in the future (see Quarantine); or the local database
+  fails. Local state stays exactly as it was apart from what had already
+  been committed — every batch the hub acknowledged is marked, every page
+  applied has advanced the cursor.
+- A `503 busy` (AGT-2430: the hub's in-flight push budget, or this
+  token's 128 MiB share of it, is full) is reported as the hub being
+  busy: nothing was stored or lost, retry shortly. Any other `503` is
+  reported as the hub being unable to reach its database.
 - A second sync with nothing new pushes and pulls nothing (`0` counts,
   `cursor == head`).
 - `--watch`: each round prints its report — one line per round in text
