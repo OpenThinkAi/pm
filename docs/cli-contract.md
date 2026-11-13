@@ -1232,7 +1232,15 @@ normalises — key order, quoting, whitespace, list order — are counted but
 are not diffs; each remaining difference is either an *explained* class
 listed in the report header with its rationale, or *unexplained*, listed
 with both values; a source file with no ticket in pm is an unexplained
-`missing`).
+`missing`). The report file is written owner-only (`0600`, an existing
+file narrowed; AGT-2434).
+
+**Symbolic links** (AGT-2432). The import never follows a link. A
+linked `tickets/` is exit `2`. Any other link — `archive/`, `projects/`,
+`archive/projects/`, an `archive/20*` month, a project folder or its
+`README.md`, a file or folder under them, anything in `ideation/` — is
+skipped and reported as an anomaly (`<path>: symbolic link; not followed,
+not imported`); a project whose `README.md` is a link is not imported.
 
 **Vault states** (AGT-1518). Every ticket's vault `state:` must resolve
 to a workspace state, through one of:
@@ -1667,7 +1675,10 @@ A state no longer wanted is re-categorised or moved to the end instead.
 
 - `add`: Exit `2`: a new state without `--category`; an unknown category;
   an empty or non-path-safe name (state names become `tickets/<state>/`
-  folders in `pm export md`); re-categorising the workspace's only
+  folders in `pm export md`; since AGT-2434 a name may not start with `.`
+  or `-`, end with `.` or a space, or hold `/`, `\`, `:`, control or
+  Unicode format characters — `docs/hub-api.md`'s `invalid_id` row has
+  the whole rule, which a pull and `pm backup --restore` apply too); re-categorising the workspace's only
   `unstarted` or only `completed` state.
 - `--json` (`add`): `{"schema": 1, "state": {"name": "qa", "category":
   "started", "position": 2}, "created": true, "changed": true, "states":
@@ -1709,6 +1720,10 @@ Flags: `--to <DIR>` (default: `backup.repo` in config.toml), `--restore
 
 - Exit `2`: no `--to` and no `backup.repo` configured (plain `pm backup`
   form only).
+- Permissions: shards and the config snapshot are written `0600` and
+  every directory the backup creates is `0700`; a shard an older binary
+  left world-readable is narrowed when it is next appended to. Git
+  records only the executable bit, so commits are unchanged.
 - Layout under `<dir>` (AGT-1378; GitHub rejects any file over 100 MB):
   - `ops/<prefix>/<NNNNNN>.jsonl` — the op log, one op per line in `seq`
     order, **sharded by size**: an op that would push the newest shard
@@ -1810,6 +1825,10 @@ no connection.
 - **URL**: `hub = "<URL>"` in config.toml. `login` edits only that key
   (other keys survive; comments do not). The URL must be `http(s)://host[:port][/path]`
   with no credentials, query or fragment (exit `2`); a trailing `/` is dropped.
+  Every verb that reads the URL back requires it to be exactly that
+  normalized form (AGT-2434): a `hub` edited into config.toml by hand
+  with credentials, a query, a fragment, whitespace or a trailing `/` is
+  an error (exit `1`) telling you to re-run `pm hub login`.
 - **Token**: never in config.toml.
   - macOS: login keychain, service `pm-hub.<workspace-id>`, account `pm`.
     `<workspace-id>` is the workspace's ULID (`workspace.id`). It is stable
@@ -1958,7 +1977,12 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
   actor-bound token the same way (`pm set <ID> assignee=<me>` on a ticket
   someone else won): refused, it is reconciled and reported alike
   (`pm: the hub refused assignee write <op_id> on ticket <ulid>: …`), with
-  `kind: "field.set"` in `--json`.
+  `kind: "field.set"` in `--json`. Since AGT-2428 an actor-bound token's
+  unassign (`pm set <ID> assignee=`, `pm unclaim`) or move out of a
+  started state, on a ticket held by an actor outside its binding, is
+  refused with `code: "held_by_another"` and reconciled and reported the
+  same way (`the hub refused unassign …` / `the hub refused state
+  transition …`, `kind: "field.set"` / `"state.transition"`).
 - **Pull.** `GET …/ops?since=<cursor>&limit=1000`, page by page until
   `next >= head` (the hub also cuts a page at 16 MiB of ops,
   `docs/hub-api.md`). Each page is applied in one transaction (foreign ops
@@ -2013,7 +2037,10 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
   answer for a rejected token or an unknown workspace; the message says to
   run `pm hub status`); the hub refuses a batch or query with a structured
   `400`/`413` (`error` and `reason` are quoted, with the op's index and id
-  when given); `503`; a pulled op this build cannot parse, or one stamped
+  when given); `503` (a `503 busy` — the hub's in-flight push budget, or
+  this token's 128 MiB share of it, is full, AGT-2430 — is reported as
+  the hub being busy: nothing was stored or lost, retry shortly; any other
+  `503` as the hub being unable to reach its database); a pulled op this build cannot parse, or one stamped
   far in the future (see Quarantine); or the local database fails. Local state stays
   exactly as it was apart from what had already been committed — every
   batch the hub acknowledged is marked, every page applied has advanced
@@ -2058,12 +2085,12 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
     "rejected": [               // outbox claims (and bound-token assignee writes, AGT-1482) the hub refused this round, reconciled locally
       {
         "op_id": "<ULID>",        // the refused op
-        "kind": "claim" | "field.set",  // AGT-1482
+        "kind": "claim" | "field.set" | "state.transition",  // field.set: AGT-1482; state.transition: AGT-2428
         "ticket": "<ULID>",       // its ticket
         "taken_by": "string" | null,
         "at": {"wall_ms": 0, "counter": 0},
         "state": "string",        // the ticket's state at the hub
-        "code": "not_unstarted" | "already_assigned" | "deleted",
+        "code": "not_unstarted" | "already_assigned" | "deleted" | "held_by_another",  // held_by_another: AGT-2428
         "reason": "string"
       }
     ]

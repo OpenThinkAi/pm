@@ -83,7 +83,12 @@ falls back to `$EDITOR` with a note naming the digest it saw.
 
 `pm export md` writes every ticket, comment and author name: each
 directory it creates is `0700` and each file `0600` (AGT-1482), like the
-editor's temp files; an existing export root keeps its own mode.
+editor's temp files; an existing export root keeps its own mode. The same
+holds for everything else pm writes that carries ticket data (AGT-2434):
+the database and its `-wal`/`-shm` (`0600`, an older one narrowed when
+opened), `pm backup` shards and config snapshot, the `pm import vault
+--report` parity report, and the workspace and config directories `pm
+init` creates (`0700`).
 
 ### View CSP
 

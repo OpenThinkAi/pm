@@ -32,9 +32,10 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 npm puts `pm` on its global bin path; the shell installer puts it in
 `~/.cargo/bin`. There's no separate daemon or service to run.
 
-**From source** (stable Rust 1.85 or newer; the workspace uses edition
-2024. The workspace declares no `rust-version`, and the minimum is not
-CI-verified; it is known to build on 1.91 and current stable):
+**From source** (stable Rust 1.89 or newer: the workspace uses edition
+2024, and `rusqlite` 0.41 declares 1.89. The workspace declares no
+`rust-version`, and the minimum is not CI-verified; it is known to build
+on 1.94 and current stable):
 
 ```sh
 cargo install --locked --git https://github.com/OpenThinkAi/pm pm
