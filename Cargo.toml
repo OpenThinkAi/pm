@@ -52,6 +52,14 @@ install-updater = false
 # RELEASING.md.
 allow-dirty = ["ci"]
 
+# Native runner per target, where dist's default is no longer offered.
+# dist 0.31.0 defaults aarch64-apple-darwin to macos-14, which GitHub retired
+# on 2026-11-02 (actions/runner-images#15226): the job is cancelled with
+# "configuration not supported". The matrix comes from `dist plan` at CI
+# time, so release.yml needs no change for this.
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # Pin every third-party Action dist emits to a full commit SHA. Keep in sync
 # with the `uses:` lines in .github/workflows/release.yml.
 [workspace.metadata.dist.github-action-commits]
