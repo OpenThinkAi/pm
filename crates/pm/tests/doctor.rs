@@ -404,3 +404,164 @@ fn prune_quarantine_drops_refused_content_and_keeps_the_entry() {
     );
     assert!(text.contains("[content pruned]"), "{text}");
 }
+
+// ------------------------------------------------- AGT-2521 (pm#2)
+
+/// The design doc of project `pm`, its `doc_id` as bound by `put_project`.
+fn design_doc_id(sb: &Sandbox) -> Ulid {
+    let id: String = sb
+        .raw()
+        .query_row("SELECT doc_id FROM project WHERE id = 'pm'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    id.parse().unwrap()
+}
+
+/// Two writers editing the design doc, concurrently at one point, as the
+/// `body.edit` updates they would push. Every update is a plain Loro text
+/// edit; applied in this order they converge on one text.
+fn two_writer_edits() -> Vec<pm_core::BodyUpdate> {
+    let mut a = pm_core::Body::with_peer(11).unwrap();
+    let mut b = pm_core::Body::with_peer(22).unwrap();
+    let mut updates = Vec::new();
+    for text in [
+        "alpha\nbeta\n",
+        "alpha\nbeta\ngamma\n",
+        "alpha\nBETA\ngamma\n",
+    ] {
+        let u = a.diff_from_text(text).unwrap();
+        b.apply(&u).unwrap();
+        updates.push(u);
+    }
+    let ua = a
+        .diff_from_text("alpha\nBETA\ngamma\ndelta from a\n")
+        .unwrap();
+    let ub = b.diff_from_text("zero\nalpha\nBETA\ngamma\n").unwrap();
+    a.apply(&ub).unwrap();
+    b.apply(&ua).unwrap();
+    updates.push(ub);
+    updates.push(ua);
+    for i in 0..10 {
+        let u = a
+            .diff_from_text(&format!("{}line {i}\n", a.text()))
+            .unwrap();
+        b.apply(&u).unwrap();
+        updates.push(u);
+        let u = b.diff_from_text(&format!("x{i} {}", b.text())).unwrap();
+        a.apply(&u).unwrap();
+        updates.push(u);
+    }
+    assert_eq!(a.text(), b.text());
+    updates
+}
+
+fn doc_view_row(sb: &Sandbox, doc: Ulid) -> String {
+    sb.raw()
+        .query_row(
+            "SELECT view FROM project_doc_view WHERE doc_id = ?1",
+            [doc.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// pm#2: a document built up one edit at a time (each commit restores the
+/// stored snapshot, folds the edit in and stores a new snapshot) and the
+/// same document replayed in one pass can serialize to different Loro
+/// snapshot bytes while decoding to the same document. That is not drift.
+#[test]
+fn an_incrementally_built_doc_whose_snapshot_bytes_differ_from_the_replay_is_healthy() {
+    let sb = Sandbox::new();
+    let doc = design_doc_id(&sb);
+    {
+        let mut store = sb.store();
+        let mut clock = Clock::from_latest(store.latest_hlc().unwrap());
+        for update in two_writer_edits() {
+            let hlc = clock.send(1_700_000_000_000);
+            let op = Op::new(
+                Ulid::new(),
+                hlc,
+                ActorId::new("tester"),
+                doc,
+                Payload::BodyEdit(pm_core::op::BodyEdit {
+                    update: update.into_bytes(),
+                }),
+            );
+            store.commit_doc_edit(doc, &op).unwrap();
+        }
+    }
+    let incremental = doc_view_row(&sb, doc);
+
+    // The premise: a one-pass replay really does write different bytes.
+    let out = sb.pm(&["doctor", "--rebuild", "--json"]);
+    assert_code(&out, 0);
+    let replayed = doc_view_row(&sb, doc);
+    assert_ne!(
+        incremental, replayed,
+        "the incremental and replayed snapshots should differ in bytes"
+    );
+    // Put the incremental row back: the database as it was before the
+    // rebuild, which doctor must call healthy.
+    sb.raw()
+        .execute(
+            "UPDATE project_doc_view SET view = ?2 WHERE doc_id = ?1",
+            [doc.to_string(), incremental],
+        )
+        .unwrap();
+
+    let out = sb.pm(&["doctor"]);
+    assert_code(&out, 0);
+    assert!(
+        stdout(&out).contains("replay          ok"),
+        "{}",
+        stdout(&out)
+    );
+    let v = json(&sb.pm(&["doctor", "--json"]));
+    assert_eq!(v["healthy"], true);
+    assert_eq!(v["drift"]["tables"], serde_json::json!([]));
+}
+
+/// The other half of pm#2: a stored snapshot that decodes to a different
+/// document — text the log never produced — is still drift.
+#[test]
+fn a_doc_snapshot_with_different_content_is_still_drift() {
+    let sb = Sandbox::new();
+    let doc = design_doc_id(&sb);
+    assert_code(
+        &sb.pm(&["project", "edit", "pm", "--from-file", &{
+            let path = sb.home.path().join("design.md");
+            std::fs::write(&path, "the real design\n").unwrap();
+            path.to_str().unwrap().to_string()
+        }]),
+        0,
+    );
+    assert_code(&sb.pm(&["doctor"]), 0);
+
+    // Same id and stamp, but a body that says something else.
+    let mut view: pm_core::DocView = serde_json::from_str(&doc_view_row(&sb, doc)).unwrap();
+    let mut forged = pm_core::Body::with_peer(99).unwrap();
+    let update = forged.diff_from_text("a forged design\n").unwrap();
+    view.body = pm_core::BodyState::new();
+    view.body.apply(&update).unwrap();
+    sb.raw()
+        .execute(
+            "UPDATE project_doc_view SET view = ?2 WHERE doc_id = ?1",
+            [doc.to_string(), serde_json::to_string(&view).unwrap()],
+        )
+        .unwrap();
+
+    let out = sb.pm(&["doctor"]);
+    assert_code(&out, 1);
+    let text = stdout(&out);
+    assert!(
+        text.contains("replay          DRIFT: 1 row(s) differ from the op log\n"),
+        "{text}"
+    );
+    let v = json(&sb.pm(&["doctor", "--json"]));
+    assert_eq!(v["drift"]["tables"][0]["table"], "project_doc_view");
+    assert_eq!(
+        v["drift"]["tables"][0]["changed"][0]["key"],
+        serde_json::json!([doc.to_string()])
+    );
+}

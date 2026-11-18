@@ -207,6 +207,21 @@ impl Body {
         self.doc.oplog_vv().encode()
     }
 
+    /// This replica's version vector as `(peer, counter end)` pairs sorted
+    /// by peer: the same set of ops [`Body::version`] names, in a form
+    /// that compares by value regardless of how the replica was built
+    /// (AGT-2521).
+    pub fn version_entries(&self) -> Vec<(u64, i32)> {
+        let mut entries: Vec<(u64, i32)> = self
+            .doc
+            .oplog_vv()
+            .iter()
+            .map(|(peer, counter)| (*peer, *counter))
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+
     /// Every op this replica holds that `version` (an encoded version
     /// vector, [`Body::version`]'s bytes) does not cover, as one update.
     /// A version that is *ahead* of this replica for some peer is fine —
