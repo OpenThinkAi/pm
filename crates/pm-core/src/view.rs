@@ -118,6 +118,11 @@ impl BodyState {
         self.body.updates_since(version)
     }
 
+    /// [`Body::version_entries`]: the ops this replica holds, by value.
+    pub fn version_entries(&self) -> Vec<(u64, i32)> {
+        self.body.version_entries()
+    }
+
     /// Everything this replica knows, as one blob: what serde writes.
     pub fn snapshot(&self) -> Result<BodyUpdate, BodyError> {
         self.body.snapshot()

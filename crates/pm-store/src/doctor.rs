@@ -1,5 +1,7 @@
 //! `pm doctor` (AGT-1337, the P0 exit gate): the op log is the source of
-//! truth only if the ticket tables regenerate from it byte-for-byte.
+//! truth only if the ticket tables regenerate from it byte-for-byte (a
+//! view's Loro body excepted: it compares as the decoded document,
+//! AGT-2521; see `canonical_view`).
 //!
 //! [`Store::doctor`] replays the whole log into emptied ticket tables
 //! inside a transaction, diffs the result against what was there, and
@@ -355,11 +357,35 @@ fn rows(conn: &Connection, table: &str) -> Result<BTreeMap<String, Row>> {
 /// differs, or that no longer decodes (left as stored), is still drift.
 /// The rule for a future view field: add it with `#[serde(default)]`; no
 /// migration is needed for doctor to stay clean.
+///
+/// A view's `body` (a ticket description or project document, AGT-2521)
+/// is a Loro snapshot, and Loro does not promise one encoding per
+/// document: a body built up one edit at a time (each commit restores the
+/// stored snapshot, folds the edit in and stores a new one) and the same
+/// body replayed in one pass decode identically but can serialize to
+/// different bytes. So `body` is compared as the decoded document — its
+/// text and the version vector naming every op it holds — not as bytes:
+/// `{"text": ..., "version": [[peer, counter], ...]}` replaces the base64
+/// in the compared (and shown) cell. Different text or a different op set
+/// is still drift.
 fn canonical_view(table: &str, cell: Value) -> Value {
     fn norm<T: serde::Serialize + serde::de::DeserializeOwned>(text: &str) -> Option<String> {
         serde_json::from_str::<T>(text)
             .ok()
             .and_then(|v| serde_json::to_string(&v).ok())
+    }
+    fn with_body<T: serde::Serialize + serde::de::DeserializeOwned>(
+        text: &str,
+        body: impl Fn(&T) -> &pm_core::BodyState,
+    ) -> Option<String> {
+        let view = serde_json::from_str::<T>(text).ok()?;
+        let mut json = serde_json::to_value(&view).ok()?;
+        let body = body(&view);
+        *json.as_object_mut()?.get_mut("body")? = serde_json::json!({
+            "text": body.text(),
+            "version": body.version_entries(),
+        });
+        serde_json::to_string(&json).ok()
     }
     let Value::String(text) = &cell else {
         return cell;
@@ -367,8 +393,8 @@ fn canonical_view(table: &str, cell: Value) -> Value {
     let canonical = match table {
         "workspace_view" => norm::<pm_core::WorkspaceView>(text),
         "project_view" => norm::<pm_core::ProjectView>(text),
-        "ticket_view" => norm::<pm_core::TicketView>(text),
-        "project_doc_view" => norm::<pm_core::DocView>(text),
+        "ticket_view" => with_body::<pm_core::TicketView>(text, |v| &v.body),
+        "project_doc_view" => with_body::<pm_core::DocView>(text, |v| &v.body),
         _ => None,
     };
     canonical.map_or(cell, Value::String)
