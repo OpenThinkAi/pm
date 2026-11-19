@@ -128,9 +128,11 @@ mod tests {
     }
 
     fn create(ticket: Ulid) -> Op {
+        // A distinct counter per op: a log holds one op per stamp.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         Op::new(
             Ulid::new(),
-            Hlc::new(1, 0),
+            Hlc::new(1, NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
             ActorId::new("matt"),
             ticket,
             Payload::TicketCreate(TicketCreate {

@@ -1671,6 +1671,7 @@ name = "pm-store"
 version = "0.2.0"
 dependencies = [
  "pm-core",
+ "proptest",
  "rusqlite",
  "serde",
  "serde_json",

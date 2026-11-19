@@ -326,6 +326,25 @@ ahead or the clock is slow, and a restored backup is history).
 `pm_core::Clock` never overflows its counter: a spent counter rolls into
 the next millisecond.
 
+**Stamps are unique (AGT-2456).** The merge rules break ties on
+`(hlc, actor)` and assume no two ops share the pair. Two machines running
+as the same actor can produce two such ops, and replicas would then keep
+whichever one they saw first. So a fresh op whose `(hlc, actor)` another
+op of the workspace already has (stored before, or earlier in the same
+batch) is `400 duplicate_stamp`, and the batch stores nothing. The op that
+reached the hub first keeps the stamp. `pm sync` answers the refusal by
+giving the named op, and every outbox op after it, a fresh stamp
+(`pm_store::Store::restamp_outbox`: same op ids and order, derived tables
+rebuilt) and pushing again. None of those ops had reached the hub, so no
+other replica has seen the old stamps. The op id check comes first, so
+re-pushing an op the hub already has is acknowledged as before. A replica
+applies the same rule on every path into its log (`StoreError::DuplicateStamp`).
+On pull, the hub's op wins: a local op holding its stamp that the hub has
+not acknowledged is re-stamped first, and any other holder means the
+pulled op is refused into quarantine. That case only arises with a log
+stored before this check, and every replica refuses the same op.
+Duplicates already stored are left alone.
+
 **Stamps in payloads (AGT-1482).** A `field.set archived_at` value and a
 `hold.set`'s `hold.at` are stamps too, copied into the ticket and stored
 as integers. They get the same two checks (`pm_core::Op::check_payload_stamps`):
@@ -383,6 +402,7 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 | `400` | `invalid_op` | `index` (position in the batch), `op_id` (if the JSON had one) | an op does not parse as `pm_core::Op`, its `actor` is empty, its `version` is newer than the hub's, a `field.set number` carries a number outside `1..=2^53-1`, or it does not fold into its ticket with `pm_core::apply` (a relation that does not touch the ticket), or it fails an admission rule (AGT-1464): a `project.create` for a project the log already has one for (`already has a project.create` — a backdated second create would move the stamp document identity is anchored to), or a `ticket.create` whose entity is already bound as a project document (`already a project document`); a replica refuses the same on every commit path, a pull included (`StoreError::DuplicateProjectCreate` / `EntityInUse`) |
 | `400` | `invalid_stamp` | `index`, `op_id` | the op's `hlc.wall_ms` exceeds `i64::MAX` or its `hlc.counter` is `u32::MAX`, or so does a stamp in its payload (`archived_at`, `hold.at`; AGT-1482) (see Stamps above) |
 | `400` | `future_stamp` | `index`, `op_id` | the op's `hlc.wall_ms`, or a payload stamp's (AGT-1482), is more than one day ahead of the hub's clock |
+| `400` | `duplicate_stamp` | `index`, `op_id` | a fresh op's `(hlc, actor)` is already another op's in this workspace, stored or earlier in the batch (AGT-2456, see Stamps are unique above); `reason` names the op that holds it. Re-stamp the op and push again |
 | `400` | `op_too_large` | `index`, `op_id` | a `body.edit` whose decoded update is over 32 MiB (`pm_core::MAX_BODY_EDIT_BYTES`, AGT-1467) — every replica would import, snapshot and re-serve it — or an op of any other kind whose payload JSON is over 1 MiB (`pm_core::MAX_OP_PAYLOAD_BYTES`, AGT-1482; the largest honest one on record is a 14 KB comment); a replica refuses the same on pull, local commit and restore (`StoreError::OpTooLarge`) |
 | `400` | `invalid_id` | `index`, `op_id` | a `workspace.set prefix`, `project.create` (id or parent), `project.set parent`, or a ticket's project (`ticket.create`, `field.set project`) whose value is not a safe file-path component (`pm_core::ids::is_safe_component`: ASCII letters, digits, `-`, `_`, `.`, at most 64 bytes, not starting with `.` or `-`, not ending with `.`, not a Windows device name); a state name (`state.upsert`, `ticket.create`, `state.transition`, and — AGT-1482 — `claim`, which writes its state into the ticket like a transition) that is not `pm_core::ids::is_safe_segment` (1–255 bytes, not starting with `.` or `-`, not ending with `.` or a space, no `/`, `\`, `:`, control or Unicode format characters (AGT-2434), not a Windows device name — `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`9`, `LPT1`–`9`, `CONIN$`, `CONOUT$`, any case, any extension; AGT-1467); or a `project.doc_add` name that is not `pm_core::ids::is_safe_doc_name` (`/`-separated safe segments, so no `.`/`..`, leading or trailing `/`; at most 255 bytes) — clients use these in export/backup paths (AGT-1453, AGT-1464); a replica refuses the same on pull, local commit and restore (`StoreError::InvalidId`) |
 | `400` | `actor_not_allowed` | `index`, `op_id` | a fresh op's `actor`, or an actor its payload names (`claim.assignee`, `hold.by`, `field.set assignee`, `actor.upsert id`), matches none of the token's actor patterns; `reason` names the token, its patterns and the field (see [Token actor bindings](#token-actor-bindings-agt-1450)) |

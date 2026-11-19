@@ -154,7 +154,7 @@ fn push_texts(port: u16, token: &str, texts: &[(String, String)]) -> Vec<(String
 fn at(wall_ms: u64, actor: &str, entity: Ulid, payload: Payload) -> Op {
     Op::new(
         Ulid::new(),
-        Hlc::new(wall_ms, 0),
+        Hlc::new(wall_ms, unique_counter(wall_ms, actor)),
         ActorId::new(actor),
         entity,
         payload,

@@ -481,6 +481,41 @@ impl Store {
         Ok(pruned)
     }
 
+    /// Gives `op_id` — an op the hub has not acknowledged — and every
+    /// outbox op after it fresh stamps, in their log order, then
+    /// rebuilds the derived tables from the log (AGT-2456). Returns how
+    /// many ops were re-stamped.
+    ///
+    /// This is what a replica does when the hub refuses one of its ops as
+    /// `duplicate_stamp`: another machine running as the same actor got
+    /// the same `(hlc, actor)` to the hub first. The outbox ops have
+    /// never been stored by the hub (a refused batch stores nothing, and
+    /// batches go up in log order), so no other replica has seen their
+    /// stamps and changing them is invisible outside this database. Their
+    /// op ids, payloads and relative order stay; the new stamps come from
+    /// this replica's clock past everything in the log, so they keep
+    /// winning over every op they won over locally, except ops the hub
+    /// already has (pulled ones, or a claim the hub admitted) stamped in
+    /// between, which they now follow — as they will on every replica.
+    ///
+    /// Refuses ([`StoreError::NotInOutbox`]) an `op_id` that is not in
+    /// the outbox: an op the hub has must keep its stamp.
+    pub fn restamp_outbox(&mut self, op_id: Ulid) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seq = match seq_of(&tx, op_id)? {
+            Some(seq) if in_outbox(&tx, seq)? => Some(seq),
+            _ => None,
+        };
+        let Some(seq) = seq else {
+            return Err(StoreError::NotInOutbox { op_id });
+        };
+        let n = restamp_outbox_in(&tx, seq)?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Every pulled op this replica has parked or refused
     /// ([`Store::apply_pulled_page`]), in hub seq order — for `pm doctor`.
     pub fn quarantine(&self) -> Result<Vec<Quarantined>> {
@@ -750,6 +785,10 @@ fn disposition(e: &StoreError, op: &Op) -> Disposition {
         | E::OpTooLarge(_)
         | E::NotADocumentEdit { .. }
         | E::DuplicateNumber { .. }
+        // AGT-2456: another op already holds the stamp; the first in hub
+        // order keeps it (`Engine::process` re-stamps a local op that never
+        // reached the hub before this can happen to it).
+        | E::DuplicateStamp { .. }
         | E::AlreadyNumbered { .. }
         | E::ClaimRejected(_)
         | E::Apply(_)
@@ -779,6 +818,7 @@ fn disposition(e: &StoreError, op: &Op) -> Disposition {
         | E::SchemaTooNew { .. }
         | E::NoWorkspace
         | E::DuplicateOp { .. }
+        | E::NotInOutbox { .. }
         | E::AlreadyJoined { .. }
         | E::NotEmpty { .. }
         | E::NotAConfigOp { .. }
@@ -929,6 +969,17 @@ impl<'a, 'c> Engine<'a, 'c> {
         if self.is_quarantined(op.op_id)? {
             self.pulled.skipped += 1;
             return Ok(());
+        }
+        // AGT-2456: the hub admitted `op`, so its stamp is taken. A local
+        // op holding the same stamp that the hub has not acknowledged
+        // never reached any other replica: it gives the stamp up
+        // ([`restamp_outbox_in`]) and `op` lands as it does everywhere
+        // else. A holder the hub does have makes `op` a duplicate
+        // stamp, refused below like on every replica that pulls both.
+        if let Some((seq, _)) = crate::commit::stamp_holder(self.tx, op)?
+            && in_outbox(self.tx, seq)?
+        {
+            restamp_outbox_in(self.tx, seq)?;
         }
         match self.attempt(op)? {
             Attempt::Landed => {
@@ -1198,6 +1249,46 @@ fn pull_error(op: &Op, source: StoreError) -> StoreError {
         kind: op.kind(),
         source: Box::new(source),
     }
+}
+
+/// Whether the op at `seq` is in the outbox: local, and not acknowledged
+/// by the hub.
+fn in_outbox(conn: &Connection, seq: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT ?1 > (SELECT pushed_through FROM sync_state)
+                AND ?1 NOT IN (SELECT seq FROM sync_pushed)",
+        params![seq],
+        |r| r.get(0),
+    )?)
+}
+
+/// [`Store::restamp_outbox`]'s body: re-stamps every outbox op from `seq`
+/// on, in log order, and rebuilds the derived tables.
+fn restamp_outbox_in(tx: &Transaction<'_>, seq: i64) -> Result<usize> {
+    let mut stmt = tx.prepare(
+        "SELECT seq FROM ops
+         WHERE seq >= ?1
+           AND seq > (SELECT pushed_through FROM sync_state)
+           AND seq NOT IN (SELECT seq FROM sync_pushed)
+         ORDER BY seq",
+    )?;
+    let seqs: Vec<i64> = stmt
+        .query_map(params![seq], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    let mut clock = pm_core::Clock::from_latest(crate::commit::latest_hlc(tx)?);
+    for seq in &seqs {
+        let hlc = clock.send(now_ms());
+        hlc.check_range().map_err(StoreError::InvalidStamp)?;
+        tx.execute(
+            "UPDATE ops SET hlc_wall_ms = ?1, hlc_counter = ?2 WHERE seq = ?3",
+            params![crate::codec::wall_ms(hlc)?, hlc.counter, seq],
+        )?;
+    }
+    if !seqs.is_empty() {
+        crate::doctor::replay(tx)?;
+    }
+    Ok(seqs.len())
 }
 
 fn seq_of(conn: &Connection, op_id: Ulid) -> Result<Option<i64>> {

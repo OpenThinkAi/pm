@@ -316,3 +316,24 @@ pub fn admin(database_url: &str, args: &[&str]) -> (bool, String, String) {
         String::from_utf8(out.stderr).unwrap(),
     )
 }
+
+/// The HLC counter for a fixture op on `wall_ms` by `actor` (AGT-2456):
+/// 0 the first time this test thread uses the pair, then 1, 2, ... The hub
+/// refuses a fresh op whose `(hlc, actor)` another op already has, so
+/// fixtures that place several of one actor's ops on one millisecond need
+/// distinct counters; different actors on one millisecond still share an
+/// HLC.
+pub fn unique_counter(wall_ms: u64, actor: &str) -> u32 {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static USED: RefCell<HashMap<(u64, String), u32>> = RefCell::new(HashMap::new());
+    }
+    USED.with(|used| {
+        let mut used = used.borrow_mut();
+        let next = used.entry((wall_ms, actor.to_string())).or_insert(0);
+        let counter = *next;
+        *next += 1;
+        counter
+    })
+}

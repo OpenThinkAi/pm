@@ -16,6 +16,16 @@ pub enum StoreError {
     NoWorkspace,
     #[error("op {op_id} is already in the log")]
     DuplicateOp { op_id: Ulid },
+    /// AGT-2456: an op whose `(hlc, actor)` stamp another op in the log
+    /// already has. The merge rules break ties on exactly that pair, so
+    /// two ops sharing it would merge differently by arrival order.
+    #[error("op {op_id} has the same stamp (hlc and actor) as op {existing}, already in the log")]
+    DuplicateStamp { op_id: Ulid, existing: Ulid },
+    /// `Store::restamp_outbox` on an op the hub already has (or that is
+    /// not in the log): only an op no other replica has seen may change
+    /// its stamp.
+    #[error("op {op_id} is not in the outbox, so its stamp may not change")]
+    NotInOutbox { op_id: Ulid },
     #[error("ticket {ticket} does not exist; only ticket.create can start a ticket")]
     UnknownTicket { ticket: Ulid },
     #[error("state '{state}' is not a workflow state of this workspace")]

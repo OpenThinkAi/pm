@@ -364,9 +364,11 @@ fn fake_hub_with(numbering: bool) -> String {
                     for (i, (entity, wall_ms)) in stragglers.enumerate() {
                         let op = pm_core::Op::new(
                             ulid::Ulid::new(),
+                            // A distinct counter each: a log holds one op
+                            // per (hlc, actor), and creates share a ms.
                             pm_core::Hlc {
                                 wall_ms: wall_ms + 1,
-                                counter: 0,
+                                counter: i as u32,
                             },
                             pm_core::ActorId::new("hub"),
                             entity.parse().unwrap(),
