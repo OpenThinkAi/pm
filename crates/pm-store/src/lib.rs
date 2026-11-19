@@ -71,8 +71,8 @@ pub use error::{Result, StoreError};
 pub use query::TicketFilter;
 pub use ready::ReadyQuery;
 pub use sync::{
-    MAX_PARK_RETRIES, PULL_MAX_FUTURE_SKEW_MS, Pulled, QUARANTINE_RETENTION_MS, QuarantineStatus,
-    Quarantined, SyncStatus,
+    MAX_PARK_RETRIES, PARK_HORIZON_SEQS, PULL_MAX_FUTURE_SKEW_MS, Pulled, QUARANTINE_RETENTION_MS,
+    QuarantineStatus, Quarantined, SyncStatus,
 };
 
 /// Embedded migrations, in order. Each runs once, inside its own

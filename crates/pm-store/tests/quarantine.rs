@@ -13,7 +13,9 @@ use pm_core::{
     ActorId, ActorKind, Body, Hlc, Op, Payload, Priority, Project, ProjectStatus, State,
     StateCategory, Workspace,
 };
-use pm_store::{MAX_PARK_RETRIES, QuarantineStatus, Quarantined, Store, StoreError};
+use pm_store::{
+    MAX_PARK_RETRIES, PARK_HORIZON_SEQS, QuarantineStatus, Quarantined, Store, StoreError,
+};
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -970,4 +972,79 @@ fn unique_counter(wall_ms: u64, actor: &str) -> u32 {
         *next += 1;
         counter
     })
+}
+
+/// AGT-2457: a parked op is given up on once the hub log moves more than
+/// `PARK_HORIZON_SEQS` past it, measured in hub seqs, so parked rows stay
+/// bounded. A replica that gave the op up still converges once its
+/// missing dependency arrives: every replica gives it up at the same
+/// point in the log, whatever its page boundaries, so the dependency
+/// lands everywhere and the op is refused everywhere.
+#[test]
+fn a_parked_op_past_the_horizon_is_given_up_alike_on_every_replica() {
+    let log = log_head();
+    let n = log.config.len() as i64;
+    let t = Ulid::new();
+    let early = comment(t, 20, "before the create");
+    let filler = actor_upsert(log.ws, 21, "filler");
+    let late = create(t, 22, "pm");
+    // Hub seqs are not contiguous (they are shared across workspaces), so
+    // a gap stands in for a long stretch of the log.
+    let parked_at = n + 1;
+    let past = parked_at + PARK_HORIZON_SEQS + 1;
+    let page = vec![
+        (parked_at, early.clone()),
+        (past, filler.clone()),
+        (past + 1, late.clone()),
+    ];
+
+    // One replica pulls it all in one page; one a page per op.
+    let (_a, mut whole) = replica(&log);
+    whole.apply_pulled_page(&seqd(1, &log.config), n).unwrap();
+    let pulled = whole.apply_pulled_page(&page, past + 1).unwrap();
+    assert_eq!(pulled.refused.len(), 1, "{pulled:?}");
+    let (_b, mut paged) = replica(&log);
+    paged.apply_pulled_page(&seqd(1, &log.config), n).unwrap();
+    for (seq, op) in &page {
+        paged
+            .apply_pulled_page(&[(*seq, op.clone())], *seq)
+            .unwrap();
+        if *seq == parked_at {
+            assert_eq!(paged.sync_status().unwrap().parked, 1);
+        }
+    }
+    for store in [&mut whole, &mut paged] {
+        let q = store.quarantine().unwrap();
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert_eq!(q[0].op_id, early.op_id);
+        assert_eq!(q[0].status, QuarantineStatus::Refused);
+        assert!(q[0].reason.starts_with("gave up"), "{q:?}");
+        assert_eq!(store.sync_status().unwrap().parked, 0);
+        // The dependency landed; the given-up op stayed out.
+        assert!(store.ticket(t).unwrap().is_some());
+        assert!(store.comments(t).unwrap().is_empty());
+        assert!(store.doctor().unwrap().is_healthy());
+    }
+    assert_eq!(state_of(&whole, &[t]), state_of(&paged, &[t]));
+}
+
+/// The horizon is inclusive: a dependency exactly `PARK_HORIZON_SEQS`
+/// after the parked op still lands it.
+#[test]
+fn a_dependency_at_the_horizon_still_lands_the_parked_op() {
+    let log = log_head();
+    let n = log.config.len() as i64;
+    let (_d, mut store) = replica(&log);
+    store.apply_pulled_page(&seqd(1, &log.config), n).unwrap();
+    let t = Ulid::new();
+    let early = comment(t, 20, "before the create");
+    let at = n + 1;
+    store.apply_pulled_page(&[(at, early.clone())], at).unwrap();
+    let edge = at + PARK_HORIZON_SEQS;
+    let pulled = store
+        .apply_pulled_page(&[(edge, create(t, 21, "pm"))], edge)
+        .unwrap();
+    assert_eq!((pulled.applied, pulled.unparked), (2, 1), "{pulled:?}");
+    assert!(store.quarantine().unwrap().is_empty());
+    assert_eq!(store.comments(t).unwrap().len(), 1);
 }
