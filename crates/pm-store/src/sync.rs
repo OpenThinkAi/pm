@@ -114,6 +114,25 @@ pub enum QuarantineStatus {
 /// so this only bounds the work an adversarial or corrupt log can cause.
 pub const MAX_PARK_RETRIES: u32 = 32;
 
+/// How far the hub log may move past a parked op before it is refused
+/// (AGT-2457), in hub sequence numbers: an op parked at hub seq `s` is
+/// given up on when this replica processes an op at a seq greater than
+/// `s + PARK_HORIZON_SEQS`. With [`MAX_PARK_RETRIES`] it bounds the parked
+/// set: whatever a log does, at most the ops of one horizon's span of hub
+/// seqs (at most this many) are parked at once, so `sync_quarantine`'s
+/// parked rows, and the set every pulled page loads, stop growing.
+///
+/// The rule is measured on the hub log, never on this machine's clock or
+/// on how often it pulls: the seq of the op being processed is the same on
+/// every replica, ops are processed in hub seq order whatever the page
+/// boundaries, and the give-up happens before that op is processed. So
+/// every replica gives up on the same parked ops at the same point in the
+/// log, and the convergence argument on [`Store::apply_pulled_page`]
+/// holds unchanged. Like the retry cap, honest logs never reach it (they
+/// park nothing); a dependency that arrives after the horizon finds the
+/// op refused on every replica, not applied on some.
+pub const PARK_HORIZON_SEQS: i64 = 10_000;
+
 /// The sync state `pm doctor` reports.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct SyncStatus {
@@ -385,7 +404,9 @@ impl Store {
     ///   and any other op wakes those waiting on its entity (a missing
     ///   ticket or relation target, the edits a `body.edit` builds on) or
     ///   targeting it. A parked op still blocked after
-    ///   [`MAX_PARK_RETRIES`] retries is refused;
+    ///   [`MAX_PARK_RETRIES`] retries is refused, and so is one still
+    ///   parked once the hub log has moved [`PARK_HORIZON_SEQS`] past it
+    ///   (AGT-2457);
     /// - **refused** — it can never apply: an unsafe id, a stamp out of
     ///   range, an oversized `body.edit`, a duplicate `project.create`, a
     ///   document or ticket id already in use, a number already taken, an
@@ -425,6 +446,19 @@ impl Store {
     /// most [`MAX_PARK_RETRIES`] times after, so a page costs at most
     /// `1 + MAX_PARK_RETRIES` attempts per op whatever order it arrives
     /// in (the old pass-until-nothing-lands loop was quadratic).
+    ///
+    /// Bounded storage (AGT-2457): a parked op is refused once an op more
+    /// than [`PARK_HORIZON_SEQS`] hub seqs after it is processed, so the
+    /// parked rows — kept with their content, and loaded by every page —
+    /// never span more than that much of the hub log. The give-up is a
+    /// function of the hub log (the seq being processed), never of this
+    /// machine's clock or pull schedule, so it is one more decision every
+    /// replica makes identically, and the convergence argument above
+    /// covers it: a dependency that lands later finds the op refused
+    /// everywhere. Re-fetching a given-up op from the hub once its
+    /// dependency lands would *break* that — a replica that re-fetched it
+    /// would hold an op the others refused — so a given-up op stays
+    /// refused, like any other.
     ///
     /// `ops` may come in any order; it is sorted by hub seq. `next` is
     /// the page's `next`: the cursor becomes the greater of it and the
@@ -959,6 +993,7 @@ impl<'a, 'c> Engine<'a, 'c> {
 
     /// One incoming op at `order`.
     fn process(&mut self, order: i64, op: &Op) -> Result<()> {
+        self.expire(order)?;
         if let Some(seq) = seq_of(self.tx, op.op_id)? {
             // Already in the log (this replica's own, echoed back): on
             // every other replica it lands here, so it wakes here too.
@@ -989,6 +1024,29 @@ impl<'a, 'c> Engine<'a, 'c> {
             Attempt::Blocked(e, wake) => self.park(order, op, wake, e),
             Attempt::Refused(e) => self.refuse(order, op, 0, e.to_string(), e),
         }
+    }
+
+    /// Refuses every parked op the hub log has moved more than
+    /// [`PARK_HORIZON_SEQS`] past, now that an op at hub seq `order` is
+    /// being processed (AGT-2457), oldest first. [`Mode::Quarantine`]
+    /// only: a strict batch's orders are batch positions, and it parks
+    /// nothing across calls.
+    fn expire(&mut self, order: i64) -> Result<()> {
+        if self.mode != Mode::Quarantine {
+            return Ok(());
+        }
+        let horizon = order.saturating_sub(PARK_HORIZON_SEQS);
+        let expired: Vec<i64> = self.parked.range(..horizon).map(|(o, _)| *o).collect();
+        for at in expired {
+            let parked = self.unindex(at).expect("it was parked");
+            let op = self.load(at, parked.op_id)?;
+            let reason = format!(
+                "gave up: still waiting when the hub log reached seq {order}, more than \
+                 {PARK_HORIZON_SEQS} past this op's seq {at}"
+            );
+            self.record_refused(at, &op, parked.attempts, reason, false)?;
+        }
+        Ok(())
     }
 
     fn is_quarantined(&self, op_id: Ulid) -> Result<bool> {
@@ -1073,11 +1131,24 @@ impl<'a, 'c> Engine<'a, 'c> {
         if self.mode == Mode::Strict {
             return Err(pull_error(op, e));
         }
-        let recorded_ms = now_ms();
         // AGT-2434: an op refused for its size is not kept at all — storing
         // it would keep the very bytes the limit exists to refuse. Its id,
         // seq, kind, entity and reason are enough for `pm doctor`.
         let pruned = matches!(e, StoreError::OpTooLarge(_));
+        self.record_refused(order, op, attempts, reason, pruned)
+    }
+
+    /// Records `op` as refused in `sync_quarantine` ([`Mode::Quarantine`]),
+    /// without its content when `pruned`.
+    fn record_refused(
+        &mut self,
+        order: i64,
+        op: &Op,
+        attempts: u32,
+        reason: String,
+        pruned: bool,
+    ) -> Result<()> {
+        let recorded_ms = now_ms();
         let content = if pruned {
             String::new()
         } else {
