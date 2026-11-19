@@ -480,8 +480,11 @@ generated from the exact versions pinned in
 `cd crates/pm/views-vendor && bun install --frozen-lockfile && bun build.ts`,
 and committed (`.gitattributes` marks them `-diff`: a vendor bump reviews
 as the pin change, and the build is reproducible — rerunning it on a clean
-checkout leaves `git status` clean). Building or installing pm needs no
-JavaScript toolchain.
+checkout leaves `git status` clean). The `vendor` stamp required check
+(AGT-2458) reruns that build at every merge to `main` and fails if
+`views/vendor/` or `vendor.sha256` changes, so a tampered bundle cannot
+pass by also editing its checksum. Building or installing pm needs no
+JavaScript toolchain; merging to `main` needs `bun`.
 
 The body binding (`lib/body.ts`, `BodySync`) is DOM-free and binds any
 body endpoint — `bodyTransport(api, path)` with `ticketBodyPath(ref)`
