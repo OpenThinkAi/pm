@@ -40,6 +40,14 @@
 //!   assignee` the same way (it may not take a ticket a claim could not);
 //!   a refused one is acknowledged, reconciled and reported alike, with
 //!   its `kind` in `--json`.
+//! - **Duplicate stamps** (AGT-2456). Two machines running as the same
+//!   actor can stamp an op with the same `(hlc, actor)`; the hub keeps the
+//!   one that reached it first and answers the other's batch `400
+//!   duplicate_stamp`, naming the op. That op never reached the hub, nor
+//!   did anything after it in the outbox, so the push re-stamps it and
+//!   the rest of the outbox ([`Store::restamp_outbox`]: same op ids and
+//!   order, fresh stamps, tables rebuilt) and sends the batch again,
+//!   noting it on stderr. At most [`MAX_RESTAMPS`] times per push.
 //! - **Pull.** Pages of `GET /ops?since=<cursor>&limit=` are applied one
 //!   page per transaction ([`Store::apply_pulled_page`]: foreign ops land
 //!   through the normal commit path, ops already present by `op_id` — this
@@ -251,6 +259,11 @@ impl Progress {
     }
 }
 
+/// How many times one push re-stamps its outbox after a `duplicate_stamp`
+/// before giving up (module docs). One is all an honest hub needs: the
+/// fresh stamps are past everything this replica has seen.
+pub const MAX_RESTAMPS: usize = 3;
+
 /// Which part of the outbox a push drains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outbox {
@@ -278,6 +291,7 @@ pub(crate) fn push_all(
     round: &mut Round,
 ) -> Result<()> {
     let mut batches = 0;
+    let mut restamps = 0;
     loop {
         let outbox = match which {
             Outbox::All => store.outbox(limits.batch_ops)?,
@@ -287,7 +301,31 @@ pub(crate) fn push_all(
             return Ok(());
         }
         let batch = Batch::take(&outbox, MAX_BATCH_BYTES)?;
-        let acks = post_batch(hub, &batch)?;
+        let acks = match post_batch(hub, &batch)? {
+            Posted::Acks(acks) => acks,
+            Posted::DuplicateStamp { op_id, refusal } => {
+                restamps += 1;
+                if restamps > MAX_RESTAMPS {
+                    return Err(refusal);
+                }
+                let n = store.restamp_outbox(op_id).map_err(|e| {
+                    let CliError { code, error } = CliError::from(e);
+                    CliError {
+                        code,
+                        error: error.context(format!(
+                            "re-stamping op {op_id} after the hub refused its stamp"
+                        )),
+                    }
+                })?;
+                eprintln!(
+                    "pm: the hub already holds another op with op {op_id}'s stamp (another \
+                     machine running as the same actor?); gave it and {} later outbox op(s) \
+                     fresh stamps and pushing again",
+                    n.saturating_sub(1)
+                );
+                continue;
+            }
+        };
         batches += 1;
         if limits.crash_after_batches == Some(batches) {
             // Test hook (module docs): the hub has this batch, the outbox
@@ -337,10 +375,18 @@ pub(crate) fn push_all(
 /// `POST /ops` with `batch`: the hub's acknowledgement of every op in it,
 /// in batch order. Every non-`200` is the error `pm sync` reports; so is a
 /// `200` that acknowledges none of the batch.
-fn post_batch(hub: &HubClient, batch: &Batch) -> Result<Vec<Ack>> {
+fn post_batch(hub: &HubClient, batch: &Batch) -> Result<Posted> {
     let (status, body) = hub
         .post_json("ops", &batch.body)
         .map_err(|e| transport(hub, e))?;
+    if status == 400
+        && let Some(op_id) = duplicate_stamp(&body, batch)
+    {
+        return Ok(Posted::DuplicateStamp {
+            op_id,
+            refusal: refused(status, &body),
+        });
+    }
     match status {
         200 => {}
         404 => return Err(unauthorized(hub)),
@@ -355,7 +401,28 @@ fn post_batch(hub: &HubClient, batch: &Batch) -> Result<Vec<Ack>> {
             batch.op_ids.len()
         )));
     }
-    Ok(acks)
+    Ok(Posted::Acks(acks))
+}
+
+/// What the hub made of a pushed batch, short of an error.
+enum Posted {
+    /// The `200`: one acknowledgement per op.
+    Acks(Vec<Ack>),
+    /// `400 duplicate_stamp` naming `op_id`, one of the batch's ops
+    /// (AGT-2456): nothing was stored. `refusal` is the error to report
+    /// if re-stamping does not help.
+    DuplicateStamp { op_id: Ulid, refusal: CliError },
+}
+
+/// The op a `400` refuses as `duplicate_stamp`, when the body says so
+/// and names one of `batch`'s ops.
+fn duplicate_stamp(body: &str, batch: &Batch) -> Option<Ulid> {
+    let detail: Value = serde_json::from_str(body).ok()?;
+    if detail.get("error").and_then(Value::as_str) != Some("duplicate_stamp") {
+        return None;
+    }
+    let op_id: Ulid = detail.get("op_id")?.as_str()?.parse().ok()?;
+    batch.op_ids.contains(&op_id).then_some(op_id)
 }
 
 /// Pushes one `claim` op on its own — nothing else may ride along, since
@@ -365,8 +432,12 @@ fn post_batch(hub: &HubClient, batch: &Batch) -> Result<Vec<Ack>> {
 pub(crate) fn push_claim(hub: &HubClient, claim: &Op) -> Result<Ack> {
     debug_assert!(matches!(claim.payload, Payload::Claim(_)));
     let batch = Batch::take(std::slice::from_ref(&(0, claim.clone())), MAX_BATCH_BYTES)?;
-    let mut acks = post_batch(hub, &batch)?;
-    Ok(acks.swap_remove(0))
+    match post_batch(hub, &batch)? {
+        Posted::Acks(mut acks) => Ok(acks.swap_remove(0)),
+        // The claim is not in the log, so there is nothing to re-stamp;
+        // trying again stamps a fresh one.
+        Posted::DuplicateStamp { refusal, .. } => Err(refusal),
+    }
 }
 
 /// Logs the writes that bring a ticket to the hub's answer on a refused
@@ -1050,5 +1121,26 @@ mod tests {
         assert!(msg.contains("op #3 of the batch, 01X"), "{msg}");
         let e = refused(413, "");
         assert!(e.error.to_string().contains("HTTP 413"));
+    }
+
+    /// AGT-2456: a `duplicate_stamp` 400 is recognised only when it names
+    /// one of the batch's ops; anything else stays a plain refusal.
+    #[test]
+    fn a_duplicate_stamp_refusal_names_one_of_the_batch() {
+        let outbox = [comment("a"), comment("b")];
+        let batch = Batch::take(&outbox, MAX_BATCH_BYTES).unwrap();
+        let named = outbox[1].1.op_id;
+        let body = format!(
+            r#"{{"error":"duplicate_stamp","reason":"taken","index":1,"op_id":"{named}"}}"#
+        );
+        assert_eq!(duplicate_stamp(&body, &batch), Some(named));
+        let stranger = format!(
+            r#"{{"error":"duplicate_stamp","reason":"taken","index":1,"op_id":"{}"}}"#,
+            Ulid::new()
+        );
+        assert_eq!(duplicate_stamp(&stranger, &batch), None);
+        let other = format!(r#"{{"error":"invalid_op","reason":"x","op_id":"{named}"}}"#);
+        assert_eq!(duplicate_stamp(&other, &batch), None);
+        assert_eq!(duplicate_stamp("not json", &batch), None);
     }
 }

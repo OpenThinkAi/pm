@@ -251,6 +251,13 @@ fn ticket_create_entities(tx: &Transaction<'_>) -> Result<BTreeSet<Ulid>> {
     rows.map(|row| ulid("ops.entity", &row?)).collect()
 }
 
+/// Regenerates the derived tables from the log inside the caller's
+/// transaction (AGT-2456: after [`crate::Store::restamp_outbox`] moves
+/// stamps the views were folded with).
+pub(crate) fn replay(tx: &Transaction<'_>) -> Result<()> {
+    replay_all(tx).map(drop)
+}
+
 fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
     let tables = derived_tables();
     let before = snapshot(tx, &tables)?;

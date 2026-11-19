@@ -21,7 +21,10 @@ use ulid::Ulid;
 fn op(payload: Payload) -> Op {
     Op::new(
         Ulid::new(),
-        Hlc::new(1_790_000_000_000, 0),
+        Hlc::new(
+            1_790_000_000_000,
+            unique_counter(1_790_000_000_000, "studio"),
+        ),
         ActorId::new("studio"),
         Ulid::new(),
         payload,
@@ -116,8 +119,8 @@ fn push_assigns_seqs_idempotently_and_rejects_bad_batches_whole() {
     let a_json = serde_json::to_string_pretty(&a).unwrap();
     let b_json = serde_json::to_string(&b).unwrap();
     let c_json = format!(
-        r#"{{"version": 1, "kind": "hold.clear", "entity": "{}", "actor": "studio", "hlc": {{"counter": 0, "wall_ms": 1790000000000}}, "op_id": "{}"}}"#,
-        c.entity, c.op_id
+        r#"{{"version": 1, "kind": "hold.clear", "entity": "{}", "actor": "studio", "hlc": {{"counter": {}, "wall_ms": 1790000000000}}, "op_id": "{}"}}"#,
+        c.entity, c.hlc.counter, c.op_id
     );
     let body = format!("{{\"ops\": [{a_json}, {b_json}, {c_json}]}}");
     let resp = push_raw(port, &studio, &body);
@@ -158,7 +161,7 @@ fn push_assigns_seqs_idempotently_and_rejects_bad_batches_whole() {
                 "saltline",
                 op.op_id.to_string().as_str(),
                 "1790000000000",
-                "0",
+                op.hlc.counter.to_string().as_str(),
                 "studio",
                 op.entity.to_string().as_str(),
                 kind,
@@ -629,4 +632,83 @@ fn in_flight_push_bodies_are_bounded() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(count_ops(&url), 1);
     drop(stalled);
+}
+
+/// AGT-2456: a fresh op whose `(hlc, actor)` another op already has —
+/// stored before, or earlier in the same batch — is `400
+/// duplicate_stamp` and the batch stores nothing; the same stamp by
+/// another actor is fine, and re-pushing the op that holds the stamp is
+/// still acknowledged by `op_id`.
+#[test]
+fn a_duplicate_stamp_is_refused_and_the_holder_still_re_pushes() {
+    let Some((_container, url)) =
+        postgres_for("a_duplicate_stamp_is_refused_and_the_holder_still_re_pushes")
+    else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&url, port);
+    wait_for_health(&mut hub, port);
+    let studio = create_token(&url, "studio", "saltline");
+
+    let at = |actor: &str, counter: u32| {
+        Op::new(
+            Ulid::new(),
+            Hlc::new(1_795_000_000_000, counter),
+            ActorId::new(actor),
+            Ulid::new(),
+            Payload::LabelAdd(LabelAdd {
+                label: "x".to_string(),
+            }),
+        )
+    };
+    let held = at("matt", 0);
+    let (status, body) = push(port, &studio, &[json!(held)]);
+    assert_eq!(status, 200, "{body}");
+    let before = count_ops(&url);
+
+    // Another machine running as matt, same stamp, behind a fresh op.
+    let fine = at("matt", 1);
+    let twin = at("matt", 0);
+    let (status, body) = push(port, &studio, &[json!(fine), json!(twin)]);
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "duplicate_stamp", "{body}");
+    assert_eq!(body["index"], 1, "{body}");
+    assert_eq!(body["op_id"], twin.op_id.to_string(), "{body}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&held.op_id.to_string()),
+        "{body}"
+    );
+    assert_eq!(count_ops(&url), before, "a refused batch stores nothing");
+
+    // Two ops of one batch on one stamp: the second is refused.
+    let (one, two) = (at("matt", 5), at("matt", 5));
+    let (status, body) = push(port, &studio, &[json!(one), json!(two)]);
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "duplicate_stamp", "{body}");
+    assert_eq!(body["op_id"], two.op_id.to_string(), "{body}");
+    assert_eq!(count_ops(&url), before);
+
+    // The holder re-pushed: acknowledged as before, with its seq.
+    let (status, body) = push(port, &studio, &[json!(held)]);
+    assert_eq!(status, 200, "{body}");
+    assert!(!acks(&body)[0].2, "{body}");
+    // The same HLC by another actor is another stamp; the re-stamped
+    // twin goes through.
+    let alice = at("alice", 0);
+    let restamped = Op {
+        hlc: Hlc::new(1_795_000_000_000, 6),
+        ..twin.clone()
+    };
+    let (status, body) = push(
+        port,
+        &studio,
+        &[json!(fine), json!(alice), json!(restamped)],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(acks(&body).iter().all(|a| a.2), "{body}");
+    assert_eq!(count_ops(&url), before + 3);
 }

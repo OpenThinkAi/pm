@@ -20,7 +20,7 @@ use ulid::Ulid;
 fn op(entity: Ulid, wall_ms: u64, payload: Payload) -> Op {
     Op::new(
         Ulid::new(),
-        Hlc::new(wall_ms, 0),
+        Hlc::new(wall_ms, unique_counter(wall_ms, "studio")),
         ActorId::new("studio"),
         entity,
         payload,

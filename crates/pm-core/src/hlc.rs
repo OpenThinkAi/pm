@@ -250,8 +250,12 @@ impl Hlc {
 
 /// The total order every merge rule uses: HLC first, actor id as the
 /// tie-break. Two ops from different actors can share an `Hlc`; two ops
-/// from the same actor never can (its clock is strictly monotonic), so
-/// `Stamp` is unique per op and `Ord` is total.
+/// from one actor's clock never can (it is strictly monotonic), so
+/// `Stamp` is unique per op and `Ord` is total. Two *machines* running as
+/// the same actor have two clocks and can repeat a stamp, so uniqueness
+/// is also enforced where ops are admitted (AGT-2456): pm-store refuses a
+/// second op on a stamp its log holds, and pm-hub refuses one its log
+/// holds (`duplicate_stamp`), whose author re-stamps it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Stamp {
     pub hlc: Hlc,

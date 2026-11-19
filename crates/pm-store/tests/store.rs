@@ -77,7 +77,7 @@ fn store() -> (TempDir, Store) {
 fn op(ticket: Ulid, wall_ms: u64, actor: &str, payload: Payload) -> Op {
     Op::new(
         Ulid::new(),
-        Hlc::new(wall_ms, 0),
+        Hlc::new(wall_ms, unique_counter(wall_ms, actor)),
         ActorId::new(actor),
         ticket,
         payload,
@@ -647,7 +647,8 @@ fn one_hundred_concurrent_allocations_never_share_a_number() {
             thread::spawn(move || {
                 let mut store = Store::open(&path).unwrap();
                 let id = Ulid::new();
-                store.commit(&create(id, 1, None)).unwrap();
+                // One millisecond each: a log holds one op per stamp.
+                store.commit(&create(id, 1 + i as u64, None)).unwrap();
                 let actor = ActorId::new(format!("claude:worker-{i}"));
                 (id, store.allocate_number(id, &actor).unwrap())
             })
@@ -1077,4 +1078,25 @@ fn actors_are_registered_with_their_kind_on_first_op() {
             ("matt".to_string(), "human".to_string()),
         ]
     );
+}
+
+/// The HLC counter for a fixture op on `wall_ms` by `actor` (AGT-2456):
+/// 0 the first time this test thread uses the pair, then 1, 2, ... A log
+/// refuses two ops with the same `(hlc, actor)`, so fixtures that place
+/// several of one actor's ops on one millisecond need distinct counters;
+/// ops by different actors on one millisecond still share an HLC, which
+/// is what the merge rules' actor tie-break is tested with.
+fn unique_counter(wall_ms: u64, actor: &str) -> u32 {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static USED: RefCell<HashMap<(u64, String), u32>> = RefCell::new(HashMap::new());
+    }
+    USED.with(|used| {
+        let mut used = used.borrow_mut();
+        let next = used.entry((wall_ms, actor.to_string())).or_insert(0);
+        let counter = *next;
+        *next += 1;
+        counter
+    })
 }

@@ -406,7 +406,18 @@ pub(crate) fn load_view(conn: &Connection, ticket: Ulid) -> Result<Option<Ticket
 
 /// `pub(crate)`: reused by [`crate::project::commit_doc_edit`] so a
 /// document's `body.edit` op lands in the same `ops` table, the same way.
+///
+/// Refuses an op whose `(hlc, actor)` another op in the log already has
+/// ([`StoreError::DuplicateStamp`], AGT-2456): every ingest path — a local
+/// verb, a pull, a restore, a migration's backfill — appends here, so no
+/// two ops in a log share the pair pm-core's merge rules tie-break on.
 pub(crate) fn append_op(conn: &Connection, op: &Op) -> Result<()> {
+    if let Some((_, existing)) = stamp_holder(conn, op)? {
+        return Err(StoreError::DuplicateStamp {
+            op_id: op.op_id,
+            existing,
+        });
+    }
     let mut envelope = serde_json::to_value(op).expect("an op serializes");
     let payload = envelope
         .as_object_mut()
@@ -427,6 +438,32 @@ pub(crate) fn append_op(conn: &Connection, op: &Op) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// The op already in the log, other than `op` itself, with `op`'s
+/// `(hlc, actor)` stamp, as `(seq, op_id)` (AGT-2456).
+pub(crate) fn stamp_holder(conn: &Connection, op: &Op) -> Result<Option<(i64, Ulid)>> {
+    // A wall time no column can hold is in no op of the log; the ingest
+    // checks refuse it with the right error.
+    let Ok(wall) = wall_ms(op.hlc) else {
+        return Ok(None);
+    };
+    let held = conn
+        .query_row(
+            "SELECT seq, op_id FROM ops
+             WHERE hlc_wall_ms = ?1 AND hlc_counter = ?2 AND actor = ?3 AND op_id <> ?4
+             ORDER BY seq LIMIT 1",
+            params![
+                wall,
+                op.hlc.counter,
+                op.actor.as_str(),
+                op.op_id.to_string()
+            ],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    held.map(|(seq, id)| Ok((seq, crate::codec::ulid("ops.op_id", &id)?)))
+        .transpose()
 }
 
 /// Rewrites every derived row of the ticket from its view. Checks the

@@ -112,6 +112,19 @@
 //! historical ops. Stamps carried in payloads (`archived_at`, `hold.at`;
 //! AGT-1482) get the same range and one-day checks.
 //!
+//! **Stamps are unique (AGT-2456).** The merge rules order writes by
+//! `(hlc, actor)` and assume no two ops share one (pm-core `hlc.rs`); two
+//! machines running as the same actor can break that, and replicas would
+//! then keep whichever of the pair they saw first. So a fresh op whose
+//! `(hlc, actor)` another op of the workspace already has (stored before,
+//! or earlier in this batch) is `400 duplicate_stamp`, and the batch is
+//! refused whole. The op that reached the hub first keeps the stamp; the
+//! client that authored the refused one re-stamps it and the rest of its
+//! outbox (`pm_store::Store::restamp_outbox`) and pushes again. A re-push
+//! of an op the hub already has is matched by `op_id` first and
+//! acknowledged as before. Logs written before this check may already
+//! hold such pairs; they are left alone.
+//!
 //! **Identifiers (AGT-1450).** A `workspace.set prefix`, `project.create`
 //! (id, parent) or `project.set parent` whose value is not a safe path
 //! component (`pm_core::ids::is_safe_component`) is `400 invalid_id`:
@@ -346,6 +359,13 @@ enum PushError {
         op_id: String,
         reason: String,
     },
+    /// A fresh op whose `(hlc, actor)` another op of the workspace
+    /// already has (AGT-2456).
+    DuplicateStamp {
+        index: usize,
+        op_id: String,
+        reason: String,
+    },
     /// A fresh op authored as the hub's own actor.
     ReservedActor {
         index: usize,
@@ -520,6 +540,19 @@ impl IntoResponse for PushError {
                 StatusCode::BAD_REQUEST,
                 ErrorBody {
                     error: "actor_not_allowed",
+                    reason,
+                    index: Some(index),
+                    op_id: Some(op_id),
+                },
+            ),
+            PushError::DuplicateStamp {
+                index,
+                op_id,
+                reason,
+            } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "duplicate_stamp",
                     reason,
                     index: Some(index),
                     op_id: Some(op_id),
@@ -898,6 +931,7 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
         for p in &fresh {
             check_actor(caller, allocator.seeded, p, first_at[&p.op_id])?;
         }
+        check_unique_stamps(&tx, workspace, &fresh, &first_at).await?;
 
         // Fold the batch into the views in order; once seeded, that is
         // where a claim is decided. A refused claim is answered, not
@@ -1024,6 +1058,55 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
         })
         .collect();
     Ok(Pushed { ops, numbers })
+}
+
+/// Refuses the first fresh op (in batch order) whose `(hlc, actor)` an op
+/// already in `workspace`'s log, or an earlier fresh op of this batch,
+/// carries (AGT-2456, see the module doc). Fresh ops are not in the log
+/// by `op_id`, so any stored match is a different op.
+async fn check_unique_stamps(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    fresh: &[&Parsed<'_>],
+    first_at: &HashMap<String, usize>,
+) -> Result<(), PushError> {
+    if fresh.is_empty() {
+        return Ok(());
+    }
+    let wall_ms: Vec<i64> = fresh.iter().map(|p| p.hlc_wall_ms).collect();
+    let counters: Vec<i64> = fresh.iter().map(|p| p.hlc_counter).collect();
+    let actors: Vec<&str> = fresh.iter().map(|p| p.actor.as_str()).collect();
+    let stored = tx
+        .query(
+            "SELECT o.hlc_wall_ms, o.hlc_counter, o.actor, MIN(o.op_id)
+             FROM ops o
+             JOIN unnest($2::bigint[], $3::bigint[], $4::text[]) AS n (wall_ms, counter, actor)
+               ON o.hlc_wall_ms = n.wall_ms AND o.hlc_counter = n.counter AND o.actor = n.actor
+             WHERE o.workspace_id = $1
+             GROUP BY o.hlc_wall_ms, o.hlc_counter, o.actor",
+            &[&workspace, &wall_ms, &counters, &actors],
+        )
+        .await?;
+    let mut held: HashMap<(i64, i64, String), String> = stored
+        .into_iter()
+        .map(|row| ((row.get(0), row.get(1), row.get(2)), row.get(3)))
+        .collect();
+    for p in fresh {
+        let key = (p.hlc_wall_ms, p.hlc_counter, p.actor.clone());
+        if let Some(other) = held.get(&key) {
+            return Err(PushError::DuplicateStamp {
+                index: first_at[&p.op_id],
+                op_id: p.op_id.clone(),
+                reason: format!(
+                    "op {} has stamp {}.{} by {:?}, which op {other} already has; \
+                     re-stamp it and push again",
+                    p.op_id, p.hlc_wall_ms, p.hlc_counter, p.actor
+                ),
+            });
+        }
+        held.insert(key, p.op_id.clone());
+    }
+    Ok(())
 }
 
 /// Whether `caller` may store `p` as its actor (see the module doc).

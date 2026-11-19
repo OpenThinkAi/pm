@@ -94,7 +94,7 @@ fn replica(log: &Log) -> (TempDir, Store) {
 fn op(entity: Ulid, wall_ms: u64, actor: &str, payload: Payload) -> Op {
     Op::new(
         Ulid::new(),
-        Hlc::new(wall_ms, 0),
+        Hlc::new(wall_ms, unique_counter(wall_ms, actor)),
         ActorId::new(actor),
         entity,
         payload,
@@ -949,4 +949,25 @@ fn refused_content_is_pruned_after_the_retention_window() {
     assert_eq!((again.applied, again.skipped), (0, 1));
     assert_eq!(store.ticket(t).unwrap().unwrap().state, "triage");
     assert!(store.doctor().unwrap().is_healthy());
+}
+
+/// The HLC counter for a fixture op on `wall_ms` by `actor` (AGT-2456):
+/// 0 the first time this test thread uses the pair, then 1, 2, ... A log
+/// refuses two ops with the same `(hlc, actor)`, so fixtures that place
+/// several of one actor's ops on one millisecond need distinct counters;
+/// ops by different actors on one millisecond still share an HLC, which
+/// is what the merge rules' actor tie-break is tested with.
+fn unique_counter(wall_ms: u64, actor: &str) -> u32 {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static USED: RefCell<HashMap<(u64, String), u32>> = RefCell::new(HashMap::new());
+    }
+    USED.with(|used| {
+        let mut used = used.borrow_mut();
+        let next = used.entry((wall_ms, actor.to_string())).or_insert(0);
+        let counter = *next;
+        *next += 1;
+        counter
+    })
 }

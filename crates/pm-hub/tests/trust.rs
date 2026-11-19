@@ -40,7 +40,7 @@ fn label_as(actor: &str, hlc: Hlc) -> Op {
 fn create_as(actor: &str, entity: Ulid, wall_ms: u64) -> Op {
     Op::new(
         Ulid::new(),
-        Hlc::new(wall_ms, 0),
+        Hlc::new(wall_ms, unique_counter(wall_ms, actor)),
         ActorId::new(actor),
         entity,
         Payload::TicketCreate(TicketCreate {
@@ -152,7 +152,7 @@ fn bound_tokens_author_only_their_actors_and_legacy_tokens_survive_the_migration
     query_rows(
         &url,
         "ALTER TABLE tokens DROP COLUMN actors;
-         DELETE FROM schema_version WHERE version = 4",
+         DELETE FROM schema_version WHERE version >= 4",
     )
     .unwrap();
     // The admin CLI refuses a schema older than it expects.
@@ -711,7 +711,7 @@ fn pushed_project_identity_is_admission_checked() {
     let at = |wall_ms: u64, entity: Ulid, payload: Payload| {
         Op::new(
             Ulid::new(),
-            Hlc::new(wall_ms, 0),
+            Hlc::new(wall_ms, unique_counter(wall_ms, "matt")),
             ActorId::new("matt"),
             entity,
             payload,
@@ -912,7 +912,7 @@ fn only_an_unrestricted_token_pushes_config_before_the_seed() {
     let state = |ws: Ulid, wall_ms: u64, actor: &str, name: &str| {
         Op::new(
             Ulid::new(),
-            Hlc::new(wall_ms, 0),
+            Hlc::new(wall_ms, unique_counter(wall_ms, actor)),
             ActorId::new(actor),
             ws,
             Payload::StateUpsert(StateUpsert {
