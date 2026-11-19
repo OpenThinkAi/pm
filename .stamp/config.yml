@@ -13,6 +13,12 @@ branches:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: fmt
         run: cargo fmt --check
+      # AGT-2458: rebuild the vendored view libraries from their pinned
+      # lockfile and fail if the committed bytes (or their checksum
+      # manifest) differ. The build is byte-reproducible across runs,
+      # machines (macOS, Linux) and bun 1.2.22 to 1.3.13.
+      - name: vendor
+        run: cd crates/pm/views-vendor && bun install --frozen-lockfile && bun build.ts && git diff --exit-code -- ../views/vendor vendor.sha256
 reviewers:
   security:
     prompt: .stamp/reviewers/security.md
