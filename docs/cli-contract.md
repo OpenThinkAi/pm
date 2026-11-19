@@ -1984,6 +1984,19 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
   refused with `code: "held_by_another"` and reconciled and reported the
   same way (`the hub refused unassign …` / `the hub refused state
   transition …`, `kind: "field.set"` / `"state.transition"`).
+- **Duplicate stamps** (AGT-2456). Two machines running as the same
+  actor can give two ops the same `(hlc, actor)` stamp. The hub keeps the
+  one that reached it first and refuses the other's batch as `400
+  duplicate_stamp` (`docs/hub-api.md`). That op had not reached the hub,
+  and neither had anything after it in the outbox, so `pm sync` gives it
+  and the rest of the outbox fresh stamps (same op ids, same order, local
+  tables rebuilt), notes it on stderr (`pm: the hub already holds another
+  op with op <op_id>'s stamp …`) and pushes again. It retries at most 3
+  times, then exits `1` with the hub's refusal. Nothing changes in
+  `--json`. On pull, a hub op whose stamp an unpushed local op holds lands,
+  and the local op is re-stamped. A pulled op whose stamp an op the hub
+  already has holds is refused into the quarantine; only a log stored
+  before the hub's check can contain one.
 - **Pull.** `GET …/ops?since=<cursor>&limit=1000`, page by page until
   `next >= head` (the hub also cuts a page at 16 MiB of ops,
   `docs/hub-api.md`). Each page is applied in one transaction (foreign ops
@@ -1999,7 +2012,10 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
     relation target, a project, state or document binding, or the edits
     a `body.edit` builds on). It is retried, in hub order, whenever an op
     that could supply it lands, and lands itself once that works (counted
-    in `unparked`). One still waiting after 32 retries is refused.
+    in `unparked`). One still waiting after 32 retries is refused, and so
+    is one still parked once the hub log has moved 10,000 sequence numbers
+    past it (AGT-2457). Every replica gives up on the same ops, because the
+    rule is measured on the hub log, not on this machine's clock.
   - **refused** — it can never apply here: an id or name unsafe in a file
     path (a `claim`'s state included, AGT-1482), a stamp out of range (the
     op's, or one in its payload: `archived_at`, `hold.at`), a `body.edit`

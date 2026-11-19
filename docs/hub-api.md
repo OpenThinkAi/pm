@@ -256,7 +256,7 @@ AGT-1463). The build stage copies only `Cargo.toml`, `Cargo.lock`,
 ## `GET /health` (open)
 
 ```json
-{"status": "ok", "schema_version": 4, "op_version": 1, "build": "<git sha>"}
+{"status": "ok", "schema_version": 5, "op_version": 1, "build": "<git sha>"}
 ```
 
 `schema_version` is read live from the database; `op_version` is the
