@@ -622,8 +622,9 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
-        let Some(seq) = seq.filter(|s| in_outbox(&tx, *s).unwrap_or(false)) else {
-            return Err(StoreError::NotInOutbox { op_id });
+        let seq = match seq {
+            Some(seq) if in_outbox(&tx, seq)? => seq,
+            _ => return Err(StoreError::NotInOutbox { op_id }),
         };
         tx.execute("DELETE FROM ops WHERE seq = ?1", params![seq])?;
         fold_pushed(&tx)?;

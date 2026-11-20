@@ -333,7 +333,7 @@ pub(crate) fn push_all(
                 eprintln!(
                     "pm: the hub refused redact {op_id} ({}); dropped it from the outbox. The text \
                      stays erased on this replica, but the hub and other replicas keep it: redact \
-                     with a token allowed to (an unrestricted one), or ask whoever holds one",
+                     it again from another replica that syncs with an unrestricted token",
                     crate::text::inline(&reason)
                 );
                 round.refused_redacts.push(RefusedRedact {
