@@ -13,6 +13,7 @@
     "refused": 0
   },
   "refused": [],
+  "refused_redacts": [],
   "rejected": [],
   "schema": 1,
   "seed": {
