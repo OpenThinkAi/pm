@@ -125,6 +125,15 @@
 //! acknowledged as before. Logs written before this check may already
 //! hold such pairs; they are left alone.
 //!
+//! **Redactions (AGT-2427, see `redact`).** A `redact` naming no ops, too
+//! many, or itself is `400 invalid_redact`. From an actor-bound token, each
+//! op it names must already be stored (or earlier in the batch) on the
+//! redact's entity, written by an actor the binding permits, else `400
+//! redact_not_allowed` and the batch is refused whole. After the batch is
+//! stored, every redact touching its entities is applied to the stored
+//! rows — a redact pushed now, or a target pushed after its redact — and
+//! the affected ticket views are refolded, all before commit.
+//!
 //! **Identifiers (AGT-1450).** A `workspace.set prefix`, `project.create`
 //! (id, parent) or `project.set parent` whose value is not a safe path
 //! component (`pm_core::ids::is_safe_component`) is `400 invalid_id`:
@@ -366,6 +375,13 @@ enum PushError {
         op_id: String,
         reason: String,
     },
+    /// A `redact` from an actor-bound token naming an op it may not
+    /// erase (AGT-2427, `redact::check`).
+    RedactNotAllowed {
+        index: usize,
+        op_id: String,
+        reason: String,
+    },
     /// A fresh op authored as the hub's own actor.
     ReservedActor {
         index: usize,
@@ -540,6 +556,19 @@ impl IntoResponse for PushError {
                 StatusCode::BAD_REQUEST,
                 ErrorBody {
                     error: "actor_not_allowed",
+                    reason,
+                    index: Some(index),
+                    op_id: Some(op_id),
+                },
+            ),
+            PushError::RedactNotAllowed {
+                index,
+                op_id,
+                reason,
+            } => (
+                StatusCode::BAD_REQUEST,
+                ErrorBody {
+                    error: "redact_not_allowed",
                     reason,
                     index: Some(index),
                     op_id: Some(op_id),
@@ -724,6 +753,13 @@ fn parse_op(index: usize, raw: &RawValue, now_ms: u64) -> Result<Parsed<'_>, Pus
     // any kind — would be re-served to, and folded by, every replica.
     op.check_size().map_err(|e| PushError::OpCheck {
         error: "op_too_large",
+        index,
+        op_id: Some(op.op_id.to_string()),
+        reason: e.to_string(),
+    })?;
+    // AGT-2427: a redact naming no ops, too many, or itself.
+    op.check_redact().map_err(|e| PushError::OpCheck {
+        error: "invalid_redact",
         index,
         op_id: Some(op.op_id.to_string()),
         reason: e.to_string(),
@@ -932,6 +968,30 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
             check_actor(caller, allocator.seeded, p, first_at[&p.op_id])?;
         }
         check_unique_stamps(&tx, workspace, &fresh, &first_at).await?;
+        // AGT-2427: an actor-bound token may erase only ops it could have
+        // written (`redact`).
+        if !caller.actors.unrestricted() {
+            let mut earlier: HashMap<ulid::Ulid, (ulid::Ulid, String)> = HashMap::new();
+            for p in &fresh {
+                if crate::redact::targets(&p.op).is_some() {
+                    let verdict = crate::redact::check(&tx, workspace, &p.op, &earlier, |a| {
+                        caller.actors.permits(a)
+                    })
+                    .await?;
+                    if let Err(no) = verdict {
+                        return Err(PushError::RedactNotAllowed {
+                            index: first_at[&p.op_id],
+                            op_id: p.op_id.clone(),
+                            reason: format!(
+                                "token {} ({}) is bound to actors and may not redact op {}: {};                                  only an unrestricted token may redact ops it could not have written",
+                                caller.token_id, caller.token_label, no.target, no.why
+                            ),
+                        });
+                    }
+                }
+                earlier.insert(p.op.op_id, (p.op.entity, p.actor.clone()));
+            }
+        }
 
         // Fold the batch into the views in order; once seeded, that is
         // where a claim is decided. A refused claim is answered, not
@@ -1030,6 +1090,11 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
         } else {
             Vec::new()
         };
+        // AGT-2427: erase what any redact the batch touches names, from
+        // the stored rows and the views, before both are committed.
+        let stored: std::collections::HashSet<String> =
+            admitted.iter().map(|p| p.entity.clone()).collect();
+        crate::redact::apply(&tx, workspace, &stored, &mut views).await?;
         views.save(&tx, workspace).await?;
         let entities: Vec<String> = creates.iter().map(|c| c.entity.to_string()).collect();
         numbers = numbers::report(&tx, workspace, &entities, allocated).await?;

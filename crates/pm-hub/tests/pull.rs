@@ -441,7 +441,7 @@ fn pull_pages_the_seed_log_back_byte_for_byte() {
         ("?limit=0", "limit must be"),
         ("?limit=-1", "limit must be"),
         ("?limit=x", "limit must be"),
-        ("?since=0&kind=claim", "unknown query parameter"),
+        ("?since=0&kind=claim", "kind may only be"),
         ("?since=%ZZ", ""),
     ] {
         let resp = pull_raw(port, &studio, query);

@@ -38,7 +38,7 @@ use std::fmt::Write as _;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
@@ -105,6 +105,31 @@ impl IntoResponse for PullError {
 struct Cursor {
     since: i64,
     limit: i64,
+    /// `kind=redact` (AGT-2427): only `redact` ops — the one-off fetch
+    /// an upgraded client makes of every redact it may have missed.
+    only_redacts: bool,
+}
+
+/// Which ops a page serves (AGT-2427, `redact`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kinds {
+    /// Every op: the client sent `redact::ACCEPT_HEADER`.
+    All,
+    /// Every op but `redact`: a client that never said it understands
+    /// them (an older build would fail its pull on one).
+    NoRedacts,
+    /// Only `redact` ops (`kind=redact`).
+    OnlyRedacts,
+}
+
+impl Kinds {
+    fn sql(self) -> &'static str {
+        match self {
+            Kinds::All => "all",
+            Kinds::NoRedacts => "no-redacts",
+            Kinds::OnlyRedacts => "only-redacts",
+        }
+    }
 }
 
 fn parse_query(uri: &Uri) -> Result<Cursor, PullError> {
@@ -113,6 +138,7 @@ fn parse_query(uri: &Uri) -> Result<Cursor, PullError> {
     let mut cursor = Cursor {
         since: 0,
         limit: DEFAULT_PAGE_OPS,
+        only_redacts: false,
     };
     for (name, value) in &params {
         match name.as_str() {
@@ -139,9 +165,15 @@ fn parse_query(uri: &Uri) -> Result<Cursor, PullError> {
                     })?;
                 cursor.limit = limit.min(MAX_PAGE_OPS);
             }
+            "kind" if value == "redact" => cursor.only_redacts = true,
+            "kind" => {
+                return Err(PullError::Query(format!(
+                    "kind may only be \"redact\", got {value:?}"
+                )));
+            }
             other => {
                 return Err(PullError::Query(format!(
-                    "unknown query parameter {other:?}; this route takes since and limit"
+                    "unknown query parameter {other:?}; this route takes since, limit and kind"
                 )));
             }
         }
@@ -149,16 +181,34 @@ fn parse_query(uri: &Uri) -> Result<Cursor, PullError> {
     Ok(cursor)
 }
 
-pub async fn pull(State(db): State<Db>, caller: Authed, uri: Uri) -> Response {
-    match pull_page(&db, &caller.workspace, &uri).await {
+pub async fn pull(State(db): State<Db>, caller: Authed, headers: HeaderMap, uri: Uri) -> Response {
+    let accepts_redacts = headers
+        .get_all(crate::redact::ACCEPT_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|kind| kind.trim() == crate::redact::ACCEPT_VALUE);
+    match pull_page(&db, &caller.workspace, &uri, accepts_redacts).await {
         Ok(body) => ([(CONTENT_TYPE, "application/json")], body).into_response(),
         Err(e) => e.into_response(),
     }
 }
 
 /// The response body, assembled from the stored op text.
-async fn pull_page(db: &Db, workspace: &str, uri: &Uri) -> Result<String, PullError> {
+async fn pull_page(
+    db: &Db,
+    workspace: &str,
+    uri: &Uri,
+    accepts_redacts: bool,
+) -> Result<String, PullError> {
     let cursor = parse_query(uri)?;
+    let kinds = if cursor.only_redacts {
+        Kinds::OnlyRedacts
+    } else if accepts_redacts {
+        Kinds::All
+    } else {
+        Kinds::NoRedacts
+    };
     // One statement, so the page and `head` are read from one snapshot.
     // With nothing past `since` the join yields one row of `(head, NULL,
     // NULL)`, which still carries `head`. The byte cap ([`MAX_PAGE_BYTES`])
@@ -178,12 +228,23 @@ async fn pull_page(db: &Db, workspace: &str, uri: &Uri) -> Result<String, PullEr
                             sum(octet_length(op::text)) OVER (ORDER BY seq) AS through
                      FROM (SELECT seq, op FROM ops
                            WHERE workspace_id = $1 AND seq > $2
+                             AND CASE $5::text
+                                     WHEN 'no-redacts' THEN kind <> 'redact'
+                                     WHEN 'only-redacts' THEN kind = 'redact'
+                                     ELSE true
+                                 END
                            ORDER BY seq LIMIT $3) AS l
                  ) AS w
                  WHERE n = 1 OR through <= $4
              ) AS p ON true
              ORDER BY p.seq",
-            &[&workspace, &cursor.since, &cursor.limit, &MAX_PAGE_BYTES],
+            &[
+                &workspace,
+                &cursor.since,
+                &cursor.limit,
+                &MAX_PAGE_BYTES,
+                &kinds.sql(),
+            ],
         )
         .await?;
     let head: i64 = rows.first().map_or(0, |row| row.get(0));
@@ -199,6 +260,23 @@ async fn pull_page(db: &Db, workspace: &str, uri: &Uri) -> Result<String, PullEr
         }
         write!(body, r#"{{"seq":{seq},"op":{op}}}"#).expect("writing to a String");
         next = seq;
+    }
+    // AGT-2427: a page left empty only because its ops were all withheld
+    // `redact`s moves the cursor past them (still within `head`, and an
+    // empty page may move `next` that far), or a client could never get
+    // beyond a run of them.
+    if next == cursor.since && kinds == Kinds::NoRedacts && head > cursor.since {
+        let skipped: Option<i64> = db
+            .reader
+            .query_one(
+                "SELECT max(seq) FROM (SELECT seq FROM ops
+                                       WHERE workspace_id = $1 AND seq > $2
+                                       ORDER BY seq LIMIT $3) AS s",
+                &[&workspace, &cursor.since, &cursor.limit],
+            )
+            .await?
+            .get(0);
+        next = skipped.unwrap_or(next).min(head);
     }
     write!(body, r#"],"next":{next},"head":{head}}}"#).expect("writing to a String");
     Ok(body)
@@ -222,20 +300,24 @@ mod tests {
             parse("").unwrap(),
             Cursor {
                 since: 0,
-                limit: DEFAULT_PAGE_OPS
+                limit: DEFAULT_PAGE_OPS,
+                only_redacts: false,
             }
         );
         assert_eq!(
             parse("?since=42&limit=7").unwrap(),
             Cursor {
                 since: 42,
-                limit: 7
+                limit: 7,
+                only_redacts: false,
             }
         );
         assert_eq!(parse("?limit=1000000").unwrap().limit, MAX_PAGE_OPS);
         assert_eq!(parse("?limit=1000").unwrap().limit, MAX_PAGE_OPS);
         assert_eq!(parse("?limit=1").unwrap().limit, 1);
         assert_eq!(parse("?since=0").unwrap().since, 0);
+        assert!(parse("?kind=redact").unwrap().only_redacts);
+        assert!(parse("?kind=ticket.create").is_err());
     }
 
     #[test]
@@ -253,7 +335,8 @@ mod tests {
             ("?limit=0", "limit must be an integer >= 1", "\"0\""),
             ("?limit=-5", "limit must be an integer >= 1", "\"-5\""),
             ("?limit=ten", "limit must be an integer >= 1", "\"ten\""),
-            ("?kind=claim", "unknown query parameter", "\"kind\""),
+            ("?kind=claim", "kind may only be", "\"claim\""),
+            ("?order=desc", "unknown query parameter", "\"order\""),
         ] {
             let reason = parse(query).unwrap_err();
             assert!(reason.starts_with(expect), "{query}: {reason}");

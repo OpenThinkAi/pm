@@ -210,6 +210,12 @@ pub(crate) fn run_once(
         &mut round,
     )?;
     pull_all(store, hub, &mut round)?;
+    backfill_redacts(store, hub, &mut round)?;
+    // AGT-2427: a pulled redact rewrote ops in place; checkpoint so the
+    // pages that held their text leave the write-ahead log too.
+    if round.applied > 0 {
+        store.scrub_wal()?;
+    }
     Ok(round)
 }
 
@@ -724,6 +730,64 @@ fn pull_all(store: &mut Store, hub: &HubClient, round: &mut Round) -> Result<()>
         }
         since = page.next;
     }
+}
+
+/// The one-off fetch of every `redact` op a replica upgraded from a build
+/// before redaction owes (AGT-2427, `Store::redact_backfill_due`): the hub
+/// withheld redacts from that build's pulls (`docs/hub-api.md`), so its
+/// cursor may be past some. `GET ops?kind=redact` pages through all of
+/// them; each is applied as a pulled op would be, and the cursor stays
+/// where the pull left it. A hub that does not know the parameter (400
+/// `invalid_query`) predates redaction and so holds none: nothing is owed.
+fn backfill_redacts(store: &mut Store, hub: &HubClient, round: &mut Round) -> Result<()> {
+    if !store.redact_backfill_due()? {
+        return Ok(());
+    }
+    let mut since = 0;
+    loop {
+        let (status, body) = hub
+            .get(&format!("ops?since={since}&limit={PAGE_LIMIT}&kind=redact"))
+            .map_err(|e| transport(hub, e))?;
+        let page: Page = match status {
+            200 => serde_json::from_str(&body)
+                .context("the hub's redact backfill response is not a page")?,
+            400 if serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+                .as_deref()
+                == Some("invalid_query") =>
+            {
+                break;
+            }
+            404 => return Err(unauthorized(hub)),
+            400 => return Err(refused(status, &body)),
+            503 => return Err(unavailable(&body)),
+            other => return Err(unexpected(other, "the redact backfill")),
+        };
+        check_page_next(&page, since)?;
+        let ops = page
+            .ops
+            .into_iter()
+            .map(|item| {
+                serde_json::from_value::<Op>(item.op)
+                    .map(|op| (item.seq, op))
+                    .with_context(|| {
+                        format!("hub seq {}: not an op this build understands", item.seq)
+                    })
+            })
+            .collect::<std::result::Result<Vec<(i64, Op)>, _>>()?;
+        let pulled = store.apply_redact_backfill(&ops)?;
+        round.pulled += ops.len();
+        round.applied += pulled.applied;
+        round.skipped += pulled.skipped;
+        round.refused.extend(pulled.refused);
+        if ops.is_empty() || page.next >= page.head || page.next <= since {
+            break;
+        }
+        since = page.next;
+    }
+    store.mark_redact_backfilled()?;
+    Ok(())
 }
 
 // ----------------------------------------------------------------- errors

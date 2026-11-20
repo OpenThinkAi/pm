@@ -25,6 +25,7 @@ mod pipe;
 mod project;
 mod read;
 mod ready;
+mod redact;
 mod section;
 mod seed;
 mod sync;
@@ -321,6 +322,31 @@ enum Cmd {
         /// Clear the hold instead of setting one
         #[arg(long)]
         clear: bool,
+    },
+    /// Erase a ticket's text for good: titles, description, comments or hold reasons (a redact
+    /// op that rewrites them on this replica, the hub and every replica that syncs)
+    Redact {
+        /// Ticket id (e.g. PM-12) or ULID
+        id: String,
+        /// Every title the ticket has had (it then reads "[redacted]")
+        #[arg(long)]
+        title: bool,
+        /// The description and its whole edit history (it then reads empty)
+        #[arg(long)]
+        description: bool,
+        /// The Nth comment, numbered from 1 oldest first as `pm show` lists them; repeat or
+        /// comma-separate
+        #[arg(long = "comment", value_name = "N", value_delimiter = ',')]
+        comments: Vec<usize>,
+        /// Every hold reason the ticket has had
+        #[arg(long)]
+        hold: bool,
+        /// One op by its op_id from `pm log <ID> --json`; repeat or comma-separate
+        #[arg(long = "op", value_name = "OP-ID", value_delimiter = ',')]
+        ops: Vec<ulid::Ulid>,
+        /// All of it: every title, the description, every comment and every hold reason
+        #[arg(long)]
+        all: bool,
     },
     /// List held tickets
     Holds {
@@ -726,6 +752,26 @@ fn run(ctx: &verbs::Ctx<'_>, cmd: Cmd) -> exit::Result<()> {
             },
         ),
         Cmd::Hold { args, clear } => markers::hold(ctx, &args, clear),
+        Cmd::Redact {
+            id,
+            title,
+            description,
+            comments,
+            hold,
+            ops,
+            all,
+        } => redact::ticket(
+            ctx,
+            &id,
+            &redact::Selection {
+                title,
+                description,
+                comments,
+                hold,
+                ops,
+                all,
+            },
+        ),
         Cmd::Holds { project, ids } => markers::holds(ctx, markers::HoldsArgs { project, ids }),
         Cmd::Waive { id, rule, reason } => markers::waive(ctx, &id, &rule, &reason),
         Cmd::Check { project } => check::check(ctx, project.as_deref()),

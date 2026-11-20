@@ -208,6 +208,12 @@ fn commit_in(
         commit_config_in(tx, op, Mode::Commit, between)?;
         return Ok(None);
     }
+    if matches!(op.payload, Payload::Redact(_)) {
+        return crate::redact::commit_in(tx, op, Origin::Local);
+    }
+    // AGT-2427: an op a redact in the log already names (a restore that
+    // replays a redact before its target) lands redacted.
+    let op = &*crate::redact::effective(tx, op)?;
     check_ingest(op, Origin::Local)?;
     check_ticket_entity(tx, op)?;
     ensure_actor(tx, &op.actor)?;
@@ -235,6 +241,12 @@ pub(crate) fn commit_foreign_in(tx: &Transaction<'_>, op: &Op) -> Result<Option<
         commit_config_in(tx, op, Mode::Foreign, || Ok(()))?;
         return Ok(None);
     }
+    if matches!(op.payload, Payload::Redact(_)) {
+        return crate::redact::commit_in(tx, op, Origin::Pulled);
+    }
+    // AGT-2427: a target that arrives after its redact never shows its
+    // text to the view or the log.
+    let op = &*crate::redact::effective(tx, op)?;
     check_ticket_entity(tx, op)?;
     ensure_actor(tx, &op.actor)?;
     let view = next_view(tx, op, Fold::Foreign)?;
@@ -267,6 +279,7 @@ pub(crate) fn check_ingest_at(op: &Op, now_ms: u64, origin: Origin) -> Result<()
     op.check_payload_stamps(now_ms, origin.max_future_skew_ms())?;
     pm_core::ids::check_op_ids(op)?;
     op.check_size()?;
+    op.check_redact()?;
     Ok(())
 }
 
@@ -418,11 +431,7 @@ pub(crate) fn append_op(conn: &Connection, op: &Op) -> Result<()> {
             existing,
         });
     }
-    let mut envelope = serde_json::to_value(op).expect("an op serializes");
-    let payload = envelope
-        .as_object_mut()
-        .and_then(|o| o.remove("payload"))
-        .map(|p| p.to_string());
+    let payload = payload_text(op);
     conn.execute(
         "INSERT INTO ops (op_id, hlc_wall_ms, hlc_counter, actor, entity, kind, payload, version)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -438,6 +447,16 @@ pub(crate) fn append_op(conn: &Connection, op: &Op) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// `op`'s payload as the `ops.payload` column stores it: its JSON, or
+/// `None` for a unit kind (`hold.clear`, `tombstone`).
+pub(crate) fn payload_text(op: &Op) -> Option<String> {
+    let mut envelope = serde_json::to_value(op).expect("an op serializes");
+    envelope
+        .as_object_mut()
+        .and_then(|o| o.remove("payload"))
+        .map(|p| p.to_string())
 }
 
 /// The op already in the log, other than `op` itself, with `op`'s

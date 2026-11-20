@@ -189,6 +189,18 @@ impl Body {
             .map_err(|e| BodyError::Export(e.to_string()))
     }
 
+    /// The update a redacted `body.edit` carries in place of its own
+    /// (AGT-2427, [`crate::op::Payload::redacted`]): what an empty
+    /// document exports, which names no op. Every Loro build imports it
+    /// as a no-op into any document, so a replica that predates redaction
+    /// still applies a redacted edit served to it instead of refusing it.
+    /// Deterministic: the same bytes on every call.
+    pub fn redacted_update() -> Vec<u8> {
+        LoroDoc::new()
+            .export(ExportMode::all_updates())
+            .expect("an empty document exports")
+    }
+
     /// Everything this replica knows, as one blob: the materialized-cache
     /// form for pm-store. Feed it to [`Body::apply`] on a fresh `Body` (or to
     /// any replica, which will simply learn what it was missing).

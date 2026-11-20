@@ -164,6 +164,13 @@ fn print_report(report: &Report) {
         }
     }
 
+    if report.unredacted > 0 {
+        println!(
+            "redaction       {} op(s) still hold text a redact erases (`pm doctor --rebuild` erases it)",
+            report.unredacted
+        );
+    }
+
     match &report.replay_error {
         Some(error) => println!("replay          FAILED: {}", crate::text::inline(error)),
         None if report.drift.is_empty() => {

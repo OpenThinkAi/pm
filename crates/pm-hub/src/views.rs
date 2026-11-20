@@ -47,7 +47,9 @@
 //! importing and re-snapshotting up to 23 MB of CRDT history per push
 //! (the entity namespace is also shared with project documents, whose
 //! edits are not ticket ops at all). Project kinds (`project.*`) are
-//! skipped too: nothing conditional depends on them. Skipping is not
+//! skipped too: nothing conditional depends on them. A `redact`
+//! (AGT-2427) folds into nothing: `redact` rewrites the ops it names and
+//! refolds their ticket with [`Views::refold_ticket`]. Skipping is not
 //! merging — every op is still stored and served verbatim; the view just
 //! does not carry those fields. Hub-authored `field.set number` ops and
 //! the number ops a seed carries fold like any other.
@@ -292,7 +294,10 @@ impl Views {
             | Payload::ProjectSet(_)
             | Payload::ProjectDelete
             | Payload::ProjectDocAdd(_)
-            | Payload::BodyEdit(_) => Ok(Verdict::Folded),
+            | Payload::BodyEdit(_)
+            // AGT-2427: a redact changes no view field; `redact` rewrites
+            // its targets and refolds their ticket after the batch lands.
+            | Payload::Redact(_) => Ok(Verdict::Folded),
             _ => {
                 let states = self.states();
                 let view = self
@@ -319,6 +324,22 @@ impl Views {
                 Ok(Verdict::Folded)
             }
         }
+    }
+
+    /// Replaces `entity`'s ticket view with one folded afresh from `ops`
+    /// (its stored ops, in seq order) — what a redact needs once it has
+    /// rewritten some of them (AGT-2427, `redact`). Like [`rebuild`], an
+    /// op that does not fold is skipped with a warning: the log is
+    /// already stored.
+    pub fn refold_ticket(&mut self, entity: Ulid, ops: &[Op]) {
+        let mut view = TicketView::new(entity);
+        for op in ops {
+            if let Err(e) = apply(&mut view, op) {
+                eprintln!("pm-hub: views: refolding {entity} ({}): {e}", op.op_id);
+            }
+        }
+        self.tickets.insert(entity, view);
+        self.dirty.insert(entity);
     }
 
     /// Folds one of the hub's own `field.set number` ops (`numbers`)

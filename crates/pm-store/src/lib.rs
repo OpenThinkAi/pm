@@ -51,6 +51,7 @@ mod import;
 mod project;
 mod query;
 mod ready;
+mod redact;
 mod reencode;
 mod sync;
 
@@ -92,10 +93,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (12, include_str!("../migrations/0012_sync_quarantine.sql")),
     (13, include_str!("../migrations/0013_project_kind.sql")),
     (14, include_str!("../migrations/0014_project_parked.sql")),
+    (15, include_str!("../migrations/0015_redact.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// The migration whose work is Rust, not SQL: after its (comment-only)
 /// SQL file runs, [`reencode::run`] rewrites every stored byte payload in
@@ -164,6 +166,20 @@ impl Store {
         let mut store = Store { conn };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Copies the write-ahead log into the database file and truncates it
+    /// (`PRAGMA wal_checkpoint(TRUNCATE)`), so page images written before
+    /// a redaction (AGT-2427) do not linger in `pm.sqlite-wal`; with
+    /// `secure_delete` on, the rewritten pages then hold none of the old
+    /// text either. Returns whether the checkpoint completed: another
+    /// connection reading the database keeps it from finishing, which is
+    /// not an error (SQLite checkpoints again on its own later).
+    pub fn scrub_wal(&self) -> Result<bool> {
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        Ok(busy == 0)
     }
 
     /// The schema version recorded in the database (0 before the first

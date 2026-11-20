@@ -316,12 +316,15 @@ impl HubClient {
     }
 
     /// `GET <url>/w/<workspace>/<route>` with the bearer token:
-    /// `(status, body)`.
+    /// `(status, body)`. Every request says this build understands
+    /// `redact` ops (AGT-2427), so the hub's pulls include them; a hub
+    /// that predates them ignores the header.
     pub(crate) fn get(&self, route: &str) -> std::result::Result<(u16, String), Transport> {
         let req = self
             .agent
             .get(self.route(route))
-            .header("Authorization", format!("Bearer {}", self.token));
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Pm-Accept-Ops", "redact");
         let mut resp = req.call().map_err(|e| Transport(e.to_string()))?;
         read_response(&mut resp)
     }

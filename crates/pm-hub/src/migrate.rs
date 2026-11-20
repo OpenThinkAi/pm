@@ -15,10 +15,11 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (3, include_str!("../migrations/0003_views.sql")),
     (4, include_str!("../migrations/0004_token_actors.sql")),
     (5, include_str!("../migrations/0005_op_stamps.sql")),
+    (6, include_str!("../migrations/0006_redact.sql")),
 ];
 
 /// The newest schema version this build understands.
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// The version whose migration is followed by a backfill of the
 /// materialized views from the log (`views::rebuild`, AGT-1392): a hub

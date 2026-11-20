@@ -59,7 +59,10 @@ pub use domain::{
 pub use hlc::{
     Clock, ClockError, Hlc, MAX_COUNTER, MAX_FUTURE_SKEW_MS, MAX_WALL_MS, Stamp, StampError,
 };
-pub use op::{MAX_BODY_EDIT_BYTES, MAX_OP_PAYLOAD_BYTES, OP_VERSION, Op, OpTooLarge, Payload};
+pub use op::{
+    MAX_BODY_EDIT_BYTES, MAX_OP_PAYLOAD_BYTES, MAX_REDACT_TARGETS, OP_VERSION, Op, OpTooLarge,
+    Payload, REDACTED, RedactError,
+};
 pub use view::{ApplyError, BodyState, ClaimRejected, TicketView, apply, apply_persisted};
 
 /// This crate's own version, exposed so dependents can sanity-check they

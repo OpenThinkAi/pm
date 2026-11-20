@@ -110,7 +110,10 @@ where the doc and `pm --help` disagree, the code is the bug.
 
 Deleting a ticket or project only tombstones it: titles, comments, hold
 reasons and removed body text remain in the op log, the Loro body history,
-the hub and any git backups, and there is no purge command today. See
+the hub and any git backups. To erase text for good, `pm redact <ID>`
+(titles, description, comments, hold reasons) and `pm project redact <ID>`
+(a project document) rewrite it on your replica, the hub and every replica
+that syncs; a backup repo's git history needs a manual rewrite. See
 **[`docs/data-retention.md`](./docs/data-retention.md)** before storing
 anything sensitive.
 

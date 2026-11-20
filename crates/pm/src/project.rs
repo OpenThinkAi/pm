@@ -95,6 +95,14 @@ pub enum ProjectCmd {
     },
     /// Refuses while the project still has tickets or child projects (FK)
     Delete { id: String },
+    /// Erase a project document for good: its text and whole edit history (the design doc, or
+    /// --doc NAME); a redact op that syncs to the hub and every replica
+    Redact {
+        id: String,
+        /// A named document instead of the design doc
+        #[arg(long, value_name = "NAME")]
+        doc: Option<String>,
+    },
     /// Named documents beyond the design doc
     Doc {
         #[command(subcommand)]
@@ -167,6 +175,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: ProjectCmd) -> Result<()> {
         ProjectCmd::Edit { id, view, .. } => edit(ctx, &id, view),
         ProjectCmd::Set { id, assignments } => set(ctx, &id, &assignments),
         ProjectCmd::Delete { id } => delete(ctx, &id),
+        ProjectCmd::Redact { id, doc } => crate::redact::project_doc(ctx, &id, doc.as_deref()),
         ProjectCmd::Doc { cmd } => match cmd {
             ProjectDocCmd::Add {
                 id,

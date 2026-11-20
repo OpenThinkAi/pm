@@ -1034,6 +1034,44 @@ No flags beyond the globals.
 - Exit `2`: empty `REASON`; `RULE` fails `pm_core::markers::normalize_rule`.
 - `--json`: **Ticket** (`waivers` extended or re-reasoned).
 
+### `pm redact <ID>`
+
+Flags (at least one): `--title` (every title the ticket has had: its
+`ticket.create` and each `field.set title`), `--description` (every
+description edit, so the whole edit history), `--comment <N>` (the `N`th
+comment, numbered from 1 oldest first exactly as `pm show` lists them;
+repeat or comma-separate), `--hold` (every hold reason the ticket has
+had), `--op <OP-ID>` (one op by its `op_id` from `pm log <ID> --json`;
+repeat or comma-separate), `--all` (every title, description edit, comment
+and hold reason).
+
+**Erases text for good** (AGT-2427). Commits one `redact` op naming the
+chosen ops; the store rewrites each in place (a title, comment body or
+hold reason becomes `[redacted]`, a description edit becomes an edit that
+adds nothing; op id, stamp, actor, kind and every other field stay) and
+refolds the ticket, so the text is gone from this replica's log and tables
+at once: the title reads `[redacted]` until a `pm set title=…`, the
+description reads empty (a later `pm edit` starts it afresh), a redacted
+comment keeps its place and author with body `[redacted]`, a redacted hold
+keeps its `by` and `at`. `pm sync` carries the redact to the hub, which
+rewrites its copy (`docs/hub-api.md` §Redactions), and on to every
+replica. There is no undo. Ops already redacted are skipped; if nothing is
+left, no op is written. What a redact cannot reach (backups' git history,
+files already exported, replicas on pm before 0.4.0) is in
+`docs/data-retention.md`, and the text output says so on stderr.
+
+A hub refuses an actor-bound token's redact of an op another actor wrote
+(`redact_not_allowed`): the push fails and the redact stays in the outbox.
+
+- Exit `2`: no flag given; `--op` names an op that is not this ticket's,
+  or one of a kind with no text to erase (only `ticket.create`, `field.set
+  title`, `body.edit`, `comment.add` and `hold.set` carry any).
+- Exit `3`: unknown ticket; `--comment N` past the ticket's comments (or
+  `0`).
+- Text output: `<ID>: redacted N op(s)` (or `nothing left to redact`).
+- `--json`: **Ticket** as it now reads, plus `"redacted": <ops erased by
+  this call>`.
+
 ### `pm check`
 
 Flags: `--project <PROJECT>` (only findings touching this project's
@@ -1120,7 +1158,7 @@ op's content is dropped 30 days after its refusal, on the next pull).
     "healthy": true,
     "rebuilt": {"tables": [...]} | null,   // a Diff, only present with --rebuild
     "pruned_quarantine": 2,                 // only with --prune-quarantine: refused ops whose content it dropped (AGT-1482)
-    "schema_version": 14,                   // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state); 9 since AGT-1396 (seeded flag); 12 since AGT-1467 (sync quarantine); 13 since AGT-1488 (project kind); 14 since AGT-1635 (parked project status)
+    "schema_version": 15,                   // 5 since AGT-1378 (byte payloads stored as base64); 6 since AGT-1393 (sync state); 9 since AGT-1396 (seeded flag); 12 since AGT-1467 (sync quarantine); 13 since AGT-1488 (project kind); 14 since AGT-1635 (parked project status); 15 since AGT-2427 (redaction)
     "op_count": 30,
     "tables": {"ticket": 5, "comment": 2, ...},
     "integrity": [],                        // SQLite integrity_check messages, if any
@@ -1148,7 +1186,8 @@ op's content is dropped 30 days after its refusal, on the next pull).
         "recorded_ms": 1790000000000,       // when this replica recorded it (refused: when it was refused)
         "pruned": false                     // its content was dropped (AGT-1482: 30 days after refusal, or --prune-quarantine)
       }
-    ]
+    ],
+    "unredacted": 0                         // AGT-2427: ops still holding text a redact in the log erases; any makes it unhealthy
   }
   ```
 - Text output adds a `sync` line: `outbox N op(s), pushed through seq S,
@@ -1161,6 +1200,11 @@ op's content is dropped 30 days after its refusal, on the next pull).
   <reason>`; see `pm sync` §Quarantine). With `--prune-quarantine` the
   report is preceded by `pruned the content of N refused op(s) in the sync
   quarantine`.
+- `unredacted` (AGT-2427): a redact rewrites its targets when either
+  lands, so this is `0` unless the log was edited behind pm's back; then a
+  `redaction` line names the count, the database is unhealthy, and
+  `--rebuild` erases the text again (the replay always re-applies every
+  redact in the log first).
 
 ### `pm archive [ID]...`
 
@@ -1585,6 +1629,19 @@ op; the slug can later be re-created as a new project). `pm doctor
 - Exit `3`: unknown project.
 - `--json`: `{"schema": 1, "id": "string", "deleted": true}`.
 
+### `pm project redact <ID>`
+
+Flags: `--doc <NAME>` (a named document instead of the design doc).
+
+Erases the document's text and its whole edit history for good
+(AGT-2427): one `redact` op naming every `body.edit` of the document,
+applied as `pm redact` applies one (see there). The document then reads
+empty; a later `pm project edit` starts it afresh.
+
+- Exit `3`: unknown project, or no such document.
+- `--json`: `{"schema": 1, "project": "id", "doc": "design" | "NAME",
+  "redacted": <ops erased by this call>}`.
+
 ### `pm project doc add <ID> <NAME>`
 
 Flags: `--from-file <PATH>` (required).
@@ -1730,7 +1787,12 @@ Flags: `--to <DIR>` (default: `backup.repo` in config.toml), `--restore
     order, **sharded by size**: an op that would push the newest shard
     past 16 MiB starts the next one (`000001.jsonl`, `000002.jsonl`, …).
     Only the newest shard is ever appended to. Byte payloads are base64
-    (see `pm log` above).
+    (see `pm log` above). One exception (AGT-2427): when the ops a run
+    appends include a `redact`, the lines of the ops it names are
+    rewritten redacted in whichever shard holds them (every other line
+    byte for byte), so the run's commit no longer holds that text, and the
+    text output says on stderr that the repo's git history still does
+    (erasing it there is a manual history rewrite: `docs/data-retention.md`).
   - `ops/<prefix>.config.json` — the workspace + project config snapshot
     (`schema: 1`), rewritten every run. The text of a document body the
     op log already carries (one with a `doc_id`, i.e. every `pm project
@@ -2004,6 +2066,18 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
   this replica's own, echoed back — is skipped and counts as pushed), and
   the cursor moves to the page's `next` in that same transaction
   (AGT-1467), so a page is never applied twice.
+- **Redactions** (AGT-2427). Every request to the hub carries
+  `Pm-Accept-Ops: redact`, so pulls include `redact` ops (`pm redact`),
+  each applied like any pulled op: its targets are rewritten in this
+  replica's log and tables, and a target that arrives later lands already
+  rewritten. A hub withholds redacts from builds that do not send the
+  header (pm 0.3.0 and earlier, which cannot parse them), so a replica
+  that synced as such a build may have pulled past some: after the
+  upgrade (schema 15), its first sync with a cursor past `0` also fetches
+  every redact once (`GET …/ops?kind=redact`, the cursor untouched) and
+  applies them; their counts join `pulled`/`applied`/`skipped`. A hub
+  that answers that request `400 invalid_query` predates redaction and
+  holds none.
 - **Quarantine** (AGT-1467). A pulled op this replica cannot apply no
   longer fails the sync — which, since the hub serves it again from the
   same cursor, used to fail every later sync too. Instead it is kept out

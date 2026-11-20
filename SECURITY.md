@@ -157,6 +157,15 @@ same checks on pull, local commit and `pm backup --restore`).
   stamped before its project's create counts only under the creator's
   actor), so an unrestricted token (legacy or `--any`) is as trusted as
   any actor; bind every other token to its machine's actors.
+- **Redaction (AGT-2427).** `pm redact` / `pm project redact` write a
+  `redact` op that every replica and the hub apply by rewriting the named
+  ops' text in place (op id, stamp, actor and kind kept). An actor-bound
+  token may redact only ops written by actors its binding permits (`400
+  redact_not_allowed`), so an agent cannot erase a person's comments; an
+  unrestricted token may redact anything. Redaction cannot reach replicas
+  on pm 0.3.0 or earlier until they upgrade (the hub withholds the op from
+  them), a backup repo's git history, or exports already written:
+  `docs/data-retention.md`.
 - **Hub to Postgres.** No `sslmode` means plaintext and prints a notice at
   start-up; `prefer` tries TLS then falls back as libpq does (a passive
   listener only); `require`/`verify-*` always verify. Use TLS whenever

@@ -79,6 +79,10 @@ const SHAPES: &[(&[&str], &str)] = &[
     ),
     (&["waive"], TICKET),
     (
+        &["redact"],
+        r#"object: a Ticket {"schema": 1, ...} plus "redacted": number of ops erased"#,
+    ),
+    (
         &["check"],
         r#"object {"schema": 1, "ok": ..., "count": ..., "findings": [...]}"#,
     ),
@@ -122,6 +126,10 @@ const SHAPES: &[(&[&str], &str)] = &[
     (
         &["project", "delete"],
         r#"object {"schema": 1, "id": ..., "deleted": ...}"#,
+    ),
+    (
+        &["project", "redact"],
+        r#"object {"schema": 1, "project": ..., "doc": ..., "redacted": number of ops erased}"#,
     ),
     (&["project", "doc"], GROUP),
     (
