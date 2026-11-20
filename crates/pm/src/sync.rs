@@ -168,6 +168,10 @@ pub(crate) struct Round {
     /// Outbox redacts the hub refused this round (AGT-2427), each dropped
     /// from the log; their targets stay erased here only.
     refused_redacts: Vec<RefusedRedact>,
+    /// The hub's `/health` `schema_version`, probed at most once a round
+    /// and only when a batch carries a `redact` (AGT-2551): `None` until
+    /// probed, `Some(None)` when `/health` gave no usable answer.
+    hub_schema: Option<Option<i64>>,
 }
 
 /// A `redact` the hub refused (`redact_not_allowed`, AGT-2427): dropped
@@ -321,6 +325,19 @@ pub(crate) fn push_all(
             return Ok(());
         }
         let batch = Batch::take(&outbox, MAX_BATCH_BYTES)?;
+        // AGT-2551: ask a hub that may predate redaction before sending it
+        // a redact, rather than reading its parse error afterwards.
+        if outbox[..batch.op_ids.len()]
+            .iter()
+            .any(|(_, op)| matches!(op.payload, Payload::Redact(_)))
+        {
+            let schema = *round.hub_schema.get_or_insert_with(|| hub_schema(hub));
+            if let Some(v) = schema
+                && v < REDACT_HUB_SCHEMA
+            {
+                return Err(predates_redaction(Some(v)));
+            }
+        }
         let acks = match post_batch(hub, &batch)? {
             Posted::Acks(acks) => acks,
             Posted::RedactRefused { op_id, reason } => {
@@ -424,13 +441,10 @@ fn post_batch(hub: &HubClient, batch: &Batch) -> Result<Posted> {
     {
         return Ok(Posted::RedactRefused { op_id, reason });
     }
-    // AGT-2427: a hub from before redaction cannot parse a redact op.
+    // AGT-2427: a hub from before redaction cannot parse a redact op. Only
+    // reached when `/health` could not say so first (AGT-2551).
     if status == 400 && body.contains("unknown variant `redact`") {
-        return Err(CliError::error(
-            "the hub predates redaction and cannot store a redact op: upgrade pm-hub (schema 6 \
-             or later), then run `pm sync` again (the redact waits in the outbox, and so does \
-             everything after it)",
-        ));
+        return Err(predates_redaction(None));
     }
     if status == 400
         && let Some(op_id) = duplicate_stamp(&body, batch)
@@ -455,6 +469,35 @@ fn post_batch(hub: &HubClient, batch: &Batch) -> Result<Posted> {
         )));
     }
     Ok(Posted::Acks(acks))
+}
+
+/// The first hub schema that stores `redact` ops: pm-hub's migration
+/// `0006_redact.sql` (AGT-2427).
+pub(crate) const REDACT_HUB_SCHEMA: i64 = 6;
+
+/// The hub's `GET /health` `schema_version` (`docs/hub-api.md`), or `None`
+/// when it cannot be had: unreachable, a non-`200`, or no integer there.
+/// `None` sends the push on regardless, and the hub's parse error is the
+/// fallback ([`post_batch`]).
+fn hub_schema(hub: &HubClient) -> Option<i64> {
+    match hub.health() {
+        Ok((200, body)) => serde_json::from_str::<Value>(&body)
+            .ok()?
+            .get("schema_version")?
+            .as_i64(),
+        _ => None,
+    }
+}
+
+/// The error for a hub too old to store a redact; `schema` is what its
+/// `/health` reported, when it did.
+fn predates_redaction(schema: Option<i64>) -> CliError {
+    let found = schema.map_or(String::new(), |v| format!(" (it reports schema {v})"));
+    CliError::error(format!(
+        "the hub predates redaction{found} and cannot store a redact op: upgrade pm-hub \
+         (schema {REDACT_HUB_SCHEMA} or later), then run `pm sync` again (the redact waits in \
+         the outbox, and so does everything after it)"
+    ))
 }
 
 /// What the hub made of a pushed batch, short of an error.

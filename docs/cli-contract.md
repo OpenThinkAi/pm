@@ -1067,9 +1067,13 @@ the text stays erased on this replica only, and someone with an
 unrestricted token has to redact it again for the hub and the other
 replicas. So `pm redact` warns on stderr when some of the ops it erases
 were written by another actor. A hub older than pm-hub schema 6 cannot
-store a redact at all: `pm sync` fails with an error saying to upgrade the
-hub, and the redact (with everything after it) waits in the outbox until
-then. Upgrade the hub before anyone runs `pm redact`.
+store a redact at all: before it pushes a batch holding a redact, `pm
+sync` reads the hub's `GET /health` `schema_version` (once per round) and,
+below 6, fails with an error saying to upgrade the hub without sending
+anything; the redact (with everything after it) waits in the outbox until
+then. If `/health` gives no usable answer the push goes ahead, and the
+same error follows from the old hub's refusal to parse the op. Upgrade the
+hub before anyone runs `pm redact`.
 
 - Exit `2`: no flag given; `--op` names an op that is not this ticket's,
   or one of a kind with no text to erase (only `ticket.create`, `field.set
