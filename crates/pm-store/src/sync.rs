@@ -605,6 +605,32 @@ impl Store {
         Ok(n)
     }
 
+    /// Drops `op_id` — a `redact` in the outbox the hub refused
+    /// (`redact_not_allowed`, AGT-2427) — from the log, so it stops
+    /// blocking every later push. Its targets stay redacted here (a
+    /// redaction cannot be undone); the hub and other replicas keep their
+    /// text. Refuses ([`StoreError::NotInOutbox`]) an op that is not an
+    /// unacknowledged redact.
+    pub fn drop_refused_redact(&mut self, op_id: Ulid) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seq: Option<i64> = tx
+            .query_row(
+                "SELECT seq FROM ops WHERE op_id = ?1 AND kind = 'redact'",
+                params![op_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(seq) = seq.filter(|s| in_outbox(&tx, *s).unwrap_or(false)) else {
+            return Err(StoreError::NotInOutbox { op_id });
+        };
+        tx.execute("DELETE FROM ops WHERE seq = ?1", params![seq])?;
+        fold_pushed(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Every pulled op this replica has parked or refused
     /// ([`Store::apply_pulled_page`]), in hub seq order — for `pm doctor`.
     pub fn quarantine(&self) -> Result<Vec<Quarantined>> {

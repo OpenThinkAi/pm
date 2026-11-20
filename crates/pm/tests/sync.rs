@@ -1704,3 +1704,59 @@ fn a_redact_reaches_the_hub_and_every_replica() {
         assert!(!all_db_text(r).contains(SECRET), "{} kept it", r.actor);
     }
 }
+
+/// AGT-2427: a redact the hub refuses (an actor-bound token naming
+/// another actor's op) does not wedge the outbox: `pm sync` drops it,
+/// reports it, and pushes what came after.
+#[test]
+fn a_refused_redact_is_dropped_not_wedged() {
+    let Some((_container, db)) = postgres_for("a_refused_redact_is_dropped_not_wedged") else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&db, port);
+    wait_for_health(&mut hub, port);
+    let hub_url = format!("http://127.0.0.1:{port}");
+    let mut alice = Replica::init("alice");
+    let hub_ws = alice.workspace_id().to_ascii_lowercase();
+    let token = create_token(&db, "alice", &hub_ws);
+    alice.configure(&hub_url, &token);
+    alice.sync();
+    let (ok, dave_token, stderr) = admin(
+        &db,
+        &[
+            "token",
+            "create",
+            "dave",
+            "--workspace",
+            &hub_ws,
+            "--actor",
+            "dave",
+        ],
+    );
+    assert!(ok, "{stderr}");
+    let mut dave = Replica::clone_from(&alice, "dave");
+    dave.configure(&hub_url, dave_token.trim());
+    alice.ok(&["new", "--title", "shared"]);
+    alice.sync();
+    alice.ok(&["comment", "T-1", "alice wrote this"]);
+    alice.sync();
+    dave.sync();
+
+    let out = dave.ok(&["redact", "T-1", "--comment", "1"]);
+    assert!(err(&out).contains("written by alice"), "{}", err(&out));
+    dave.ok(&["comment", "T-1", "dave wrote this"]);
+    let round = dave.sync();
+    assert_eq!(
+        round["refused_redacts"].as_array().unwrap().len(),
+        1,
+        "{round}"
+    );
+    assert_eq!(round["outbox"], 0, "{round}");
+    alice.sync();
+    let comments = alice.show("T-1")["comments"].clone();
+    assert_eq!(comments[0]["body"], "alice wrote this");
+    assert_eq!(comments[1]["body"], "dave wrote this");
+    let (code, report) = dave.json(&["doctor"]);
+    assert_eq!(code, 0, "{report}");
+}

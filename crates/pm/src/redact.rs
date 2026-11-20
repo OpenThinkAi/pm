@@ -118,6 +118,7 @@ pub fn ticket(ctx: &Ctx<'_>, reference: &str, sel: &Selection) -> Result<()> {
         pick(op);
     }
     let fresh = still_readable(&ops, &targets);
+    warn_foreign_authors(&ops, &fresh, &actor);
     let mut stamper = Stamper::new(&store, actor)?;
     let redacts = redact_ops(&mut stamper, ticket.id, &fresh);
     if !redacts.is_empty() {
@@ -157,6 +158,7 @@ pub fn project_doc(ctx: &Ctx<'_>, project: &str, doc: Option<&str>) -> Result<()
         .map(|o| o.op_id)
         .collect();
     let fresh = still_readable(&ops, &edits);
+    warn_foreign_authors(&ops, &fresh, &actor);
     let mut stamper = Stamper::new(&store, actor)?;
     let redacts = redact_ops(&mut stamper, doc_id, &fresh);
     if !redacts.is_empty() {
@@ -185,6 +187,26 @@ fn still_readable(ops: &[Op], targets: &[Ulid]) -> Vec<Ulid> {
         .filter(|o| o.redacted().is_some_and(|r| r != **o))
         .map(|o| o.op_id)
         .collect()
+}
+
+/// Warns (stderr) when some of `targets` were written by another actor: a
+/// hub refuses that redact from an actor-bound token (`pm sync` then drops
+/// it, and only this replica stays erased).
+fn warn_foreign_authors(ops: &[Op], targets: &[Ulid], actor: &pm_core::ActorId) {
+    let others: std::collections::BTreeSet<&str> = ops
+        .iter()
+        .filter(|o| targets.contains(&o.op_id) && o.actor != *actor)
+        .map(|o| o.actor.as_str())
+        .collect();
+    if !others.is_empty() {
+        let names: Vec<String> = others.iter().map(|a| crate::text::inline(a)).collect();
+        eprintln!(
+            "pm: some of these ops were written by {} — a hub refuses that redact from a token \
+             bound to {} (`pm sync` then drops it, and only this replica stays erased)",
+            names.join(", "),
+            crate::text::inline(actor.as_str())
+        );
+    }
 }
 
 /// One `redact` op per [`MAX_REDACT_TARGETS`] targets.

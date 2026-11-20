@@ -69,8 +69,12 @@ Where it reaches:
 Who may redact: anyone who can write to the workspace may redact on their
 own replica. At the hub, a token bound to actors (an agent's) may only
 redact ops written by actors it is bound to; an unrestricted token may
-redact anything. A refused redact stays in the outbox and `pm sync`
-reports the refusal.
+redact anything. When the hub refuses a redact, `pm sync` drops it and
+says so: the text stays erased on your replica only, so redact again with
+an unrestricted token. `pm redact` warns when it is about to erase ops
+another actor wrote. The hub must run pm-hub with schema 6 or later
+before anyone uses `pm redact`; an older hub cannot store the op, and
+`pm sync` stops with an error saying to upgrade it.
 
 What a redaction does not cover: label names, project titles, workflow
 state names, `ext` values, waiver reasons and actor ids are not erased by

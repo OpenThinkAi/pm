@@ -983,7 +983,8 @@ async fn push_batch(db: &Db, caller: &Authed, req: Request) -> Result<Pushed, Pu
                             index: first_at[&p.op_id],
                             op_id: p.op_id.clone(),
                             reason: format!(
-                                "token {} ({}) is bound to actors and may not redact op {}: {};                                  only an unrestricted token may redact ops it could not have written",
+                                "token {} ({}) is bound to actors and may not redact op {}: {}; \
+                                 only an unrestricted token may redact ops it could not have written",
                                 caller.token_id, caller.token_label, no.target, no.why
                             ),
                         });

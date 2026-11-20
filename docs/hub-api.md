@@ -367,7 +367,12 @@ the hub's database, not just hidden. A target of a kind with no such text
   stored (or come earlier in the batch) as an op of the redact's entity,
   authored by an actor its binding permits; otherwise `400
   redact_not_allowed`, and the batch stores nothing. So an agent token can
-  erase its own comment but not a person's.
+  erase its own comment but not a person's. `pm sync` answers the refusal
+  by dropping that redact from its outbox and reporting it, so the rest of
+  the outbox still goes up.
+- A hub from before redaction (schema 5 or older) refuses a `redact` as
+  `invalid_op` (`unknown variant`); `pm sync` reports that the hub needs
+  upgrading. Deploy the hub first.
 - A replica applies a redact the same way on every path into its log
   (pull, local commit, restore), including to a target parked in its sync
   quarantine.

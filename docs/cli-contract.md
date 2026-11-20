@@ -1061,7 +1061,15 @@ files already exported, replicas on pm before 0.4.0) is in
 `docs/data-retention.md`, and the text output says so on stderr.
 
 A hub refuses an actor-bound token's redact of an op another actor wrote
-(`redact_not_allowed`): the push fails and the redact stays in the outbox.
+(`redact_not_allowed`). `pm sync` then drops the redact from the outbox,
+reports it (stderr and `refused_redacts` in `--json`) and pushes the rest:
+the text stays erased on this replica only, and someone with an
+unrestricted token has to redact it again for the hub and the other
+replicas. So `pm redact` warns on stderr when some of the ops it erases
+were written by another actor. A hub older than pm-hub schema 6 cannot
+store a redact at all: `pm sync` fails with an error saying to upgrade the
+hub, and the redact (with everything after it) waits in the outbox until
+then. Upgrade the hub before anyone runs `pm redact`.
 
 - Exit `2`: no flag given; `--op` names an op that is not this ticket's,
   or one of a kind with no text to erase (only `ticket.create`, `field.set
@@ -2185,12 +2193,16 @@ Ctrl-C, a dropped connection) leaves the outbox and cursor consistent:
         "code": "not_unstarted" | "already_assigned" | "deleted" | "held_by_another",  // held_by_another: AGT-2428
         "reason": "string"
       }
+    ],
+    "refused_redacts": [        // AGT-2427: outbox redacts the hub refused (redact_not_allowed), dropped from the log; their text stays erased here only
+      {"op_id": "<ULID>", "entity": "<ULID>", "reason": "string"}
     ]
   }
   ```
 - Text output is one line: `pushed 3 op(s); pulled 5 op(s): 4 applied,
   1 skipped; cursor 42 (hub head 42)`, with `; N op(s) still in the outbox`,
-  `; N ticket(s) still awaiting a hub number`, `; N parked op(s) applied`,
+  `; N ticket(s) still awaiting a hub number`, `; N redact(s) refused by
+  the hub and dropped`, `; N parked op(s) applied`,
   `; N pulled op(s) refused and kept out of the log` and `; quarantine: P
   parked, R refused (`pm doctor` lists them)` appended when non-zero,
   and — on the round that seeded — prefixed with `seeded hub workspace

@@ -165,6 +165,20 @@ pub(crate) struct Round {
     head: i64,
     /// Outbox claims the hub refused this round, each reconciled locally.
     rejected: Vec<RejectedClaim>,
+    /// Outbox redacts the hub refused this round (AGT-2427), each dropped
+    /// from the log; their targets stay erased here only.
+    refused_redacts: Vec<RefusedRedact>,
+}
+
+/// A `redact` the hub refused (`redact_not_allowed`, AGT-2427): dropped
+/// from the outbox so the rest can go up.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RefusedRedact {
+    pub op_id: Ulid,
+    /// The ticket or document it named ops of.
+    pub entity: Ulid,
+    /// The hub's `reason`.
+    pub reason: String,
 }
 
 pub fn sync(ctx: &Ctx<'_>, args: SyncArgs) -> Result<()> {
@@ -309,6 +323,26 @@ pub(crate) fn push_all(
         let batch = Batch::take(&outbox, MAX_BATCH_BYTES)?;
         let acks = match post_batch(hub, &batch)? {
             Posted::Acks(acks) => acks,
+            Posted::RedactRefused { op_id, reason } => {
+                let entity = outbox
+                    .iter()
+                    .find(|(_, op)| op.op_id == op_id)
+                    .map(|(_, op)| op.entity)
+                    .expect("redact_refused names one of the batch's ops");
+                store.drop_refused_redact(op_id)?;
+                eprintln!(
+                    "pm: the hub refused redact {op_id} ({}); dropped it from the outbox. The text \
+                     stays erased on this replica, but the hub and other replicas keep it: redact \
+                     with a token allowed to (an unrestricted one), or ask whoever holds one",
+                    crate::text::inline(&reason)
+                );
+                round.refused_redacts.push(RefusedRedact {
+                    op_id,
+                    entity,
+                    reason,
+                });
+                continue;
+            }
             Posted::DuplicateStamp { op_id, refusal } => {
                 restamps += 1;
                 if restamps > MAX_RESTAMPS {
@@ -386,6 +420,19 @@ fn post_batch(hub: &HubClient, batch: &Batch) -> Result<Posted> {
         .post_json("ops", &batch.body)
         .map_err(|e| transport(hub, e))?;
     if status == 400
+        && let Some((op_id, reason)) = redact_refused(&body, batch)
+    {
+        return Ok(Posted::RedactRefused { op_id, reason });
+    }
+    // AGT-2427: a hub from before redaction cannot parse a redact op.
+    if status == 400 && body.contains("unknown variant `redact`") {
+        return Err(CliError::error(
+            "the hub predates redaction and cannot store a redact op: upgrade pm-hub (schema 6 \
+             or later), then run `pm sync` again (the redact waits in the outbox, and so does \
+             everything after it)",
+        ));
+    }
+    if status == 400
         && let Some(op_id) = duplicate_stamp(&body, batch)
     {
         return Ok(Posted::DuplicateStamp {
@@ -418,6 +465,25 @@ enum Posted {
     /// (AGT-2456): nothing was stored. `refusal` is the error to report
     /// if re-stamping does not help.
     DuplicateStamp { op_id: Ulid, refusal: CliError },
+    /// `400 redact_not_allowed` naming `op_id`, one of the batch's ops
+    /// (AGT-2427): nothing was stored; `reason` is the hub's.
+    RedactRefused { op_id: Ulid, reason: String },
+}
+
+/// The op a `400` refuses as `redact_not_allowed`, with the hub's reason,
+/// when the body says so and names one of `batch`'s ops.
+fn redact_refused(body: &str, batch: &Batch) -> Option<(Ulid, String)> {
+    let detail: Value = serde_json::from_str(body).ok()?;
+    if detail.get("error").and_then(Value::as_str) != Some("redact_not_allowed") {
+        return None;
+    }
+    let op_id: Ulid = detail.get("op_id")?.as_str()?.parse().ok()?;
+    let reason = detail
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    batch.op_ids.contains(&op_id).then_some((op_id, reason))
 }
 
 /// The op a `400` refuses as `duplicate_stamp`, when the body says so
@@ -443,6 +509,12 @@ pub(crate) fn push_claim(hub: &HubClient, claim: &Op) -> Result<Ack> {
         // The claim is not in the log, so there is nothing to re-stamp;
         // trying again stamps a fresh one.
         Posted::DuplicateStamp { refusal, .. } => Err(refusal),
+        // A claim is never a redact; a hub that names one is answering
+        // something else.
+        Posted::RedactRefused { op_id, reason } => Err(CliError::error(format!(
+            "the hub refused op {op_id} as a redact: {}",
+            crate::text::inline(&reason)
+        ))),
     }
 }
 
@@ -878,6 +950,7 @@ fn report(
             "outbox": state.outbox,
             "pending_numbers": state.pending_numbers,
             "rejected": round.rejected,
+            "refused_redacts": round.refused_redacts,
             "unparked": round.unparked,
             "parked": round.parked,
             "refused": round.refused,
@@ -917,6 +990,12 @@ fn report(
             line.push_str(&format!(
                 "; {} claim(s) refused by the hub and reconciled",
                 round.rejected.len()
+            ));
+        }
+        if !round.refused_redacts.is_empty() {
+            line.push_str(&format!(
+                "; {} redact(s) refused by the hub and dropped",
+                round.refused_redacts.len()
             ));
         }
         if round.unparked > 0 {
