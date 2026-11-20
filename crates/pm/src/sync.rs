@@ -165,6 +165,20 @@ pub(crate) struct Round {
     head: i64,
     /// Outbox claims the hub refused this round, each reconciled locally.
     rejected: Vec<RejectedClaim>,
+    /// Outbox redacts the hub refused this round (AGT-2427), each dropped
+    /// from the log; their targets stay erased here only.
+    refused_redacts: Vec<RefusedRedact>,
+}
+
+/// A `redact` the hub refused (`redact_not_allowed`, AGT-2427): dropped
+/// from the outbox so the rest can go up.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RefusedRedact {
+    pub op_id: Ulid,
+    /// The ticket or document it named ops of.
+    pub entity: Ulid,
+    /// The hub's `reason`.
+    pub reason: String,
 }
 
 pub fn sync(ctx: &Ctx<'_>, args: SyncArgs) -> Result<()> {
@@ -210,6 +224,12 @@ pub(crate) fn run_once(
         &mut round,
     )?;
     pull_all(store, hub, &mut round)?;
+    backfill_redacts(store, hub, &mut round)?;
+    // AGT-2427: a pulled redact rewrote ops in place; checkpoint so the
+    // pages that held their text leave the write-ahead log too.
+    if round.applied > 0 {
+        store.scrub_wal()?;
+    }
     Ok(round)
 }
 
@@ -303,6 +323,26 @@ pub(crate) fn push_all(
         let batch = Batch::take(&outbox, MAX_BATCH_BYTES)?;
         let acks = match post_batch(hub, &batch)? {
             Posted::Acks(acks) => acks,
+            Posted::RedactRefused { op_id, reason } => {
+                let entity = outbox
+                    .iter()
+                    .find(|(_, op)| op.op_id == op_id)
+                    .map(|(_, op)| op.entity)
+                    .expect("redact_refused names one of the batch's ops");
+                store.drop_refused_redact(op_id)?;
+                eprintln!(
+                    "pm: the hub refused redact {op_id} ({}); dropped it from the outbox. The text \
+                     stays erased on this replica, but the hub and other replicas keep it: redact \
+                     it again from another replica that syncs with an unrestricted token",
+                    crate::text::inline(&reason)
+                );
+                round.refused_redacts.push(RefusedRedact {
+                    op_id,
+                    entity,
+                    reason,
+                });
+                continue;
+            }
             Posted::DuplicateStamp { op_id, refusal } => {
                 restamps += 1;
                 if restamps > MAX_RESTAMPS {
@@ -380,6 +420,19 @@ fn post_batch(hub: &HubClient, batch: &Batch) -> Result<Posted> {
         .post_json("ops", &batch.body)
         .map_err(|e| transport(hub, e))?;
     if status == 400
+        && let Some((op_id, reason)) = redact_refused(&body, batch)
+    {
+        return Ok(Posted::RedactRefused { op_id, reason });
+    }
+    // AGT-2427: a hub from before redaction cannot parse a redact op.
+    if status == 400 && body.contains("unknown variant `redact`") {
+        return Err(CliError::error(
+            "the hub predates redaction and cannot store a redact op: upgrade pm-hub (schema 6 \
+             or later), then run `pm sync` again (the redact waits in the outbox, and so does \
+             everything after it)",
+        ));
+    }
+    if status == 400
         && let Some(op_id) = duplicate_stamp(&body, batch)
     {
         return Ok(Posted::DuplicateStamp {
@@ -412,6 +465,25 @@ enum Posted {
     /// (AGT-2456): nothing was stored. `refusal` is the error to report
     /// if re-stamping does not help.
     DuplicateStamp { op_id: Ulid, refusal: CliError },
+    /// `400 redact_not_allowed` naming `op_id`, one of the batch's ops
+    /// (AGT-2427): nothing was stored; `reason` is the hub's.
+    RedactRefused { op_id: Ulid, reason: String },
+}
+
+/// The op a `400` refuses as `redact_not_allowed`, with the hub's reason,
+/// when the body says so and names one of `batch`'s ops.
+fn redact_refused(body: &str, batch: &Batch) -> Option<(Ulid, String)> {
+    let detail: Value = serde_json::from_str(body).ok()?;
+    if detail.get("error").and_then(Value::as_str) != Some("redact_not_allowed") {
+        return None;
+    }
+    let op_id: Ulid = detail.get("op_id")?.as_str()?.parse().ok()?;
+    let reason = detail
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    batch.op_ids.contains(&op_id).then_some((op_id, reason))
 }
 
 /// The op a `400` refuses as `duplicate_stamp`, when the body says so
@@ -437,6 +509,12 @@ pub(crate) fn push_claim(hub: &HubClient, claim: &Op) -> Result<Ack> {
         // The claim is not in the log, so there is nothing to re-stamp;
         // trying again stamps a fresh one.
         Posted::DuplicateStamp { refusal, .. } => Err(refusal),
+        // A claim is never a redact; a hub that names one is answering
+        // something else.
+        Posted::RedactRefused { op_id, reason } => Err(CliError::error(format!(
+            "the hub refused op {op_id} as a redact: {}",
+            crate::text::inline(&reason)
+        ))),
     }
 }
 
@@ -726,6 +804,64 @@ fn pull_all(store: &mut Store, hub: &HubClient, round: &mut Round) -> Result<()>
     }
 }
 
+/// The one-off fetch of every `redact` op a replica upgraded from a build
+/// before redaction owes (AGT-2427, `Store::redact_backfill_due`): the hub
+/// withheld redacts from that build's pulls (`docs/hub-api.md`), so its
+/// cursor may be past some. `GET ops?kind=redact` pages through all of
+/// them; each is applied as a pulled op would be, and the cursor stays
+/// where the pull left it. A hub that does not know the parameter (400
+/// `invalid_query`) predates redaction and so holds none: nothing is owed.
+fn backfill_redacts(store: &mut Store, hub: &HubClient, round: &mut Round) -> Result<()> {
+    if !store.redact_backfill_due()? {
+        return Ok(());
+    }
+    let mut since = 0;
+    loop {
+        let (status, body) = hub
+            .get(&format!("ops?since={since}&limit={PAGE_LIMIT}&kind=redact"))
+            .map_err(|e| transport(hub, e))?;
+        let page: Page = match status {
+            200 => serde_json::from_str(&body)
+                .context("the hub's redact backfill response is not a page")?,
+            400 if serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+                .as_deref()
+                == Some("invalid_query") =>
+            {
+                break;
+            }
+            404 => return Err(unauthorized(hub)),
+            400 => return Err(refused(status, &body)),
+            503 => return Err(unavailable(&body)),
+            other => return Err(unexpected(other, "the redact backfill")),
+        };
+        check_page_next(&page, since)?;
+        let ops = page
+            .ops
+            .into_iter()
+            .map(|item| {
+                serde_json::from_value::<Op>(item.op)
+                    .map(|op| (item.seq, op))
+                    .with_context(|| {
+                        format!("hub seq {}: not an op this build understands", item.seq)
+                    })
+            })
+            .collect::<std::result::Result<Vec<(i64, Op)>, _>>()?;
+        let pulled = store.apply_redact_backfill(&ops)?;
+        round.pulled += ops.len();
+        round.applied += pulled.applied;
+        round.skipped += pulled.skipped;
+        round.refused.extend(pulled.refused);
+        if ops.is_empty() || page.next >= page.head || page.next <= since {
+            break;
+        }
+        since = page.next;
+    }
+    store.mark_redact_backfilled()?;
+    Ok(())
+}
+
 // ----------------------------------------------------------------- errors
 
 /// `pub(crate)`: `crate::claim`'s probe of the hub reports the same way.
@@ -814,6 +950,7 @@ fn report(
             "outbox": state.outbox,
             "pending_numbers": state.pending_numbers,
             "rejected": round.rejected,
+            "refused_redacts": round.refused_redacts,
             "unparked": round.unparked,
             "parked": round.parked,
             "refused": round.refused,
@@ -853,6 +990,12 @@ fn report(
             line.push_str(&format!(
                 "; {} claim(s) refused by the hub and reconciled",
                 round.rejected.len()
+            ));
+        }
+        if !round.refused_redacts.is_empty() {
+            line.push_str(&format!(
+                "; {} redact(s) refused by the hub and dropped",
+                round.refused_redacts.len()
             ));
         }
         if round.unparked > 0 {

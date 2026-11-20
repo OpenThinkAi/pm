@@ -500,6 +500,61 @@ impl Store {
         Ok(pulled)
     }
 
+    /// Whether this replica owes the hub a one-off fetch of every `redact`
+    /// op (AGT-2427): it pulled as a build that did not ask for them, so
+    /// the hub may have withheld some it has since passed. `pm sync` then
+    /// fetches them ([`Store::apply_redact_backfill`]) and calls
+    /// [`Store::mark_redact_backfilled`].
+    pub fn redact_backfill_due(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT due FROM sync_redact_backfill", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Records that the redact backfill is done (or not needed).
+    pub fn mark_redact_backfilled(&mut self) -> Result<()> {
+        self.conn
+            .execute("UPDATE sync_redact_backfill SET due = 0", [])?;
+        Ok(())
+    }
+
+    /// Applies `redact` ops fetched from the hub out of band — `(hub seq,
+    /// op)`, at or below the pull cursor (AGT-2427) — in **one**
+    /// transaction, without moving the cursor. Each is processed as a
+    /// page's op would be ([`Store::apply_pulled_page`]): skipped when
+    /// already in the log or quarantined, else landed or refused. A redact
+    /// waits on nothing, so none parks, and none gives up a parked op (the
+    /// hub log is not moving forward here). Anything but a `redact` is
+    /// refused as a caller error ([`StoreError::NotARedact`]) before any
+    /// write: the backfill must not let other ops in out of order.
+    pub fn apply_redact_backfill(&mut self, ops: &[(i64, Op)]) -> Result<Pulled> {
+        if let Some((_, op)) = ops
+            .iter()
+            .find(|(_, op)| !matches!(op.payload, Payload::Redact(_)))
+        {
+            return Err(StoreError::NotARedact {
+                op_id: op.op_id,
+                kind: op.kind(),
+            });
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut engine = Engine::new(&tx, Mode::Quarantine)?;
+        engine.backfill = true;
+        let mut page: Vec<&(i64, Op)> = ops.iter().collect();
+        page.sort_by_key(|(seq, _)| *seq);
+        for (seq, op) in page {
+            engine.process(*seq, op)?;
+        }
+        let pulled = engine.finish()?;
+        finish_pull(&tx)?;
+        tx.commit()?;
+        Ok(pulled)
+    }
+
     /// Drops the content of every refused op in `sync_quarantine` now
     /// (`pm doctor --prune-quarantine`, AGT-1482), keeping each row's op
     /// id, hub seq, kind, entity and reason. Parked ops keep theirs: they
@@ -548,6 +603,33 @@ impl Store {
         let n = restamp_outbox_in(&tx, seq)?;
         tx.commit()?;
         Ok(n)
+    }
+
+    /// Drops `op_id` — a `redact` in the outbox the hub refused
+    /// (`redact_not_allowed`, AGT-2427) — from the log, so it stops
+    /// blocking every later push. Its targets stay redacted here (a
+    /// redaction cannot be undone); the hub and other replicas keep their
+    /// text. Refuses ([`StoreError::NotInOutbox`]) an op that is not an
+    /// unacknowledged redact.
+    pub fn drop_refused_redact(&mut self, op_id: Ulid) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seq: Option<i64> = tx
+            .query_row(
+                "SELECT seq FROM ops WHERE op_id = ?1 AND kind = 'redact'",
+                params![op_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let seq = match seq {
+            Some(seq) if in_outbox(&tx, seq)? => seq,
+            _ => return Err(StoreError::NotInOutbox { op_id }),
+        };
+        tx.execute("DELETE FROM ops WHERE seq = ?1", params![seq])?;
+        fold_pushed(&tx)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Every pulled op this replica has parked or refused
@@ -728,7 +810,8 @@ fn apply_foreign(tx: &Transaction<'_>, op: &Op) -> Result<()> {
         | Payload::HoldSet(_)
         | Payload::HoldClear
         | Payload::BodyEdit(_)
-        | Payload::Tombstone => {
+        | Payload::Tombstone
+        | Payload::Redact(_) => {
             commit_foreign_in(tx, op)?;
         }
     }
@@ -817,6 +900,7 @@ fn disposition(e: &StoreError, op: &Op) -> Disposition {
         E::InvalidStamp(_)
         | E::InvalidId(_)
         | E::OpTooLarge(_)
+        | E::InvalidRedact(_)
         | E::NotADocumentEdit { .. }
         | E::DuplicateNumber { .. }
         // AGT-2456: another op already holds the stamp; the first in hub
@@ -853,6 +937,7 @@ fn disposition(e: &StoreError, op: &Op) -> Disposition {
         | E::NoWorkspace
         | E::DuplicateOp { .. }
         | E::NotInOutbox { .. }
+        | E::NotARedact { .. }
         | E::AlreadyJoined { .. }
         | E::NotEmpty { .. }
         | E::NotAConfigOp { .. }
@@ -910,6 +995,9 @@ struct Engine<'a, 'c> {
     /// [`Mode::Strict`]: why each parked op is blocked, for the error.
     blocked: HashMap<i64, StoreError>,
     pulled: Pulled,
+    /// [`Store::apply_redact_backfill`]: orders are old hub seqs, so the
+    /// park horizon is not measured from them.
+    backfill: bool,
 }
 
 impl<'a, 'c> Engine<'a, 'c> {
@@ -923,6 +1011,7 @@ impl<'a, 'c> Engine<'a, 'c> {
             ops: HashMap::new(),
             blocked: HashMap::new(),
             pulled: Pulled::default(),
+            backfill: false,
         };
         if mode == Mode::Quarantine {
             let mut stmt = tx.prepare(
@@ -1032,7 +1121,7 @@ impl<'a, 'c> Engine<'a, 'c> {
     /// only: a strict batch's orders are batch positions, and it parks
     /// nothing across calls.
     fn expire(&mut self, order: i64) -> Result<()> {
-        if self.mode != Mode::Quarantine {
+        if self.mode != Mode::Quarantine || self.backfill {
             return Ok(());
         }
         let horizon = order.saturating_sub(PARK_HORIZON_SEQS);

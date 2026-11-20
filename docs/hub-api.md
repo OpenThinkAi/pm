@@ -256,7 +256,7 @@ AGT-1463). The build stage copies only `Cargo.toml`, `Cargo.lock`,
 ## `GET /health` (open)
 
 ```json
-{"status": "ok", "schema_version": 5, "op_version": 1, "build": "<git sha>"}
+{"status": "ok", "schema_version": 6, "op_version": 1, "build": "<git sha>"}
 ```
 
 `schema_version` is read live from the database; `op_version` is the
@@ -345,6 +345,38 @@ pulled op is refused into quarantine. That case only arises with a log
 stored before this check, and every replica refuses the same op.
 Duplicates already stored are left alone.
 
+**Redactions (AGT-2427).** A `redact` op (`{"kind": "redact", "payload":
+{"targets": ["<op_id>", …]}}`, `entity` = the ticket, or a project
+document's `doc_id`) erases the text of the ops it names. Inside the push
+transaction the hub rewrites the stored `op` of every target that is an op
+of the redact's entity with `pm_core::Op::redacted`: a title, comment body
+or hold reason becomes `[redacted]`, a `body.edit` update becomes a Loro
+update that adds nothing, and the op id, stamp, actor, entity, kind,
+version and every other field stay. It then refolds the ticket's view from
+the rewritten log. The order does not matter: a target pushed after its
+redact is stored already rewritten, and a redact and its target may share
+a batch. Pulls serve the rewritten JSON, so the original text is gone from
+the hub's database, not just hidden. A target of a kind with no such text
+(a label, a claim, …), or of another entity, is left alone.
+
+- A `redact` with no targets, more than 10,000
+  (`pm_core::MAX_REDACT_TARGETS`), or itself as a target is `400
+  invalid_redact`.
+- An unrestricted token may redact any op. An actor-bound token may
+  redact only ops it could have written: every target must already be
+  stored (or come earlier in the batch) as an op of the redact's entity,
+  authored by an actor its binding permits; otherwise `400
+  redact_not_allowed`, and the batch stores nothing. So an agent token can
+  erase its own comment but not a person's. `pm sync` answers the refusal
+  by dropping that redact from its outbox and reporting it, so the rest of
+  the outbox still goes up.
+- A hub from before redaction (schema 5 or older) refuses a `redact` as
+  `invalid_op` (`unknown variant`); `pm sync` reports that the hub needs
+  upgrading. Deploy the hub first.
+- A replica applies a redact the same way on every path into its log
+  (pull, local commit, restore), including to a target parked in its sync
+  quarantine.
+
 **Stamps in payloads (AGT-1482).** A `field.set archived_at` value and a
 `hold.set`'s `hold.at` are stamps too, copied into the ticket and stored
 as integers. They get the same two checks (`pm_core::Op::check_payload_stamps`):
@@ -405,6 +437,8 @@ Errors (all JSON, `error` names the case, `reason` says what to fix):
 | `400` | `duplicate_stamp` | `index`, `op_id` | a fresh op's `(hlc, actor)` is already another op's in this workspace, stored or earlier in the batch (AGT-2456, see Stamps are unique above); `reason` names the op that holds it. Re-stamp the op and push again |
 | `400` | `op_too_large` | `index`, `op_id` | a `body.edit` whose decoded update is over 32 MiB (`pm_core::MAX_BODY_EDIT_BYTES`, AGT-1467) — every replica would import, snapshot and re-serve it — or an op of any other kind whose payload JSON is over 1 MiB (`pm_core::MAX_OP_PAYLOAD_BYTES`, AGT-1482; the largest honest one on record is a 14 KB comment); a replica refuses the same on pull, local commit and restore (`StoreError::OpTooLarge`) |
 | `400` | `invalid_id` | `index`, `op_id` | a `workspace.set prefix`, `project.create` (id or parent), `project.set parent`, or a ticket's project (`ticket.create`, `field.set project`) whose value is not a safe file-path component (`pm_core::ids::is_safe_component`: ASCII letters, digits, `-`, `_`, `.`, at most 64 bytes, not starting with `.` or `-`, not ending with `.`, not a Windows device name); a state name (`state.upsert`, `ticket.create`, `state.transition`, and — AGT-1482 — `claim`, which writes its state into the ticket like a transition) that is not `pm_core::ids::is_safe_segment` (1–255 bytes, not starting with `.` or `-`, not ending with `.` or a space, no `/`, `\`, `:`, control or Unicode format characters (AGT-2434), not a Windows device name — `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`9`, `LPT1`–`9`, `CONIN$`, `CONOUT$`, any case, any extension; AGT-1467); or a `project.doc_add` name that is not `pm_core::ids::is_safe_doc_name` (`/`-separated safe segments, so no `.`/`..`, leading or trailing `/`; at most 255 bytes) — clients use these in export/backup paths (AGT-1453, AGT-1464); a replica refuses the same on pull, local commit and restore (`StoreError::InvalidId`) |
+| `400` | `invalid_redact` | `index`, `op_id` | a `redact` names no targets, more than 10,000, or itself (AGT-2427, see Redactions above); a replica refuses the same on every ingest path (`StoreError::InvalidRedact`) |
+| `400` | `redact_not_allowed` | `index`, `op_id` | an actor-bound token's `redact` names an op the hub does not hold, an op of another entity, or one written by an actor its binding does not permit (AGT-2427); `reason` names the op and why. Only an unrestricted token may redact other actors' ops |
 | `400` | `actor_not_allowed` | `index`, `op_id` | a fresh op's `actor`, or an actor its payload names (`claim.assignee`, `hold.by`, `field.set assignee`, `actor.upsert id`), matches none of the token's actor patterns; `reason` names the token, its patterns and the field (see [Token actor bindings](#token-actor-bindings-agt-1450)) |
 | `400` | `reserved_actor` | `index`, `op_id` | a fresh op authored as `hub`, or naming `hub` in one of those payload fields — from any token once the workspace is seeded, from a bound token while seeding |
 | `400` | `foreign_workspace` | `index`, `op_id` | a config op (`workspace.set`, `state.upsert`, `actor.upsert`) for a workspace Ulid other than the one this hub workspace's config already belongs to |
@@ -447,7 +481,25 @@ The workspace's ops with `seq > since`, in seq order, at most `limit` of
 them. Both parameters are optional: `since` defaults to `0` (the whole
 log), `limit` to **500** and is clamped to **1000**
 (`pm_hub::pull::{DEFAULT_PAGE_OPS, MAX_PAGE_OPS}`, the push batch cap).
-Any other parameter is a `400`.
+`kind=redact` serves only `redact` ops (below). Any other parameter, or
+another `kind`, is a `400`.
+
+**`redact` ops and older clients (AGT-2427).** A client built before
+redaction (pm 0.3.0 and earlier) cannot parse a `redact` op, and its pull
+fails on an op it does not understand rather than skip it. So a pull
+serves `redact` ops only when the request carries the header
+`Pm-Accept-Ops: redact` (a comma-separated list of the newer op kinds the
+client understands; `pm` 0.4.0 and later send it on every request). For a
+request without it, `redact` ops are left out of the page; the targets
+they rewrote are still served, already rewritten, and are ops every build
+folds. A page left empty only because every op in its range was a
+withheld `redact` answers `next` = the last seq it passed over (never past
+`head`), so such a client's cursor moves past them. An older client keeps
+whatever text it pulled before the redaction until it upgrades: an
+upgraded client's first `pm sync` fetches every redact once with
+`GET /ops?since=0&kind=redact` (paging as usual; the cursor is not moved)
+and applies them. `kind=redact` implies the client understands them, with
+or without the header.
 
 **Byte cap (AGT-1467).** Whatever `limit` says, a page stops before
 **16 MiB** of op text (`pm_hub::pull::MAX_PAGE_BYTES`): it is the longest
@@ -500,7 +552,7 @@ Errors:
 
 | Status | `error` | When |
 |---|---|---|
-| `400` | `invalid_query` | `since` is not an integer `>= 0`, `limit` is not an integer `>= 1`, the query names another parameter, or it is not decodable |
+| `400` | `invalid_query` | `since` is not an integer `>= 0`, `limit` is not an integer `>= 1`, `kind` is anything but `redact`, the query names another parameter, or it is not decodable |
 
 The body is `{"error": "invalid_query", "reason": "…"}`; `reason` quotes
 the offending value.

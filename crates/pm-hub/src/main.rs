@@ -31,6 +31,7 @@ mod migrate;
 mod numbers;
 mod ops;
 mod pull;
+mod redact;
 mod views;
 mod writer;
 

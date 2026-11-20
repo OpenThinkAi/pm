@@ -147,6 +147,40 @@ impl Op {
         Ok(())
     }
 
+    /// Refuses a `redact` with no targets, more than
+    /// [`MAX_REDACT_TARGETS`], or itself among them (AGT-2427). Every
+    /// other kind passes. A pure function of the op, so every replica and
+    /// the hub decide alike.
+    pub fn check_redact(&self) -> Result<(), RedactError> {
+        let Payload::Redact(r) = &self.payload else {
+            return Ok(());
+        };
+        if r.targets.is_empty() {
+            return Err(RedactError::NoTargets { op_id: self.op_id });
+        }
+        if r.targets.len() > MAX_REDACT_TARGETS {
+            return Err(RedactError::TooManyTargets {
+                op_id: self.op_id,
+                count: r.targets.len(),
+                max: MAX_REDACT_TARGETS,
+            });
+        }
+        if r.targets.contains(&self.op_id) {
+            return Err(RedactError::SelfTarget { op_id: self.op_id });
+        }
+        Ok(())
+    }
+
+    /// This op with its text erased ([`Payload::redacted`]): same op id,
+    /// stamp, actor, entity, kind and version. `None` for a kind that
+    /// carries no text a redact erases.
+    pub fn redacted(&self) -> Option<Op> {
+        Some(Op {
+            payload: self.payload.redacted()?,
+            ..self.clone()
+        })
+    }
+
     /// The stamps this op carries as data in its payload, by field:
     /// a `field.set archived_at` value and a `hold.set`'s `hold.at`
     /// (AGT-1482). The fold copies them into the ticket, where they are
@@ -244,6 +278,14 @@ pub enum Payload {
     /// where its document edits go.
     #[serde(rename = "project.doc_add")]
     ProjectDocAdd(ProjectDocAdd),
+    /// Erases the user-written text of earlier ops on the same entity
+    /// (AGT-2427): every replica, and the hub, rewrites each target's
+    /// payload with [`Payload::redacted`] — keeping its op id, stamp,
+    /// actor and kind, so replay and merge still work — and rebuilds what
+    /// it materialized from them. Folds into no view itself. See
+    /// [`Redact`].
+    #[serde(rename = "redact")]
+    Redact(Redact),
 }
 
 impl Payload {
@@ -269,7 +311,46 @@ impl Payload {
             Payload::ProjectSet(_) => "project.set",
             Payload::ProjectDelete => "project.delete",
             Payload::ProjectDocAdd(_) => "project.doc_add",
+            Payload::Redact(_) => "redact",
         }
+    }
+
+    /// This payload with its user-written text replaced (AGT-2427), or
+    /// `None` for a kind that carries none [`Redact`] erases. What is
+    /// replaced:
+    ///
+    /// - a `ticket.create`'s and a `field.set title`'s title, a
+    ///   `comment.add`'s body and a `hold.set`'s reason become
+    ///   [`REDACTED`] — every other field (state, priority, the hold's
+    ///   `by` and `at`, …) is kept, so the op folds exactly as before;
+    /// - a `body.edit`'s update becomes [`crate::Body::redacted_update`],
+    ///   a valid Loro update that adds nothing, so every build (an older
+    ///   one included) imports it as a no-op.
+    ///
+    /// Idempotent: redacting a redacted payload gives it back unchanged.
+    pub fn redacted(&self) -> Option<Payload> {
+        Some(match self {
+            Payload::TicketCreate(c) => Payload::TicketCreate(TicketCreate {
+                title: REDACTED.to_string(),
+                ..c.clone()
+            }),
+            Payload::FieldSet(FieldSet::Title(_)) => {
+                Payload::FieldSet(FieldSet::Title(REDACTED.to_string()))
+            }
+            Payload::CommentAdd(_) => Payload::CommentAdd(CommentAdd {
+                body: REDACTED.to_string(),
+            }),
+            Payload::HoldSet(h) => Payload::HoldSet(HoldSet {
+                hold: crate::domain::Hold {
+                    reason: REDACTED.to_string(),
+                    ..h.hold.clone()
+                },
+            }),
+            Payload::BodyEdit(_) => Payload::BodyEdit(BodyEdit {
+                update: crate::body::Body::redacted_update(),
+            }),
+            _ => return None,
+        })
     }
 
     /// Whether this kind mutates workspace config (the workspace, its
@@ -288,6 +369,47 @@ impl Payload {
                 | Payload::ProjectDocAdd(_)
         )
     }
+}
+
+/// What [`Payload::redacted`] writes in place of erased text.
+pub const REDACTED: &str = "[redacted]";
+
+/// Most targets one `redact` op may name (AGT-2427). `pm redact` names
+/// one op per comment, title, hold reason or description edit, so even a
+/// long-lived ticket stays far below it; the bound keeps a hostile op from
+/// making every replica rewrite an unbounded set.
+pub const MAX_REDACT_TARGETS: usize = 10_000;
+
+/// `redact` (AGT-2427): the op ids whose text to erase. `entity` is the
+/// ticket — or, for a project document, the document's `doc_id` — and a
+/// target counts only if it is an op of that same entity (one naming
+/// another entity's op erases nothing), so a redact is routed, admitted
+/// and authorized like any other op on its entity. Targets of a kind
+/// [`Payload::redacted`] leaves alone are ignored. The ids themselves are
+/// not sensitive: they are what every replica already holds.
+///
+/// Order-independent like every merge rule: a target that arrives after
+/// its redact is stored already redacted, one that arrived before is
+/// rewritten in place, and both end the same. Permanent: nothing restores
+/// the text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Redact {
+    pub targets: Vec<Ulid>,
+}
+
+/// A `redact` op that is malformed on its face ([`Op::check_redact`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RedactError {
+    #[error("redact {op_id} names no targets")]
+    NoTargets { op_id: Ulid },
+    #[error("redact {op_id} names {count} targets, over the {max} limit")]
+    TooManyTargets {
+        op_id: Ulid,
+        count: usize,
+        max: usize,
+    },
+    #[error("redact {op_id} names itself as a target")]
+    SelfTarget { op_id: Ulid },
 }
 
 /// Initial scalar fields. Labels, relations, comments and the body follow
@@ -909,7 +1031,115 @@ mod tests {
                 name: Some("notes".into()),
                 doc_id: Ulid::new(),
             })),
+            op(Payload::Redact(Redact {
+                targets: vec![Ulid::new()],
+            })),
         ]
+    }
+
+    /// AGT-2427: redacting replaces only the user-written text, keeps the
+    /// envelope and every other field, is idempotent, and leaves kinds
+    /// without such text alone.
+    #[test]
+    fn redacting_blanks_text_and_keeps_everything_else() {
+        let mut redactable = 0;
+        for o in all_kinds() {
+            let Some(r) = o.redacted() else {
+                assert!(
+                    !matches!(
+                        o.payload,
+                        Payload::TicketCreate(_)
+                            | Payload::FieldSet(FieldSet::Title(_))
+                            | Payload::CommentAdd(_)
+                            | Payload::HoldSet(_)
+                            | Payload::BodyEdit(_)
+                    ),
+                    "{} should be redactable",
+                    o.kind()
+                );
+                continue;
+            };
+            redactable += 1;
+            assert_eq!(
+                (r.op_id, r.hlc, &r.actor, r.entity, r.kind(), r.version),
+                (o.op_id, o.hlc, &o.actor, o.entity, o.kind(), o.version)
+            );
+            assert_eq!(r.redacted().as_ref(), Some(&r), "idempotent: {}", o.kind());
+            let json = serde_json::to_string(&r).unwrap();
+            assert_eq!(serde_json::from_str::<Op>(&json).unwrap(), r);
+            match (&o.payload, &r.payload) {
+                (Payload::TicketCreate(a), Payload::TicketCreate(b)) => {
+                    assert_eq!(b.title, REDACTED);
+                    assert_eq!(
+                        (&a.state, a.priority, &a.ext),
+                        (&b.state, b.priority, &b.ext)
+                    );
+                }
+                (Payload::FieldSet(_), Payload::FieldSet(FieldSet::Title(t))) => {
+                    assert_eq!(t, REDACTED)
+                }
+                (Payload::CommentAdd(_), Payload::CommentAdd(c)) => assert_eq!(c.body, REDACTED),
+                (Payload::HoldSet(a), Payload::HoldSet(b)) => {
+                    assert_eq!(b.hold.reason, REDACTED);
+                    assert_eq!((&a.hold.by, a.hold.at), (&b.hold.by, b.hold.at));
+                }
+                (Payload::BodyEdit(_), Payload::BodyEdit(b)) => {
+                    assert_eq!(b.update, crate::Body::redacted_update())
+                }
+                (a, b) => panic!("{a:?} redacted to {b:?}"),
+            }
+        }
+        assert_eq!(redactable, 5);
+    }
+
+    /// AGT-2427: a redacted `body.edit` imports as a no-op into an empty
+    /// document and into one with text, and is the same bytes every time.
+    #[test]
+    fn a_redacted_body_update_is_a_deterministic_no_op() {
+        let blank = crate::Body::redacted_update();
+        assert_eq!(blank, crate::Body::redacted_update());
+        let mut empty = crate::Body::new();
+        empty
+            .apply(&crate::BodyUpdate::from_bytes(blank.clone()))
+            .unwrap();
+        assert_eq!(empty.text(), "");
+        let mut full = crate::Body::new();
+        full.diff_from_text("secret\n").unwrap();
+        assert!(
+            !full
+                .apply_awaiting(&crate::BodyUpdate::from_bytes(blank))
+                .unwrap()
+        );
+        assert_eq!(full.text(), "secret\n");
+    }
+
+    /// AGT-2427: a redact must name at least one target, not too many,
+    /// and not itself.
+    #[test]
+    fn redact_targets_are_checked() {
+        let redact = |targets: Vec<Ulid>| op(Payload::Redact(Redact { targets }));
+        assert_eq!(redact(vec![Ulid::new()]).check_redact(), Ok(()));
+        assert!(matches!(
+            redact(vec![]).check_redact(),
+            Err(RedactError::NoTargets { .. })
+        ));
+        assert!(matches!(
+            redact(vec![Ulid::new(); MAX_REDACT_TARGETS + 1]).check_redact(),
+            Err(RedactError::TooManyTargets { .. })
+        ));
+        let mut own = redact(vec![]);
+        own.payload = Payload::Redact(Redact {
+            targets: vec![own.op_id],
+        });
+        assert!(matches!(
+            own.check_redact(),
+            Err(RedactError::SelfTarget { .. })
+        ));
+        for o in all_kinds() {
+            if !matches!(o.payload, Payload::Redact(_)) {
+                assert_eq!(o.check_redact(), Ok(()), "{}", o.kind());
+            }
+        }
     }
 
     #[test]
@@ -937,6 +1167,7 @@ mod tests {
             "project.create",
             "project.set",
             "project.doc_add",
+            "redact",
         ];
         let ops = all_kinds();
         assert_eq!(ops.len(), expected.len());
@@ -956,7 +1187,7 @@ mod tests {
     fn config_kinds_use_the_field_value_shape() {
         let ops = all_kinds();
         let (tickets, config): (Vec<_>, Vec<_>) = ops.iter().partition(|o| !o.payload.is_config());
-        assert_eq!(tickets.len(), 14);
+        assert_eq!(tickets.len(), 15);
         assert_eq!(config.len(), 8);
 
         let json =

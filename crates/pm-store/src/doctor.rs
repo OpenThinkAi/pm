@@ -119,6 +119,11 @@ pub struct Report {
     /// hub seq order. Informational like `sync`: the log and tables are
     /// consistent without them.
     pub quarantine: Vec<Quarantined>,
+    /// Ops in the log that still hold text a `redact` in the log erases
+    /// (AGT-2427): each was rewritten when its redact or the op itself
+    /// landed, so any here means the log was changed behind pm's back.
+    /// Unhealthy; `pm doctor --rebuild` redacts them.
+    pub unredacted: u64,
 }
 
 impl Report {
@@ -127,6 +132,7 @@ impl Report {
             && self.foreign_keys.is_empty()
             && self.replay_error.is_none()
             && self.drift.is_empty()
+            && self.unredacted == 0
     }
 }
 
@@ -211,9 +217,9 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let replayed = replay_all(&tx);
         tx.rollback()?;
-        let (drift, replay_error) = match replayed {
-            Ok(diff) => (diff, None),
-            Err(e) => (Diff::default(), Some(e.to_string())),
+        let (drift, unredacted, replay_error) = match replayed {
+            Ok((diff, unredacted)) => (diff, unredacted as u64, None),
+            Err(e) => (Diff::default(), 0, Some(e.to_string())),
         };
         Ok(Report {
             schema_version,
@@ -225,6 +231,7 @@ impl Store {
             drift,
             sync,
             quarantine,
+            unredacted,
         })
     }
 
@@ -236,7 +243,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let diff = replay_all(&tx)?;
+        let (diff, _) = replay_all(&tx)?;
         tx.commit()?;
         Ok(diff)
     }
@@ -258,9 +265,13 @@ pub(crate) fn replay(tx: &Transaction<'_>) -> Result<()> {
     replay_all(tx).map(drop)
 }
 
-fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
+/// Replays the log into the derived tables; returns the drift and how
+/// many ops still held text a redact erases (AGT-2427), which this
+/// redacts first so the replay folds what the log should say.
+fn replay_all(tx: &Transaction<'_>) -> Result<(Diff, usize)> {
     let tables = derived_tables();
     let before = snapshot(tx, &tables)?;
+    let unredacted = crate::redact::reapply_all(tx)?;
     for table in TICKET_TABLES.iter().rev() {
         tx.execute(&format!("DELETE FROM {table}"), [])?;
     }
@@ -297,6 +308,11 @@ fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
         if op.payload.is_config() {
             continue; // replayed above
         }
+        // AGT-2427: a redact folds into no view; its effect is already in
+        // its targets' payloads (redacted above).
+        if matches!(op.payload, pm_core::Payload::Redact(_)) {
+            continue;
+        }
         if op.kind() == "body.edit" && !ticket_entities.contains(&op.entity) {
             continue;
         }
@@ -312,7 +328,7 @@ fn replay_all(tx: &Transaction<'_>) -> Result<Diff> {
     crate::project::replay_project_docs(tx)?;
 
     let after = snapshot(tx, &tables)?;
-    Ok(diff(before, after))
+    Ok((diff(before, after), unredacted))
 }
 
 /// Every row of `tables`, keyed by primary key.

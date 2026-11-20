@@ -451,6 +451,11 @@ fn fold(view: &mut TicketView, op: &Op, persisted: bool) -> Result<(), ApplyErro
                 return Err(ApplyError::MissingDependency { op_id: op.op_id });
             }
         }
+        // AGT-2427: a redact changes no field of the view. Its effect is on
+        // the ops it targets, which the store and the hub rewrite before
+        // refolding the ticket from them; and it leaves `updated` alone,
+        // so erasing text does not read as an edit.
+        Payload::Redact(_) => return Ok(()),
         Payload::Tombstone => {
             if view.deleted_at.as_ref().is_none_or(|s| stamp < *s) {
                 view.deleted_at = Some(stamp.clone());

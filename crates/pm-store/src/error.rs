@@ -139,6 +139,15 @@ pub enum StoreError {
     /// (AGT-1467) — refused on every ingest path, like the hub's push.
     #[error(transparent)]
     OpTooLarge(#[from] pm_core::OpTooLarge),
+    /// [`crate::Store::apply_redact_backfill`] was handed an op that is
+    /// not a `redact` (AGT-2427): a caller bug; nothing is written.
+    #[error("op {op_id} ({kind}) is not a redact; the redact backfill applies only redacts")]
+    NotARedact { op_id: Ulid, kind: &'static str },
+    /// A `redact` with no targets, too many, or itself among them
+    /// (AGT-2427, [`pm_core::Op::check_redact`]) — refused on every ingest
+    /// path, like the hub's push.
+    #[error(transparent)]
+    InvalidRedact(#[from] pm_core::RedactError),
     /// The document commit path was handed an op that is not a
     /// `body.edit` of that document (AGT-1467): another kind, or an
     /// `entity` other than the `doc_id` it is folded into. Only a crafted

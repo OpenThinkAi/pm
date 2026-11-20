@@ -990,3 +990,57 @@ fn backup_files_are_owner_only_and_git_still_works() {
     let tree = stdout(&git(&remote.work, &["ls-tree", "-r", "HEAD"]));
     assert!(tree.lines().all(|l| l.starts_with("100644 ")), "{tree}");
 }
+
+/// AGT-2427: after `pm redact`, the next `pm backup` erases the redacted
+/// ops' text from the shards already written (the commit no longer holds
+/// it; older commits do, which is the documented manual history rewrite),
+/// and a restore comes back redacted.
+#[test]
+fn backup_erases_redacted_text_from_its_shards_and_restores_redacted() {
+    const SECRET: &str = "hunter2-secret";
+    let sb = Sandbox::initialized();
+    let id = sb.new_ticket(&format!("title {SECRET}"));
+    assert_ok(&sb.pm(&["comment", &id, &format!("comment {SECRET}")]));
+    let remote = RemoteBackup::new();
+    let work = remote.work.to_str().unwrap();
+    assert_ok(&sb.pm(&["backup", "--to", work]));
+    let shard = remote.work.join("ops/agt/000001.jsonl");
+    let before = std::fs::read_to_string(&shard).unwrap();
+    assert!(before.contains(SECRET));
+
+    assert_ok(&sb.pm(&["redact", &id, "--all"]));
+    let out = sb.pm(&["backup", "--to", work]);
+    assert_ok(&out);
+    assert!(stderr(&out).contains("git history"), "{}", stderr(&out));
+    let after = std::fs::read_to_string(&shard).unwrap();
+    assert!(!after.contains(SECRET), "{after}");
+    // Every other line is untouched, and one line was appended (the redact).
+    assert_eq!(after.lines().count(), before.lines().count() + 1);
+    let changed = before
+        .lines()
+        .zip(after.lines())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(changed, 2, "the create's title and the comment");
+    // The commit's tree is clean; the history before it is not.
+    let head = git(&remote.work, &["show", "HEAD:ops/agt/000001.jsonl"]);
+    assert!(!String::from_utf8_lossy(&head.stdout).contains(SECRET));
+    let prev = git(&remote.work, &["show", "HEAD~1:ops/agt/000001.jsonl"]);
+    assert!(String::from_utf8_lossy(&prev.stdout).contains(SECRET));
+
+    let restored = Sandbox::new();
+    assert_ok(&restored.run(
+        &[
+            "backup",
+            "--restore",
+            work,
+            "--workspace",
+            restored.ws_str(),
+        ],
+        &[],
+    ));
+    assert_ok(&restored.pm(&["doctor", "--workspace", restored.ws_str()]));
+    let shown = json(&restored.pm(&["show", &id, "--workspace", restored.ws_str(), "--json"]));
+    assert_eq!(shown["title"], "[redacted]");
+    assert_eq!(shown["comments"][0]["body"], "[redacted]");
+}

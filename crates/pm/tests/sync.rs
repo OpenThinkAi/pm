@@ -1554,3 +1554,209 @@ fn a_pulled_op_that_cannot_apply_is_quarantined_not_fatal() {
         assert_eq!(again["refused"], json!([]));
     }
 }
+
+/// Every text value in every table of a replica's database.
+fn all_db_text(r: &Replica) -> String {
+    let conn = rusqlite::Connection::open(r.ws.join("pm.sqlite")).unwrap();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let mut out = String::new();
+    for table in tables {
+        let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        let n = stmt.column_count();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            for i in 0..n {
+                if let Ok(rusqlite::types::ValueRef::Text(t)) = row.get_ref(i) {
+                    out.push_str(&String::from_utf8_lossy(t));
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// AGT-2427: `pm redact` erases a ticket's text on the replica that runs
+/// it, on the hub, and on every replica that syncs; a replica that pulled
+/// past the redact without it (as a build before redaction does — the
+/// hub withholds redacts from clients that do not ask for them) fetches
+/// it once when it upgrades. `pm doctor` stays clean everywhere.
+#[test]
+fn a_redact_reaches_the_hub_and_every_replica() {
+    const SECRET: &str = "hunter2-secret";
+    let Some((_container, db)) = postgres_for("a_redact_reaches_the_hub_and_every_replica") else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&db, port);
+    wait_for_health(&mut hub, port);
+    let hub_url = format!("http://127.0.0.1:{port}");
+    let mut alice = Replica::init("alice");
+    let hub_ws = alice.workspace_id().to_ascii_lowercase();
+    let token = create_token(&db, "alice", &hub_ws);
+    alice.configure(&hub_url, &token);
+    alice.sync();
+    let mut bob = Replica::clone_from(&alice, "bob");
+    bob.configure(&hub_url, &token);
+    let mut carol = Replica::clone_from(&alice, "carol");
+    carol.configure(&hub_url, &token);
+    bob.sync();
+    carol.sync();
+
+    alice.ok(&[
+        "new",
+        "--title",
+        &format!("title {SECRET}"),
+        "--description",
+        &format!("body {SECRET}"),
+    ]);
+    alice.sync();
+    alice.ok(&["comment", "T-1", &format!("comment {SECRET}")]);
+    alice.ok(&["comment", "T-1", "harmless"]);
+    alice.ok(&["hold", "T-1", &format!("hold {SECRET}")]);
+    alice.sync();
+    bob.sync();
+    carol.sync();
+    assert!(bob.show("T-1")["title"].as_str().unwrap().contains(SECRET));
+
+    // Usage: something must be named; comments exist; ops belong.
+    assert_eq!(alice.pm(&["redact", "T-1"]).status.code(), Some(2));
+    assert_eq!(
+        alice.pm(&["redact", "T-1", "--comment", "9"]).status.code(),
+        Some(3)
+    );
+    assert_eq!(
+        alice
+            .pm(&["redact", "T-1", "--op", &ulid::Ulid::new().to_string()])
+            .status
+            .code(),
+        Some(2)
+    );
+
+    let (code, out) = alice.json(&[
+        "redact",
+        "T-1",
+        "--title",
+        "--description",
+        "--comment",
+        "1",
+        "--hold",
+    ]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out["redacted"].as_u64().unwrap() >= 4, "{out}");
+    assert_eq!(out["title"], "[redacted]");
+    assert_eq!(out["description"], "");
+    // Nothing left: a second run erases nothing and says so.
+    let (code, again) = alice.json(&["redact", "T-1", "--title"]);
+    assert_eq!((code, again["redacted"].as_u64()), (0, Some(0)));
+    alice.sync();
+    let hub_text = hub::query_rows(
+        &db,
+        "SELECT op::text FROM ops UNION ALL SELECT view FROM ticket_views",
+    )
+    .unwrap()
+    .into_iter()
+    .flatten()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(!hub_text.contains(SECRET), "the hub kept it");
+
+    bob.sync();
+    let shown = bob.show("T-1");
+    assert_eq!(shown, alice.show("T-1"));
+    let comments: Vec<&str> = shown["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(comments, ["[redacted]", "harmless"]);
+    assert_eq!(shown["hold"]["reason"], "[redacted]");
+
+    // Carol pulled past the redact without it, as an older build would.
+    let head = alice.sync()["head"].as_i64().unwrap();
+    let carol_cursor = carol.sync_state()["cursor"].as_i64().unwrap();
+    carol.shift_cursor(head - carol_cursor);
+    rusqlite::Connection::open(carol.ws.join("pm.sqlite"))
+        .unwrap()
+        .execute("UPDATE sync_redact_backfill SET due = 1", [])
+        .unwrap();
+    assert!(
+        carol.show("T-1")["title"]
+            .as_str()
+            .unwrap()
+            .contains(SECRET)
+    );
+    carol.sync();
+    assert_eq!(carol.show("T-1")["title"], "[redacted]");
+    assert_eq!(carol.show("T-1")["comments"], shown["comments"]);
+
+    for r in [&alice, &bob, &carol] {
+        let (code, report) = r.json(&["doctor"]);
+        assert_eq!(code, 0, "{}: {report}", r.actor);
+        assert!(!all_db_text(r).contains(SECRET), "{} kept it", r.actor);
+    }
+}
+
+/// AGT-2427: a redact the hub refuses (an actor-bound token naming
+/// another actor's op) does not wedge the outbox: `pm sync` drops it,
+/// reports it, and pushes what came after.
+#[test]
+fn a_refused_redact_is_dropped_not_wedged() {
+    let Some((_container, db)) = postgres_for("a_refused_redact_is_dropped_not_wedged") else {
+        return;
+    };
+    let port = free_port();
+    let mut hub = spawn_hub(&db, port);
+    wait_for_health(&mut hub, port);
+    let hub_url = format!("http://127.0.0.1:{port}");
+    let mut alice = Replica::init("alice");
+    let hub_ws = alice.workspace_id().to_ascii_lowercase();
+    let token = create_token(&db, "alice", &hub_ws);
+    alice.configure(&hub_url, &token);
+    alice.sync();
+    let (ok, dave_token, stderr) = admin(
+        &db,
+        &[
+            "token",
+            "create",
+            "dave",
+            "--workspace",
+            &hub_ws,
+            "--actor",
+            "dave",
+        ],
+    );
+    assert!(ok, "{stderr}");
+    let mut dave = Replica::clone_from(&alice, "dave");
+    dave.configure(&hub_url, dave_token.trim());
+    alice.ok(&["new", "--title", "shared"]);
+    alice.sync();
+    alice.ok(&["comment", "T-1", "alice wrote this"]);
+    alice.sync();
+    dave.sync();
+
+    let out = dave.ok(&["redact", "T-1", "--comment", "1"]);
+    assert!(err(&out).contains("written by alice"), "{}", err(&out));
+    dave.ok(&["comment", "T-1", "dave wrote this"]);
+    let round = dave.sync();
+    assert_eq!(
+        round["refused_redacts"].as_array().unwrap().len(),
+        1,
+        "{round}"
+    );
+    assert_eq!(round["outbox"], 0, "{round}");
+    alice.sync();
+    let comments = alice.show("T-1")["comments"].clone();
+    assert_eq!(comments[0]["body"], "alice wrote this");
+    assert_eq!(comments[1]["body"], "dave wrote this");
+    let (code, report) = dave.json(&["doctor"]);
+    assert_eq!(code, 0, "{report}");
+}

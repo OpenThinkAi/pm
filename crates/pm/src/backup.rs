@@ -51,7 +51,8 @@
 //! - The log is **sharded by size**, in `seq` order: ops append to
 //!   `ops/<prefix>/<NNNNNN>.jsonl`, and once a shard would grow past
 //!   [`SHARD_ROTATE_BYTES`] the next op starts `<NNNNNN+1>.jsonl`. Only
-//!   the newest shard is ever appended to; older ones never change again.
+//!   the newest shard is ever appended to; older ones never change again,
+//!   except that a redact (AGT-2427) rewrites the lines of the ops it names.
 //!   Shards are cut by size rather than by HLC month because restore must
 //!   replay in `seq` order and `pm import vault` back-dates HLCs to the
 //!   vault's own timestamps — a month-keyed layout could put a ticket's
@@ -383,6 +384,52 @@ fn read_jsonl(path: &Path) -> Result<Vec<Op>> {
     Ok(ops)
 }
 
+/// Rewrites, in every shard under `shard_dir`, the line of each op a
+/// `redact` among `ops` names (same entity) with that op redacted
+/// (AGT-2427), leaving every other line byte for byte; returns how many
+/// lines changed. The only time a closed shard is rewritten.
+fn redact_shards<'a>(shard_dir: &Path, ops: impl Iterator<Item = &'a Op>) -> Result<usize> {
+    let targets: BTreeSet<(Ulid, Ulid)> = ops
+        .filter_map(|op| match &op.payload {
+            pm_core::Payload::Redact(r) => Some(r.targets.iter().map(|t| (op.entity, *t))),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    let mut changed = 0;
+    for (_, path) in list_shards(shard_dir)? {
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let mut out = String::with_capacity(text.len());
+        let mut touched = false;
+        for line in text.split_inclusive('\n') {
+            let body = line.trim_end_matches('\n');
+            let blank = serde_json::from_str::<Op>(body)
+                .ok()
+                .filter(|op| targets.contains(&(op.entity, op.op_id)))
+                .and_then(|op| op.redacted().filter(|r| *r != op));
+            match blank {
+                Some(op) => {
+                    out.push_str(&serde_json::to_string(&op).expect("an op serializes"));
+                    if line.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    touched = true;
+                    changed += 1;
+                }
+                None => out.push_str(line),
+            }
+        }
+        if touched {
+            write_private(&path, out.as_bytes())?;
+        }
+    }
+    Ok(changed)
+}
+
 /// Rewrites a pre-AGT-1378 `ops/<stem>.jsonl` as shards under
 /// `layout.shard_dir` and removes it. Any shards already there are from
 /// an earlier, interrupted migration of the same file (a completed one
@@ -453,6 +500,17 @@ pub fn run(ctx: &Ctx<'_>, to: Option<PathBuf>) -> Result<()> {
         writer.append(&serde_json::to_string(op).expect("an op serializes"))?;
     }
     let shards = writer.finish()?;
+    // AGT-2427: a redact in this batch erases its targets' text from the
+    // shards already written too, so the backup's working tree (and the
+    // commit below) no longer holds it. Its git history still does.
+    let redacted = redact_shards(&layout.shard_dir, new_ops.iter().map(|(_, op)| op))?;
+    if redacted > 0 && !ctx.json {
+        eprintln!(
+            "pm: erased the text of {redacted} redacted op(s) from the backup's shards; \
+             its git history (and every clone) still holds them until you rewrite it \
+             (see docs/data-retention.md)"
+        );
+    }
 
     // Rewritten every backup, whether or not there were new ops: what
     // the snapshot carries beyond the (now op-logged, AGT-1385) config —

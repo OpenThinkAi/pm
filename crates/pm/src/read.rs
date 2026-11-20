@@ -182,6 +182,10 @@ fn op_summary_in(op: &Op, slugs: &BTreeMap<Ulid, String>) -> String {
         Payload::HoldClear => "cleared hold".to_string(),
         Payload::BodyEdit(_) => "edited description".to_string(),
         Payload::Tombstone => "deleted".to_string(),
+        Payload::Redact(r) => match r.targets.len() {
+            1 => "redacted 1 op".to_string(),
+            n => format!("redacted {n} ops"),
+        },
         // Config kinds (AGT-1384/1386): the workspace-wide `pm log` (no
         // ticket) lists these.
         Payload::WorkspaceSet(w) => workspace_summary(w),

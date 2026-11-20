@@ -240,7 +240,9 @@ impl Store {
     /// other writer (the CLI's own verbs) already knows and calls the
     /// specific method directly.
     pub fn commit_any(&mut self, op: &Op) -> Result<()> {
-        if self.is_known_doc_id(op.entity)? {
+        // A redact (AGT-2427) of a document is routed by kind: it is not
+        // a document edit, and `commit` handles both entity kinds.
+        if !matches!(op.payload, Payload::Redact(_)) && self.is_known_doc_id(op.entity)? {
             self.commit_doc_edit(op.entity, op)?;
         } else {
             self.commit(op)?;
@@ -250,7 +252,7 @@ impl Store {
 }
 
 /// Whether a `project` or `project_doc` row shows document `doc_id`.
-fn doc_has_row(conn: &rusqlite::Connection, doc_id: Ulid) -> Result<bool> {
+pub(crate) fn doc_has_row(conn: &rusqlite::Connection, doc_id: Ulid) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM project WHERE doc_id = ?1)
              OR EXISTS(SELECT 1 FROM project_doc WHERE doc_id = ?1)",
@@ -337,6 +339,8 @@ pub(crate) fn commit_doc_edit_in(
     )? {
         return Err(StoreError::DuplicateOp { op_id: op.op_id });
     }
+    // AGT-2427: an edit a redact already names lands redacted.
+    let op = &*crate::redact::effective(tx, op)?;
     crate::commit::check_ingest(op, origin)?;
     ensure_actor(tx, &op.actor)?;
     if !doc_has_row(tx, doc_id)? {
@@ -365,7 +369,7 @@ pub(crate) fn commit_doc_edit_in(
 /// Rewrites `project_doc_view` and whichever `project`/`project_doc` row
 /// owns `view.id`. Errors if no row does ([`StoreError::UnknownDocument`]):
 /// callers only materialize a row's document.
-fn materialize_doc(tx: &Transaction<'_>, view: &DocView) -> Result<String> {
+pub(crate) fn materialize_doc(tx: &Transaction<'_>, view: &DocView) -> Result<String> {
     let doc_id = view.id;
     let text = view.text();
     let owning_project: Option<String> = tx

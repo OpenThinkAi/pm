@@ -10,7 +10,7 @@
   "rebuilt": null,
   "replay_error": null,
   "schema": 1,
-  "schema_version": 14,
+  "schema_version": 15,
   "sync": {
     "cursor": 0,
     "outbox": 52,
@@ -33,15 +33,17 @@
     "project_doc_view": 1,
     "project_view": 1,
     "relation": 2,
-    "schema_version": 14,
+    "schema_version": 15,
     "state": 4,
     "sync_pushed": 0,
     "sync_quarantine": 0,
+    "sync_redact_backfill": 1,
     "sync_state": 1,
     "ticket": 4,
     "ticket_label": 3,
     "ticket_view": 4,
     "workspace": 1,
     "workspace_view": 1
-  }
+  },
+  "unredacted": 0
 }

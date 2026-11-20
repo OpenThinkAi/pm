@@ -1476,6 +1476,21 @@ fn every_verbs_json_output_matches_its_fixture() {
         &mut failures,
     );
 
+    // ---- pm redact / pm project redact (AGT-2427) ----
+    // Last: they erase text other fixtures above show.
+    cap(
+        "redact",
+        &["redact", "AGT-1", "--comment", "1", "--hold", "--json"],
+        0,
+        &mut failures,
+    );
+    cap(
+        "project_redact",
+        &["project", "redact", "pm", "--json"],
+        0,
+        &mut failures,
+    );
+
     assert!(
         failures.is_empty(),
         "{} verb(s) drifted from their fixture:\n\n{}",
