@@ -326,7 +326,8 @@ pub(crate) fn push_all(
         }
         let batch = Batch::take(&outbox, MAX_BATCH_BYTES)?;
         // AGT-2551: ask a hub that may predate redaction before sending it
-        // a redact, rather than reading its parse error afterwards.
+        // a redact, rather than reading its parse error afterwards. The
+        // batch is a prefix of the outbox (`Batch::take`).
         if outbox[..batch.op_ids.len()]
             .iter()
             .any(|(_, op)| matches!(op.payload, Payload::Redact(_)))
@@ -473,7 +474,7 @@ fn post_batch(hub: &HubClient, batch: &Batch) -> Result<Posted> {
 
 /// The first hub schema that stores `redact` ops: pm-hub's migration
 /// `0006_redact.sql` (AGT-2427).
-pub(crate) const REDACT_HUB_SCHEMA: i64 = 6;
+const REDACT_HUB_SCHEMA: i64 = 6;
 
 /// The hub's `GET /health` `schema_version` (`docs/hub-api.md`), or `None`
 /// when it cannot be had: unreachable, a non-`200`, or no integer there.
