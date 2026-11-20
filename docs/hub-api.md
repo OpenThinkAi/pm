@@ -265,7 +265,8 @@ git sha the binary was built from (`PM_HUB_BUILD_SHA` at build time;
 `"unknown"` when unset). `scripts/deploy-hub.sh` writes the sha to
 `.build-sha` in the upload (`railway up` ships no `.git` and takes no
 build args), the Dockerfile passes it to cargo, and the script waits for
-`/health` to report it.
+`/health` to report it. `pm sync` reads `schema_version` before pushing
+a `redact` and refuses to send one to a hub below 6 (AGT-2551).
 
 ## `GET /w/{workspace}/whoami`
 

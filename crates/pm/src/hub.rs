@@ -329,6 +329,16 @@ impl HubClient {
         read_response(&mut resp)
     }
 
+    /// `GET <url>/health`, the one open route (no token): `(status, body)`.
+    pub(crate) fn health(&self) -> std::result::Result<(u16, String), Transport> {
+        let mut resp = self
+            .agent
+            .get(format!("{}/health", self.url))
+            .call()
+            .map_err(|e| Transport(e.to_string()))?;
+        read_response(&mut resp)
+    }
+
     /// `POST <url>/w/<workspace>/<route>` with a JSON body and the bearer
     /// token: `(status, body)`.
     pub(crate) fn post_json(

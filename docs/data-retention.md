@@ -73,8 +73,9 @@ redact anything. When the hub refuses a redact, `pm sync` drops it and
 says so: the text stays erased on your replica only, so redact again with
 an unrestricted token. `pm redact` warns when it is about to erase ops
 another actor wrote. The hub must run pm-hub with schema 6 or later
-before anyone uses `pm redact`; an older hub cannot store the op, and
-`pm sync` stops with an error saying to upgrade it.
+before anyone uses `pm redact`; an older hub cannot store the op, so
+`pm sync` checks the hub's schema before pushing one and stops with an
+error saying to upgrade it.
 
 What a redaction does not cover: label names, project titles, workflow
 state names, `ext` values, waiver reasons and actor ids are not erased by
